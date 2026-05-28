@@ -17,22 +17,17 @@
 
 use std::collections::{HashMap, HashSet};
 
-use codegraph_core::{normalize_path, HttpMethod, Language, Span};
+use codegraph_core::Language;
 use tree_sitter::{Node, Parser};
 
+use super::ts::{
+    collect_builders, collect_referenced_builders, func_name, join, last_segment, method_router,
+    named_arg, router_chain_roots, span_of, string_literal_text, text,
+};
+use super::RawEndpoint;
 use crate::registry::grammar;
 
-/// A server endpoint extracted from axum router code.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RawEndpoint {
-    pub method: HttpMethod,
-    /// Accumulated, normalized route path (e.g. `/api/users/{id}`).
-    pub path: String,
-    /// Handler symbol name (last path segment), empty for closures.
-    pub handler: String,
-    /// Span of the `.route(...)` call.
-    pub span: Span,
-}
+const ROUTER: &str = "Router";
 
 /// Extract axum endpoints from Rust `source`. Returns empty on parse failure.
 pub fn extract_axum(source: &str) -> Vec<RawEndpoint> {
@@ -47,7 +42,7 @@ pub fn extract_axum(source: &str) -> Vec<RawEndpoint> {
     let root = tree.root_node();
 
     // `fn name() -> Router { ... }` builders, keyed by name -> their router chain.
-    let builders = collect_builders(root, src);
+    let builders = collect_builders(root, src, ROUTER);
     let builder_ids: HashSet<usize> = builders.values().map(|n| n.id()).collect();
     let referenced = collect_referenced_builders(root, src, &builders);
 
@@ -55,7 +50,7 @@ pub fn extract_axum(source: &str) -> Vec<RawEndpoint> {
 
     // Inline entry routers: a `Router::new()` chain that is a statement / binding
     // (not nested as an argument of another chain, and not a builder body).
-    for cr in router_chain_roots(root, src) {
+    for cr in router_chain_roots(root, src, ROUTER) {
         if builder_ids.contains(&cr.id()) {
             continue;
         }
@@ -104,30 +99,32 @@ fn expand<'a>(
                 let args = expr.child_by_field_name("arguments");
                 match method.as_str() {
                     "route" | "route_service" => {
-                        if let (Some(path), Some(mr)) =
-                            (named_arg(args, 0, src), named_arg(args, 1, src))
-                        {
-                            let p = join(prefix, &string_text(path, src));
-                            for (m, h) in method_router(mr, src) {
-                                out.push(RawEndpoint {
-                                    method: m,
-                                    path: p.clone(),
-                                    handler: h,
-                                    span: span_of(expr),
-                                });
+                        if let (Some(path), Some(mr)) = (named_arg(args, 0), named_arg(args, 1)) {
+                            // Dynamic (non-literal) paths are out of scope.
+                            if let Some(path) = string_literal_text(path, src) {
+                                let p = join(prefix, &path);
+                                for (m, h) in method_router(mr, src) {
+                                    out.push(RawEndpoint {
+                                        method: m,
+                                        path: p.clone(),
+                                        handler: h,
+                                        span: span_of(expr),
+                                    });
+                                }
                             }
                         }
                     }
                     "nest" | "nest_service" => {
-                        if let (Some(pre), Some(inner)) =
-                            (named_arg(args, 0, src), named_arg(args, 1, src))
-                        {
-                            let p = join(prefix, &string_text(pre, src));
-                            expand(inner, &p, src, builders, visited, out);
+                        if let (Some(pre), Some(inner)) = (named_arg(args, 0), named_arg(args, 1)) {
+                            // Dynamic (non-literal) prefixes are out of scope.
+                            if let Some(pre) = string_literal_text(pre, src) {
+                                let p = join(prefix, &pre);
+                                expand(inner, &p, src, builders, visited, out);
+                            }
                         }
                     }
                     "merge" => {
-                        if let Some(inner) = named_arg(args, 0, src) {
+                        if let Some(inner) = named_arg(args, 0) {
                             expand(inner, prefix, src, builders, visited, out);
                         }
                     }
@@ -168,240 +165,10 @@ fn expand_ref<'a>(
     }
 }
 
-/// Collect `(method, handler)` pairs from a MethodRouter expression such as
-/// `get(list)` or `get(list).post(create)`.
-fn method_router(node: Node, src: &[u8]) -> Vec<(HttpMethod, String)> {
-    let mut out = Vec::new();
-    collect_method_router(node, src, &mut out);
-    out
-}
-
-fn collect_method_router(node: Node, src: &[u8], out: &mut Vec<(HttpMethod, String)>) {
-    if node.kind() != "call_expression" {
-        return;
-    }
-    let Some(func) = node.child_by_field_name("function") else {
-        return;
-    };
-    let args = node.child_by_field_name("arguments");
-    if func.kind() == "field_expression" {
-        if let Some(recv) = func.child_by_field_name("value") {
-            collect_method_router(recv, src, out);
-        }
-        let verb = func
-            .child_by_field_name("field")
-            .map(|n| text(n, src))
-            .unwrap_or_default();
-        if let Some(m) = HttpMethod::parse(&verb) {
-            out.push((m, handler_name(args, src)));
-        }
-    } else {
-        let verb = func_name(func, src);
-        if let Some(m) = HttpMethod::parse(last_segment(&verb)) {
-            out.push((m, handler_name(args, src)));
-        }
-    }
-}
-
-/// Index `fn NAME(...) -> Router { ... }` builders to their router chain root.
-fn collect_builders<'a>(root: Node<'a>, src: &[u8]) -> HashMap<String, Node<'a>> {
-    let mut builders = HashMap::new();
-    walk(root, &mut |n| {
-        if n.kind() != "function_item" {
-            return;
-        }
-        let returns_router = n
-            .child_by_field_name("return_type")
-            .map(|rt| text(rt, src).contains("Router"))
-            .unwrap_or(false);
-        if !returns_router {
-            return;
-        }
-        let (Some(name), Some(body)) = (
-            n.child_by_field_name("name").map(|x| text(x, src)),
-            n.child_by_field_name("body"),
-        ) else {
-            return;
-        };
-        // The returned router is the body's top-level chain (not one nested as
-        // an argument of another chain); take the last such in source order.
-        let chain = router_chain_roots(body, src)
-            .into_iter()
-            .rfind(|c| c.parent().map(|p| p.kind()) != Some("arguments"));
-        if let Some(chain) = chain {
-            builders.insert(name, chain);
-        }
-    });
-    builders
-}
-
-/// Names of builder fns referenced by a `.nest`/`.merge` argument.
-fn collect_referenced_builders(
-    root: Node,
-    src: &[u8],
-    builders: &HashMap<String, Node>,
-) -> HashSet<String> {
-    let mut referenced = HashSet::new();
-    walk(root, &mut |n| {
-        if n.kind() != "call_expression" {
-            return;
-        }
-        let Some(func) = n.child_by_field_name("function") else {
-            return;
-        };
-        if func.kind() != "field_expression" {
-            return;
-        }
-        let method = func
-            .child_by_field_name("field")
-            .map(|x| text(x, src))
-            .unwrap_or_default();
-        if method != "nest" && method != "merge" && method != "nest_service" {
-            return;
-        }
-        let args = n.child_by_field_name("arguments");
-        for i in 0..2 {
-            if let Some(a) = named_arg(args, i, src) {
-                let name = match a.kind() {
-                    "call_expression" => a
-                        .child_by_field_name("function")
-                        .map(|f| func_name(f, src))
-                        .unwrap_or_default(),
-                    "identifier" | "scoped_identifier" => text(a, src),
-                    _ => String::new(),
-                };
-                let short = last_segment(&name);
-                if builders.contains_key(short) {
-                    referenced.insert(short.to_string());
-                }
-            }
-        }
-    });
-    referenced
-}
-
-/// The topmost `call_expression` of every `Router::new()` method chain.
-fn router_chain_roots<'a>(root: Node<'a>, src: &[u8]) -> Vec<Node<'a>> {
-    let mut roots = Vec::new();
-    let mut seen = HashSet::new();
-    walk(root, &mut |n| {
-        if n.kind() != "call_expression" {
-            return;
-        }
-        let is_router_new = n
-            .child_by_field_name("function")
-            .map(|f| f.kind() == "scoped_identifier" && text(f, src) == "Router::new")
-            .unwrap_or(false);
-        if !is_router_new {
-            return;
-        }
-        let cr = chain_root(n);
-        if seen.insert(cr.id()) {
-            roots.push(cr);
-        }
-    });
-    roots
-}
-
-/// Ascend a node through `receiver.method(...)` chains to the outermost call.
-fn chain_root(mut n: Node) -> Node {
-    while let Some(p) = n.parent() {
-        if p.kind() == "field_expression"
-            && p.child_by_field_name("value").map(|v| v.id()) == Some(n.id())
-        {
-            if let Some(gp) = p.parent() {
-                if gp.kind() == "call_expression"
-                    && gp.child_by_field_name("function").map(|f| f.id()) == Some(p.id())
-                {
-                    n = gp;
-                    continue;
-                }
-            }
-        }
-        break;
-    }
-    n
-}
-
-fn walk<'a>(node: Node<'a>, f: &mut dyn FnMut(Node<'a>)) {
-    f(node);
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        walk(child, f);
-    }
-}
-
-fn named_arg<'a>(args: Option<Node<'a>>, i: usize, _src: &[u8]) -> Option<Node<'a>> {
-    let args = args?;
-    let mut cursor = args.walk();
-    let nth = args.named_children(&mut cursor).nth(i);
-    nth
-}
-
-/// The handler name from a call's arguments (first arg's last path segment).
-fn handler_name(args: Option<Node>, src: &[u8]) -> String {
-    match named_arg(args, 0, src) {
-        Some(n) if matches!(n.kind(), "identifier" | "scoped_identifier") => {
-            last_segment(&text(n, src)).to_string()
-        }
-        _ => String::new(),
-    }
-}
-
-fn func_name(func: Node, src: &[u8]) -> String {
-    text(func, src)
-}
-
-fn last_segment(name: &str) -> &str {
-    name.rsplit("::").next().unwrap_or(name)
-}
-
-fn text(node: Node, src: &[u8]) -> String {
-    node.utf8_text(src).unwrap_or("").to_string()
-}
-
-/// Inner text of a string literal, with quotes and any raw-string `r#"…"#`
-/// delimiters removed. Works for plain (`"…"`) and raw (`r"…"`, `r#"…"#`)
-/// literals by reading the grammar's `string_content` child.
-fn string_text(node: Node, src: &[u8]) -> String {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == "string_content" {
-            return text(child, src);
-        }
-    }
-    // Fallback for unexpected shapes (e.g. an empty literal with no content
-    // node): strip a leading `r`, matched `#`s, then the surrounding quotes.
-    text(node, src)
-        .trim()
-        .trim_start_matches('r')
-        .trim_matches('#')
-        .trim_matches('"')
-        .to_string()
-}
-
-/// Join an accumulated prefix with a path segment and normalize.
-fn join(prefix: &str, path: &str) -> String {
-    let combined = format!(
-        "{}/{}",
-        prefix.trim_end_matches('/'),
-        path.trim_start_matches('/')
-    );
-    normalize_path(&combined)
-}
-
-fn span_of(node: Node) -> Span {
-    Span {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: node.start_position().row + 1,
-        end_line: node.end_position().row + 1,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codegraph_core::HttpMethod;
 
     fn ep<'a>(eps: &'a [RawEndpoint], method: HttpMethod, path: &str) -> Option<&'a RawEndpoint> {
         eps.iter().find(|e| e.method == method && e.path == path)
@@ -517,6 +284,36 @@ fn app() -> Router {
                 .handler,
             "show"
         );
+    }
+
+    #[test]
+    fn turbofish_constructor_is_a_root() {
+        let src = r#"
+fn app() -> Router {
+    Router::<AppState>::new().route("/x", get(h))
+}
+"#;
+        let eps = extract_axum(src);
+        assert_eq!(ep(&eps, HttpMethod::Get, "/x").unwrap().handler, "h");
+    }
+
+    #[test]
+    fn non_literal_path_and_prefix_are_skipped() {
+        // Dynamically-built paths/prefixes (consts, idents) are out of scope:
+        // they must be skipped, not emitted as literal `"/PATH"` routes.
+        let src = r#"
+const PATH: &str = "/users";
+fn app() -> Router {
+    Router::new()
+        .route(PATH, get(list))
+        .nest(PREFIX, Router::new().route("/inner", get(inner)))
+}
+"#;
+        let eps = extract_axum(src);
+        assert!(eps.iter().all(|e| e.path != "/PATH"));
+        assert!(ep(&eps, HttpMethod::Get, "/users").is_none());
+        // The route under the dynamic nest prefix is not emitted either.
+        assert!(eps.iter().all(|e| e.handler != "inner"));
     }
 
     #[test]

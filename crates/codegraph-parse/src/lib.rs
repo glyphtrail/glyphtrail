@@ -5,7 +5,7 @@ pub mod rest;
 
 pub use build::{build_file_graph, FileGraph, PendingEdge, SymbolEntry};
 pub use extract::{parse_source, ParsedFile};
-pub use rest::{extract_axum, RawEndpoint};
+pub use rest::{extract_axum, extract_utoipa, RawEndpoint};
 
 #[cfg(test)]
 mod tests {
