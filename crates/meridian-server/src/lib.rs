@@ -40,7 +40,7 @@ async fn api_graph(State(state): State<AppState>) -> Json<Value> {
     let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
     let (nodes, edges) = store.export_graph(5000).unwrap_or_default();
     let ops = store.all_operations().unwrap_or_default();
-    Json(meridian_viz::to_elements(&nodes, &edges, &ops))
+    Json(meridian_viz::to_elements(&nodes, &edges, &ops, None))
 }
 
 async fn api_search(
