@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>meridian</title>
+<script src="https://cdn.jsdelivr.net/npm/cytoscape@3.30.2/dist/cytoscape.min.js"></script>
+<style>
+  html, body { margin: 0; height: 100%; font-family: ui-monospace, monospace; }
+  #toolbar {
+    position: fixed; top: 0; left: 0; right: 0; height: 44px; z-index: 10;
+    display: flex; align-items: center; gap: 10px; padding: 0 12px;
+    background: #1b1f24; color: #e6e6e6; border-bottom: 1px solid #333;
+  }
+  #toolbar input { background: #0d1117; color: #e6e6e6; border: 1px solid #444;
+    padding: 5px 8px; border-radius: 4px; width: 240px; }
+  #toolbar label { font-size: 12px; opacity: 0.8; }
+  #cy { position: absolute; top: 44px; bottom: 0; left: 0; right: 0; background: #0d1117; }
+  #info {
+    position: fixed; right: 0; top: 44px; width: 320px; bottom: 0; overflow: auto;
+    background: #161b22; color: #c9d1d9; border-left: 1px solid #333;
+    padding: 12px; font-size: 13px; display: none;
+  }
+  #info h3 { margin: 0 0 6px; font-size: 14px; }
+  #info pre { white-space: pre-wrap; background: #0d1117; padding: 8px; border-radius: 4px; }
+  .tag { font-size: 11px; padding: 1px 6px; border-radius: 8px; background: #30363d; }
+</style>
+</head>
+<body>
+<div id="toolbar">
+  <strong>meridian</strong>
+  <input id="filter" placeholder="filter by name…" />
+  <label><input type="checkbox" id="hideContains" /> hide containment</label>
+  <span id="counts"></span>
+</div>
+<div id="cy"></div>
+<div id="info"></div>
+<script>
+const KIND_COLOR = {
+  repo: "#f0c674", directory: "#b294bb", file: "#81a2be",
+  module: "#8abeb7", function: "#b5bd68", method: "#8abeb7",
+  class: "#de935f", struct: "#de935f", interface: "#cc6666",
+  enum: "#cc6666", trait: "#cc6666", comment: "#969896",
+};
+const EDGE_COLOR = {
+  contains: "#3a3f44", calls: "#b5bd68", imports: "#81a2be",
+  extends: "#de935f", implements: "#cc6666", documents: "#969896",
+  defines: "#3a3f44", references: "#666",
+};
+
+async function loadData() {
+  if (window.MERIDIAN_DATA) return window.MERIDIAN_DATA;
+  const res = await fetch("/api/graph");
+  return await res.json();
+}
+
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+loadData().then((data) => {
+  const cy = cytoscape({
+    container: document.getElementById("cy"),
+    elements: data,
+    style: [
+      { selector: "node", style: {
+        "background-color": (e) => KIND_COLOR[e.data("kind")] || "#888",
+        "label": "data(label)", "color": "#ddd", "font-size": 9,
+        "text-valign": "bottom", "text-wrap": "ellipsis", "text-max-width": 90,
+        "width": 14, "height": 14 } },
+      { selector: "edge", style: {
+        "width": 1, "line-color": (e) => EDGE_COLOR[e.data("kind")] || "#555",
+        "target-arrow-color": (e) => EDGE_COLOR[e.data("kind")] || "#555",
+        "target-arrow-shape": "triangle", "arrow-scale": 0.7,
+        "curve-style": "bezier", "line-style": (e) => e.data("confidence") === "inferred" ? "dashed" : "solid" } },
+      { selector: ".faded", style: { "opacity": 0.08 } },
+      { selector: ":selected", style: { "border-width": 3, "border-color": "#fff" } },
+    ],
+    layout: { name: "cose", animate: false, nodeRepulsion: 8000, idealEdgeLength: 60 },
+  });
+
+  document.getElementById("counts").textContent =
+    cy.nodes().length + " nodes, " + cy.edges().length + " edges";
+
+  cy.on("tap", "node", (evt) => {
+    const d = evt.target.data();
+    const info = document.getElementById("info");
+    info.style.display = "block";
+    info.innerHTML = "<h3>" + esc(d.qualified_name || d.label) + "</h3>" +
+      "<span class='tag'>" + esc(d.kind) + "</span> " +
+      (d.language ? "<span class='tag'>" + esc(d.language) + "</span>" : "") +
+      "<p>" + esc(d.file || "") + (d.line ? ":" + esc(d.line) : "") + "</p>" +
+      (d.doc ? "<pre>" + esc(d.doc) + "</pre>" : "");
+    cy.elements().addClass("faded");
+    evt.target.removeClass("faded");
+    evt.target.neighborhood().removeClass("faded");
+  });
+  cy.on("tap", (evt) => { if (evt.target === cy) {
+    cy.elements().removeClass("faded");
+    document.getElementById("info").style.display = "none";
+  }});
+
+  document.getElementById("filter").addEventListener("input", (e) => {
+    const q = e.target.value.toLowerCase();
+    if (!q) { cy.elements().removeClass("faded"); return; }
+    cy.elements().addClass("faded");
+    const hit = cy.nodes().filter((n) =>
+      (n.data("label") || "").toLowerCase().includes(q) ||
+      (n.data("qualified_name") || "").toLowerCase().includes(q));
+    hit.removeClass("faded");
+    hit.neighborhood().removeClass("faded");
+  });
+
+  document.getElementById("hideContains").addEventListener("change", (e) => {
+    const edges = cy.edges('[kind = "contains"]');
+    if (e.target.checked) edges.style("display", "none");
+    else edges.style("display", "element");
+  });
+});
+</script>
+</body>
+</html>

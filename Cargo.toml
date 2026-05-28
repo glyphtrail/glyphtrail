@@ -1,12 +1,12 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/codegraph-core",
-    "crates/codegraph-parse",
-    "crates/codegraph-store",
-    "crates/codegraph-viz",
-    "crates/codegraph-server",
-    "crates/codegraph-cli",
+    "crates/meridian-core",
+    "crates/meridian-parse",
+    "crates/meridian-store",
+    "crates/meridian-viz",
+    "crates/meridian-server",
+    "crates/meridian-cli",
 ]
 
 [workspace.package]
@@ -16,11 +16,11 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/sunsided/codegraph"
 
 [workspace.dependencies]
-codegraph-core = { path = "crates/codegraph-core" }
-codegraph-parse = { path = "crates/codegraph-parse" }
-codegraph-store = { path = "crates/codegraph-store" }
-codegraph-viz = { path = "crates/codegraph-viz" }
-codegraph-server = { path = "crates/codegraph-server" }
+meridian-core = { path = "crates/meridian-core" }
+meridian-parse = { path = "crates/meridian-parse" }
+meridian-store = { path = "crates/meridian-store" }
+meridian-viz = { path = "crates/meridian-viz" }
+meridian-server = { path = "crates/meridian-server" }
 
 anyhow = "1"
 thiserror = "2"
