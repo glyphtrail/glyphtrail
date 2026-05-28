@@ -12,7 +12,7 @@ pub use build::{
     build_file_graph, build_rest_graph,
 };
 pub use client::{RawClientCall, extract_client_calls};
-pub use extract::{ParsedFile, parse_source};
+pub use extract::{ParsedFile, parse_source, parse_with};
 pub use imports::resolve_import;
 pub use rest::{
     RawEndpoint, RawMount, extract_axum, extract_axum_mounts, extract_utoipa, extract_utoipa_mounts,
@@ -32,6 +32,24 @@ mod tests {
             Query::new(&grammar, src)
                 .unwrap_or_else(|e| panic!("query for {} failed: {e}", lang.name()));
         }
+    }
+
+    // parse_with (grammar + query) is the decoupled core of parse_source; for a
+    // built-in language the two must produce identical results.
+    #[test]
+    fn parse_with_matches_parse_source_for_builtin() {
+        let src = "fn helper() {}\nfn main() { helper(); }\n";
+        let via_lang = parse_source(Language::Rust, src).unwrap();
+        let via_grammar = parse_with(
+            &registry::grammar(Language::Rust),
+            registry::query_source(Language::Rust),
+            src,
+        )
+        .unwrap();
+        assert_eq!(via_lang.defs.len(), via_grammar.defs.len());
+        assert_eq!(via_lang.calls.len(), via_grammar.calls.len());
+        assert!(via_grammar.defs.iter().any(|d| d.name == "helper"));
+        assert!(via_grammar.calls.iter().any(|c| c.name == "helper"));
     }
 
     // #23: every supported language extracts a top-level function definition
