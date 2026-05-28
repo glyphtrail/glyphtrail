@@ -43,3 +43,15 @@ CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
     qualified_name,
     doc
 );
+
+-- API operation keys for endpoint / client-call / schema-op nodes. Kept in a
+-- side table (keyed by node id) so the generic nodes table stays protocol-free.
+CREATE TABLE IF NOT EXISTS api_operations (
+    node_id   TEXT PRIMARY KEY,
+    protocol  TEXT NOT NULL,
+    method    TEXT,
+    path      TEXT NOT NULL,
+    signature TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_api_ops_sig ON api_operations(signature);

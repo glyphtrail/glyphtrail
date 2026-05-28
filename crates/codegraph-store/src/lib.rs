@@ -57,4 +57,43 @@ mod tests {
         assert_eq!(impacted.len(), 1);
         assert_eq!(impacted[0].name, "caller");
     }
+
+    #[test]
+    fn api_operations_persist_and_filter_by_kind() {
+        use codegraph_core::{HttpMethod, OperationKey};
+
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mut endpoint = node("e1", "get_user", NodeKind::Endpoint);
+        endpoint.file = "routes.rs".into();
+        let mut client = node("c1", "fetchUser", NodeKind::ClientCall);
+        client.file = "client.ts".into();
+        store.insert_graph(&[endpoint, client], &[]).unwrap();
+        store
+            .insert_operations(&[
+                (
+                    NodeId("e1".into()),
+                    OperationKey::rest(HttpMethod::Get, "/api/users/{id}"),
+                ),
+                (
+                    NodeId("c1".into()),
+                    OperationKey::rest(HttpMethod::Get, "/users/123"),
+                ),
+            ])
+            .unwrap();
+
+        let endpoints = store.operations_by_kind(NodeKind::Endpoint).unwrap();
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].0, NodeId("e1".into()));
+        assert_eq!(endpoints[0].1.path, "/api/users/{id}");
+        assert_eq!(endpoints[0].1.method, Some(HttpMethod::Get));
+
+        let calls = store.operations_by_kind(NodeKind::ClientCall).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, NodeId("c1".into()));
+
+        // Incremental re-index of the endpoint's file drops its operation row.
+        store.delete_file_data("routes.rs").unwrap();
+        assert!(store.operations_by_kind(NodeKind::Endpoint).unwrap().is_empty());
+        assert_eq!(store.operations_by_kind(NodeKind::ClientCall).unwrap().len(), 1);
+    }
 }
