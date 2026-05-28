@@ -3,8 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use meridian_core::{
-    Confidence, Edge, EdgeKind, HttpMethod, Node, NodeId, NodeKind, OperationKey, PendingLink,
-    Protocol, Span,
+    Adjacency, Confidence, Direction, Edge, EdgeKind, HttpMethod, Node, NodeId, NodeKind,
+    OperationKey, PendingLink, Protocol, Span,
 };
 use rusqlite::{Connection, params};
 
@@ -529,6 +529,31 @@ impl SqliteStore {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// One traversal hop: neighbour ids of `node` along `kind`, with each edge's
+    /// confidence. `outgoing` follows `src = node` (→ `dst`); otherwise
+    /// `dst = node` (→ `src`). Cheaper than [`Self::neighbors`] — no node join.
+    pub fn edge_step(
+        &self,
+        node: &str,
+        kind: EdgeKind,
+        outgoing: bool,
+    ) -> Result<Vec<(NodeId, Confidence)>> {
+        let (key, other) = if outgoing {
+            ("src", "dst")
+        } else {
+            ("dst", "src")
+        };
+        let sql = format!("SELECT {other}, confidence FROM edges WHERE {key} = ?1 AND kind = ?2");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![node, kind.as_str()], |r| {
+            Ok((
+                NodeId(r.get::<_, String>(0)?),
+                parse_conf(&r.get::<_, String>(1)?),
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Drop edges whose endpoints no longer exist (e.g. after a symbol was removed).
     pub fn prune_dangling_edges(&mut self) -> Result<usize> {
         let n = self.conn.execute(
@@ -596,6 +621,15 @@ pub struct Stats {
     pub files: usize,
     /// Indexed file counts per language, descending by count.
     pub languages: Vec<(String, usize)>,
+}
+
+impl Adjacency for SqliteStore {
+    fn step(&self, node: &NodeId, kind: EdgeKind, dir: Direction) -> Vec<(NodeId, Confidence)> {
+        // The engine is infallible; a query error (malformed DB) yields no
+        // neighbours rather than aborting the whole traversal.
+        self.edge_step(&node.0, kind, matches!(dir, Direction::Outgoing))
+            .unwrap_or_default()
+    }
 }
 
 fn parse_kind(s: &str) -> NodeKind {

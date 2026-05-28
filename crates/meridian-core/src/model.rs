@@ -132,6 +132,24 @@ impl Confidence {
             Confidence::Inferred => "inferred",
         }
     }
+
+    /// Strength of evidence; higher is stronger. `Extracted` (straight from the
+    /// AST) outranks `Inferred` (heuristically resolved).
+    pub fn rank(self) -> u8 {
+        match self {
+            Confidence::Extracted => 2,
+            Confidence::Inferred => 1,
+        }
+    }
+
+    /// The weaker of two confidences — the min-confidence along an edge path.
+    pub fn weaker(self, other: Self) -> Self {
+        if other.rank() < self.rank() {
+            other
+        } else {
+            self
+        }
+    }
 }
 
 /// Byte/line span within a source file.
