@@ -6,7 +6,7 @@ use meridian_core::{
 
 use crate::client::extract_client_calls;
 use crate::extract::{ParsedFile, RawDef};
-use crate::rest::{extract_axum, extract_axum_mounts, extract_utoipa, extract_utoipa_mounts};
+use crate::rest::extractors_for;
 
 /// A symbol exported from a file for cross-file resolution.
 #[derive(Debug, Clone)]
@@ -46,13 +46,26 @@ pub struct RestGraph {
     pub pending_handlers: Vec<(String, NodeId)>,
 }
 
-/// Build the REST endpoint fragment for a Rust router file. `symbols` are the
-/// file's own definitions (from [`build_file_graph`]), used to resolve a
-/// handler to a `HANDLES` edge when it is uniquely defined in the same file.
-pub fn build_rest_graph(rel_path: &str, symbols: &[SymbolEntry], source: &str) -> RestGraph {
+/// Build the REST endpoint fragment for a router file in `lang`, running every
+/// registered [`RestServerExtractor`](crate::rest::RestServerExtractor) for that
+/// language. `symbols` are the file's own definitions (from [`build_file_graph`]),
+/// used to resolve a handler to a `HANDLES` edge when it is uniquely defined in
+/// the same file. Languages with no registered extractor yield an empty graph.
+pub fn build_rest_graph(
+    rel_path: &str,
+    lang: Language,
+    symbols: &[SymbolEntry],
+    source: &str,
+) -> RestGraph {
     let mut rg = RestGraph::default();
-    let mut raws = extract_axum(source);
-    raws.extend(extract_utoipa(source));
+    let extractors = extractors_for(lang);
+    if extractors.is_empty() {
+        return rg;
+    }
+    let mut raws = Vec::new();
+    for ex in &extractors {
+        raws.extend(ex.endpoints(source));
+    }
 
     let mut seen: HashSet<NodeId> = HashSet::new();
     for ep in raws {
@@ -69,7 +82,7 @@ pub fn build_rest_graph(rel_path: &str, symbols: &[SymbolEntry], source: &str) -
             name: format!("{method} {}", key.path),
             qualified_name: key.path.clone(),
             file: rel_path.to_string(),
-            language: Some(Language::Rust.name().to_string()),
+            language: Some(lang.name().to_string()),
             span: Some(ep.span),
             doc: None,
         });
@@ -101,9 +114,10 @@ pub fn build_rest_graph(rel_path: &str, symbols: &[SymbolEntry], source: &str) -
         }
     };
     let mut mounts: HashSet<(NodeId, NodeId)> = HashSet::new();
-    let raw_mounts = extract_axum_mounts(source)
-        .into_iter()
-        .chain(extract_utoipa_mounts(source));
+    let mut raw_mounts = Vec::new();
+    for ex in &extractors {
+        raw_mounts.extend(ex.mounts(source));
+    }
     for m in raw_mounts {
         if let (Some(p), Some(c)) = (resolve(&m.parent), resolve(&m.child))
             && mounts.insert((p.clone(), c.clone()))

@@ -137,7 +137,7 @@ fn app() -> Router {
         let parsed = parse_source(Language::Rust, src).unwrap();
         let file_id = NodeId::derive(&["file", "r.rs"]);
         let fg = build_file_graph("r.rs", Language::Rust, &file_id, &parsed);
-        let rg = build_rest_graph("r.rs", &fg.symbols, src);
+        let rg = build_rest_graph("r.rs", Language::Rust, &fg.symbols, src);
 
         let ep = rg
             .graph
@@ -170,7 +170,7 @@ fn app() -> Router {
         let parsed = parse_source(Language::Rust, src).unwrap();
         let file_id = NodeId::derive(&["file", "r.rs"]);
         let fg = build_file_graph("r.rs", Language::Rust, &file_id, &parsed);
-        let rg = build_rest_graph("r.rs", &fg.symbols, src);
+        let rg = build_rest_graph("r.rs", Language::Rust, &fg.symbols, src);
 
         let ep = rg
             .graph
@@ -206,7 +206,7 @@ fn app() -> Router {
         let parsed = parse_source(Language::Rust, src).unwrap();
         let file_id = NodeId::derive(&["file", "r.rs"]);
         let fg = build_file_graph("r.rs", Language::Rust, &file_id, &parsed);
-        let rg = build_rest_graph("r.rs", &fg.symbols, src);
+        let rg = build_rest_graph("r.rs", Language::Rust, &fg.symbols, src);
 
         let sym = |name: &str| {
             fg.symbols
