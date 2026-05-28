@@ -8,6 +8,14 @@ CREATE TABLE IF NOT EXISTS files (
     indexed_at INTEGER NOT NULL
 );
 
+-- Small key/value store for index-wide markers (e.g. the tool version that
+-- produced the index, used to invalidate the "nothing changed" fast path when
+-- the extractor logic changes between releases).
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS nodes (
     id             TEXT PRIMARY KEY,
     kind           TEXT NOT NULL,

@@ -82,6 +82,27 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
     let cfg = Config::load(&root)?;
     let files = discover(&root, &cfg.languages)?;
     tracing::info!("discovered {} source files", files.len());
+
+    // Fast path (#110): when every discovered file matches the stored
+    // (path, hash) set and the index was produced by this tool version, nothing
+    // has changed — skip parsing, re-resolution and writes entirely. A version
+    // mismatch forces a rebuild so extractor changes between releases take
+    // effect even on an unchanged tree.
+    const VERSION: &str = env!("CARGO_PKG_VERSION");
+    let current_set: std::collections::BTreeSet<(String, String)> = files
+        .iter()
+        .map(|f| (f.rel_path.clone(), f.hash.clone()))
+        .collect();
+    let stored_set: std::collections::BTreeSet<(String, String)> =
+        store.files_with_hashes()?.into_iter().collect();
+    if !files.is_empty()
+        && current_set == stored_set
+        && store.get_meta("tool_version")?.as_deref() == Some(VERSION)
+    {
+        println!("Index up to date ({} files); nothing changed.", files.len());
+        return Ok(());
+    }
+
     // Lazily-loaded dynamic grammars, keyed by language name. `None` records a
     // load failure so we warn once and skip that language's files thereafter.
     let mut dyn_grammars: HashMap<String, Option<meridian_parse::DynamicGrammar>> = HashMap::new();
@@ -387,6 +408,8 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
     if pruned > 0 {
         tracing::info!("pruned {pruned} dangling edges");
     }
+
+    store.set_meta("tool_version", VERSION)?;
 
     let stats = store.stats()?;
     println!(
