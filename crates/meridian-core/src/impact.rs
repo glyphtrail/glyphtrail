@@ -398,6 +398,74 @@ impl ImpactReport {
             s.total, s.tests, s.api, s.cross_boundary
         )
     }
+
+    /// True if the change reaches the public API surface (an endpoint or a
+    /// declared schema operation) — the signal for the CI drift gate.
+    pub fn touches_contract(&self) -> bool {
+        self.items.iter().any(|i| i.class == ImpactClass::Api)
+    }
+
+    /// Render a PR-comment / job-summary Markdown report.
+    pub fn to_markdown(&self) -> String {
+        let s = &self.summary;
+        let mut md = String::new();
+        md.push_str("## Impact analysis\n\n");
+        md.push_str(&format!(
+            "**Blast radius:** {} symbols · {} tests · {} API surface · {} cross-boundary consumers · max distance {}\n",
+            s.total, s.tests, s.api, s.cross_boundary, s.max_distance
+        ));
+
+        let section = |md: &mut String, title: &str, rows: Vec<&ClassifiedItem>| {
+            if rows.is_empty() {
+                return;
+            }
+            md.push_str(&format!("\n### {title}\n\n"));
+            for i in rows {
+                let loc = match i.line {
+                    Some(l) => format!("{}:{}", i.file, l),
+                    None => i.file.clone(),
+                };
+                let conf = if i.min_confidence == Confidence::Inferred {
+                    " _(inferred)_"
+                } else {
+                    ""
+                };
+                md.push_str(&format!(
+                    "- `{}` ({}) — d{}{}\n",
+                    i.qualified_name, loc, i.distance, conf
+                ));
+            }
+        };
+
+        section(
+            &mut md,
+            "Tests to run",
+            self.items
+                .iter()
+                .filter(|i| i.class == ImpactClass::Test)
+                .collect(),
+        );
+        section(
+            &mut md,
+            "API surface affected",
+            self.items
+                .iter()
+                .filter(|i| i.class == ImpactClass::Api)
+                .collect(),
+        );
+        section(
+            &mut md,
+            "Cross-boundary consumers",
+            self.items.iter().filter(|i| i.cross_boundary).collect(),
+        );
+        if !self.removed_files.is_empty() {
+            md.push_str("\n### Removed files (former dependents may be affected)\n\n");
+            for f in &self.removed_files {
+                md.push_str(&format!("- `{f}`\n"));
+            }
+        }
+        md
+    }
 }
 
 #[cfg(test)]
@@ -518,6 +586,39 @@ mod tests {
             .collect();
         check!(by["c"] == 1);
         check!(by["d"] == 1);
+    }
+
+    #[test]
+    fn report_summary_markdown_and_gate() {
+        let item = |kind: NodeKind, file: &str, name: &str, cb: bool| ClassifiedItem {
+            id: name.into(),
+            name: name.into(),
+            qualified_name: name.into(),
+            kind,
+            file: file.into(),
+            line: Some(1),
+            class: classify(kind, file, name),
+            distance: 1,
+            min_confidence: Confidence::Extracted,
+            cross_boundary: cb,
+            path: vec!["calls".into()],
+        };
+        let report = ImpactReport::new(
+            vec![
+                item(NodeKind::Endpoint, "src/routes.rs", "get_user", false),
+                item(NodeKind::Function, "tests/it.rs", "test_x", false),
+            ],
+            vec![],
+            vec![],
+        );
+        check!(report.summary.total == 2);
+        check!(report.summary.api == 1);
+        check!(report.summary.tests == 1);
+        check!(report.touches_contract()); // endpoint present -> gate trips
+        let md = report.to_markdown();
+        check!(md.contains("## Impact analysis"));
+        check!(md.contains("Tests to run"));
+        check!(md.contains("API surface affected"));
     }
 
     #[test]

@@ -47,6 +47,15 @@ meridian query search <text>         # full-text search (names + doc comments)
 meridian query impact <name>         # transitive blast radius if it changes
 #   add --json for machine-readable output
 
+# Impact analysis (blast radius from a symbol, file, or change set)
+meridian impact <name>                       # seed: a symbol
+meridian impact --file src/api.rs            # seed: every symbol in a file
+meridian impact --since main..HEAD           # seed: changed symbols vs a git range
+meridian impact --staged | --diff            # seed: staged / working-tree changes
+#   [--cross-boundary] reach API consumers (HANDLES/INVOKES/EXPOSES/MOUNTS)
+#   [--edges calls,imports,impl,api] [--depth N] [--min-confidence extracted|inferred]
+#   [--format text|json|md]   [--gate]  exit 2 when the change touches the API surface
+
 # Visualize
 meridian viz --output graph.html     # self-contained interactive page
 meridian serve --port 7700           # live explorer at http://127.0.0.1:7700
@@ -57,6 +66,36 @@ meridian mcp                         # MCP server over stdio (query/endpoints/im
 
 # Stats
 meridian status
+```
+
+### Impact reports in CI
+
+Seed the impact analysis from a pull request's diff and post a Markdown summary,
+optionally failing the job when the change touches the public API / schema
+surface (drift gate):
+
+```yaml
+# .github/workflows/impact.yml
+name: impact
+on: pull_request
+jobs:
+  impact:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0           # need the base ref for the diff
+      - run: cargo install --path crates/meridian-cli   # or download a release binary
+      - run: meridian analyze .
+      - name: Impact report
+        run: |
+          meridian impact --since "origin/${{ github.base_ref }}...HEAD" \
+            --cross-boundary --format md >> "$GITHUB_STEP_SUMMARY"
+      # Optional: fail the job if the PR changes the API/contract surface.
+      - name: Drift gate
+        run: |
+          meridian impact --since "origin/${{ github.base_ref }}...HEAD" \
+            --cross-boundary --gate
 ```
 
 ## Languages
