@@ -15,7 +15,10 @@ pub use api::{
 };
 pub use config::{ApiConfig, Config, DynamicLanguage, SchemaSource};
 pub use error::{CoreError, Result};
-pub use impact::{Adjacency, Direction, EdgeRule, ImpactItem, ImpactPolicy, compute_impact};
+pub use impact::{
+    Adjacency, ClassifiedItem, Direction, EdgeRule, ImpactClass, ImpactItem, ImpactPolicy,
+    ImpactReport, ImpactSummary, classify, compute_impact, is_cross_boundary_path,
+};
 pub use lang::Language;
 pub use matcher::{ClientCall, Endpoint, Match, Matcher};
 pub use model::{CodeGraph, Confidence, Edge, EdgeKind, Node, NodeId, NodeKind, PendingLink, Span};

@@ -65,6 +65,8 @@ enum Command {
         #[arg(long, default_value_t = 7700)]
         port: u16,
     },
+    /// Compute the blast radius of a change (symbol, file, or git change set).
+    Impact(commands::impact::ImpactArgs),
     /// Run a Model Context Protocol server over stdio (for agents/editors).
     Mcp {
         #[arg(long, default_value = ".")]
@@ -126,6 +128,7 @@ fn main() -> anyhow::Result<()> {
             limit,
         } => commands::viz::run(&repo, &output, limit),
         Command::Serve { repo, port } => commands::serve::run(&repo, port),
+        Command::Impact(args) => commands::impact::run(args),
         Command::Mcp { repo } => meridian_mcp::serve_stdio(repo),
         Command::Repo { cmd } => commands::repo::run(cmd),
         Command::Status { repo, all } => {

@@ -12,7 +12,9 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::{Confidence, EdgeKind, NodeId};
+use serde::Serialize;
+
+use crate::{Confidence, EdgeKind, NodeId, NodeKind};
 
 /// Which way to walk an edge kind during traversal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +106,58 @@ pub struct ImpactItem {
     pub min_confidence: Confidence,
     /// Edge kinds from a seed to this node (the recorded shortest/strongest path).
     pub path: Vec<EdgeKind>,
+}
+
+/// Actionable category for an impacted node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImpactClass {
+    /// A test — the highest-value output ("run these").
+    Test,
+    /// Public API surface: a server endpoint or a declared schema operation.
+    Api,
+    /// A program entrypoint (e.g. `main`).
+    Entrypoint,
+    /// Everything else (internal dependents and client call sites — the latter
+    /// are surfaced separately via the cross-boundary flag).
+    Internal,
+}
+
+/// Classify an impacted node by kind, file path and qualified name, using
+/// path/name heuristics for tests and entrypoints. Precedence:
+/// test > api > entrypoint > internal. Client call sites are *not* API surface
+/// — they are downstream consumers, flagged via `cross_boundary` instead.
+pub fn classify(kind: NodeKind, file: &str, qualified_name: &str) -> ImpactClass {
+    if is_test(file, qualified_name) {
+        ImpactClass::Test
+    } else if matches!(kind, NodeKind::Endpoint | NodeKind::SchemaOp) {
+        ImpactClass::Api
+    } else if is_entrypoint(kind, qualified_name) {
+        ImpactClass::Entrypoint
+    } else {
+        ImpactClass::Internal
+    }
+}
+
+fn is_test(file: &str, qualified_name: &str) -> bool {
+    let f = file.replace('\\', "/").to_ascii_lowercase();
+    let base = f.rsplit('/').next().unwrap_or(&f);
+    f.contains("/tests/")
+        || f.starts_with("tests/")
+        || f.contains("/test/")
+        || f.starts_with("test/")
+        || base.contains(".test.")
+        || base.contains(".spec.")
+        || base.ends_with("_test.go")
+        || base.starts_with("test_")
+        || base.ends_with("_test.py")
+        || base.ends_with("_test.rs")
+        || qualified_name.contains("tests::")
+}
+
+fn is_entrypoint(kind: NodeKind, qualified_name: &str) -> bool {
+    matches!(kind, NodeKind::Function | NodeKind::Method)
+        && (qualified_name == "main" || qualified_name.ends_with("::main"))
 }
 
 /// Supplies graph adjacency to the engine. Implemented by the store.
@@ -219,6 +273,92 @@ pub fn compute_impact<A: Adjacency>(
             .then(a.node.0.cmp(&b.node.0))
     });
     items
+}
+
+/// Whether a path reaches a downstream consumer *across the wire* — i.e. it
+/// traverses an `Invokes` edge (a client calling an affected endpoint). Other
+/// API edges (`Handles`/`Exposes`/`Mounts`) stay within the service and are
+/// reported as ordinary API surface, not cross-boundary consumers.
+pub fn is_cross_boundary_path(path: &[EdgeKind]) -> bool {
+    path.contains(&EdgeKind::Invokes)
+}
+
+/// A classified, resolved impacted node, ready for reporting.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClassifiedItem {
+    pub id: String,
+    pub name: String,
+    pub qualified_name: String,
+    pub kind: NodeKind,
+    pub file: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
+    pub class: ImpactClass,
+    pub distance: usize,
+    pub min_confidence: Confidence,
+    /// Reached across the service boundary (HANDLES/INVOKES/EXPOSES/MOUNTS).
+    pub cross_boundary: bool,
+    /// Edge-kind path from a seed (string form for stable JSON).
+    pub path: Vec<String>,
+}
+
+/// Blast-radius counts.
+#[derive(Debug, Clone, Serialize)]
+pub struct ImpactSummary {
+    pub total: usize,
+    pub tests: usize,
+    pub api: usize,
+    pub entrypoints: usize,
+    pub internal: usize,
+    pub cross_boundary: usize,
+    pub max_distance: usize,
+}
+
+/// The full impact report: summary + ranked, classified items + change notes.
+#[derive(Debug, Clone, Serialize)]
+pub struct ImpactReport {
+    pub summary: ImpactSummary,
+    pub items: Vec<ClassifiedItem>,
+    /// Files whose deletion removed symbols (former dependents can't be seeded).
+    pub removed_files: Vec<String>,
+    /// Changed files with no overlapping indexed symbol.
+    pub unresolved_files: Vec<String>,
+}
+
+impl ImpactReport {
+    /// Assemble a report from already-ranked, classified items. The summary is
+    /// derived from the items.
+    pub fn new(
+        items: Vec<ClassifiedItem>,
+        removed_files: Vec<String>,
+        unresolved_files: Vec<String>,
+    ) -> Self {
+        let count = |c: ImpactClass| items.iter().filter(|i| i.class == c).count();
+        let summary = ImpactSummary {
+            total: items.len(),
+            tests: count(ImpactClass::Test),
+            api: count(ImpactClass::Api),
+            entrypoints: count(ImpactClass::Entrypoint),
+            internal: count(ImpactClass::Internal),
+            cross_boundary: items.iter().filter(|i| i.cross_boundary).count(),
+            max_distance: items.iter().map(|i| i.distance).max().unwrap_or(0),
+        };
+        ImpactReport {
+            summary,
+            items,
+            removed_files,
+            unresolved_files,
+        }
+    }
+
+    /// One-line blast-radius headline.
+    pub fn headline(&self) -> String {
+        let s = &self.summary;
+        format!(
+            "blast radius: {} symbols, {} tests, {} API, {} cross-boundary consumers",
+            s.total, s.tests, s.api, s.cross_boundary
+        )
+    }
 }
 
 #[cfg(test)]
@@ -339,6 +479,26 @@ mod tests {
             .collect();
         check!(by["c"] == 1);
         check!(by["d"] == 1);
+    }
+
+    #[test]
+    fn classification_heuristics() {
+        check!(classify(NodeKind::Function, "src/tests/foo.rs", "foo") == ImpactClass::Test);
+        check!(classify(NodeKind::Function, "web/api.test.ts", "loadUser") == ImpactClass::Test);
+        check!(classify(NodeKind::Function, "svc/user_test.go", "TestX") == ImpactClass::Test);
+        check!(classify(NodeKind::Endpoint, "src/routes.rs", "get_user") == ImpactClass::Api);
+        check!(classify(NodeKind::Function, "src/main.rs", "main") == ImpactClass::Entrypoint);
+        check!(classify(NodeKind::Function, "src/util.rs", "helper") == ImpactClass::Internal);
+    }
+
+    #[test]
+    fn cross_boundary_path_detection() {
+        check!(is_cross_boundary_path(&[EdgeKind::Calls]) == false);
+        check!(is_cross_boundary_path(&[EdgeKind::Handles]) == false); // within-service
+        check!(is_cross_boundary_path(&[
+            EdgeKind::Handles,
+            EdgeKind::Invokes
+        ])); // across the wire
     }
 
     #[test]

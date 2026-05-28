@@ -437,6 +437,14 @@ impl SqliteStore {
         }
     }
 
+    /// All nodes living in a repo-relative file, for change-set seeding and
+    /// span-overlap mapping.
+    pub fn nodes_in_file(&self, file: &str) -> Result<Vec<Node>> {
+        let mut stmt = self.conn.prepare("SELECT * FROM nodes WHERE file = ?1")?;
+        let rows = stmt.query_map(params![file], Self::row_to_node)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Find nodes by exact name or qualified-name suffix.
     pub fn find_by_name(&self, name: &str) -> Result<Vec<Node>> {
         let mut stmt = self.conn.prepare(
