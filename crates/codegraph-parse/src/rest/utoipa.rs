@@ -97,7 +97,7 @@ pub fn extract_utoipa_mounts(source: &str) -> Vec<RawMount> {
     let src = source.as_bytes();
     let root = tree.root_node();
     let builders = collect_builders(root, src, ROUTER);
-    collect_mounts(root, src, &builders)
+    collect_mounts(src, &builders)
         .into_iter()
         .map(|(parent, child)| RawMount { parent, child })
         .collect()

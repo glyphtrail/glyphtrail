@@ -85,7 +85,7 @@ pub fn extract_axum_mounts(source: &str) -> Vec<RawMount> {
     let src = source.as_bytes();
     let root = tree.root_node();
     let builders = collect_builders(root, src, ROUTER);
-    collect_mounts(root, src, &builders)
+    collect_mounts(src, &builders)
         .into_iter()
         .map(|(parent, child)| RawMount { parent, child })
         .collect()
@@ -340,6 +340,26 @@ fn app() -> Router {
         }));
         // Inline routers (not builders) do not produce mounts.
         assert_eq!(mounts.len(), 2);
+    }
+
+    #[test]
+    fn mounts_ignore_routers_outside_the_returned_chain() {
+        // A local router that is built but not part of the returned/composed
+        // chain must not produce a phantom mount.
+        let src = r#"
+fn other() -> Router { Router::new().route("/o", get(o)) }
+fn child() -> Router { Router::new().route("/c", get(c)) }
+fn app() -> Router {
+    let _unused = Router::new().merge(other());
+    Router::new().nest("/api", child())
+}
+"#;
+        let mounts = extract_axum_mounts(src);
+        assert!(mounts.contains(&RawMount {
+            parent: "app".into(),
+            child: "child".into()
+        }));
+        assert!(!mounts.iter().any(|m| m.child == "other"));
     }
 
     #[test]
