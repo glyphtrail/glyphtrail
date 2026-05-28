@@ -393,6 +393,12 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
         "Indexed {} files: {} nodes, {} edges",
         stats.files, stats.nodes, stats.edges
     );
+    if !stats.languages.is_empty() {
+        println!(
+            "Languages: {}",
+            super::status::format_languages(&stats.languages)
+        );
+    }
     Ok(())
 }
 
