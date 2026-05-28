@@ -45,7 +45,7 @@ meridian query callees <name>        # what it calls
 meridian query neighbors <name>      # direct graph neighbours
 meridian query search <text>         # full-text search (names + doc comments)
 meridian query impact <name>         # transitive blast radius if it changes
-#   add --json for machine-readable output
+#   add --json (or --yaml, compact for agents) for machine-readable output
 
 # Impact analysis (blast radius from a symbol, file, or change set)
 meridian impact <name>                       # seed: a symbol

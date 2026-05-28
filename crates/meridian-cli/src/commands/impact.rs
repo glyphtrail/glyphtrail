@@ -19,6 +19,8 @@ pub enum Format {
     #[default]
     Text,
     Json,
+    /// YAML — compact, low-boilerplate structured output for LLMs/agents.
+    Yaml,
     /// Markdown for a PR comment or CI job summary.
     Md,
 }
@@ -160,6 +162,7 @@ fn resolve_seeds(store: &SqliteStore, args: &ImpactArgs) -> Result<SeedSet> {
 fn emit(report: &ImpactReport, format: Format) -> Result<()> {
     match format {
         Format::Json => println!("{}", serde_json::to_string_pretty(report)?),
+        Format::Yaml => print!("{}", serde_norway::to_string(report)?),
         Format::Md => print!("{}", report.to_markdown()),
         Format::Text => print_text(report),
     }
