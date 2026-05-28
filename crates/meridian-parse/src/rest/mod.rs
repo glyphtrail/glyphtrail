@@ -1,5 +1,6 @@
 //! REST server-side route extraction (per-framework).
 
+pub mod aspnet;
 pub mod axum;
 pub mod express;
 pub mod flask;
@@ -10,6 +11,7 @@ pub mod utoipa;
 
 use meridian_core::{HttpMethod, Language, Span};
 
+pub use aspnet::{extract_aspnet, extract_aspnet_mounts};
 pub use axum::{extract_axum, extract_axum_mounts};
 pub use express::{extract_express, extract_express_mounts};
 pub use flask::{extract_flask, extract_flask_mounts};
@@ -132,6 +134,22 @@ impl RestServerExtractor for FlaskExtractor {
     }
 }
 
+struct AspNetExtractor;
+impl RestServerExtractor for AspNetExtractor {
+    fn name(&self) -> &'static str {
+        "aspnet"
+    }
+    fn language(&self) -> Language {
+        Language::CSharp
+    }
+    fn endpoints(&self, source: &str) -> Vec<RawEndpoint> {
+        extract_aspnet(source)
+    }
+    fn mounts(&self, source: &str) -> Vec<RawMount> {
+        extract_aspnet_mounts(source)
+    }
+}
+
 /// Express applies to JS, TS and TSX; the bound language selects the grammar.
 struct ExpressExtractor(Language);
 impl RestServerExtractor for ExpressExtractor {
@@ -158,6 +176,7 @@ pub fn registry() -> Vec<Box<dyn RestServerExtractor>> {
         Box::new(SpringExtractor),
         Box::new(GinExtractor),
         Box::new(FlaskExtractor),
+        Box::new(AspNetExtractor),
         Box::new(ExpressExtractor(Language::JavaScript)),
         Box::new(ExpressExtractor(Language::TypeScript)),
         Box::new(ExpressExtractor(Language::Tsx)),
@@ -203,6 +222,11 @@ mod tests {
             .map(|e| e.name())
             .collect();
         check!(go == ["gin"]);
+        let cs: Vec<_> = extractors_for(Language::CSharp)
+            .iter()
+            .map(|e| e.name())
+            .collect();
+        check!(cs == ["aspnet"]);
         for js in [Language::JavaScript, Language::TypeScript, Language::Tsx] {
             let names: Vec<_> = extractors_for(js).iter().map(|e| e.name()).collect();
             check!(names == ["express"]);
