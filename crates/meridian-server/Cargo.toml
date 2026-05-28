@@ -11,6 +11,7 @@ repository.workspace = true
 meridian-core.workspace = true
 meridian-store.workspace = true
 meridian-viz.workspace = true
+meridian-mcp.workspace = true
 axum.workspace = true
 tokio.workspace = true
 tower-http.workspace = true

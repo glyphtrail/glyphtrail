@@ -666,6 +666,7 @@ dependencies = [
  "anyhow",
  "axum",
  "meridian-core",
+ "meridian-mcp",
  "meridian-store",
  "meridian-viz",
  "serde",

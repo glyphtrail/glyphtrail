@@ -43,6 +43,7 @@ meridian serve --port 7700           # live explorer at http://127.0.0.1:7700
 
 # Agent integration (Model Context Protocol)
 meridian mcp                         # MCP server over stdio (query/endpoints/impact/…)
+#   `meridian serve` also exposes the same tools at POST /mcp (JSON-RPC)
 
 # Stats
 meridian status
