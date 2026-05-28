@@ -17,7 +17,8 @@ pub use config::{ApiConfig, Config, DynamicLanguage, SchemaSource};
 pub use error::{CoreError, Result};
 pub use impact::{
     Adjacency, ClassifiedItem, Direction, EdgeRule, ImpactClass, ImpactItem, ImpactPolicy,
-    ImpactReport, ImpactSummary, classify, compute_impact, is_cross_boundary_path,
+    ImpactReport, ImpactSummary, classify, compute_impact, edge_rules, is_cross_boundary_path,
+    parse_confidence,
 };
 pub use lang::Language;
 pub use matcher::{ClientCall, Endpoint, Match, Matcher};

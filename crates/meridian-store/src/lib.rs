@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
+pub mod changeset;
 pub mod sqlite;
 
+pub use changeset::{ChangeSpec, ChangedFile, SeedSet, changed_files, seed_nodes};
 pub use sqlite::{SqliteStore, Stats};
 
 #[cfg(test)]
