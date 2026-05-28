@@ -42,6 +42,11 @@ tasks:
     cmds:
       - cargo run -p codegraph-cli {{.PROFILE_FLAG}} -- analyze {{.TARGET}} {{.CLI_ARGS}}
 
+  query:
+    desc: 'Query the graph (pass args after --, e.g. task query -- def main)'
+    cmds:
+      - cargo run -p codegraph-cli {{.PROFILE_FLAG}} -- query {{.CLI_ARGS}}
+
   serve:
     desc: Start the interactive graph explorer on PORT (default 7700)
     cmds:
@@ -53,6 +58,18 @@ tasks:
       OUT: '{{ .OUT | default "graph.html" }}'
     cmds:
       - cargo run -p codegraph-cli {{.PROFILE_FLAG}} -- viz --output {{.OUT}} {{.CLI_ARGS}}
+
+  status:
+    desc: Show index statistics
+    cmds:
+      - cargo run -p codegraph-cli {{.PROFILE_FLAG}} -- status {{.CLI_ARGS}}
+
+  completions:
+    desc: 'Generate a shell completion script (SHELL_KIND=bash|zsh|fish|powershell|elvish)'
+    vars:
+      SHELL_KIND: '{{ .SHELL_KIND | default "bash" }}'
+    cmds:
+      - cargo run -p codegraph-cli {{.PROFILE_FLAG}} -- completions {{.SHELL_KIND}}
 
   test:
     desc: Run the workspace test suite
