@@ -17,6 +17,7 @@ pub fn grammar(lang: &Language) -> Option<TsLanguage> {
         Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
         Language::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
         Language::Ruby => tree_sitter_ruby::LANGUAGE.into(),
+        Language::Kotlin => tree_sitter_kotlin_ng::LANGUAGE.into(),
         Language::Other(_) => return None,
     })
 }
@@ -41,6 +42,7 @@ pub fn query_source(lang: &Language) -> Option<&'static str> {
         Language::Cpp => include_str!("../queries/cpp.scm"),
         Language::CSharp => include_str!("../queries/csharp.scm"),
         Language::Ruby => include_str!("../queries/ruby.scm"),
+        Language::Kotlin => include_str!("../queries/kotlin.scm"),
         Language::Other(_) => return None,
     })
 }
