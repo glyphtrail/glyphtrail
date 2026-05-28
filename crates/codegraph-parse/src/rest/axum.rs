@@ -486,4 +486,21 @@ fn app() -> Router {
         let eps = extract_axum(src);
         assert_eq!(ep(&eps, HttpMethod::Get, "/u").unwrap().handler, "list");
     }
+
+    #[test]
+    fn layered_method_router_is_captured() {
+        // A `.layer(..)` (or other combinator) applied to a MethodRouter must not
+        // hide the verbs: collect_method_router recurses into the receiver.
+        let src = r#"
+fn app() -> Router {
+    Router::new()
+        .route("/a", get(show).layer(mw))
+        .route("/b", get(list).layer(mw).post(create))
+}
+"#;
+        let eps = extract_axum(src);
+        assert_eq!(ep(&eps, HttpMethod::Get, "/a").unwrap().handler, "show");
+        assert_eq!(ep(&eps, HttpMethod::Get, "/b").unwrap().handler, "list");
+        assert_eq!(ep(&eps, HttpMethod::Post, "/b").unwrap().handler, "create");
+    }
 }
