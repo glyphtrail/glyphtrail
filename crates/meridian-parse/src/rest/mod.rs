@@ -1,6 +1,7 @@
 //! REST server-side route extraction (per-framework).
 
 pub mod axum;
+pub mod express;
 pub mod gin;
 pub mod spring;
 mod ts;
@@ -9,6 +10,7 @@ pub mod utoipa;
 use meridian_core::{HttpMethod, Language, Span};
 
 pub use axum::{extract_axum, extract_axum_mounts};
+pub use express::{extract_express, extract_express_mounts};
 pub use gin::{extract_gin, extract_gin_mounts};
 pub use spring::{extract_spring, extract_spring_mounts};
 pub use utoipa::{extract_utoipa, extract_utoipa_mounts};
@@ -112,6 +114,23 @@ impl RestServerExtractor for GinExtractor {
     }
 }
 
+/// Express applies to JS, TS and TSX; the bound language selects the grammar.
+struct ExpressExtractor(Language);
+impl RestServerExtractor for ExpressExtractor {
+    fn name(&self) -> &'static str {
+        "express"
+    }
+    fn language(&self) -> Language {
+        self.0
+    }
+    fn endpoints(&self, source: &str) -> Vec<RawEndpoint> {
+        extract_express(source, self.0)
+    }
+    fn mounts(&self, source: &str) -> Vec<RawMount> {
+        extract_express_mounts(source, self.0)
+    }
+}
+
 /// All registered REST server extractors. New frameworks slot in here as
 /// additional self-contained modules implementing [`RestServerExtractor`].
 pub fn registry() -> Vec<Box<dyn RestServerExtractor>> {
@@ -120,6 +139,9 @@ pub fn registry() -> Vec<Box<dyn RestServerExtractor>> {
         Box::new(UtoipaExtractor),
         Box::new(SpringExtractor),
         Box::new(GinExtractor),
+        Box::new(ExpressExtractor(Language::JavaScript)),
+        Box::new(ExpressExtractor(Language::TypeScript)),
+        Box::new(ExpressExtractor(Language::Tsx)),
     ]
 }
 
@@ -155,6 +177,10 @@ mod tests {
             .map(|e| e.name())
             .collect();
         assert_eq!(go, ["gin"]);
+        for js in [Language::JavaScript, Language::TypeScript, Language::Tsx] {
+            let names: Vec<_> = extractors_for(js).iter().map(|e| e.name()).collect();
+            assert_eq!(names, ["express"]);
+        }
     }
 
     #[test]
