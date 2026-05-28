@@ -423,13 +423,43 @@ fn execute(store: &SqliteStore, cmd: &QueryCmd) -> Result<QueryResult> {
     })
 }
 
-pub fn run(repo: &Path, cmd: QueryCmd, json: bool) -> Result<()> {
+/// How to render query results.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Emit {
+    Text,
+    Json,
+    /// YAML — compact structured output for LLMs/agents.
+    Yaml,
+}
+
+impl Emit {
+    /// Resolve from the `--json` / `--yaml` flags (yaml wins if both set).
+    pub fn from_flags(json: bool, yaml: bool) -> Self {
+        if yaml {
+            Emit::Yaml
+        } else if json {
+            Emit::Json
+        } else {
+            Emit::Text
+        }
+    }
+}
+
+fn print_value(value: &serde_json::Value, emit: Emit) -> Result<()> {
+    match emit {
+        Emit::Json => println!("{}", serde_json::to_string_pretty(value)?),
+        Emit::Yaml => print!("{}", serde_norway::to_string(value)?),
+        Emit::Text => {} // handled by callers via print_text
+    }
+    Ok(())
+}
+
+pub fn run(repo: &Path, cmd: QueryCmd, emit: Emit) -> Result<()> {
     let store = open_store(repo)?;
     let result = execute(&store, &cmd)?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&result.to_value())?);
-    } else {
-        result.print_text();
+    match emit {
+        Emit::Text => result.print_text(),
+        _ => print_value(&result.to_value(), emit)?,
     }
     Ok(())
 }
@@ -441,7 +471,7 @@ pub fn run(repo: &Path, cmd: QueryCmd, json: bool) -> Result<()> {
 /// unmatched endpoint) is reported inline and does not abort the run.
 pub fn run_registry(
     cmd: QueryCmd,
-    json: bool,
+    emit: Emit,
     all: bool,
     names: Option<Vec<String>>,
 ) -> Result<()> {
@@ -467,17 +497,7 @@ pub fn run_registry(
         return Ok(());
     }
 
-    if json {
-        let mut arr = Vec::new();
-        for e in &selected {
-            let value = match open_store(&e.root).and_then(|s| execute(&s, &cmd)) {
-                Ok(r) => r.to_value(),
-                Err(err) => serde_json::json!({ "error": format!("{err:#}") }),
-            };
-            arr.push(serde_json::json!({ "repo": e.name, "result": value }));
-        }
-        println!("{}", serde_json::to_string_pretty(&arr)?);
-    } else {
+    if emit == Emit::Text {
         for e in &selected {
             println!("== {} ({}) ==", e.name, e.root.display());
             match open_store(&e.root).and_then(|s| execute(&s, &cmd)) {
@@ -485,8 +505,18 @@ pub fn run_registry(
                 Err(err) => println!("  error: {err:#}"),
             }
         }
+        return Ok(());
     }
-    Ok(())
+
+    let mut arr = Vec::new();
+    for e in &selected {
+        let value = match open_store(&e.root).and_then(|s| execute(&s, &cmd)) {
+            Ok(r) => r.to_value(),
+            Err(err) => serde_json::json!({ "error": format!("{err:#}") }),
+        };
+        arr.push(serde_json::json!({ "repo": e.name, "result": value }));
+    }
+    print_value(&serde_json::Value::Array(arr), emit)
 }
 
 fn drift_text(report: &DriftReport) {

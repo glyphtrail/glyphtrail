@@ -41,6 +41,9 @@ enum Command {
         /// Emit JSON instead of text.
         #[arg(long)]
         json: bool,
+        /// Emit YAML instead of text (compact structured output for agents).
+        #[arg(long)]
+        yaml: bool,
         /// Query every repository in the global registry, tagging each result.
         #[arg(long)]
         all: bool,
@@ -122,13 +125,15 @@ fn main() -> anyhow::Result<()> {
             query,
             repo,
             json,
+            yaml,
             all,
             repos,
         } => {
+            let emit = commands::query::Emit::from_flags(json, yaml);
             if all || repos.is_some() {
-                commands::query::run_registry(query, json, all, repos)
+                commands::query::run_registry(query, emit, all, repos)
             } else {
-                commands::query::run(&repo, query, json)
+                commands::query::run(&repo, query, emit)
             }
         }
         Command::Viz {
