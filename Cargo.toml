@@ -45,6 +45,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 tower-http = { version = "0.6", features = ["fs", "trace"] }
 
 tree-sitter = "0.26"
+tree-sitter-loader = "0.26"
 tree-sitter-language = "0.1"
 tree-sitter-rust = "0.24"
 tree-sitter-python = "0.25"

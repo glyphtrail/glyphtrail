@@ -11,7 +11,7 @@ pub mod rewrite;
 pub use api::{
     HttpMethod, OperationKey, Protocol, normalize_path, operations_matching, path_signature,
 };
-pub use config::{ApiConfig, Config, SchemaSource};
+pub use config::{ApiConfig, Config, DynamicLanguage, SchemaSource};
 pub use error::{CoreError, Result};
 pub use lang::Language;
 pub use matcher::{ClientCall, Endpoint, Match, Matcher};
