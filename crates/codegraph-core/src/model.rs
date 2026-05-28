@@ -38,6 +38,12 @@ pub enum NodeKind {
     Enum,
     Trait,
     Comment,
+    /// A server-side API operation (REST route, gRPC method, GraphQL field).
+    Endpoint,
+    /// A client-side call site targeting a remote API operation.
+    ClientCall,
+    /// An operation declared in an API schema artifact (OpenAPI/proto/GraphQL).
+    SchemaOp,
 }
 
 impl NodeKind {
@@ -55,6 +61,9 @@ impl NodeKind {
             NodeKind::Enum => "enum",
             NodeKind::Trait => "trait",
             NodeKind::Comment => "comment",
+            NodeKind::Endpoint => "endpoint",
+            NodeKind::ClientCall => "client_call",
+            NodeKind::SchemaOp => "schema_op",
         }
     }
 }
@@ -78,6 +87,14 @@ pub enum EdgeKind {
     Documents,
     /// Generic reference that is not a call.
     References,
+    /// A handler symbol serves an API endpoint.
+    Handles,
+    /// A router mounts a sub-router under a path prefix (nested route composition).
+    Mounts,
+    /// A code endpoint corresponds to an operation declared in a schema artifact.
+    Exposes,
+    /// A client call site invokes an API endpoint (cross web boundary).
+    Invokes,
 }
 
 impl EdgeKind {
@@ -91,6 +108,10 @@ impl EdgeKind {
             EdgeKind::Implements => "implements",
             EdgeKind::Documents => "documents",
             EdgeKind::References => "references",
+            EdgeKind::Handles => "handles",
+            EdgeKind::Mounts => "mounts",
+            EdgeKind::Exposes => "exposes",
+            EdgeKind::Invokes => "invokes",
         }
     }
 }

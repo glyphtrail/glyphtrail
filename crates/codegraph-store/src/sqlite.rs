@@ -339,6 +339,9 @@ fn parse_kind(s: &str) -> NodeKind {
         "interface" => NodeKind::Interface,
         "enum" => NodeKind::Enum,
         "trait" => NodeKind::Trait,
+        "endpoint" => NodeKind::Endpoint,
+        "client_call" => NodeKind::ClientCall,
+        "schema_op" => NodeKind::SchemaOp,
         _ => NodeKind::Comment,
     }
 }
@@ -352,6 +355,10 @@ fn parse_edge_kind(s: &str) -> EdgeKind {
         "extends" => EdgeKind::Extends,
         "implements" => EdgeKind::Implements,
         "documents" => EdgeKind::Documents,
+        "handles" => EdgeKind::Handles,
+        "mounts" => EdgeKind::Mounts,
+        "exposes" => EdgeKind::Exposes,
+        "invokes" => EdgeKind::Invokes,
         _ => EdgeKind::References,
     }
 }

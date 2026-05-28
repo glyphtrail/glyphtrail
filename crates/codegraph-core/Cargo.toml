@@ -9,3 +9,6 @@ repository.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 blake3.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
