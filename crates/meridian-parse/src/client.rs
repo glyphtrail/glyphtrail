@@ -561,6 +561,7 @@ fn span_of(node: Node) -> Span {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use assert2::check;
 
     fn call<'a>(
         calls: &'a [RawClientCall],
@@ -573,64 +574,64 @@ mod tests {
     #[test]
     fn fetch_get_string_url() {
         let calls = extract_client_calls("fetch(\"/api/users\");", Language::JavaScript);
-        assert!(call(&calls, HttpMethod::Get, "/api/users").is_some());
+        check!(call(&calls, HttpMethod::Get, "/api/users").is_some());
     }
 
     #[test]
     fn fetch_method_from_options() {
         let src = "fetch(\"/api/users\", { method: \"POST\" });";
         let calls = extract_client_calls(src, Language::JavaScript);
-        assert!(call(&calls, HttpMethod::Post, "/api/users").is_some());
+        check!(call(&calls, HttpMethod::Post, "/api/users").is_some());
     }
 
     #[test]
     fn fetch_template_url_keeps_interpolation() {
         let src = "const r = fetch(`/api/users/${id}`);";
         let calls = extract_client_calls(src, Language::JavaScript);
-        assert!(call(&calls, HttpMethod::Get, "/api/users/${id}").is_some());
+        check!(call(&calls, HttpMethod::Get, "/api/users/${id}").is_some());
     }
 
     #[test]
     fn axios_verb_method() {
         let src = "axios.get(\"/api/items/42\"); axios.delete(\"/api/items/42\");";
         let calls = extract_client_calls(src, Language::TypeScript);
-        assert!(call(&calls, HttpMethod::Get, "/api/items/42").is_some());
-        assert!(call(&calls, HttpMethod::Delete, "/api/items/42").is_some());
+        check!(call(&calls, HttpMethod::Get, "/api/items/42").is_some());
+        check!(call(&calls, HttpMethod::Delete, "/api/items/42").is_some());
     }
 
     #[test]
     fn dynamic_url_is_skipped() {
         // A bare variable URL is out of scope (no literal to extract).
         let calls = extract_client_calls("fetch(endpoint);", Language::JavaScript);
-        assert!(calls.is_empty());
+        check!(calls.is_empty());
     }
 
     #[test]
     fn non_axios_member_call_ignored() {
         // `.get` on an unknown object is not assumed to be an HTTP client.
         let calls = extract_client_calls("store.get(\"/x\");", Language::JavaScript);
-        assert!(calls.is_empty());
+        check!(calls.is_empty());
     }
 
     #[test]
     fn works_in_tsx() {
         let src = "const f = () => fetch(\"/api/ping\");";
         let calls = extract_client_calls(src, Language::Tsx);
-        assert!(call(&calls, HttpMethod::Get, "/api/ping").is_some());
+        check!(call(&calls, HttpMethod::Get, "/api/ping").is_some());
     }
 
     #[test]
     fn axios_config_call() {
         let src = "axios({ url: \"/things\", method: \"PUT\" });";
         let calls = extract_client_calls(src, Language::JavaScript);
-        assert!(call(&calls, HttpMethod::Put, "/things").is_some());
+        check!(call(&calls, HttpMethod::Put, "/things").is_some());
     }
 
     #[test]
     fn axios_request_config_defaults_get() {
         let src = "axios.request({ url: \"/r\" });";
         let calls = extract_client_calls(src, Language::TypeScript);
-        assert!(call(&calls, HttpMethod::Get, "/r").is_some());
+        check!(call(&calls, HttpMethod::Get, "/r").is_some());
     }
 
     #[test]
@@ -639,10 +640,10 @@ mod tests {
                    api.get(\"/users\");\n\
                    api({ url: \"/things\", method: \"post\" });";
         let calls = extract_client_calls(src, Language::TypeScript);
-        assert!(call(&calls, HttpMethod::Get, "/users").is_some());
-        assert!(call(&calls, HttpMethod::Post, "/things").is_some());
+        check!(call(&calls, HttpMethod::Get, "/users").is_some());
+        check!(call(&calls, HttpMethod::Post, "/things").is_some());
         // The `axios.create(...)` itself is not an HTTP call.
-        assert_eq!(calls.len(), 2);
+        check!(calls.len() == 2);
     }
 
     #[test]
@@ -650,7 +651,7 @@ mod tests {
         // A non-verb method on an axios instance is not a call.
         let src = "const api = axios.create();\napi.interceptors.use(fn);";
         let calls = extract_client_calls(src, Language::JavaScript);
-        assert!(calls.is_empty());
+        check!(calls.is_empty());
     }
 
     #[test]
@@ -660,8 +661,8 @@ mod tests {
         let src = "function withClient() { const api = axios.create(); return api.get(\"/in\"); }\n\
                    function other(api) { return api.get(\"/out\"); }";
         let calls = extract_client_calls(src, Language::JavaScript);
-        assert!(call(&calls, HttpMethod::Get, "/in").is_some());
-        assert!(call(&calls, HttpMethod::Get, "/out").is_none());
+        check!(call(&calls, HttpMethod::Get, "/in").is_some());
+        check!(call(&calls, HttpMethod::Get, "/out").is_none());
     }
 
     #[test]
@@ -674,9 +675,9 @@ mod tests {
             }
         "#;
         let calls = extract_client_calls(src, Language::Rust);
-        assert!(call(&calls, HttpMethod::Get, "https://api.example.com/users").is_some());
-        assert!(call(&calls, HttpMethod::Post, "/api/items").is_some());
-        assert!(call(&calls, HttpMethod::Delete, "/api/items/42").is_some());
+        check!(call(&calls, HttpMethod::Get, "https://api.example.com/users").is_some());
+        check!(call(&calls, HttpMethod::Post, "/api/items").is_some());
+        check!(call(&calls, HttpMethod::Delete, "/api/items/42").is_some());
     }
 
     #[test]
@@ -689,14 +690,14 @@ mod tests {
             }
         "#;
         let calls = extract_client_calls(src, Language::Rust);
-        assert!(calls.is_empty());
+        check!(calls.is_empty());
     }
 
     #[test]
     fn reqwest_ignores_client_construction() {
         // `reqwest::Client::new()` is not a request (verb `new` is not a method).
         let src = "fn f() { let _c = reqwest::Client::new(); }";
-        assert!(extract_client_calls(src, Language::Rust).is_empty());
+        check!(extract_client_calls(src, Language::Rust).is_empty());
     }
 
     #[test]
@@ -711,11 +712,11 @@ func f(c *http.Client) {
 }
 "#;
         let calls = extract_client_calls(src, Language::Go);
-        assert!(call(&calls, HttpMethod::Get, "https://api.example.com/x/1").is_some());
-        assert!(call(&calls, HttpMethod::Post, "/y").is_some());
-        assert!(call(&calls, HttpMethod::Post, "/form").is_some());
-        assert!(call(&calls, HttpMethod::Put, "/z").is_some());
-        assert!(call(&calls, HttpMethod::Delete, "/w").is_some());
+        check!(call(&calls, HttpMethod::Get, "https://api.example.com/x/1").is_some());
+        check!(call(&calls, HttpMethod::Post, "/y").is_some());
+        check!(call(&calls, HttpMethod::Post, "/form").is_some());
+        check!(call(&calls, HttpMethod::Put, "/z").is_some());
+        check!(call(&calls, HttpMethod::Delete, "/w").is_some());
     }
 
     #[test]
@@ -727,23 +728,23 @@ client.post("/y", json=payload)
 requests.request("DELETE", "/z")
 "#;
         let calls = extract_client_calls(src, Language::Python);
-        assert!(call(&calls, HttpMethod::Get, "https://api.example.com/x/1").is_some());
-        assert!(call(&calls, HttpMethod::Post, "/y").is_some());
-        assert!(call(&calls, HttpMethod::Delete, "/z").is_some());
+        check!(call(&calls, HttpMethod::Get, "https://api.example.com/x/1").is_some());
+        check!(call(&calls, HttpMethod::Post, "/y").is_some());
+        check!(call(&calls, HttpMethod::Delete, "/z").is_some());
     }
 
     #[test]
     fn python_skips_non_url_calls() {
         // `.get` with a non-URL literal (dict access) is not a request.
         let src = "d.get(\"key\")\nfetchData(url)\n";
-        assert!(extract_client_calls(src, Language::Python).is_empty());
+        check!(extract_client_calls(src, Language::Python).is_empty());
     }
 
     #[test]
     fn python_decorator_routes_are_not_client_calls() {
         // `@app.get("/users")` is a FastAPI route, not an outgoing request.
         let src = "@app.get(\"/users/{id}\")\ndef get_user(id): ...\n";
-        assert!(extract_client_calls(src, Language::Python).is_empty());
+        check!(extract_client_calls(src, Language::Python).is_empty());
     }
 
     #[test]
@@ -755,6 +756,6 @@ func f(m map[string]int) {
     fmt.Println("/not-a-call")
 }
 "#;
-        assert!(extract_client_calls(src, Language::Go).is_empty());
+        check!(extract_client_calls(src, Language::Go).is_empty());
     }
 }

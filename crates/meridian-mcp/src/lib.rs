@@ -96,29 +96,30 @@ fn error(id: Value, code: i64, message: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use assert2::check;
 
     #[test]
     fn initialize_advertises_tools_capability() {
         let req = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}});
         let resp = handle_request(Path::new("."), &req).unwrap();
-        assert_eq!(resp["id"], json!(1));
-        assert_eq!(resp["result"]["protocolVersion"], json!(PROTOCOL_VERSION));
-        assert!(resp["result"]["capabilities"]["tools"].is_object());
-        assert_eq!(resp["result"]["serverInfo"]["name"], json!("meridian"));
+        check!(resp["id"] == json!(1));
+        check!(resp["result"]["protocolVersion"] == json!(PROTOCOL_VERSION));
+        check!(resp["result"]["capabilities"]["tools"].is_object());
+        check!(resp["result"]["serverInfo"]["name"] == json!("meridian"));
     }
 
     #[test]
     fn notifications_get_no_response() {
         let note = json!({"jsonrpc":"2.0","method":"notifications/initialized"});
-        assert!(handle_request(Path::new("."), &note).is_none());
+        check!(handle_request(Path::new("."), &note).is_none());
     }
 
     #[test]
     fn unknown_method_is_method_not_found() {
         let req = json!({"jsonrpc":"2.0","id":7,"method":"frobnicate"});
         let resp = handle_request(Path::new("."), &req).unwrap();
-        assert_eq!(resp["error"]["code"], json!(-32601));
-        assert_eq!(resp["id"], json!(7));
+        check!(resp["error"]["code"] == json!(-32601));
+        check!(resp["id"] == json!(7));
     }
 
     #[test]
@@ -126,11 +127,11 @@ mod tests {
         let req = json!({"jsonrpc":"2.0","id":2,"method":"tools/list"});
         let resp = handle_request(Path::new("."), &req).unwrap();
         let list = resp["result"]["tools"].as_array().unwrap();
-        assert!(list.len() >= 5);
+        check!(list.len() >= 5);
         for t in list {
-            assert!(t["name"].is_string());
-            assert!(t["description"].is_string());
-            assert_eq!(t["inputSchema"]["type"], json!("object"));
+            check!(t["name"].is_string());
+            check!(t["description"].is_string());
+            check!(t["inputSchema"]["type"] == json!("object"));
         }
     }
 }

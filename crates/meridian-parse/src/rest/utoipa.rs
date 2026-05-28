@@ -331,6 +331,7 @@ fn attr_target_fn(attr_item: Node, src: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use assert2::check;
 
     fn ep<'a>(eps: &'a [RawEndpoint], method: HttpMethod, path: &str) -> Option<&'a RawEndpoint> {
         eps.iter().find(|e| e.method == method && e.path == path)
@@ -350,14 +351,8 @@ fn router() -> OpenApiRouter {
 }
 "#;
         let eps = extract_utoipa(src);
-        assert_eq!(
-            ep(&eps, HttpMethod::Get, "/users/{id}").unwrap().handler,
-            "get_user"
-        );
-        assert_eq!(
-            ep(&eps, HttpMethod::Post, "/users").unwrap().handler,
-            "create_user"
-        );
+        check!(ep(&eps, HttpMethod::Get, "/users/{id}").unwrap().handler == "get_user");
+        check!(ep(&eps, HttpMethod::Post, "/users").unwrap().handler == "create_user");
     }
 
     #[test]
@@ -375,9 +370,9 @@ fn app() -> OpenApiRouter {
 }
 "#;
         let eps = extract_utoipa(src);
-        assert!(ep(&eps, HttpMethod::Get, "/api/users/{id}").is_some());
+        check!(ep(&eps, HttpMethod::Get, "/api/users/{id}").is_some());
         // The builder is referenced via nest, so it is not also emitted bare.
-        assert!(ep(&eps, HttpMethod::Get, "/{id}").is_none());
+        check!(ep(&eps, HttpMethod::Get, "/{id}").is_none());
     }
 
     #[test]
@@ -391,7 +386,7 @@ fn app() -> OpenApiRouter {
 }
 "#;
         let eps = extract_utoipa(src);
-        assert!(ep(&eps, HttpMethod::Get, "/api/health").is_some());
+        check!(ep(&eps, HttpMethod::Get, "/api/health").is_some());
     }
 
     #[test]
@@ -402,10 +397,7 @@ fn app() -> OpenApiRouter {
 }
 "#;
         let eps = extract_utoipa(src);
-        assert_eq!(
-            ep(&eps, HttpMethod::Get, "/legacy").unwrap().handler,
-            "legacy"
-        );
+        check!(ep(&eps, HttpMethod::Get, "/legacy").unwrap().handler == "legacy");
     }
 
     #[test]
@@ -420,8 +412,8 @@ fn app() -> OpenApiRouter {
 }
 "#;
         let eps = extract_utoipa(src);
-        assert!(ep(&eps, HttpMethod::Get, "/things").is_some());
-        assert!(ep(&eps, HttpMethod::Post, "/things").is_some());
+        check!(ep(&eps, HttpMethod::Get, "/things").is_some());
+        check!(ep(&eps, HttpMethod::Post, "/things").is_some());
     }
 
     #[test]
@@ -437,7 +429,7 @@ fn app() -> OpenApiRouter {
 }
 "#;
         let eps = extract_utoipa(src);
-        assert_eq!(ep(&eps, HttpMethod::Get, "/ping").unwrap().handler, "ping");
+        check!(ep(&eps, HttpMethod::Get, "/ping").unwrap().handler == "ping");
     }
 
     #[test]
@@ -451,7 +443,7 @@ fn app() -> OpenApiRouter {
 }
 "##;
         let eps = extract_utoipa(src);
-        assert!(ep(&eps, HttpMethod::Get, "/raw/{id}").is_some());
+        check!(ep(&eps, HttpMethod::Get, "/raw/{id}").is_some());
     }
 
     #[test]
@@ -465,7 +457,7 @@ fn app() -> OpenApiRouter {
 }
 "#;
         let eps = extract_utoipa(src);
-        assert_eq!(ep(&eps, HttpMethod::Get, "/ping").unwrap().handler, "ping");
+        check!(ep(&eps, HttpMethod::Get, "/ping").unwrap().handler == "ping");
     }
 
     #[test]
@@ -480,8 +472,8 @@ fn app() -> OpenApiRouter {
 }
 "#;
         let eps = extract_utoipa(src);
-        assert!(eps.iter().all(|e| e.path != "/PATH"));
-        assert!(eps.iter().all(|e| e.handler != "inner"));
+        check!(eps.iter().all(|e| e.path != "/PATH"));
+        check!(eps.iter().all(|e| e.handler != "inner"));
     }
 
     #[test]
@@ -495,12 +487,12 @@ fn app() -> OpenApiRouter {
 }
 "#;
         let mounts = extract_utoipa_mounts(src);
-        assert_eq!(
-            mounts,
-            vec![RawMount {
-                parent: "app".into(),
-                child: "users".into()
-            }]
+        check!(
+            mounts
+                == vec![RawMount {
+                    parent: "app".into(),
+                    child: "users".into()
+                }]
         );
     }
 }

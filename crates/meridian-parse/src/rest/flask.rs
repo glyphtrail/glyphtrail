@@ -168,6 +168,7 @@ fn py_string(node: Node, src: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use assert2::check;
 
     fn ep<'a>(eps: &'a [RawEndpoint], method: HttpMethod, path: &str) -> Option<&'a RawEndpoint> {
         eps.iter().find(|e| e.method == method && e.path == path)
@@ -192,13 +193,12 @@ def plain(): ...
     #[test]
     fn fastapi_verb_decorators() {
         let eps = extract_flask(APP);
-        assert_eq!(
-            ep(&eps, HttpMethod::Get, "/users/{id}").map(|e| e.handler.as_str()),
-            Some("get_user")
+        check!(
+            ep(&eps, HttpMethod::Get, "/users/{id}").map(|e| e.handler.as_str())
+                == Some("get_user")
         );
-        assert_eq!(
-            ep(&eps, HttpMethod::Post, "/users").map(|e| e.handler.as_str()),
-            Some("create_user")
+        check!(
+            ep(&eps, HttpMethod::Post, "/users").map(|e| e.handler.as_str()) == Some("create_user")
         );
     }
 
@@ -206,24 +206,18 @@ def plain(): ...
     fn flask_route_methods_and_default() {
         let eps = extract_flask(APP);
         // One endpoint per listed method, same handler.
-        assert_eq!(
-            ep(&eps, HttpMethod::Post, "/items").map(|e| e.handler.as_str()),
-            Some("items")
-        );
-        assert!(ep(&eps, HttpMethod::Put, "/items").is_some());
+        check!(ep(&eps, HttpMethod::Post, "/items").map(|e| e.handler.as_str()) == Some("items"));
+        check!(ep(&eps, HttpMethod::Put, "/items").is_some());
         // `route` without `methods=` defaults to GET.
-        assert_eq!(
-            ep(&eps, HttpMethod::Get, "/health").map(|e| e.handler.as_str()),
-            Some("health")
-        );
+        check!(ep(&eps, HttpMethod::Get, "/health").map(|e| e.handler.as_str()) == Some("health"));
     }
 
     #[test]
     fn undecorated_functions_and_parse_failure() {
         // `plain` has no route decorator; nothing emitted for it.
         let eps = extract_flask(APP);
-        assert!(!eps.iter().any(|e| e.handler == "plain"));
-        assert!(extract_flask("def f(:::").is_empty());
-        assert!(extract_flask_mounts(APP).is_empty());
+        check!(!eps.iter().any(|e| e.handler == "plain"));
+        check!(extract_flask("def f(:::").is_empty());
+        check!(extract_flask_mounts(APP).is_empty());
     }
 }

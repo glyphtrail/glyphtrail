@@ -110,6 +110,7 @@ impl Matcher {
 mod tests {
     use super::*;
     use crate::api::HttpMethod;
+    use assert2::check;
 
     fn ep(id: &str, method: HttpMethod, path: &str) -> Endpoint {
         Endpoint {
@@ -138,14 +139,14 @@ mod tests {
 
         // External caller (no /api): matches via the heuristic strip => Inferred.
         let ext = m.resolve(&call("c1", HttpMethod::Get, "/users/123"));
-        assert_eq!(ext.len(), 1);
-        assert_eq!(ext[0].endpoint, NodeId("e1".into()));
-        assert_eq!(ext[0].confidence, Confidence::Inferred);
+        check!(ext.len() == 1);
+        check!(ext[0].endpoint == NodeId("e1".into()));
+        check!(ext[0].confidence == Confidence::Inferred);
 
         // In-cluster caller (with /api): matches the endpoint's own path => Extracted.
         let int = m.resolve(&call("c2", HttpMethod::Get, "/api/users/999"));
-        assert_eq!(int.len(), 1);
-        assert_eq!(int[0].confidence, Confidence::Extracted);
+        check!(int.len() == 1);
+        check!(int[0].confidence == Confidence::Extracted);
     }
 
     #[test]
@@ -160,8 +161,8 @@ mod tests {
         );
         let m = Matcher::build(&[ep("e1", HttpMethod::Get, "/api/users/{id}")], &eng);
         let ext = m.resolve(&call("c1", HttpMethod::Get, "/users/123"));
-        assert_eq!(ext.len(), 1);
-        assert_eq!(ext[0].confidence, Confidence::Extracted);
+        check!(ext.len() == 1);
+        check!(ext[0].confidence == Confidence::Extracted);
     }
 
     #[test]
@@ -170,11 +171,11 @@ mod tests {
             &[ep("e1", HttpMethod::Get, "/api/users/{id}")],
             &default_engine(),
         );
-        assert!(
+        check!(
             m.resolve(&call("c1", HttpMethod::Post, "/users/1"))
                 .is_empty()
         );
-        assert!(
+        check!(
             m.resolve(&call("c2", HttpMethod::Get, "/orders/1"))
                 .is_empty()
         );
@@ -191,9 +192,9 @@ mod tests {
         ];
         let m = Matcher::build(&endpoints, &default_engine());
         let res = m.resolve(&call("c1", HttpMethod::Get, "/users/5"));
-        assert_eq!(res.len(), 1);
-        assert_eq!(res[0].endpoint, NodeId("e_exact".into()));
-        assert_eq!(res[0].confidence, Confidence::Extracted);
+        check!(res.len() == 1);
+        check!(res[0].endpoint == NodeId("e_exact".into()));
+        check!(res[0].confidence == Confidence::Extracted);
     }
 
     #[test]
@@ -206,7 +207,7 @@ mod tests {
         let m = Matcher::build(&endpoints, &default_engine());
         let res = m.resolve(&call("c1", HttpMethod::Get, "/users/7"));
         let endpoints: Vec<&str> = res.iter().map(|m| m.endpoint.0.as_str()).collect();
-        assert_eq!(endpoints, vec!["e1", "e2"]);
-        assert!(res.iter().all(|m| m.confidence == Confidence::Extracted));
+        check!(endpoints == vec!["e1", "e2"]);
+        check!(res.iter().all(|m| m.confidence == Confidence::Extracted));
     }
 }

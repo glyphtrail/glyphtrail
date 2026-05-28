@@ -121,53 +121,51 @@ fn java_candidates(raw: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use assert2::check;
 
     #[test]
     fn js_relative_resolves_with_extensions_and_index() {
         let c = resolve_import("web/app.ts", "./util", Language::TypeScript);
-        assert!(c.contains(&"web/util.ts".to_string()));
-        assert!(c.contains(&"web/util/index.ts".to_string()));
+        check!(c.contains(&"web/util.ts".to_string()));
+        check!(c.contains(&"web/util/index.ts".to_string()));
         // Parent traversal.
         let c = resolve_import("web/sub/app.ts", "../util", Language::TypeScript);
-        assert!(c.contains(&"web/util.ts".to_string()));
+        check!(c.contains(&"web/util.ts".to_string()));
     }
 
     #[test]
     fn js_bare_specifier_is_external() {
-        assert!(resolve_import("web/app.ts", "react", Language::TypeScript).is_empty());
-        assert!(resolve_import("web/app.ts", "@scope/pkg", Language::Tsx).is_empty());
+        check!(resolve_import("web/app.ts", "react", Language::TypeScript).is_empty());
+        check!(resolve_import("web/app.ts", "@scope/pkg", Language::Tsx).is_empty());
     }
 
     #[test]
     fn js_escaping_root_yields_nothing() {
-        assert!(resolve_import("app.ts", "../../x", Language::JavaScript).is_empty());
+        check!(resolve_import("app.ts", "../../x", Language::JavaScript).is_empty());
     }
 
     #[test]
     fn c_include_tries_local_and_root() {
         let c = resolve_import("src/a.c", "util.h", Language::C);
-        assert!(c.contains(&"src/util.h".to_string()));
-        assert!(c.contains(&"util.h".to_string()));
+        check!(c.contains(&"src/util.h".to_string()));
+        check!(c.contains(&"util.h".to_string()));
     }
 
     #[test]
     fn python_dotted_maps_to_module_or_package() {
         let c = resolve_import("app/main.py", "app.models", Language::Python);
-        assert_eq!(c, vec!["app/models.py", "app/models/__init__.py"]);
+        check!(c == vec!["app/models.py", "app/models/__init__.py"]);
     }
 
     #[test]
     fn java_fqn_maps_to_path_but_not_wildcard() {
-        assert_eq!(
-            resolve_import("X.java", "com.foo.Bar", Language::Java),
-            vec!["com/foo/Bar.java"]
-        );
-        assert!(resolve_import("X.java", "com.foo.*", Language::Java).is_empty());
+        check!(resolve_import("X.java", "com.foo.Bar", Language::Java) == vec!["com/foo/Bar.java"]);
+        check!(resolve_import("X.java", "com.foo.*", Language::Java).is_empty());
     }
 
     #[test]
     fn go_and_rust_are_not_locally_resolved() {
-        assert!(resolve_import("m.go", "github.com/x/y", Language::Go).is_empty());
-        assert!(resolve_import("m.rs", "crate::a::b", Language::Rust).is_empty());
+        check!(resolve_import("m.go", "github.com/x/y", Language::Go).is_empty());
+        check!(resolve_import("m.rs", "crate::a::b", Language::Rust).is_empty());
     }
 }

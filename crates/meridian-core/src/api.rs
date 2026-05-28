@@ -312,35 +312,33 @@ fn is_uuid(seg: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use assert2::check;
 
     #[test]
     fn normalize_strips_query_fragment_and_trailing_slash() {
-        assert_eq!(normalize_path("/users/?page=2#x"), "/users");
-        assert_eq!(normalize_path("/users/"), "/users");
-        assert_eq!(normalize_path("/users//list///"), "/users/list");
-        assert_eq!(normalize_path("/"), "/");
-        assert_eq!(normalize_path(""), "/");
+        check!(normalize_path("/users/?page=2#x") == "/users");
+        check!(normalize_path("/users/") == "/users");
+        check!(normalize_path("/users//list///") == "/users/list");
+        check!(normalize_path("/") == "/");
+        check!(normalize_path("") == "/");
     }
 
     #[test]
     fn normalize_strips_scheme_and_host() {
-        assert_eq!(
-            normalize_path("https://api.example.com/users/1"),
-            "/users/1"
-        );
-        assert_eq!(normalize_path("http://localhost:8080/"), "/");
+        check!(normalize_path("https://api.example.com/users/1") == "/users/1");
+        check!(normalize_path("http://localhost:8080/") == "/");
     }
 
     #[test]
     fn normalize_rewrites_framework_param_syntaxes() {
-        assert_eq!(normalize_path("/users/:id"), "/users/{id}");
-        assert_eq!(normalize_path("/users/{id}"), "/users/{id}");
-        assert_eq!(normalize_path("/users/{id:[0-9]+}"), "/users/{id}");
-        assert_eq!(normalize_path("/users/<int:id>"), "/users/{id}");
-        assert_eq!(normalize_path("/files/<path..>"), "/files/{path}");
-        assert_eq!(normalize_path("/users/[id]"), "/users/{id}");
-        assert_eq!(normalize_path("/docs/[...slug]"), "/docs/{slug}");
-        assert_eq!(normalize_path("/assets/*path"), "/assets/{path}");
+        check!(normalize_path("/users/:id") == "/users/{id}");
+        check!(normalize_path("/users/{id}") == "/users/{id}");
+        check!(normalize_path("/users/{id:[0-9]+}") == "/users/{id}");
+        check!(normalize_path("/users/<int:id>") == "/users/{id}");
+        check!(normalize_path("/files/<path..>") == "/files/{path}");
+        check!(normalize_path("/users/[id]") == "/users/{id}");
+        check!(normalize_path("/docs/[...slug]") == "/docs/{slug}");
+        check!(normalize_path("/assets/*path") == "/assets/{path}");
     }
 
     #[test]
@@ -352,10 +350,10 @@ mod tests {
             HttpMethod::Get,
             "/api/users/550e8400-e29b-41d4-a716-446655440000",
         );
-        assert_eq!(server.signature(), client_num.signature());
-        assert_eq!(server.signature(), client_tmpl.signature());
-        assert_eq!(server.signature(), client_uuid.signature());
-        assert_eq!(server.signature(), "rest|GET|/api/users/{}");
+        check!(server.signature() == client_num.signature());
+        check!(server.signature() == client_tmpl.signature());
+        check!(server.signature() == client_uuid.signature());
+        check!(server.signature() == "rest|GET|/api/users/{}");
     }
 
     #[test]
@@ -363,44 +361,44 @@ mod tests {
         let get = OperationKey::rest(HttpMethod::Get, "/users/{id}");
         let post = OperationKey::rest(HttpMethod::Post, "/users/{id}");
         let collection = OperationKey::rest(HttpMethod::Get, "/users");
-        assert_ne!(get.signature(), post.signature());
-        assert_ne!(get.signature(), collection.signature());
+        check!(get.signature() != post.signature());
+        check!(get.signature() != collection.signature());
     }
 
     #[test]
     fn param_name_differences_do_not_affect_matching() {
         let a = OperationKey::rest(HttpMethod::Get, "/users/{id}/posts/{postId}");
         let b = OperationKey::rest(HttpMethod::Get, "/users/:userId/posts/:pid");
-        assert_eq!(a.signature(), b.signature());
+        check!(a.signature() == b.signature());
     }
 
     #[test]
     fn literal_numeric_prefixes_stay_literal() {
         // A version prefix is literal; only standalone numeric ids collapse.
-        assert_eq!(path_signature("/v1/users/42"), "/v1/users/{}");
+        check!(path_signature("/v1/users/42") == "/v1/users/{}");
     }
 
     #[test]
     fn protocol_serde_matches_as_str() {
         for p in [Protocol::Rest, Protocol::Grpc, Protocol::GraphQl] {
             let json = serde_json::to_string(&p).unwrap();
-            assert_eq!(json, format!("\"{}\"", p.as_str()));
-            assert_eq!(serde_json::from_str::<Protocol>(&json).unwrap(), p);
+            check!(json == format!("\"{}\"", p.as_str()));
+            check!(serde_json::from_str::<Protocol>(&json).unwrap() == p);
         }
     }
 
     #[test]
     fn http_method_parse_is_case_insensitive() {
-        assert_eq!(HttpMethod::parse("get"), Some(HttpMethod::Get));
-        assert_eq!(HttpMethod::parse("  Post "), Some(HttpMethod::Post));
-        assert_eq!(HttpMethod::parse("FETCH"), None);
+        check!(HttpMethod::parse("get") == Some(HttpMethod::Get));
+        check!(HttpMethod::parse("  Post ") == Some(HttpMethod::Post));
+        check!(HttpMethod::parse("FETCH") == None);
     }
 
     #[test]
     fn display_is_human_readable() {
         let k = OperationKey::rest(HttpMethod::Delete, "/users/:id");
-        assert_eq!(k.to_string(), "DELETE /users/{id}");
+        check!(k.to_string() == "DELETE /users/{id}");
         let g = OperationKey::opaque(Protocol::Grpc, "users.UserService/GetUser");
-        assert_eq!(g.to_string(), "grpc users.UserService/GetUser");
+        check!(g.to_string() == "grpc users.UserService/GetUser");
     }
 }

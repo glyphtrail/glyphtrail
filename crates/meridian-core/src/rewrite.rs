@@ -178,6 +178,7 @@ fn upsert(map: &mut std::collections::BTreeMap<String, Confidence>, path: &str, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use assert2::check;
 
     fn paths(c: &[RewriteCandidate]) -> Vec<&str> {
         c.iter().map(|r| r.path.as_str()).collect()
@@ -189,40 +190,37 @@ mod tests {
             from: "/api".into(),
             to: "".into(),
         };
-        assert_eq!(
-            strip.apply("/api/users/{id}").as_deref(),
-            Some("/users/{id}")
-        );
-        assert_eq!(strip.apply("/api").as_deref(), Some("/"));
+        check!(strip.apply("/api/users/{id}").as_deref() == Some("/users/{id}"));
+        check!(strip.apply("/api").as_deref() == Some("/"));
         // No partial-segment match.
-        assert_eq!(strip.apply("/apiv2/x"), None);
+        check!(strip.apply("/apiv2/x") == None);
 
         let add = PrefixRewrite {
             from: "".into(),
             to: "/api".into(),
         };
-        assert_eq!(add.apply("/users").as_deref(), Some("/api/users"));
+        check!(add.apply("/users").as_deref() == Some("/api/users"));
 
         let replace = PrefixRewrite {
             from: "/internal".into(),
             to: "/v2".into(),
         };
-        assert_eq!(replace.apply("/internal/x").as_deref(), Some("/v2/x"));
-        assert_eq!(replace.apply("/other"), None);
+        check!(replace.apply("/internal/x").as_deref() == Some("/v2/x"));
+        check!(replace.apply("/other") == None);
     }
 
     #[test]
     fn default_heuristic_strips_api_prefix_as_inferred() {
         let eng = RewriteEngine::new(vec![], vec!["/api".into()], true);
         let cands = eng.external_candidates("/api/users/{id}");
-        assert_eq!(paths(&cands), vec!["/api/users/{id}", "/users/{id}"]);
+        check!(paths(&cands) == vec!["/api/users/{id}", "/users/{id}"]);
         // identity is extracted, heuristic strip is inferred
         let inferred: Vec<_> = cands
             .iter()
             .filter(|c| c.confidence == Confidence::Inferred)
             .map(|c| c.path.as_str())
             .collect();
-        assert_eq!(inferred, vec!["/users/{id}"]);
+        check!(inferred == vec!["/users/{id}"]);
     }
 
     #[test]
@@ -239,7 +237,7 @@ mod tests {
         );
         let cands = eng.external_candidates("/api/users");
         let users = cands.iter().find(|c| c.path == "/users").unwrap();
-        assert_eq!(users.confidence, Confidence::Extracted);
+        check!(users.confidence == Confidence::Extracted);
     }
 
     #[test]
@@ -258,8 +256,8 @@ mod tests {
         let conf = |path: &str| cands.iter().find(|c| c.path == path).map(|c| c.confidence);
         // Both equivalent forms are present, and both are high-confidence
         // because the rewrite is explicit (the prefix is kept, not removed).
-        assert_eq!(conf("/api/users/{id}"), Some(Confidence::Extracted));
-        assert_eq!(conf("/users/{id}"), Some(Confidence::Extracted));
+        check!(conf("/api/users/{id}") == Some(Confidence::Extracted));
+        check!(conf("/users/{id}") == Some(Confidence::Extracted));
     }
 
     #[test]
@@ -268,22 +266,22 @@ mod tests {
             from: "/".into(),
             to: "/x".into(),
         };
-        assert!(root.validate().is_err());
+        check!(root.validate().is_err());
         // It must not silently behave like a prepend.
-        assert_eq!(root.apply("/users"), None);
+        check!(root.apply("/users") == None);
         // An empty `from` is a valid prepend rule.
         let prepend = PrefixRewrite {
             from: "".into(),
             to: "/api".into(),
         };
-        assert!(prepend.validate().is_ok());
-        assert_eq!(prepend.apply("/users").as_deref(), Some("/api/users"));
+        check!(prepend.validate().is_ok());
+        check!(prepend.apply("/users").as_deref() == Some("/api/users"));
     }
 
     #[test]
     fn heuristic_disabled_yields_identity_only() {
         let eng = RewriteEngine::new(vec![], vec!["/api".into()], false);
         let cands = eng.external_candidates("/api/users");
-        assert_eq!(paths(&cands), vec!["/api/users"]);
+        check!(paths(&cands) == vec!["/api/users"]);
     }
 }

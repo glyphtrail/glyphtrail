@@ -481,6 +481,7 @@ fn ingest_schemas(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use assert2::check;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_repo(tag: &str) -> std::path::PathBuf {
@@ -521,14 +522,14 @@ mod tests {
         run(&dir, false).unwrap();
         {
             let store = SqliteStore::open(&RepoPaths::new(&dir).db_path).unwrap();
-            assert!(store.find_by_name("foo").unwrap().is_empty());
+            check!(store.find_by_name("foo").unwrap().is_empty());
         }
 
         // Add the definition; caller.rs is unchanged, so only a global
         // re-resolution of persisted pending edges can create the link.
         std::fs::write(dir.join("def.rs"), "fn foo() {}\n").unwrap();
         run(&dir, true).unwrap();
-        assert!(
+        check!(
             callers_of(&dir, "foo").contains(&"use_it".to_string()),
             "expected use_it -> foo after adding the definition on --update"
         );
@@ -544,13 +545,13 @@ mod tests {
         std::fs::write(dir.join("caller.rs"), "fn use_it() { foo(); }\n").unwrap();
         std::fs::write(dir.join("def.rs"), "fn foo() {}\n").unwrap();
         run(&dir, false).unwrap();
-        assert!(callers_of(&dir, "foo").contains(&"use_it".to_string()));
+        check!(callers_of(&dir, "foo").contains(&"use_it".to_string()));
 
         // Remove foo; the inferred use_it -> foo edge must disappear.
         std::fs::write(dir.join("def.rs"), "fn other() {}\n").unwrap();
         run(&dir, true).unwrap();
         let store = SqliteStore::open(&RepoPaths::new(&dir).db_path).unwrap();
-        assert!(
+        check!(
             store.find_by_name("foo").unwrap().is_empty(),
             "foo should be gone after the edit"
         );
@@ -561,7 +562,7 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
-        assert!(
+        check!(
             store
                 .neighbors(&use_it.id.0, Some(EdgeKind::Calls), true)
                 .unwrap()
@@ -596,13 +597,13 @@ mod tests {
         run(&dir, false).unwrap();
 
         let targets = import_targets(&dir, "web/app.ts");
-        assert!(
+        check!(
             targets.contains(&("web/util.ts".to_string(), "file".to_string())),
             "expected app.ts -> web/util.ts (file), got {targets:?}"
         );
         // A bare specifier stays a module placeholder.
         let ext = import_targets(&dir, "web/ext.ts");
-        assert!(
+        check!(
             ext.iter().any(|(n, k)| n == "react" && k == "module"),
             "expected react to remain a module placeholder, got {ext:?}"
         );
@@ -619,7 +620,7 @@ mod tests {
         std::fs::write(dir.join("web/app.ts"), "import { x } from \"./util\";\n").unwrap();
         run(&dir, false).unwrap();
         // No util.ts yet: the import is a placeholder module.
-        assert!(
+        check!(
             import_targets(&dir, "web/app.ts")
                 .iter()
                 .any(|(n, k)| n == "./util" && k == "module"),
@@ -630,11 +631,11 @@ mod tests {
         std::fs::write(dir.join("web/util.ts"), "export const x = 1;\n").unwrap();
         run(&dir, true).unwrap();
         let targets = import_targets(&dir, "web/app.ts");
-        assert!(
+        check!(
             targets.contains(&("web/util.ts".to_string(), "file".to_string())),
             "expected app.ts -> web/util.ts after --update, got {targets:?}"
         );
-        assert!(
+        check!(
             !targets.iter().any(|(n, _)| n == "./util"),
             "stale ./util placeholder edge should be gone, got {targets:?}"
         );
@@ -674,11 +675,11 @@ mod tests {
         run(&dir, false).unwrap();
 
         // The call resolves to b.ts (imported), not c.ts.
-        assert!(
+        check!(
             callers_of_def_in(&dir, "helper", "b.ts").contains(&"use".to_string()),
             "use() should resolve to the imported helper in b.ts"
         );
-        assert!(
+        check!(
             callers_of_def_in(&dir, "helper", "c.ts").is_empty(),
             "the un-imported helper in c.ts should have no caller"
         );
@@ -711,20 +712,20 @@ mod tests {
 
         let store = SqliteStore::open(&RepoPaths::new(&dir).db_path).unwrap();
         // Four source files (2 Rust, 2 Python).
-        assert_eq!(store.stats().unwrap().files, 4);
+        check!(store.stats().unwrap().files == 4);
 
         // Cross-file calls resolve in both languages.
-        assert!(
+        check!(
             callers_of(&dir, "helper").contains(&"run".to_string()),
             "rust app.rs::run should call lib.rs::helper"
         );
-        assert!(
+        check!(
             callers_of(&dir, "shared").contains(&"go".to_string()),
             "python main.py::go should call util.py::shared"
         );
 
         // Python import resolves to the real file (suffix match under py/).
-        assert!(
+        check!(
             import_targets(&dir, "py/main.py")
                 .contains(&("py/util.py".to_string(), "file".to_string())),
             "main.py should import util.py as a file node"
@@ -732,7 +733,7 @@ mod tests {
 
         // The NOTE design-rationale comment becomes a Comment node.
         let (nodes, _) = store.export_graph(10_000).unwrap();
-        assert!(
+        check!(
             nodes.iter().any(|n| n.kind == NodeKind::Comment),
             "the NOTE comment should be a Comment node"
         );

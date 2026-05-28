@@ -7,6 +7,7 @@ pub use sqlite::{SqliteStore, Stats};
 #[cfg(test)]
 mod tests {
     use super::*;
+    use assert2::check;
     use meridian_core::{Confidence, Edge, EdgeKind, Node, NodeId, NodeKind, PendingLink, Span};
 
     fn node(id: &str, name: &str, kind: NodeKind) -> Node {
@@ -43,21 +44,21 @@ mod tests {
         store.insert_graph(&nodes, &edges).unwrap();
 
         let s = store.stats().unwrap();
-        assert_eq!(s.nodes, 2);
-        assert_eq!(s.edges, 1);
+        check!(s.nodes == 2);
+        check!(s.edges == 1);
 
         // callee's incoming Calls neighbour is the caller.
         let callers = store.neighbors("b", Some(EdgeKind::Calls), false).unwrap();
-        assert_eq!(callers.len(), 1);
-        assert_eq!(callers[0].0.name, "caller");
+        check!(callers.len() == 1);
+        check!(callers[0].0.name == "caller");
 
         // FTS finds by name.
-        assert_eq!(store.search("callee", 10).unwrap().len(), 1);
+        check!(store.search("callee", 10).unwrap().len() == 1);
 
         // Reachability: who is impacted if b changes -> a.
         let impacted = store.reachable("b", EdgeKind::Calls, false, 5).unwrap();
-        assert_eq!(impacted.len(), 1);
-        assert_eq!(impacted[0].name, "caller");
+        check!(impacted.len() == 1);
+        check!(impacted[0].name == "caller");
     }
 
     #[test]
@@ -84,35 +85,35 @@ mod tests {
             .unwrap();
 
         let endpoints = store.operations_by_kind(NodeKind::Endpoint).unwrap();
-        assert_eq!(endpoints.len(), 1);
-        assert_eq!(endpoints[0].0, NodeId("e1".into()));
-        assert_eq!(endpoints[0].1.path, "/api/users/{id}");
-        assert_eq!(endpoints[0].1.method, Some(HttpMethod::Get));
+        check!(endpoints.len() == 1);
+        check!(endpoints[0].0 == NodeId("e1".into()));
+        check!(endpoints[0].1.path == "/api/users/{id}");
+        check!(endpoints[0].1.method == Some(HttpMethod::Get));
 
         let calls = store.operations_by_kind(NodeKind::ClientCall).unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, NodeId("c1".into()));
+        check!(calls.len() == 1);
+        check!(calls[0].0 == NodeId("c1".into()));
 
         // all_operations returns every row regardless of node kind.
         let all = store.all_operations().unwrap();
-        assert_eq!(all.len(), 2);
-        assert!(all.iter().any(|(id, _)| id == &NodeId("e1".into())));
-        assert!(all.iter().any(|(id, _)| id == &NodeId("c1".into())));
+        check!(all.len() == 2);
+        check!(all.iter().any(|(id, _)| id == &NodeId("e1".into())));
+        check!(all.iter().any(|(id, _)| id == &NodeId("c1".into())));
 
         // Incremental re-index of the endpoint's file drops its operation row.
         store.delete_file_data("routes.rs").unwrap();
-        assert!(
+        check!(
             store
                 .operations_by_kind(NodeKind::Endpoint)
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(
+        check!(
             store
                 .operations_by_kind(NodeKind::ClientCall)
                 .unwrap()
-                .len(),
-            1
+                .len()
+                == 1
         );
     }
 
@@ -128,13 +129,13 @@ mod tests {
             name_is_src: false,
         };
         store.insert_pending(std::slice::from_ref(&link)).unwrap();
-        assert_eq!(store.all_pending().unwrap(), vec![link.clone()]);
+        check!(store.all_pending().unwrap() == vec![link.clone()]);
         // Re-inserting the same link is idempotent.
         store.insert_pending(&[link]).unwrap();
-        assert_eq!(store.all_pending().unwrap().len(), 1);
+        check!(store.all_pending().unwrap().len() == 1);
         // Deleting the anchor's file drops its pending rows.
         store.delete_file_data("a.rs").unwrap();
-        assert!(store.all_pending().unwrap().is_empty());
+        check!(store.all_pending().unwrap().is_empty());
     }
 
     #[test]
@@ -162,14 +163,14 @@ mod tests {
                 ],
             )
             .unwrap();
-        assert_eq!(store.stats().unwrap().edges, 2);
-        assert_eq!(
+        check!(store.stats().unwrap().edges == 2);
+        check!(
             store
                 .delete_edges_by_confidence(Confidence::Inferred)
-                .unwrap(),
-            1
+                .unwrap()
+                == 1
         );
-        assert_eq!(store.stats().unwrap().edges, 1);
+        check!(store.stats().unwrap().edges == 1);
     }
 
     #[test]
@@ -199,14 +200,14 @@ mod tests {
 
         // The schema op node, its operation row and the EXPOSES edge are gone;
         // the endpoint (a different kind) is untouched.
-        assert!(
+        check!(
             store
                 .operations_by_kind(NodeKind::SchemaOp)
                 .unwrap()
                 .is_empty()
         );
-        assert!(store.get_node("s1").unwrap().is_none());
-        assert!(store.get_node("e1").unwrap().is_some());
-        assert_eq!(store.stats().unwrap().edges, 0);
+        check!(store.get_node("s1").unwrap().is_none());
+        check!(store.get_node("e1").unwrap().is_some());
+        check!(store.stats().unwrap().edges == 0);
     }
 }

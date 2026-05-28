@@ -108,6 +108,7 @@ fn go_string(node: Node, src: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use assert2::check;
 
     fn ep<'a>(eps: &'a [RawEndpoint], method: HttpMethod, path: &str) -> Option<&'a RawEndpoint> {
         eps.iter().find(|e| e.method == method && e.path == path)
@@ -126,32 +127,27 @@ func setup(r *gin.Engine) {
     #[test]
     fn extracts_verb_path_and_handler() {
         let eps = extract_gin(ROUTER);
-        assert_eq!(
-            ep(&eps, HttpMethod::Get, "/users/:id").map(|e| e.handler.as_str()),
-            Some("getUser")
+        check!(
+            ep(&eps, HttpMethod::Get, "/users/:id").map(|e| e.handler.as_str()) == Some("getUser")
         );
         // Selector handler keeps the function name.
-        assert_eq!(
-            ep(&eps, HttpMethod::Post, "/users").map(|e| e.handler.as_str()),
-            Some("CreateUser")
+        check!(
+            ep(&eps, HttpMethod::Post, "/users").map(|e| e.handler.as_str()) == Some("CreateUser")
         );
         // Inline handler -> no symbol.
-        assert_eq!(
-            ep(&eps, HttpMethod::Delete, "/users/:id").map(|e| e.handler.as_str()),
-            Some("")
-        );
+        check!(ep(&eps, HttpMethod::Delete, "/users/:id").map(|e| e.handler.as_str()) == Some(""));
     }
 
     #[test]
     fn ignores_non_route_methods() {
         // `r.Use(...)` is middleware, not a route.
         let eps = extract_gin(ROUTER);
-        assert_eq!(eps.len(), 3);
+        check!(eps.len() == 3);
     }
 
     #[test]
     fn no_mounts_and_handles_parse_failure() {
-        assert!(extract_gin_mounts(ROUTER).is_empty());
-        assert!(extract_gin("???not go").is_empty());
+        check!(extract_gin_mounts(ROUTER).is_empty());
+        check!(extract_gin("???not go").is_empty());
     }
 }
