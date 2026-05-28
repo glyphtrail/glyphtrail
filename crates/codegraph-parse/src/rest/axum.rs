@@ -360,9 +360,24 @@ fn text(node: Node, src: &[u8]) -> String {
     node.utf8_text(src).unwrap_or("").to_string()
 }
 
-/// Text of a string literal with surrounding quotes removed.
+/// Inner text of a string literal, with quotes and any raw-string `r#"…"#`
+/// delimiters removed. Works for plain (`"…"`) and raw (`r"…"`, `r#"…"#`)
+/// literals by reading the grammar's `string_content` child.
 fn string_text(node: Node, src: &[u8]) -> String {
-    text(node, src).trim().trim_matches('"').to_string()
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "string_content" {
+            return text(child, src);
+        }
+    }
+    // Fallback for unexpected shapes (e.g. an empty literal with no content
+    // node): strip a leading `r`, matched `#`s, then the surrounding quotes.
+    text(node, src)
+        .trim()
+        .trim_start_matches('r')
+        .trim_matches('#')
+        .trim_matches('"')
+        .to_string()
 }
 
 /// Join an accumulated prefix with a path segment and normalize.
@@ -485,6 +500,23 @@ fn app() -> Router {
 "#;
         let eps = extract_axum(src);
         assert_eq!(ep(&eps, HttpMethod::Get, "/u").unwrap().handler, "list");
+    }
+
+    #[test]
+    fn raw_string_paths_are_unwrapped() {
+        let src = r##"
+fn app() -> Router {
+    Router::new()
+        .nest(r"/api", Router::new().route(r#"/users/:id"#, get(show)))
+}
+"##;
+        let eps = extract_axum(src);
+        assert_eq!(
+            ep(&eps, HttpMethod::Get, "/api/users/{id}")
+                .unwrap()
+                .handler,
+            "show"
+        );
     }
 
     #[test]
