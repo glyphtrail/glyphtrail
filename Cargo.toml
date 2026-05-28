@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/codegraph-core",
+    "crates/codegraph-parse",
+    "crates/codegraph-store",
+    "crates/codegraph-viz",
+    "crates/codegraph-server",
+    "crates/codegraph-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sunsided/codegraph"
+
+[workspace.dependencies]
+codegraph-core = { path = "crates/codegraph-core" }
+codegraph-parse = { path = "crates/codegraph-parse" }
+codegraph-store = { path = "crates/codegraph-store" }
+codegraph-viz = { path = "crates/codegraph-viz" }
+codegraph-server = { path = "crates/codegraph-server" }
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+blake3 = "1.8"
+ignore = "0.4"
+rusqlite = { version = "0.37", features = ["bundled"] }
+clap = { version = "4", features = ["derive"] }
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+tower-http = { version = "0.6", features = ["fs", "trace"] }
+
+tree-sitter = "0.26"
+tree-sitter-language = "0.1"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.25"
+tree-sitter-javascript = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-go = "0.25"
+tree-sitter-java = "0.23"
+tree-sitter-c = "0.24"
+tree-sitter-cpp = "0.23"
+
+[profile.release]
+lto = "thin"

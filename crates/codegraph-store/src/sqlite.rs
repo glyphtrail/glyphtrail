@@ -1,0 +1,353 @@
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::Result;
+use codegraph_core::{Confidence, Edge, EdgeKind, Node, NodeId, NodeKind, Span};
+use rusqlite::{params, Connection};
+
+/// Persistent code graph backed by SQLite (+ FTS5 search). The first storage
+/// backend; a LadybugDB backend implementing the same surface comes later.
+pub struct SqliteStore {
+    conn: Connection,
+}
+
+impl SqliteStore {
+    pub fn open(path: &Path) -> Result<Self> {
+        let conn = Connection::open(path)?;
+        conn.execute_batch(include_str!("schema.sql"))?;
+        Ok(Self { conn })
+    }
+
+    pub fn open_in_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(include_str!("schema.sql"))?;
+        Ok(Self { conn })
+    }
+
+    /// Wipe all indexed data (full reindex).
+    pub fn clear(&mut self) -> Result<()> {
+        self.conn.execute_batch(
+            "DELETE FROM edges; DELETE FROM nodes; DELETE FROM files; DELETE FROM nodes_fts;",
+        )?;
+        Ok(())
+    }
+
+    /// Persisted hash for a file, if indexed before.
+    pub fn file_hash(&self, path: &str) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare("SELECT hash FROM files WHERE path = ?1")?;
+        let mut rows = stmt.query(params![path])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row.get(0)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn all_files(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT path FROM files")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Remove a file's record and all nodes/edges it owns.
+    pub fn delete_file_data(&mut self, path: &str) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM edges WHERE src IN (SELECT id FROM nodes WHERE file = ?1)
+                OR dst IN (SELECT id FROM nodes WHERE file = ?1)",
+            params![path],
+        )?;
+        tx.execute(
+            "DELETE FROM nodes_fts WHERE id IN (SELECT id FROM nodes WHERE file = ?1)",
+            params![path],
+        )?;
+        tx.execute("DELETE FROM nodes WHERE file = ?1", params![path])?;
+        tx.execute("DELETE FROM files WHERE path = ?1", params![path])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn set_file(&mut self, path: &str, language: Option<&str>, hash: &str) -> Result<()> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.conn.execute(
+            "INSERT INTO files(path, language, hash, indexed_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(path) DO UPDATE SET language=?2, hash=?3, indexed_at=?4",
+            params![path, language, hash, now],
+        )?;
+        Ok(())
+    }
+
+    /// Insert nodes and edges. Existing rows are merged (nodes by id, edges by
+    /// (src,dst,kind)); `Extracted` edges should be inserted before `Inferred`
+    /// ones so the higher-confidence edge wins on conflict.
+    pub fn insert_graph(&mut self, nodes: &[Node], edges: &[Edge]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut node_stmt = tx.prepare(
+                "INSERT INTO nodes(id, kind, name, qualified_name, file, language,
+                    start_byte, end_byte, start_line, end_line, doc)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+                 ON CONFLICT(id) DO UPDATE SET
+                    kind=?2, name=?3, qualified_name=?4, file=?5, language=?6,
+                    start_byte=?7, end_byte=?8, start_line=?9, end_line=?10, doc=?11",
+            )?;
+            let mut fts_stmt = tx.prepare(
+                "INSERT INTO nodes_fts(id, name, qualified_name, doc) VALUES (?1,?2,?3,?4)",
+            )?;
+            for n in nodes {
+                let (sb, eb, sl, el) = match n.span {
+                    Some(s) => (
+                        Some(s.start_byte as i64),
+                        Some(s.end_byte as i64),
+                        Some(s.start_line as i64),
+                        Some(s.end_line as i64),
+                    ),
+                    None => (None, None, None, None),
+                };
+                node_stmt.execute(params![
+                    n.id.0,
+                    n.kind.as_str(),
+                    n.name,
+                    n.qualified_name,
+                    n.file,
+                    n.language,
+                    sb,
+                    eb,
+                    sl,
+                    el,
+                    n.doc,
+                ])?;
+                fts_stmt.execute(params![
+                    n.id.0,
+                    n.name,
+                    n.qualified_name,
+                    n.doc.as_deref().unwrap_or("")
+                ])?;
+            }
+
+            let mut edge_stmt = tx.prepare(
+                "INSERT INTO edges(src, dst, kind, confidence) VALUES (?1,?2,?3,?4)
+                 ON CONFLICT(src,dst,kind) DO NOTHING",
+            )?;
+            for e in edges {
+                edge_stmt.execute(params![
+                    e.src.0,
+                    e.dst.0,
+                    e.kind.as_str(),
+                    e.confidence.as_str()
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// (name, id) for every definition-like node, for global call resolution.
+    pub fn definition_index(&self) -> Result<Vec<(String, NodeId)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, id FROM nodes
+             WHERE kind NOT IN ('file','directory','repo','module','comment')",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, NodeId(r.get::<_, String>(1)?)))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    fn row_to_node(row: &rusqlite::Row) -> rusqlite::Result<Node> {
+        let span = match row.get::<_, Option<i64>>("start_byte")? {
+            Some(sb) => Some(Span {
+                start_byte: sb as usize,
+                end_byte: row.get::<_, Option<i64>>("end_byte")?.unwrap_or(0) as usize,
+                start_line: row.get::<_, Option<i64>>("start_line")?.unwrap_or(0) as usize,
+                end_line: row.get::<_, Option<i64>>("end_line")?.unwrap_or(0) as usize,
+            }),
+            None => None,
+        };
+        Ok(Node {
+            id: NodeId(row.get("id")?),
+            kind: parse_kind(&row.get::<_, String>("kind")?),
+            name: row.get("name")?,
+            qualified_name: row.get("qualified_name")?,
+            file: row.get("file")?,
+            language: row.get("language")?,
+            span,
+            doc: row.get("doc")?,
+        })
+    }
+
+    pub fn get_node(&self, id: &str) -> Result<Option<Node>> {
+        let mut stmt = self.conn.prepare("SELECT * FROM nodes WHERE id = ?1")?;
+        let mut rows = stmt.query(params![id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(Self::row_to_node(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Find nodes by exact name or qualified-name suffix.
+    pub fn find_by_name(&self, name: &str) -> Result<Vec<Node>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM nodes WHERE name = ?1 OR qualified_name = ?1
+             ORDER BY kind, file LIMIT 200",
+        )?;
+        let rows = stmt.query_map(params![name], Self::row_to_node)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Full-text search over names and docs.
+    pub fn search(&self, query: &str, limit: usize) -> Result<Vec<Node>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT n.* FROM nodes_fts f JOIN nodes n ON n.id = f.id
+             WHERE nodes_fts MATCH ?1 LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![query, limit as i64], Self::row_to_node)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Neighbours along edges. `outgoing` selects direction.
+    pub fn neighbors(
+        &self,
+        id: &str,
+        kind: Option<EdgeKind>,
+        outgoing: bool,
+    ) -> Result<Vec<(Node, EdgeKind, Confidence)>> {
+        let (key_col, other_col) = if outgoing {
+            ("src", "dst")
+        } else {
+            ("dst", "src")
+        };
+        let sql = format!(
+            "SELECT n.*, e.kind AS ekind, e.confidence AS econf
+             FROM edges e JOIN nodes n ON n.id = e.{other}
+             WHERE e.{key} = ?1 {kind_filter}",
+            other = other_col,
+            key = key_col,
+            kind_filter = if kind.is_some() {
+                "AND e.kind = ?2"
+            } else {
+                ""
+            },
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let map = |row: &rusqlite::Row| {
+            let node = Self::row_to_node(row)?;
+            let ek = parse_edge_kind(&row.get::<_, String>("ekind")?);
+            let conf = parse_conf(&row.get::<_, String>("econf")?);
+            Ok((node, ek, conf))
+        };
+        let rows = match kind {
+            Some(k) => stmt.query_map(params![id, k.as_str()], map)?,
+            None => stmt.query_map(params![id], map)?,
+        };
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Transitive closure of dependents/dependencies up to `depth` (impact analysis).
+    pub fn reachable(&self, id: &str, kind: EdgeKind, outgoing: bool, depth: usize) -> Result<Vec<Node>> {
+        let (from_col, to_col) = if outgoing { ("src", "dst") } else { ("dst", "src") };
+        let sql = format!(
+            "WITH RECURSIVE reach(id, d) AS (
+                 SELECT ?1, 0
+                 UNION
+                 SELECT e.{to_col}, r.d + 1
+                 FROM edges e JOIN reach r ON e.{from_col} = r.id
+                 WHERE e.kind = ?2 AND r.d < ?3
+             )
+             SELECT n.* FROM nodes n JOIN reach ON n.id = reach.id WHERE reach.id != ?1",
+            to_col = to_col,
+            from_col = from_col,
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![id, kind.as_str(), depth as i64], Self::row_to_node)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Drop edges whose endpoints no longer exist (e.g. after a symbol was removed).
+    pub fn prune_dangling_edges(&mut self) -> Result<usize> {
+        let n = self.conn.execute(
+            "DELETE FROM edges WHERE src NOT IN (SELECT id FROM nodes)
+                OR dst NOT IN (SELECT id FROM nodes)",
+            [],
+        )?;
+        Ok(n)
+    }
+
+    pub fn stats(&self) -> Result<Stats> {
+        let nodes: i64 = self.conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
+        let edges: i64 = self.conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
+        let files: i64 = self.conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?;
+        Ok(Stats {
+            nodes: nodes as usize,
+            edges: edges as usize,
+            files: files as usize,
+        })
+    }
+
+    /// Full graph (capped) for visualization export.
+    pub fn export_graph(&self, limit: usize) -> Result<(Vec<Node>, Vec<Edge>)> {
+        let mut nstmt = self.conn.prepare("SELECT * FROM nodes LIMIT ?1")?;
+        let nodes: Vec<Node> = nstmt
+            .query_map(params![limit as i64], Self::row_to_node)?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut estmt = self.conn.prepare("SELECT src, dst, kind, confidence FROM edges")?;
+        let edges: Vec<Edge> = estmt
+            .query_map([], |r| {
+                Ok(Edge {
+                    src: NodeId(r.get(0)?),
+                    dst: NodeId(r.get(1)?),
+                    kind: parse_edge_kind(&r.get::<_, String>(2)?),
+                    confidence: parse_conf(&r.get::<_, String>(3)?),
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok((nodes, edges))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Stats {
+    pub nodes: usize,
+    pub edges: usize,
+    pub files: usize,
+}
+
+fn parse_kind(s: &str) -> NodeKind {
+    match s {
+        "repo" => NodeKind::Repo,
+        "directory" => NodeKind::Directory,
+        "file" => NodeKind::File,
+        "module" => NodeKind::Module,
+        "function" => NodeKind::Function,
+        "method" => NodeKind::Method,
+        "class" => NodeKind::Class,
+        "struct" => NodeKind::Struct,
+        "interface" => NodeKind::Interface,
+        "enum" => NodeKind::Enum,
+        "trait" => NodeKind::Trait,
+        _ => NodeKind::Comment,
+    }
+}
+
+fn parse_edge_kind(s: &str) -> EdgeKind {
+    match s {
+        "contains" => EdgeKind::Contains,
+        "defines" => EdgeKind::Defines,
+        "calls" => EdgeKind::Calls,
+        "imports" => EdgeKind::Imports,
+        "extends" => EdgeKind::Extends,
+        "implements" => EdgeKind::Implements,
+        "documents" => EdgeKind::Documents,
+        _ => EdgeKind::References,
+    }
+}
+
+fn parse_conf(s: &str) -> Confidence {
+    match s {
+        "extracted" => Confidence::Extracted,
+        _ => Confidence::Inferred,
+    }
+}

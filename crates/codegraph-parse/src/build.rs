@@ -1,0 +1,288 @@
+use codegraph_core::{
+    CodeGraph, Confidence, EdgeKind, Language, Node, NodeId, NodeKind, Span,
+};
+
+use crate::extract::{ParsedFile, RawDef};
+
+/// A symbol exported from a file for cross-file resolution.
+#[derive(Debug, Clone)]
+pub struct SymbolEntry {
+    pub name: String,
+    pub id: NodeId,
+    pub kind: NodeKind,
+}
+
+/// An edge whose target could not be resolved within the file; resolved globally.
+#[derive(Debug, Clone)]
+pub struct PendingEdge {
+    pub src: NodeId,
+    pub name: String,
+    pub kind: EdgeKind,
+}
+
+#[derive(Debug, Default)]
+pub struct FileGraph {
+    pub graph: CodeGraph,
+    pub symbols: Vec<SymbolEntry>,
+    pub pending: Vec<PendingEdge>,
+}
+
+const MARKERS: [&str; 5] = ["NOTE", "WHY", "HACK", "TODO", "FIXME"];
+
+fn has_marker(text: &str) -> bool {
+    let upper = text.to_uppercase();
+    MARKERS.iter().any(|m| upper.contains(m))
+}
+
+fn type_like(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Class
+            | NodeKind::Struct
+            | NodeKind::Trait
+            | NodeKind::Interface
+            | NodeKind::Enum
+    )
+}
+
+fn contains(outer: &Span, inner: &Span) -> bool {
+    outer.start_byte <= inner.start_byte
+        && outer.end_byte >= inner.end_byte
+        && !(outer.start_byte == inner.start_byte && outer.end_byte == inner.end_byte)
+}
+
+struct DefInfo {
+    kind: NodeKind,
+    name: String,
+    span: Span,
+    parent: Option<usize>,
+    id: NodeId,
+    qualified: String,
+}
+
+/// Find the index of the smallest definition whose span encloses `byte`.
+fn enclosing_def(defs: &[DefInfo], byte: usize) -> Option<usize> {
+    let probe = Span {
+        start_byte: byte,
+        end_byte: byte,
+        ..Default::default()
+    };
+    defs.iter()
+        .enumerate()
+        .filter(|(_, d)| contains(&d.span, &probe))
+        .min_by_key(|(_, d)| d.span.end_byte - d.span.start_byte)
+        .map(|(i, _)| i)
+}
+
+/// Doc comment text: contiguous comments immediately preceding `start_line`.
+fn doc_for(parsed: &ParsedFile, start_line: usize) -> Option<String> {
+    let mut lines = Vec::new();
+    let mut want = start_line.checked_sub(1)?;
+    loop {
+        let Some(c) = parsed.comments.iter().find(|c| c.end_line() == want) else {
+            break;
+        };
+        lines.push(c.text.clone());
+        if want <= 1 {
+            break;
+        }
+        want = c.span.start_line - 1;
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    lines.reverse();
+    Some(lines.join("\n"))
+}
+
+impl crate::extract::RawComment {
+    fn end_line(&self) -> usize {
+        self.span.end_line
+    }
+}
+
+/// Build a file-scoped graph fragment from parsed items.
+pub fn build_file_graph(
+    rel_path: &str,
+    lang: Language,
+    file_id: &NodeId,
+    parsed: &ParsedFile,
+) -> FileGraph {
+    let mut fg = FileGraph::default();
+
+    // Establish parent relationships by span nesting.
+    let raw = &parsed.defs;
+    let mut parents: Vec<Option<usize>> = vec![None; raw.len()];
+    for (i, d) in raw.iter().enumerate() {
+        let mut best: Option<(usize, usize)> = None; // (idx, span_len)
+        for (j, other) in raw.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            if contains(&other.span, &d.span) {
+                let len = other.span.end_byte - other.span.start_byte;
+                if best.map_or(true, |(_, bl)| len < bl) {
+                    best = Some((j, len));
+                }
+            }
+        }
+        parents[i] = best.map(|(j, _)| j);
+    }
+
+    // Reclassify functions nested in a type as methods.
+    let kinds: Vec<NodeKind> = raw
+        .iter()
+        .enumerate()
+        .map(|(i, d)| match (d.kind, parents[i]) {
+            (NodeKind::Function, Some(p)) if type_like(raw[p].kind) => NodeKind::Method,
+            (k, _) => k,
+        })
+        .collect();
+
+    // Compute qualified names (memoized by walking the parent chain).
+    fn qualify(i: usize, raw: &[RawDef], parents: &[Option<usize>], memo: &mut [Option<String>]) -> String {
+        if let Some(q) = &memo[i] {
+            return q.clone();
+        }
+        let q = match parents[i] {
+            Some(p) => format!("{}::{}", qualify(p, raw, parents, memo), raw[i].name),
+            None => raw[i].name.clone(),
+        };
+        memo[i] = Some(q.clone());
+        q
+    }
+    let mut memo: Vec<Option<String>> = vec![None; raw.len()];
+    let qualified: Vec<String> = (0..raw.len())
+        .map(|i| qualify(i, raw, &parents, &mut memo))
+        .collect();
+
+    // Materialize definition nodes.
+    let mut defs: Vec<DefInfo> = Vec::with_capacity(raw.len());
+    for (i, d) in raw.iter().enumerate() {
+        let kind = kinds[i];
+        let id = NodeId::derive(&[rel_path, &qualified[i], kind.as_str()]);
+        defs.push(DefInfo {
+            kind,
+            name: d.name.clone(),
+            span: d.span,
+            parent: parents[i],
+            id,
+            qualified: qualified[i].clone(),
+        });
+    }
+
+    for (i, d) in defs.iter().enumerate() {
+        let doc = doc_for(parsed, d.span.start_line);
+        fg.graph.add_node(Node {
+            id: d.id.clone(),
+            kind: d.kind,
+            name: d.name.clone(),
+            qualified_name: d.qualified.clone(),
+            file: rel_path.to_string(),
+            language: Some(lang.name().to_string()),
+            span: Some(d.span),
+            doc,
+        });
+        fg.symbols.push(SymbolEntry {
+            name: d.name.clone(),
+            id: d.id.clone(),
+            kind: d.kind,
+        });
+        // Structural containment.
+        let parent_id = match d.parent {
+            Some(p) => defs[p].id.clone(),
+            None => file_id.clone(),
+        };
+        fg.graph
+            .add_edge(parent_id, d.id.clone(), EdgeKind::Contains, Confidence::Extracted);
+        let _ = i;
+    }
+
+    // Calls: resolve to a unique local definition, else defer to the global pass.
+    for r in &parsed.calls {
+        let caller = enclosing_def(&defs, r.byte)
+            .map(|i| defs[i].id.clone())
+            .unwrap_or_else(|| file_id.clone());
+        let local: Vec<&DefInfo> = defs.iter().filter(|d| d.name == r.name).collect();
+        if local.len() == 1 {
+            fg.graph.add_edge(
+                caller,
+                local[0].id.clone(),
+                EdgeKind::Calls,
+                Confidence::Extracted,
+            );
+        } else {
+            fg.pending.push(PendingEdge {
+                src: caller,
+                name: r.name.clone(),
+                kind: EdgeKind::Calls,
+            });
+        }
+    }
+
+    // Inheritance: attach to the enclosing type definition.
+    for b in &parsed.bases {
+        let Some(src_idx) = enclosing_def(&defs, b.byte) else {
+            continue;
+        };
+        let src = defs[src_idx].id.clone();
+        let local: Vec<&DefInfo> = defs.iter().filter(|d| d.name == b.name).collect();
+        if local.len() == 1 {
+            fg.graph
+                .add_edge(src, local[0].id.clone(), b.kind, Confidence::Extracted);
+        } else {
+            fg.pending.push(PendingEdge {
+                src,
+                name: b.name.clone(),
+                kind: b.kind,
+            });
+        }
+    }
+
+    // Imports recorded on the file node as IMPORTS edges to module placeholders.
+    for imp in &parsed.imports {
+        let mod_id = NodeId::derive(&["module", imp]);
+        // Only add the module node once per import name; duplicates are merged on store.
+        fg.graph.add_node(Node {
+            id: mod_id.clone(),
+            kind: NodeKind::Module,
+            name: imp.clone(),
+            qualified_name: imp.clone(),
+            file: String::new(),
+            language: None,
+            span: None,
+            doc: None,
+        });
+        fg.graph.add_edge(
+            file_id.clone(),
+            mod_id,
+            EdgeKind::Imports,
+            Confidence::Extracted,
+        );
+    }
+
+    // Design-rationale comments become first-class nodes linked to their scope.
+    for c in &parsed.comments {
+        if !has_marker(&c.text) {
+            continue;
+        }
+        let scope = enclosing_def(&defs, c.span.start_byte)
+            .map(|i| defs[i].id.clone())
+            .unwrap_or_else(|| file_id.clone());
+        let cid = NodeId::derive(&[rel_path, "comment", &c.span.start_byte.to_string()]);
+        fg.graph.add_node(Node {
+            id: cid.clone(),
+            kind: NodeKind::Comment,
+            name: c.text.chars().take(60).collect(),
+            qualified_name: String::new(),
+            file: rel_path.to_string(),
+            language: Some(lang.name().to_string()),
+            span: Some(c.span),
+            doc: Some(c.text.clone()),
+        });
+        fg.graph
+            .add_edge(cid, scope, EdgeKind::Documents, Confidence::Extracted);
+    }
+
+    fg
+}
