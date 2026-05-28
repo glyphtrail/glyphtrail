@@ -1,6 +1,7 @@
 //! REST server-side route extraction (per-framework).
 
 pub mod axum;
+pub mod gin;
 pub mod spring;
 mod ts;
 pub mod utoipa;
@@ -8,6 +9,7 @@ pub mod utoipa;
 use meridian_core::{HttpMethod, Language, Span};
 
 pub use axum::{extract_axum, extract_axum_mounts};
+pub use gin::{extract_gin, extract_gin_mounts};
 pub use spring::{extract_spring, extract_spring_mounts};
 pub use utoipa::{extract_utoipa, extract_utoipa_mounts};
 
@@ -94,6 +96,22 @@ impl RestServerExtractor for SpringExtractor {
     }
 }
 
+struct GinExtractor;
+impl RestServerExtractor for GinExtractor {
+    fn name(&self) -> &'static str {
+        "gin"
+    }
+    fn language(&self) -> Language {
+        Language::Go
+    }
+    fn endpoints(&self, source: &str) -> Vec<RawEndpoint> {
+        extract_gin(source)
+    }
+    fn mounts(&self, source: &str) -> Vec<RawMount> {
+        extract_gin_mounts(source)
+    }
+}
+
 /// All registered REST server extractors. New frameworks slot in here as
 /// additional self-contained modules implementing [`RestServerExtractor`].
 pub fn registry() -> Vec<Box<dyn RestServerExtractor>> {
@@ -101,6 +119,7 @@ pub fn registry() -> Vec<Box<dyn RestServerExtractor>> {
         Box::new(AxumExtractor),
         Box::new(UtoipaExtractor),
         Box::new(SpringExtractor),
+        Box::new(GinExtractor),
     ]
 }
 
@@ -131,6 +150,11 @@ mod tests {
             .map(|e| e.name())
             .collect();
         assert_eq!(java, ["spring"]);
+        let go: Vec<_> = extractors_for(Language::Go)
+            .iter()
+            .map(|e| e.name())
+            .collect();
+        assert_eq!(go, ["gin"]);
     }
 
     #[test]
