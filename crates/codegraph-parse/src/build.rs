@@ -121,7 +121,7 @@ pub fn build_file_graph(
             }
             if contains(&other.span, &d.span) {
                 let len = other.span.end_byte - other.span.start_byte;
-                if best.map_or(true, |(_, bl)| len < bl) {
+                if best.is_none_or(|(_, bl)| len < bl) {
                     best = Some((j, len));
                 }
             }
