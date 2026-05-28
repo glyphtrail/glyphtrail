@@ -1,5 +1,9 @@
 # Meridian
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/sunsided/meridian/main/.readme/hero.jpg" alt="Meridian" />
+</p>
+
 [![unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)](https://github.com/rust-secure-code/safety-dance/)
 
 Meridian maps codebases as **semantic and historical graphs**, so you can query
