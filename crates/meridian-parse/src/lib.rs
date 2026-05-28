@@ -34,6 +34,36 @@ mod tests {
         }
     }
 
+    // #23: every supported language extracts a top-level function definition
+    // named `f` into a graph node, exercising each grammar + query end to end.
+    #[test]
+    fn extracts_a_function_definition_per_language() {
+        use meridian_core::NodeId;
+        let cases = [
+            (Language::Rust, "fn f() {}"),
+            (Language::Python, "def f():\n    pass\n"),
+            (Language::JavaScript, "function f() {}"),
+            (Language::TypeScript, "function f(): void {}"),
+            (Language::Tsx, "function f() { return null; }"),
+            (Language::Go, "package main\nfunc f() {}"),
+            (Language::Java, "class C { void f() {} }"),
+            (Language::C, "void f() {}"),
+            (Language::Cpp, "void f() {}"),
+        ];
+        for (lang, src) in cases {
+            let parsed = parse_source(lang, src)
+                .unwrap_or_else(|e| panic!("parse failed for {}: {e}", lang.name()));
+            let file_id = NodeId::derive(&["file", "x"]);
+            let fg = build_file_graph("x", lang, &file_id, &parsed);
+            assert!(
+                fg.graph.nodes.iter().any(|n| n.name == "f"),
+                "{} should extract a definition named `f`, got {:?}",
+                lang.name(),
+                fg.graph.nodes.iter().map(|n| &n.name).collect::<Vec<_>>()
+            );
+        }
+    }
+
     #[test]
     fn extracts_rust_function_and_call() {
         let src = r#"

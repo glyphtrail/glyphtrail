@@ -669,4 +669,58 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    fn copy_dir(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let dst = to.join(entry.file_name());
+            if entry.path().is_dir() {
+                copy_dir(&entry.path(), &dst);
+            } else {
+                std::fs::copy(entry.path(), &dst).unwrap();
+            }
+        }
+    }
+
+    // #23: a full `analyze` run over the committed fixture repo asserts the
+    // cross-file links the graph should contain. The fixture is copied to a
+    // temp dir so the run's `.meridian/` index doesn't pollute the source tree.
+    #[test]
+    fn analyzes_fixture_repo_with_cross_file_links() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/sample");
+        let dir = temp_repo("fixture");
+        copy_dir(&fixture, &dir);
+        run(&dir, false).unwrap();
+
+        let store = SqliteStore::open(&RepoPaths::new(&dir).db_path).unwrap();
+        // Four source files (2 Rust, 2 Python).
+        assert_eq!(store.stats().unwrap().files, 4);
+
+        // Cross-file calls resolve in both languages.
+        assert!(
+            callers_of(&dir, "helper").contains(&"run".to_string()),
+            "rust app.rs::run should call lib.rs::helper"
+        );
+        assert!(
+            callers_of(&dir, "shared").contains(&"go".to_string()),
+            "python main.py::go should call util.py::shared"
+        );
+
+        // Python import resolves to the real file (suffix match under py/).
+        assert!(
+            import_targets(&dir, "py/main.py")
+                .contains(&("py/util.py".to_string(), "file".to_string())),
+            "main.py should import util.py as a file node"
+        );
+
+        // The NOTE design-rationale comment becomes a Comment node.
+        let (nodes, _) = store.export_graph(10_000).unwrap();
+        assert!(
+            nodes.iter().any(|n| n.kind == NodeKind::Comment),
+            "the NOTE comment should be a Comment node"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
