@@ -4,10 +4,23 @@
 //! remains the source of truth.
 
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::RepoPaths;
 use crate::{CoreError, Result};
+
+/// Liveness of a registered repository on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoHealth {
+    /// Root exists and contains an index.
+    Indexed,
+    /// Root exists but has not been analyzed yet.
+    Unindexed,
+    /// Root path no longer exists (moved, renamed, or deleted).
+    Missing,
+}
 
 /// One registered repository.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -15,6 +28,31 @@ pub struct RegistryEntry {
     pub name: String,
     /// Absolute repository root (contains `.meridian/graph.db`).
     pub root: PathBuf,
+    /// Unix seconds when the root was first observed missing; cleared when it
+    /// reappears. Drives `prune_missing` so dead entries don't collect dust,
+    /// while tolerating transient glitches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missing_since: Option<i64>,
+}
+
+impl RegistryEntry {
+    /// Current on-disk health of this entry.
+    pub fn health(&self) -> RepoHealth {
+        if !self.root.exists() {
+            RepoHealth::Missing
+        } else if RepoPaths::new(&self.root).db_path.exists() {
+            RepoHealth::Indexed
+        } else {
+            RepoHealth::Unindexed
+        }
+    }
+}
+
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// The set of registered repositories.
@@ -39,6 +77,9 @@ impl Registry {
     }
 
     /// Write the registry to `path`, creating parent directories as needed.
+    /// The write is atomic: the JSON is staged in a process-unique temp file in
+    /// the same directory and then renamed over `path`, so a concurrent reader
+    /// or an interrupted write never sees a truncated registry.
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -48,7 +89,9 @@ impl Registry {
                 path: path.to_path_buf(),
                 source,
             })?;
-        std::fs::write(path, json)?;
+        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        std::fs::write(&tmp, json)?;
+        std::fs::rename(&tmp, path)?;
         Ok(())
     }
 
@@ -58,13 +101,59 @@ impl Registry {
         match self.repos.iter_mut().find(|e| e.name == name) {
             Some(existing) => {
                 existing.root = root;
+                existing.missing_since = None;
                 false
             }
             None => {
-                self.repos.push(RegistryEntry { name, root });
+                self.repos.push(RegistryEntry {
+                    name,
+                    root,
+                    missing_since: None,
+                });
                 true
             }
         }
+    }
+
+    /// Reconcile `missing_since` with the current filesystem: stamp newly-missing
+    /// roots, clear it for roots that reappeared. Returns `true` if anything
+    /// changed (the caller should persist).
+    pub fn refresh_health(&mut self) -> bool {
+        let now = now_secs();
+        let mut changed = false;
+        for e in &mut self.repos {
+            match (e.root.exists(), e.missing_since) {
+                (false, None) => {
+                    e.missing_since = Some(now);
+                    changed = true;
+                }
+                (true, Some(_)) => {
+                    e.missing_since = None;
+                    changed = true;
+                }
+                _ => {}
+            }
+        }
+        changed
+    }
+
+    /// Remove entries whose root has been missing for at least `max_age_secs`.
+    /// Returns the names dropped. Call `refresh_health` first so stamps are
+    /// current.
+    pub fn prune_missing(&mut self, max_age_secs: i64) -> Vec<String> {
+        let now = now_secs();
+        let mut removed = Vec::new();
+        self.repos.retain(|e| {
+            let stale = e
+                .missing_since
+                .map(|t| now - t >= max_age_secs)
+                .unwrap_or(false);
+            if stale {
+                removed.push(e.name.clone());
+            }
+            !stale
+        });
+        removed
     }
 
     /// Remove the repo with the given name; returns whether one was removed.
@@ -99,6 +188,42 @@ mod tests {
         check!(!reg.add("api".into(), PathBuf::from("/b"))); // replaces
         check!(reg.repos.len() == 1);
         check!(reg.get("api").unwrap().root == PathBuf::from("/b"));
+    }
+
+    #[test]
+    fn refresh_health_stamps_and_clears_missing() {
+        let mut reg = Registry::default();
+        reg.add("gone".into(), PathBuf::from("/nope/does/not/exist"));
+        reg.add("here".into(), std::env::temp_dir());
+
+        check!(reg.refresh_health()); // first observation -> change
+        check!(reg.get("gone").unwrap().missing_since.is_some());
+        check!(reg.get("here").unwrap().missing_since == None);
+        check!(!reg.refresh_health()); // stable -> no change
+
+        // A re-add of the missing entry against an existing root clears the stamp.
+        reg.add("gone".into(), std::env::temp_dir());
+        check!(reg.get("gone").unwrap().missing_since == None);
+    }
+
+    #[test]
+    fn prune_missing_drops_only_stale_entries() {
+        let mut reg = Registry::default();
+        reg.add("fresh".into(), PathBuf::from("/nope/a"));
+        reg.add("stale".into(), PathBuf::from("/nope/b"));
+        // Stamp both as missing now, then backdate "stale" past the threshold.
+        reg.refresh_health();
+        let now = now_secs();
+        reg.repos
+            .iter_mut()
+            .find(|e| e.name == "stale")
+            .unwrap()
+            .missing_since = Some(now - 10_000);
+
+        let removed = reg.prune_missing(3600); // 1h threshold
+        check!(removed == vec!["stale".to_string()]);
+        check!(reg.get("stale").is_none());
+        check!(reg.get("fresh").is_some());
     }
 
     #[test]
