@@ -14,6 +14,7 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use meridian_core::config::RepoPaths;
 use serde_json::{Value, json};
 
 /// MCP protocol revision this server implements.
@@ -23,6 +24,7 @@ const PROTOCOL_VERSION: &str = "2024-11-05";
 /// stdin reaches EOF. Each query opens the repo's graph fresh, so results track
 /// re-indexing without restarting the server.
 pub fn serve_stdio(repo: PathBuf) -> Result<()> {
+    let db = RepoPaths::new(&repo).db_path;
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut reader = stdin.lock();
@@ -38,7 +40,7 @@ pub fn serve_stdio(repo: PathBuf) -> Result<()> {
             continue;
         }
         let response = match serde_json::from_str::<Value>(trimmed) {
-            Ok(msg) => handle_message(&repo, &msg),
+            Ok(msg) => handle_request(&db, &msg),
             // Malformed JSON: reply with a parse error and a null id (JSON-RPC).
             Err(e) => Some(error(Value::Null, -32700, &format!("parse error: {e}"))),
         };
@@ -50,9 +52,10 @@ pub fn serve_stdio(repo: PathBuf) -> Result<()> {
     Ok(())
 }
 
-/// Dispatch a single JSON-RPC message. Returns `Some(response)` for requests
-/// (those carrying an `id`) and `None` for notifications.
-fn handle_message(repo: &Path, msg: &Value) -> Option<Value> {
+/// Dispatch a single JSON-RPC message against the graph database at `db`.
+/// Returns `Some(response)` for requests (those carrying an `id`) and `None`
+/// for notifications. Shared by the stdio loop and the HTTP `/mcp` endpoint.
+pub fn handle_request(db: &Path, msg: &Value) -> Option<Value> {
     let method = msg.get("method").and_then(Value::as_str)?;
     let id = msg.get("id").cloned();
     match method {
@@ -67,7 +70,7 @@ fn handle_message(repo: &Path, msg: &Value) -> Option<Value> {
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            Some(success(id, tools::call(repo, name, &args)))
+            Some(success(id, tools::call(db, name, &args)))
         }
         // Notifications (initialized, cancelled, …) carry no id and need no reply.
         _ => id.map(|id| error(id, -32601, &format!("method not found: {method}"))),
@@ -97,7 +100,7 @@ mod tests {
     #[test]
     fn initialize_advertises_tools_capability() {
         let req = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}});
-        let resp = handle_message(Path::new("."), &req).unwrap();
+        let resp = handle_request(Path::new("."), &req).unwrap();
         assert_eq!(resp["id"], json!(1));
         assert_eq!(resp["result"]["protocolVersion"], json!(PROTOCOL_VERSION));
         assert!(resp["result"]["capabilities"]["tools"].is_object());
@@ -107,13 +110,13 @@ mod tests {
     #[test]
     fn notifications_get_no_response() {
         let note = json!({"jsonrpc":"2.0","method":"notifications/initialized"});
-        assert!(handle_message(Path::new("."), &note).is_none());
+        assert!(handle_request(Path::new("."), &note).is_none());
     }
 
     #[test]
     fn unknown_method_is_method_not_found() {
         let req = json!({"jsonrpc":"2.0","id":7,"method":"frobnicate"});
-        let resp = handle_message(Path::new("."), &req).unwrap();
+        let resp = handle_request(Path::new("."), &req).unwrap();
         assert_eq!(resp["error"]["code"], json!(-32601));
         assert_eq!(resp["id"], json!(7));
     }
@@ -121,7 +124,7 @@ mod tests {
     #[test]
     fn tools_list_returns_named_tools_with_schemas() {
         let req = json!({"jsonrpc":"2.0","id":2,"method":"tools/list"});
-        let resp = handle_message(Path::new("."), &req).unwrap();
+        let resp = handle_request(Path::new("."), &req).unwrap();
         let list = resp["result"]["tools"].as_array().unwrap();
         assert!(list.len() >= 5);
         for t in list {

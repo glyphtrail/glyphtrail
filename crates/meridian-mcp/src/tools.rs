@@ -2,7 +2,6 @@
 
 use std::path::Path;
 
-use meridian_core::config::RepoPaths;
 use meridian_core::{
     Confidence, EdgeKind, HttpMethod, Node, NodeId, NodeKind, OperationKey, Protocol,
     operations_matching,
@@ -98,15 +97,15 @@ pub fn definitions() -> Vec<Value> {
 /// Execute a tool call, returning a `tools/call` result object. Tool-level
 /// failures are reported as `isError` results rather than protocol errors, per
 /// the MCP convention.
-pub fn call(repo: &Path, name: &str, args: &Value) -> Value {
-    match dispatch(repo, name, args) {
+pub fn call(db: &Path, name: &str, args: &Value) -> Value {
+    match dispatch(db, name, args) {
         Ok(value) => text_result(&value, false),
         Err(message) => text_result(&json!({ "error": message }), true),
     }
 }
 
-fn dispatch(repo: &Path, name: &str, args: &Value) -> Result<Value, String> {
-    let store = open(repo)?;
+fn dispatch(db: &Path, name: &str, args: &Value) -> Result<Value, String> {
+    let store = open(db)?;
     match name {
         "search" => {
             let limit = opt_usize(args, "limit").unwrap_or(30);
@@ -180,15 +179,14 @@ fn dispatch(repo: &Path, name: &str, args: &Value) -> Result<Value, String> {
     }
 }
 
-fn open(repo: &Path) -> Result<SqliteStore, String> {
-    let paths = RepoPaths::new(repo);
-    if !paths.db_path.exists() {
+fn open(db: &Path) -> Result<SqliteStore, String> {
+    if !db.exists() {
         return Err(format!(
             "no index at {} — run `meridian analyze` first",
-            paths.db_path.display()
+            db.display()
         ));
     }
-    SqliteStore::open(&paths.db_path).map_err(err)
+    SqliteStore::open(db).map_err(err)
 }
 
 fn neighbors_of(
@@ -353,10 +351,13 @@ mod tests {
     use super::*;
     use meridian_core::{Confidence, Edge, Span};
 
-    fn build_repo(dir: &Path) {
-        // Build a tiny graph directly in the store the tools will open.
-        let db = RepoPaths::new(dir).db_path;
-        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    // Build a tiny graph at a temp db path and return that path.
+    fn build_db(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let db = std::env::temp_dir().join(format!("meridian-mcp-{tag}-{nanos}.db"));
         let mut store = SqliteStore::open(&db).unwrap();
         let mk = |id: &str, name: &str, file: &str, kind: NodeKind| Node {
             id: NodeId(id.into()),
@@ -387,53 +388,43 @@ mod tests {
                 }],
             )
             .unwrap();
-    }
-
-    fn tmp(tag: &str) -> std::path::PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("meridian-mcp-{tag}-{nanos}"))
+        db
     }
 
     #[test]
     fn missing_index_is_a_tool_error() {
-        let res = call(&tmp("noidx"), "status", &json!({}));
+        let res = call(Path::new("/nonexistent/meridian.db"), "status", &json!({}));
         assert_eq!(res["isError"], json!(true));
     }
 
     #[test]
     fn callers_tool_returns_the_caller() {
-        let dir = tmp("callers");
-        build_repo(&dir);
-        let res = call(&dir, "callers", &json!({ "name": "callee" }));
+        let db = build_db("callers");
+        let res = call(&db, "callers", &json!({ "name": "callee" }));
         assert_eq!(res["isError"], json!(false));
         let text = res["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
         assert_eq!(parsed[0]["node"]["name"], json!("caller"));
         assert_eq!(parsed[0]["edge"], json!("calls"));
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_file(&db).ok();
     }
 
     #[test]
     fn status_tool_reports_counts() {
-        let dir = tmp("status");
-        build_repo(&dir);
-        let res = call(&dir, "status", &json!({}));
+        let db = build_db("status");
+        let res = call(&db, "status", &json!({}));
         let text = res["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
         assert_eq!(parsed["nodes"], json!(2));
         assert_eq!(parsed["edges"], json!(1));
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_file(&db).ok();
     }
 
     #[test]
     fn unknown_tool_errors() {
-        let dir = tmp("unknown");
-        build_repo(&dir);
-        let res = call(&dir, "nope", &json!({}));
+        let db = build_db("unknown");
+        let res = call(&db, "nope", &json!({}));
         assert_eq!(res["isError"], json!(true));
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_file(&db).ok();
     }
 }
