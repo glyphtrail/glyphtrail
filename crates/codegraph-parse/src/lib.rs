@@ -10,7 +10,9 @@ pub use build::{
 };
 pub use client::{extract_client_calls, RawClientCall};
 pub use extract::{parse_source, ParsedFile};
-pub use rest::{extract_axum, extract_utoipa, RawEndpoint};
+pub use rest::{
+    extract_axum, extract_axum_mounts, extract_utoipa, extract_utoipa_mounts, RawEndpoint, RawMount,
+};
 
 #[cfg(test)]
 mod tests {
@@ -173,5 +175,36 @@ fn app() -> Router {
             rg.pending_handlers,
             vec![("list".to_string(), ep.id.clone())]
         );
+    }
+
+    #[test]
+    fn rest_mounts_link_router_builders() {
+        use codegraph_core::{Confidence, EdgeKind, NodeId};
+        let src = r#"
+async fn list() {}
+fn users_router() -> Router {
+    Router::new().route("/", get(list))
+}
+fn app() -> Router {
+    Router::new().nest("/api/users", users_router())
+}
+"#;
+        let parsed = parse_source(Language::Rust, src).unwrap();
+        let file_id = NodeId::derive(&["file", "r.rs"]);
+        let fg = build_file_graph("r.rs", Language::Rust, &file_id, &parsed);
+        let rg = build_rest_graph("r.rs", &fg.symbols, src);
+
+        let sym = |name: &str| {
+            fg.symbols
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap()
+                .id
+                .clone()
+        };
+        assert!(rg.graph.edges.iter().any(|e| e.kind == EdgeKind::Mounts
+            && e.src == sym("app")
+            && e.dst == sym("users_router")
+            && e.confidence == Confidence::Extracted));
     }
 }

@@ -20,10 +20,11 @@ use codegraph_core::{HttpMethod, Language};
 use tree_sitter::{Node, Parser};
 
 use super::ts::{
-    collect_builders, collect_referenced_builders, func_name, join, last_segment, method_router,
-    named_arg, router_chain_roots, span_of, string_literal_text, string_text, text, walk,
+    collect_builders, collect_mounts, collect_referenced_builders, func_name, join, last_segment,
+    method_router, named_arg, router_chain_roots, span_of, string_literal_text, string_text, text,
+    walk,
 };
-use super::RawEndpoint;
+use super::{RawEndpoint, RawMount};
 use crate::registry::grammar;
 
 const ROUTER: &str = "OpenApiRouter";
@@ -81,6 +82,25 @@ pub fn extract_utoipa(source: &str) -> Vec<RawEndpoint> {
     }
 
     out
+}
+
+/// Extract router-composition mounts (`fn parent` nests/merges builder `child`)
+/// from utoipa `OpenApiRouter` code. Returns empty on parse failure.
+pub fn extract_utoipa_mounts(source: &str) -> Vec<RawMount> {
+    let mut parser = Parser::new();
+    if parser.set_language(&grammar(Language::Rust)).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+    let src = source.as_bytes();
+    let root = tree.root_node();
+    let builders = collect_builders(root, src, ROUTER);
+    collect_mounts(root, src, &builders)
+        .into_iter()
+        .map(|(parent, child)| RawMount { parent, child })
+        .collect()
 }
 
 /// Recursively expand an `OpenApiRouter` expression, accumulating `prefix`.
@@ -464,5 +484,25 @@ fn app() -> OpenApiRouter {
         let eps = extract_utoipa(src);
         assert!(eps.iter().all(|e| e.path != "/PATH"));
         assert!(eps.iter().all(|e| e.handler != "inner"));
+    }
+
+    #[test]
+    fn mounts_link_parent_builder_to_child() {
+        let src = r#"
+fn users() -> OpenApiRouter {
+    OpenApiRouter::new().routes(routes!(show))
+}
+fn app() -> OpenApiRouter {
+    OpenApiRouter::new().nest("/api/users", users())
+}
+"#;
+        let mounts = extract_utoipa_mounts(src);
+        assert_eq!(
+            mounts,
+            vec![RawMount {
+                parent: "app".into(),
+                child: "users".into()
+            }]
+        );
     }
 }

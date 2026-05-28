@@ -6,7 +6,7 @@ use codegraph_core::{
 
 use crate::client::extract_client_calls;
 use crate::extract::{ParsedFile, RawDef};
-use crate::rest::{extract_axum, extract_utoipa};
+use crate::rest::{extract_axum, extract_axum_mounts, extract_utoipa, extract_utoipa_mounts};
 
 /// A symbol exported from a file for cross-file resolution.
 #[derive(Debug, Clone)]
@@ -85,6 +85,28 @@ pub fn build_rest_graph(rel_path: &str, symbols: &[SymbolEntry], source: &str) -
             );
         } else {
             rg.pending_handlers.push((ep.handler, ep_id));
+        }
+    }
+
+    // Router composition: `parent` mounts sub-router `child` (both same-file
+    // builder fns, so both resolve to local Function nodes).
+    let resolve = |name: &str| -> Option<NodeId> {
+        let mut hits = symbols.iter().filter(|s| s.name == name);
+        match (hits.next(), hits.next()) {
+            (Some(s), None) => Some(s.id.clone()),
+            _ => None,
+        }
+    };
+    let mut mounts: HashSet<(NodeId, NodeId)> = HashSet::new();
+    let raw_mounts = extract_axum_mounts(source)
+        .into_iter()
+        .chain(extract_utoipa_mounts(source));
+    for m in raw_mounts {
+        if let (Some(p), Some(c)) = (resolve(&m.parent), resolve(&m.child)) {
+            if mounts.insert((p.clone(), c.clone())) {
+                rg.graph
+                    .add_edge(p, c, EdgeKind::Mounts, Confidence::Extracted);
+            }
         }
     }
     rg
