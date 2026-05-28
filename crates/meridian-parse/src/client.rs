@@ -17,6 +17,11 @@
 //!   URL-shape check is what separates a request builder from an unrelated
 //!   `.get(...)`.
 //!
+//! Go (net/http):
+//! - package verbs `http.Get(url)` / `http.Post` / `http.PostForm`, client
+//!   verbs `client.Get(url)` / `.Post(...)`, and
+//!   `http.NewRequest[WithContext](method, url, …)`. Same URL-shape guard.
+//!
 //! Only string-literal and template-literal URLs are extracted; fully dynamic
 //! URLs (bare variables, concatenations) are out of scope. Template
 //! interpolations (`/users/${id}`) are preserved verbatim so they collapse to a
@@ -45,6 +50,7 @@ pub fn extract_client_calls(source: &str, lang: Language) -> Vec<RawClientCall> 
             js_client_calls(source, lang)
         }
         Language::Rust => rust_client_calls(source),
+        Language::Go => go_client_calls(source),
         _ => Vec::new(),
     }
 }
@@ -138,6 +144,104 @@ fn rust_string(node: Node, src: &[u8]) -> Option<String> {
 /// Guards the type-free verb heuristic against unrelated getters/setters.
 fn is_url_like(s: &str) -> bool {
     s.starts_with("http://") || s.starts_with("https://") || s.starts_with('/')
+}
+
+/// net/http calls in Go source.
+fn go_client_calls(source: &str) -> Vec<RawClientCall> {
+    let mut parser = Parser::new();
+    if parser.set_language(&grammar(Language::Go)).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+    let src = source.as_bytes();
+    let mut out = Vec::new();
+    walk(tree.root_node(), &mut |n| {
+        if n.kind() == "call_expression"
+            && let Some(call) = go_call(n, src)
+        {
+            out.push(call);
+        }
+    });
+    out
+}
+
+/// Classify a Go `call_expression` as an net/http request: package verbs
+/// (`http.Get`, `http.PostForm`), client verbs (`client.Post`), or
+/// `http.NewRequest[WithContext](method, url, …)`. A URL-shaped string literal
+/// argument is required, since the receiver type isn't inferred.
+fn go_call(call: Node, src: &[u8]) -> Option<RawClientCall> {
+    let func = call.child_by_field_name("function")?;
+    if func.kind() != "selector_expression" {
+        return None;
+    }
+    let field = text(func.child_by_field_name("field")?, src);
+    let args = call.child_by_field_name("arguments");
+    let (method, path) = match field.as_str() {
+        "Get" | "Post" | "Put" | "Delete" | "Patch" | "Head" | "PostForm" => {
+            (go_verb(&field)?, first_url_arg(args, src)?)
+        }
+        "NewRequest" | "NewRequestWithContext" => {
+            let strings = go_string_args(args, src);
+            let method = strings.iter().find_map(|s| HttpMethod::parse(s))?;
+            let url = strings.into_iter().find(|s| is_url_like(s))?;
+            (method, url)
+        }
+        _ => return None,
+    };
+    Some(RawClientCall {
+        method,
+        path,
+        span: span_of(call),
+    })
+}
+
+/// First URL-shaped string-literal argument, if any.
+fn first_url_arg(args: Option<Node>, src: &[u8]) -> Option<String> {
+    go_string_args(args, src)
+        .into_iter()
+        .find(|s| is_url_like(s))
+}
+
+/// Text of every string-literal argument (interpreted or raw), in order.
+fn go_string_args(args: Option<Node>, src: &[u8]) -> Vec<String> {
+    let Some(args) = args else {
+        return Vec::new();
+    };
+    let mut cursor = args.walk();
+    args.named_children(&mut cursor)
+        .filter_map(|a| go_string(a, src))
+        .collect()
+}
+
+/// Inner text of a Go string literal (interpreted or raw), else `None`.
+fn go_string(node: Node, src: &[u8]) -> Option<String> {
+    let content_kind = match node.kind() {
+        "interpreted_string_literal" => "interpreted_string_literal_content",
+        "raw_string_literal" => "raw_string_literal_content",
+        _ => return None,
+    };
+    let mut cursor = node.walk();
+    Some(
+        node.named_children(&mut cursor)
+            .find(|c| c.kind() == content_kind)
+            .map(|c| text(c, src))
+            .unwrap_or_default(),
+    )
+}
+
+/// Map a net/http convenience-function name to its HTTP method.
+fn go_verb(field: &str) -> Option<HttpMethod> {
+    match field {
+        "Get" => Some(HttpMethod::Get),
+        "Post" | "PostForm" => Some(HttpMethod::Post),
+        "Put" => Some(HttpMethod::Put),
+        "Delete" => Some(HttpMethod::Delete),
+        "Patch" => Some(HttpMethod::Patch),
+        "Head" => Some(HttpMethod::Head),
+        _ => None,
+    }
 }
 
 /// A same-file `axios.create(...)` instance binding and the byte range of the
@@ -501,5 +605,36 @@ mod tests {
         // `reqwest::Client::new()` is not a request (verb `new` is not a method).
         let src = "fn f() { let _c = reqwest::Client::new(); }";
         assert!(extract_client_calls(src, Language::Rust).is_empty());
+    }
+
+    #[test]
+    fn go_net_http_verbs_and_new_request() {
+        let src = r#"
+func f(c *http.Client) {
+    http.Get("https://api.example.com/x/1")
+    c.Post("/y", "application/json", nil)
+    http.PostForm("/form", nil)
+    req, _ := http.NewRequest("PUT", "/z", nil)
+    req2, _ := http.NewRequestWithContext(ctx, "DELETE", "/w", nil)
+}
+"#;
+        let calls = extract_client_calls(src, Language::Go);
+        assert!(call(&calls, HttpMethod::Get, "https://api.example.com/x/1").is_some());
+        assert!(call(&calls, HttpMethod::Post, "/y").is_some());
+        assert!(call(&calls, HttpMethod::Post, "/form").is_some());
+        assert!(call(&calls, HttpMethod::Put, "/z").is_some());
+        assert!(call(&calls, HttpMethod::Delete, "/w").is_some());
+    }
+
+    #[test]
+    fn go_skips_non_url_and_non_http_calls() {
+        // `.Get` with a non-URL literal (e.g. a map key) is not a request.
+        let src = r#"
+func f(m map[string]int) {
+    _ = m.Get("key")
+    fmt.Println("/not-a-call")
+}
+"#;
+        assert!(extract_client_calls(src, Language::Go).is_empty());
     }
 }
