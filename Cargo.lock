@@ -606,6 +606,7 @@ dependencies = [
  "clap_complete",
  "ignore",
  "meridian-core",
+ "meridian-mcp",
  "meridian-parse",
  "meridian-server",
  "meridian-store",
@@ -626,6 +627,18 @@ dependencies = [
  "serde_json",
  "thiserror",
  "toml",
+]
+
+[[package]]
+name = "meridian-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "meridian-core",
+ "meridian-store",
+ "serde",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]

@@ -6,6 +6,7 @@
 //! which collapses path parameters and concrete dynamic values so that a server
 //! template like `/users/{id}` matches a client call to `/users/123`.
 
+use crate::model::NodeId;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -143,6 +144,25 @@ impl fmt::Display for OperationKey {
             None => write!(f, "{} {}", self.protocol.as_str(), self.path),
         }
     }
+}
+
+/// Select operations from `ops` matching a query path (and optional method),
+/// comparing by path signature so templates match concrete values
+/// (`/users/{id}` matches `/users/123`). When `method` is `None`, every method
+/// on a matching path shape is returned. Shared by the CLI query verbs and the
+/// MCP tools so the matching rules stay identical.
+pub fn operations_matching(
+    ops: &[(NodeId, OperationKey)],
+    method: Option<HttpMethod>,
+    path: &str,
+) -> Vec<(NodeId, OperationKey)> {
+    let want = path_signature(path);
+    ops.iter()
+        .filter(|(_, key)| {
+            path_signature(&key.path) == want && method.is_none_or(|m| key.method == Some(m))
+        })
+        .cloned()
+        .collect()
 }
 
 /// Normalize a path or URL into a canonical templated path:

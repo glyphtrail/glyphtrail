@@ -41,6 +41,9 @@ meridian query impact <name>         # transitive blast radius if it changes
 meridian viz --output graph.html     # self-contained interactive page
 meridian serve --port 7700           # live explorer at http://127.0.0.1:7700
 
+# Agent integration (Model Context Protocol)
+meridian mcp                         # MCP server over stdio (query/endpoints/impact/…)
+
 # Stats
 meridian status
 ```
@@ -71,10 +74,11 @@ A Cargo workspace:
 | `meridian-store`  | SQLite + FTS5 storage and graph queries |
 | `meridian-viz`    | Cytoscape graph rendering (HTML/JSON) |
 | `meridian-server` | `axum` server for the interactive explorer |
+| `meridian-mcp`    | Model Context Protocol server (stdio) exposing the query tools |
 | `meridian-cli`    | the `meridian` binary |
 
 Storage is SQLite-first behind a store layer so a LadybugDB (Cypher) backend can
-be added later. An MCP server and multi-repo support are planned.
+be added later. Multi-repo support is planned.
 
 ## Development
 

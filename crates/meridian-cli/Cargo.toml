@@ -17,6 +17,7 @@ meridian-parse.workspace = true
 meridian-store.workspace = true
 meridian-viz.workspace = true
 meridian-server.workspace = true
+meridian-mcp.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 ignore.workspace = true

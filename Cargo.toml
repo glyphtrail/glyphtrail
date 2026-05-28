@@ -6,6 +6,7 @@ members = [
     "crates/meridian-store",
     "crates/meridian-viz",
     "crates/meridian-server",
+    "crates/meridian-mcp",
     "crates/meridian-cli",
 ]
 
@@ -23,6 +24,7 @@ meridian-parse = { path = "crates/meridian-parse" }
 meridian-store = { path = "crates/meridian-store" }
 meridian-viz = { path = "crates/meridian-viz" }
 meridian-server = { path = "crates/meridian-server" }
+meridian-mcp = { path = "crates/meridian-mcp" }
 
 anyhow = "1"
 thiserror = "2"
