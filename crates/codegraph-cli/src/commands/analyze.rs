@@ -4,9 +4,9 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use codegraph_core::config::{RepoPaths, IGNORE_FILE};
 use codegraph_core::{
-    CodeGraph, Confidence, Edge, EdgeKind, Language, Node, NodeId, NodeKind,
+    CodeGraph, Confidence, Edge, EdgeKind, Language, Node, NodeId, NodeKind, OperationKey,
 };
-use codegraph_parse::{build_file_graph, parse_source, PendingEdge};
+use codegraph_parse::{build_file_graph, build_rest_graph, parse_source, PendingEdge};
 use codegraph_store::SqliteStore;
 use ignore::WalkBuilder;
 
@@ -110,6 +110,10 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
     });
 
     let mut pending: Vec<PendingEdge> = Vec::new();
+    // API endpoints (kept separate so their operation keys persist after nodes).
+    let mut operations: Vec<(NodeId, OperationKey)> = Vec::new();
+    // (handler name, endpoint id) HANDLES links resolved against the global index.
+    let mut pending_handlers: Vec<(String, NodeId)> = Vec::new();
 
     for f in &changed {
         if update {
@@ -140,6 +144,12 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
         match parse_source(f.language, &source) {
             Ok(parsed) => {
                 let fg = build_file_graph(&f.rel_path, f.language, &file_id, &parsed);
+                if f.language == Language::Rust {
+                    let rg = build_rest_graph(&f.rel_path, &fg.symbols, &source);
+                    graph.extend(rg.graph);
+                    operations.extend(rg.operations);
+                    pending_handlers.extend(rg.pending_handlers);
+                }
                 graph.extend(fg.graph);
                 pending.extend(fg.pending);
             }
@@ -155,6 +165,7 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
         .cloned()
         .collect();
     store.insert_graph(&graph.nodes, &extracted)?;
+    store.insert_operations(&operations)?;
 
     // Resolve deferred edges against the global symbol index.
     let mut index: HashMap<String, Vec<NodeId>> = HashMap::new();
@@ -169,6 +180,19 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
                     src: p.src.clone(),
                     dst: candidates[0].clone(),
                     kind: p.kind,
+                    confidence: Confidence::Inferred,
+                });
+            }
+        }
+    }
+    // HANDLES links whose handler is defined elsewhere: handler -> endpoint.
+    for (handler, endpoint_id) in &pending_handlers {
+        if let Some(candidates) = index.get(handler) {
+            if candidates.len() == 1 {
+                inferred.push(Edge {
+                    src: candidates[0].clone(),
+                    dst: endpoint_id.clone(),
+                    kind: EdgeKind::Handles,
                     confidence: Confidence::Inferred,
                 });
             }

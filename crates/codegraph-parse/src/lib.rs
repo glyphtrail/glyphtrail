@@ -3,7 +3,9 @@ pub mod extract;
 pub mod registry;
 pub mod rest;
 
-pub use build::{build_file_graph, FileGraph, PendingEdge, SymbolEntry};
+pub use build::{
+    build_file_graph, build_rest_graph, FileGraph, PendingEdge, RestGraph, SymbolEntry,
+};
 pub use extract::{parse_source, ParsedFile};
 pub use rest::{extract_axum, extract_utoipa, RawEndpoint};
 
@@ -103,5 +105,70 @@ class Service:
             .edges
             .iter()
             .any(|e| &e.dst == helper_id && e.kind == codegraph_core::EdgeKind::Calls));
+    }
+
+    #[test]
+    fn rest_endpoints_link_local_handlers() {
+        use codegraph_core::{Confidence, EdgeKind, NodeId, NodeKind};
+        let src = r#"
+async fn list() {}
+fn app() -> Router {
+    Router::new().route("/users", get(list))
+}
+"#;
+        let parsed = parse_source(Language::Rust, src).unwrap();
+        let file_id = NodeId::derive(&["file", "r.rs"]);
+        let fg = build_file_graph("r.rs", Language::Rust, &file_id, &parsed);
+        let rg = build_rest_graph("r.rs", &fg.symbols, src);
+
+        let ep = rg
+            .graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Endpoint)
+            .expect("endpoint node");
+        assert_eq!(ep.name, "GET /users");
+        assert_eq!(rg.operations.len(), 1);
+        assert_eq!(rg.operations[0].0, ep.id);
+        assert_eq!(rg.operations[0].1.path, "/users");
+
+        // HANDLES is emitted handler -> endpoint at Extracted confidence.
+        let list_id = &fg.symbols.iter().find(|s| s.name == "list").unwrap().id;
+        assert!(rg.graph.edges.iter().any(|e| e.kind == EdgeKind::Handles
+            && &e.src == list_id
+            && e.dst == ep.id
+            && e.confidence == Confidence::Extracted));
+        assert!(rg.pending_handlers.is_empty());
+    }
+
+    #[test]
+    fn rest_handler_deferred_when_not_local() {
+        use codegraph_core::{NodeId, NodeKind};
+        let src = r#"
+fn app() -> Router {
+    Router::new().route("/users", get(handlers::list))
+}
+"#;
+        let parsed = parse_source(Language::Rust, src).unwrap();
+        let file_id = NodeId::derive(&["file", "r.rs"]);
+        let fg = build_file_graph("r.rs", Language::Rust, &file_id, &parsed);
+        let rg = build_rest_graph("r.rs", &fg.symbols, src);
+
+        let ep = rg
+            .graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Endpoint)
+            .expect("endpoint node");
+        // No local def named `list`, so the handler link is deferred, not emitted.
+        assert!(!rg
+            .graph
+            .edges
+            .iter()
+            .any(|e| e.kind == codegraph_core::EdgeKind::Handles));
+        assert_eq!(
+            rg.pending_handlers,
+            vec![("list".to_string(), ep.id.clone())]
+        );
     }
 }
