@@ -55,6 +55,11 @@ enum Command {
         #[arg(long, default_value_t = 7700)]
         port: u16,
     },
+    /// Run a Model Context Protocol server over stdio (for agents/editors).
+    Mcp {
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
     /// Show index statistics.
     Status {
         #[arg(long, default_value = ".")]
@@ -85,6 +90,7 @@ fn main() -> anyhow::Result<()> {
             limit,
         } => commands::viz::run(&repo, &output, limit),
         Command::Serve { repo, port } => commands::serve::run(&repo, port),
+        Command::Mcp { repo } => meridian_mcp::serve_stdio(repo),
         Command::Status { repo } => commands::status::run(&repo),
         Command::Completions { shell } => {
             let mut cmd = Cli::command();

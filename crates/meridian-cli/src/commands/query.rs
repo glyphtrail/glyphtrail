@@ -3,9 +3,8 @@ use std::path::Path;
 use anyhow::{Result, anyhow, bail};
 use clap::Subcommand;
 use meridian_core::config::RepoPaths;
-use meridian_core::{
-    EdgeKind, HttpMethod, Node, NodeId, NodeKind, OperationKey, Protocol, path_signature,
-};
+use meridian_core::operations_matching as match_operations;
+use meridian_core::{EdgeKind, HttpMethod, Node, NodeKind, OperationKey, Protocol};
 use meridian_store::SqliteStore;
 use serde::Serialize;
 
@@ -174,23 +173,6 @@ fn parse_protocol_filter(s: Option<&str>) -> Result<Option<Protocol>> {
             .map(Some)
             .ok_or_else(|| anyhow!("unknown protocol '{p}' (expected rest, grpc, or graphql)")),
     }
-}
-
-/// Match operations from `ops` against a query path (and optional method),
-/// comparing by path signature so templates match concrete values
-/// (`/users/{id}` matches `/users/123`).
-fn match_operations(
-    ops: &[(NodeId, OperationKey)],
-    method: Option<HttpMethod>,
-    path: &str,
-) -> Vec<(NodeId, OperationKey)> {
-    let want = path_signature(path);
-    ops.iter()
-        .filter(|(_, key)| {
-            path_signature(&key.path) == want && method.is_none_or(|m| key.method == Some(m))
-        })
-        .cloned()
-        .collect()
 }
 
 fn operation_out(key: &OperationKey, node: Option<&Node>, handler: Option<String>) -> OperationOut {
@@ -409,6 +391,7 @@ fn print_api_impact(report: &[ApiImpactOut], json: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use meridian_core::NodeId;
 
     fn ops() -> Vec<(NodeId, OperationKey)> {
         vec![
