@@ -70,13 +70,26 @@ fn clean_import(raw: &str) -> String {
 
 /// Parse `source` and extract raw definitions, calls, imports, bases and comments.
 pub fn parse_source(lang: Language, source: &str) -> anyhow::Result<ParsedFile> {
+    parse_with(&grammar(lang), query_source(lang), source)
+}
+
+/// Parse `source` with an explicit tree-sitter `grammar` and extraction
+/// `query`, mapping the shared capture convention (`@def.<kind>` + `@name`,
+/// `@call`, `@import`, `@extends`/`@implements`, `@comment`) into a
+/// [`ParsedFile`]. Decoupled from the built-in [`Language`] enum so the same
+/// extraction works for dynamically-loaded grammars.
+pub fn parse_with(
+    grammar: &tree_sitter::Language,
+    query_src: &str,
+    source: &str,
+) -> anyhow::Result<ParsedFile> {
     let mut parser = Parser::new();
-    parser.set_language(&grammar(lang))?;
+    parser.set_language(grammar)?;
     let tree = parser
         .parse(source, None)
         .ok_or_else(|| anyhow::anyhow!("tree-sitter failed to parse"))?;
 
-    let query = Query::new(&grammar(lang), query_source(lang))?;
+    let query = Query::new(grammar, query_src)?;
     let capture_names = query.capture_names();
     let src = source.as_bytes();
 
