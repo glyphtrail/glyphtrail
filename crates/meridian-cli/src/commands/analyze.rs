@@ -159,14 +159,11 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
                 graph.extend(rg.graph);
                 operations.extend(rg.operations);
                 pending_handlers.extend(rg.pending_handlers);
-                if matches!(
-                    f.language,
-                    Language::JavaScript | Language::TypeScript | Language::Tsx
-                ) {
-                    let cg = build_client_graph(&f.rel_path, &source, f.language);
-                    graph.extend(cg.graph);
-                    operations.extend(cg.operations);
-                }
+                // Client-call extraction runs for any language with a client
+                // extractor (the extractor decides; no-op otherwise).
+                let cg = build_client_graph(&f.rel_path, &source, f.language);
+                graph.extend(cg.graph);
+                operations.extend(cg.operations);
                 graph.extend(fg.graph);
                 pending.extend(fg.pending);
                 imports.extend(
