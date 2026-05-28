@@ -55,3 +55,18 @@ CREATE TABLE IF NOT EXISTS api_operations (
 );
 
 CREATE INDEX IF NOT EXISTS idx_api_ops_sig ON api_operations(signature);
+
+-- Unresolved cross-file edges, persisted so they can be re-resolved against the
+-- whole graph on every (incremental) run. `anchor` is the known endpoint of the
+-- edge; `name` is the symbol to resolve for the other endpoint. When
+-- `name_is_src` is 1 the resolved node is the edge source (`name -> anchor`),
+-- otherwise it is the destination (`anchor -> name`).
+CREATE TABLE IF NOT EXISTS pending_edges (
+    anchor      TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    name_is_src INTEGER NOT NULL,
+    PRIMARY KEY (anchor, name, kind, name_is_src)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_anchor ON pending_edges(anchor);

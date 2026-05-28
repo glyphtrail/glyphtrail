@@ -3,7 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use meridian_core::{
-    Confidence, Edge, EdgeKind, HttpMethod, Node, NodeId, NodeKind, OperationKey, Protocol, Span,
+    Confidence, Edge, EdgeKind, HttpMethod, Node, NodeId, NodeKind, OperationKey, PendingLink,
+    Protocol, Span,
 };
 use rusqlite::{Connection, params};
 
@@ -30,7 +31,7 @@ impl SqliteStore {
     pub fn clear(&mut self) -> Result<()> {
         self.conn.execute_batch(
             "DELETE FROM edges; DELETE FROM nodes; DELETE FROM files; DELETE FROM nodes_fts;
-             DELETE FROM api_operations;",
+             DELETE FROM api_operations; DELETE FROM pending_edges;",
         )?;
         Ok(())
     }
@@ -68,6 +69,10 @@ impl SqliteStore {
         )?;
         tx.execute(
             "DELETE FROM api_operations WHERE node_id IN (SELECT id FROM nodes WHERE file = ?1)",
+            params![path],
+        )?;
+        tx.execute(
+            "DELETE FROM pending_edges WHERE anchor IN (SELECT id FROM nodes WHERE file = ?1)",
             params![path],
         )?;
         tx.execute("DELETE FROM nodes WHERE file = ?1", params![path])?;
@@ -262,6 +267,53 @@ impl SqliteStore {
             ))
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Persist unresolved cross-file edges for later global re-resolution.
+    /// Upserts by the full key, so re-inserting the same link is a no-op.
+    pub fn insert_pending(&mut self, links: &[PendingLink]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO pending_edges(anchor, name, kind, name_is_src) VALUES (?1,?2,?3,?4)
+                 ON CONFLICT(anchor, name, kind, name_is_src) DO NOTHING",
+            )?;
+            for l in links {
+                stmt.execute(params![
+                    l.anchor.0,
+                    l.name,
+                    l.kind.as_str(),
+                    l.name_is_src as i64
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Every persisted pending edge, for re-resolution against the full graph.
+    pub fn all_pending(&self) -> Result<Vec<PendingLink>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT anchor, name, kind, name_is_src FROM pending_edges")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(PendingLink {
+                anchor: NodeId(r.get::<_, String>(0)?),
+                name: r.get::<_, String>(1)?,
+                kind: parse_edge_kind(&r.get::<_, String>(2)?),
+                name_is_src: r.get::<_, i64>(3)? != 0,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Delete every edge of a given confidence. Used to drop all `Inferred`
+    /// edges before re-resolving them, so resolution is authoritative each run.
+    pub fn delete_edges_by_confidence(&mut self, confidence: Confidence) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM edges WHERE confidence = ?1",
+            params![confidence.as_str()],
+        )?)
     }
 
     /// (name, id) for every definition-like node, for global call resolution.
