@@ -22,6 +22,10 @@
 //!   verbs `client.Get(url)` / `.Post(...)`, and
 //!   `http.NewRequest[WithContext](method, url, …)`. Same URL-shape guard.
 //!
+//! Python (requests / httpx):
+//! - attribute verbs `requests.get(url)` / `client.post(url, …)` and
+//!   `requests.request(method, url)`. Same URL-shape guard.
+//!
 //! Only string-literal and template-literal URLs are extracted; fully dynamic
 //! URLs (bare variables, concatenations) are out of scope. Template
 //! interpolations (`/users/${id}`) are preserved verbatim so they collapse to a
@@ -51,6 +55,7 @@ pub fn extract_client_calls(source: &str, lang: Language) -> Vec<RawClientCall> 
         }
         Language::Rust => rust_client_calls(source),
         Language::Go => go_client_calls(source),
+        Language::Python => python_client_calls(source),
         _ => Vec::new(),
     }
 }
@@ -242,6 +247,88 @@ fn go_verb(field: &str) -> Option<HttpMethod> {
         "Head" => Some(HttpMethod::Head),
         _ => None,
     }
+}
+
+/// requests / httpx calls in Python source.
+fn python_client_calls(source: &str) -> Vec<RawClientCall> {
+    let mut parser = Parser::new();
+    if parser.set_language(&grammar(Language::Python)).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+    let src = source.as_bytes();
+    let mut out = Vec::new();
+    walk(tree.root_node(), &mut |n| {
+        if n.kind() == "call"
+            && let Some(call) = python_call(n, src)
+        {
+            out.push(call);
+        }
+    });
+    out
+}
+
+/// Classify a Python `call` as a requests/httpx request: attribute verbs
+/// (`requests.get`, `client.post`) or `requests.request(method, url)`. A
+/// URL-shaped string argument is required, since the receiver isn't typed.
+fn python_call(call: Node, src: &[u8]) -> Option<RawClientCall> {
+    let func = call.child_by_field_name("function")?;
+    if func.kind() != "attribute" {
+        return None;
+    }
+    let attr = text(func.child_by_field_name("attribute")?, src);
+    let args = call.child_by_field_name("arguments");
+    let (method, path) = match attr.as_str() {
+        "get" | "post" | "put" | "delete" | "patch" | "head" => {
+            (HttpMethod::parse(&attr)?, first_py_url(args, src)?)
+        }
+        "request" => {
+            let strings = py_string_args(args, src);
+            let method = strings.iter().find_map(|s| HttpMethod::parse(s))?;
+            let url = strings.into_iter().find(|s| is_url_like(s))?;
+            (method, url)
+        }
+        _ => return None,
+    };
+    Some(RawClientCall {
+        method,
+        path,
+        span: span_of(call),
+    })
+}
+
+/// First URL-shaped positional string argument, if any.
+fn first_py_url(args: Option<Node>, src: &[u8]) -> Option<String> {
+    py_string_args(args, src)
+        .into_iter()
+        .find(|s| is_url_like(s))
+}
+
+/// Text of every positional string-literal argument (keyword args skipped).
+fn py_string_args(args: Option<Node>, src: &[u8]) -> Vec<String> {
+    let Some(args) = args else {
+        return Vec::new();
+    };
+    let mut cursor = args.walk();
+    args.named_children(&mut cursor)
+        .filter_map(|a| py_string(a, src))
+        .collect()
+}
+
+/// Inner text of a Python `string` literal, else `None`.
+fn py_string(node: Node, src: &[u8]) -> Option<String> {
+    if node.kind() != "string" {
+        return None;
+    }
+    let mut cursor = node.walk();
+    Some(
+        node.named_children(&mut cursor)
+            .find(|c| c.kind() == "string_content")
+            .map(|c| text(c, src))
+            .unwrap_or_default(),
+    )
 }
 
 /// A same-file `axios.create(...)` instance binding and the byte range of the
@@ -624,6 +711,27 @@ func f(c *http.Client) {
         assert!(call(&calls, HttpMethod::Post, "/form").is_some());
         assert!(call(&calls, HttpMethod::Put, "/z").is_some());
         assert!(call(&calls, HttpMethod::Delete, "/w").is_some());
+    }
+
+    #[test]
+    fn python_requests_and_httpx_verbs_and_request() {
+        let src = r#"
+import requests
+requests.get("https://api.example.com/x/1")
+client.post("/y", json=payload)
+requests.request("DELETE", "/z")
+"#;
+        let calls = extract_client_calls(src, Language::Python);
+        assert!(call(&calls, HttpMethod::Get, "https://api.example.com/x/1").is_some());
+        assert!(call(&calls, HttpMethod::Post, "/y").is_some());
+        assert!(call(&calls, HttpMethod::Delete, "/z").is_some());
+    }
+
+    #[test]
+    fn python_skips_non_url_calls() {
+        // `.get` with a non-URL literal (dict access) is not a request.
+        let src = "d.get(\"key\")\nfetchData(url)\n";
+        assert!(extract_client_calls(src, Language::Python).is_empty());
     }
 
     #[test]
