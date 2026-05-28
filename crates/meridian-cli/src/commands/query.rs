@@ -4,7 +4,10 @@ use anyhow::{Result, anyhow, bail};
 use clap::Subcommand;
 use meridian_core::config::RepoPaths;
 use meridian_core::operations_matching as match_operations;
-use meridian_core::{EdgeKind, HttpMethod, Node, NodeKind, OperationKey, Protocol};
+use meridian_core::{
+    EdgeKind, HttpMethod, Node, NodeKind, OperationKey, Protocol, Registry, RegistryEntry,
+    default_registry_path,
+};
 use meridian_store::SqliteStore;
 use serde::Serialize;
 
@@ -81,11 +84,52 @@ fn resolve_one(store: &SqliteStore, name: &str) -> Result<Node> {
     }
 }
 
-fn print_nodes(nodes: &[Node], json: bool) -> Result<()> {
-    if json {
-        println!("{}", serde_json::to_string_pretty(nodes)?);
-        return Ok(());
+/// A computed query answer, decoupled from rendering. One variant per verb
+/// output shape, so the same value renders as text (single repo) or as
+/// repo-tagged JSON (cross-repo).
+enum QueryResult {
+    Nodes(Vec<Node>),
+    Neighbors(Vec<NeighborOut>),
+    Operations(Vec<OperationOut>),
+    ApiImpact(Vec<ApiImpactOut>),
+    Drift(DriftReport),
+}
+
+impl QueryResult {
+    fn to_value(&self) -> serde_json::Value {
+        match self {
+            QueryResult::Nodes(v) => serde_json::to_value(v),
+            QueryResult::Neighbors(v) => serde_json::to_value(v),
+            QueryResult::Operations(v) => serde_json::to_value(v),
+            QueryResult::ApiImpact(v) => serde_json::to_value(v),
+            QueryResult::Drift(v) => serde_json::to_value(v),
+        }
+        .unwrap_or(serde_json::Value::Null)
     }
+
+    fn print_text(&self) {
+        match self {
+            QueryResult::Nodes(v) => nodes_text(v),
+            QueryResult::Neighbors(v) => neighbors_text(v),
+            QueryResult::Operations(v) => operations_text(v),
+            QueryResult::ApiImpact(v) => api_impact_text(v),
+            QueryResult::Drift(v) => drift_text(v),
+        }
+    }
+}
+
+fn neighbor_out(items: Vec<(Node, EdgeKind, meridian_core::Confidence)>) -> Vec<NeighborOut> {
+    items
+        .into_iter()
+        .map(|(n, e, c)| NeighborOut {
+            node: n,
+            edge: e.as_str().to_string(),
+            confidence: c.as_str().to_string(),
+        })
+        .collect()
+}
+
+fn nodes_text(nodes: &[Node]) {
     if nodes.is_empty() {
         println!("(none)");
     }
@@ -100,42 +144,23 @@ fn print_nodes(nodes: &[Node], json: bool) -> Result<()> {
             println!("    {}", first);
         }
     }
-    Ok(())
 }
 
-fn print_neighbors(
-    items: &[(Node, EdgeKind, meridian_core::Confidence)],
-    json: bool,
-) -> Result<()> {
-    if json {
-        let out: Vec<NeighborOut> = items
-            .iter()
-            .map(|(n, e, c)| NeighborOut {
-                node: n.clone(),
-                edge: e.as_str().to_string(),
-                confidence: c.as_str().to_string(),
-            })
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&out)?);
-        return Ok(());
-    }
+fn neighbors_text(items: &[NeighborOut]) {
     if items.is_empty() {
         println!("(none)");
     }
-    for (n, e, c) in items {
+    for nb in items {
+        let n = &nb.node;
         let loc = n
             .span
             .map(|s| format!("{}:{}", n.file, s.start_line))
             .unwrap_or_else(|| n.file.clone());
         println!(
             "{:>10} {} ({}) [{}]",
-            e.as_str(),
-            n.qualified_name,
-            loc,
-            c.as_str()
+            nb.edge, n.qualified_name, loc, nb.confidence
         );
     }
-    Ok(())
 }
 
 /// A flattened API operation for display/JSON output.
@@ -206,11 +231,7 @@ fn endpoint_handler(store: &SqliteStore, id: &str) -> Result<Option<String>> {
         .map(|(n, _, _)| n.qualified_name))
 }
 
-fn print_operations(ops: &[OperationOut], json: bool) -> Result<()> {
-    if json {
-        println!("{}", serde_json::to_string_pretty(ops)?);
-        return Ok(());
-    }
+fn operations_text(ops: &[OperationOut]) {
     if ops.is_empty() {
         println!("(none)");
     }
@@ -226,7 +247,6 @@ fn print_operations(ops: &[OperationOut], json: bool) -> Result<()> {
         }
         println!("{line}");
     }
-    Ok(())
 }
 
 /// Build display rows for every operation of `kind`, optionally filtered by
@@ -255,7 +275,7 @@ fn collect_operations(
     Ok(out)
 }
 
-pub fn run(repo: &Path, cmd: QueryCmd, json: bool) -> Result<()> {
+fn open_store(repo: &Path) -> Result<SqliteStore> {
     let paths = RepoPaths::new(repo);
     if !paths.db_path.exists() {
         bail!(
@@ -263,64 +283,70 @@ pub fn run(repo: &Path, cmd: QueryCmd, json: bool) -> Result<()> {
             paths.db_path.display()
         );
     }
-    let store = SqliteStore::open(&paths.db_path)?;
+    SqliteStore::open(&paths.db_path)
+}
 
-    match cmd {
-        QueryCmd::Def { name } => {
-            let nodes = store.find_by_name(&name)?;
-            print_nodes(&nodes, json)?;
-        }
+/// Compute a query answer against one open store. Pure of output so the same
+/// arm serves single-repo text, single-repo JSON, and cross-repo aggregation.
+fn execute(store: &SqliteStore, cmd: &QueryCmd) -> Result<QueryResult> {
+    Ok(match cmd {
+        QueryCmd::Def { name } => QueryResult::Nodes(store.find_by_name(name)?),
         QueryCmd::Callers { name } => {
-            let n = resolve_one(&store, &name)?;
-            let items = store.neighbors(&n.id.0, Some(EdgeKind::Calls), false)?;
-            print_neighbors(&items, json)?;
+            let n = resolve_one(store, name)?;
+            QueryResult::Neighbors(neighbor_out(store.neighbors(
+                &n.id.0,
+                Some(EdgeKind::Calls),
+                false,
+            )?))
         }
         QueryCmd::Callees { name } => {
-            let n = resolve_one(&store, &name)?;
-            let items = store.neighbors(&n.id.0, Some(EdgeKind::Calls), true)?;
-            print_neighbors(&items, json)?;
+            let n = resolve_one(store, name)?;
+            QueryResult::Neighbors(neighbor_out(store.neighbors(
+                &n.id.0,
+                Some(EdgeKind::Calls),
+                true,
+            )?))
         }
         QueryCmd::Neighbors { name } => {
-            let n = resolve_one(&store, &name)?;
+            let n = resolve_one(store, name)?;
             let mut items = store.neighbors(&n.id.0, None, true)?;
             items.extend(store.neighbors(&n.id.0, None, false)?);
-            print_neighbors(&items, json)?;
+            QueryResult::Neighbors(neighbor_out(items))
         }
-        QueryCmd::Search { text } => {
-            let nodes = store.search(&text, 50)?;
-            print_nodes(&nodes, json)?;
-        }
+        QueryCmd::Search { text } => QueryResult::Nodes(store.search(text, 50)?),
         QueryCmd::Impact { name, depth } => {
-            let n = resolve_one(&store, &name)?;
+            let n = resolve_one(store, name)?;
             // Callers (transitively) are what breaks if this symbol changes.
-            let nodes = store.reachable(&n.id.0, EdgeKind::Calls, false, depth)?;
-            print_nodes(&nodes, json)?;
+            QueryResult::Nodes(store.reachable(&n.id.0, EdgeKind::Calls, false, *depth)?)
         }
         QueryCmd::Endpoints { protocol } => {
             let proto = parse_protocol_filter(protocol.as_deref())?;
-            let ops = collect_operations(&store, NodeKind::Endpoint, proto, true)?;
-            print_operations(&ops, json)?;
+            QueryResult::Operations(collect_operations(store, NodeKind::Endpoint, proto, true)?)
         }
         QueryCmd::Clients { protocol } => {
             let proto = parse_protocol_filter(protocol.as_deref())?;
-            let ops = collect_operations(&store, NodeKind::ClientCall, proto, false)?;
-            print_operations(&ops, json)?;
+            QueryResult::Operations(collect_operations(
+                store,
+                NodeKind::ClientCall,
+                proto,
+                false,
+            )?)
         }
         QueryCmd::Serves { path, method } => {
             let m = parse_method_opt(method.as_deref())?;
             let endpoints = store.operations_by_kind(NodeKind::Endpoint)?;
             let mut out = Vec::new();
-            for (id, key) in match_operations(&endpoints, m, &path) {
+            for (id, key) in match_operations(&endpoints, m, path) {
                 let node = store.get_node(&id.0)?;
-                let handler = endpoint_handler(&store, &id.0)?;
+                let handler = endpoint_handler(store, &id.0)?;
                 out.push(operation_out(&key, node.as_ref(), handler));
             }
-            print_operations(&out, json)?;
+            QueryResult::Operations(out)
         }
         QueryCmd::WhoCalls { path, method } => {
             let m = parse_method_opt(method.as_deref())?;
             let endpoints = store.operations_by_kind(NodeKind::Endpoint)?;
-            let matched = match_operations(&endpoints, m, &path);
+            let matched = match_operations(&endpoints, m, path);
             if matched.is_empty() {
                 bail!("no endpoint matching '{path}' in the index");
             }
@@ -328,12 +354,12 @@ pub fn run(repo: &Path, cmd: QueryCmd, json: bool) -> Result<()> {
             for (id, _) in matched {
                 items.extend(store.neighbors(&id.0, Some(EdgeKind::Invokes), false)?);
             }
-            print_neighbors(&items, json)?;
+            QueryResult::Neighbors(neighbor_out(items))
         }
         QueryCmd::ApiImpact { path, method } => {
             let m = parse_method_opt(method.as_deref())?;
             let endpoints = store.operations_by_kind(NodeKind::Endpoint)?;
-            let matched = match_operations(&endpoints, m, &path);
+            let matched = match_operations(&endpoints, m, path);
             if matched.is_empty() {
                 bail!("no endpoint matching '{path}' in the index");
             }
@@ -362,7 +388,7 @@ pub fn run(repo: &Path, cmd: QueryCmd, json: bool) -> Result<()> {
                     schema_ops,
                 });
             }
-            print_api_impact(&report, json)?;
+            QueryResult::ApiImpact(report)
         }
         QueryCmd::Drift => {
             // EXPOSES links a code endpoint (src) to the schema op it implements
@@ -375,7 +401,7 @@ pub fn run(repo: &Path, cmd: QueryCmd, json: bool) -> Result<()> {
                     .is_empty()
                 {
                     let node = store.get_node(&id.0)?;
-                    let handler = endpoint_handler(&store, &id.0)?;
+                    let handler = endpoint_handler(store, &id.0)?;
                     undocumented_endpoints.push(operation_out(&key, node.as_ref(), handler));
                 }
             }
@@ -389,26 +415,84 @@ pub fn run(repo: &Path, cmd: QueryCmd, json: bool) -> Result<()> {
                     unimplemented_schema_ops.push(operation_out(&key, node.as_ref(), None));
                 }
             }
-            print_drift(
-                &DriftReport {
-                    undocumented_endpoints,
-                    unimplemented_schema_ops,
-                },
-                json,
-            )?;
+            QueryResult::Drift(DriftReport {
+                undocumented_endpoints,
+                unimplemented_schema_ops,
+            })
+        }
+    })
+}
+
+pub fn run(repo: &Path, cmd: QueryCmd, json: bool) -> Result<()> {
+    let store = open_store(repo)?;
+    let result = execute(&store, &cmd)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result.to_value())?);
+    } else {
+        result.print_text();
+    }
+    Ok(())
+}
+
+/// Run a query across registered repositories. `all` selects every repo;
+/// otherwise `names` selects by registry name. Results are tagged by repo:
+/// text mode prints a `== name (root) ==` header before each, JSON mode emits
+/// an array of `{ "repo", "result" }`. A per-repo failure (missing index,
+/// unmatched endpoint) is reported inline and does not abort the run.
+pub fn run_registry(
+    cmd: QueryCmd,
+    json: bool,
+    all: bool,
+    names: Option<Vec<String>>,
+) -> Result<()> {
+    let path = default_registry_path()
+        .ok_or_else(|| anyhow!("cannot locate home directory (set HOME or USERPROFILE)"))?;
+    let registry = Registry::load(&path)?;
+    let selected: Vec<&RegistryEntry> = match (all, &names) {
+        (true, _) => registry.repos.iter().collect(),
+        (false, Some(ns)) => {
+            let mut out = Vec::new();
+            for name in ns {
+                match registry.get(name) {
+                    Some(e) => out.push(e),
+                    None => bail!("no repository named '{name}' in the registry"),
+                }
+            }
+            out
+        }
+        (false, None) => registry.repos.iter().collect(),
+    };
+    if selected.is_empty() {
+        println!("(no repositories registered; use `meridian repo add`)");
+        return Ok(());
+    }
+
+    if json {
+        let mut arr = Vec::new();
+        for e in &selected {
+            let value = match open_store(&e.root).and_then(|s| execute(&s, &cmd)) {
+                Ok(r) => r.to_value(),
+                Err(err) => serde_json::json!({ "error": format!("{err:#}") }),
+            };
+            arr.push(serde_json::json!({ "repo": e.name, "result": value }));
+        }
+        println!("{}", serde_json::to_string_pretty(&arr)?);
+    } else {
+        for e in &selected {
+            println!("== {} ({}) ==", e.name, e.root.display());
+            match open_store(&e.root).and_then(|s| execute(&s, &cmd)) {
+                Ok(r) => r.print_text(),
+                Err(err) => println!("  error: {err:#}"),
+            }
         }
     }
     Ok(())
 }
 
-fn print_drift(report: &DriftReport, json: bool) -> Result<()> {
-    if json {
-        println!("{}", serde_json::to_string_pretty(report)?);
-        return Ok(());
-    }
+fn drift_text(report: &DriftReport) {
     if report.undocumented_endpoints.is_empty() && report.unimplemented_schema_ops.is_empty() {
         println!("no drift: every endpoint and schema operation is reconciled");
-        return Ok(());
+        return;
     }
     if !report.undocumented_endpoints.is_empty() {
         println!("endpoints absent from the schema:");
@@ -428,14 +512,9 @@ fn print_drift(report: &DriftReport, json: bool) -> Result<()> {
             println!("  {verb} {} ({})", o.path, o.file);
         }
     }
-    Ok(())
 }
 
-fn print_api_impact(report: &[ApiImpactOut], json: bool) -> Result<()> {
-    if json {
-        println!("{}", serde_json::to_string_pretty(report)?);
-        return Ok(());
-    }
+fn api_impact_text(report: &[ApiImpactOut]) {
     if report.is_empty() {
         println!("(none)");
     }
@@ -459,7 +538,6 @@ fn print_api_impact(report: &[ApiImpactOut], json: bool) -> Result<()> {
         group("callers", &r.callers);
         group("schema", &r.schema_ops);
     }
-    Ok(())
 }
 
 #[cfg(test)]
