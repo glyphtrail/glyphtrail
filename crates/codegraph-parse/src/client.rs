@@ -2,13 +2,20 @@
 //!
 //! Detects the `(method, url)` of outgoing HTTP calls so they can be linked to
 //! the server endpoints that answer them (the `INVOKES` edge). Recognizes:
-//! - `fetch(url, { method })` — the method defaults to GET, and
-//! - `axios.get(url)` / `axios.post(url, ...)` — verb taken from the call.
+//! - `fetch(url, { method })` — the method defaults to GET;
+//! - `axios.get(url)` / `axios.post(url, ...)` — verb taken from the call;
+//! - `axios(config)` / `axios.request(config)` — `url`/`method` from the config
+//!   object (method defaults to GET); and
+//! - instance clients created in the same file via `const api = axios.create(…)`
+//!   — `api.get(url)`, `api(config)`, `api.request(config)` are treated like
+//!   their `axios` equivalents.
 //!
 //! Only string-literal and template-literal URLs are extracted; fully dynamic
 //! URLs (bare variables, concatenations) are out of scope. Template
 //! interpolations (`/users/${id}`) are preserved verbatim so they collapse to a
 //! dynamic segment in the operation signature.
+
+use std::collections::HashSet;
 
 use codegraph_core::{HttpMethod, Language, Span};
 use tree_sitter::{Node, Parser};
@@ -36,10 +43,12 @@ pub fn extract_client_calls(source: &str, lang: Language) -> Vec<RawClientCall> 
         return Vec::new();
     };
     let src = source.as_bytes();
+    let root = tree.root_node();
+    let clients = axios_clients(root, src);
     let mut out = Vec::new();
-    walk(tree.root_node(), &mut |n| {
+    walk(root, &mut |n| {
         if n.kind() == "call_expression" {
-            if let Some(call) = client_call(n, src) {
+            if let Some(call) = client_call(n, src, &clients) {
                 out.push(call);
             }
         }
@@ -47,26 +56,87 @@ pub fn extract_client_calls(source: &str, lang: Language) -> Vec<RawClientCall> 
     out
 }
 
+/// Names that behave like an axios client: `axios` itself plus same-file
+/// instances bound via `const NAME = axios.create(...)`.
+fn axios_clients(root: Node, src: &[u8]) -> HashSet<String> {
+    let mut names = HashSet::new();
+    names.insert("axios".to_string());
+    walk(root, &mut |n| {
+        if n.kind() != "variable_declarator" {
+            return;
+        }
+        let (Some(name), Some(value)) = (
+            n.child_by_field_name("name"),
+            n.child_by_field_name("value"),
+        ) else {
+            return;
+        };
+        if name.kind() == "identifier" && is_axios_create(value, src) {
+            names.insert(text(name, src));
+        }
+    });
+    names
+}
+
+/// Whether `node` is an `axios.create(...)` call.
+fn is_axios_create(node: Node, src: &[u8]) -> bool {
+    if node.kind() != "call_expression" {
+        return false;
+    }
+    let Some(func) = node.child_by_field_name("function") else {
+        return false;
+    };
+    func.kind() == "member_expression"
+        && func
+            .child_by_field_name("object")
+            .map(|o| text(o, src))
+            .as_deref()
+            == Some("axios")
+        && func
+            .child_by_field_name("property")
+            .map(|p| text(p, src))
+            .as_deref()
+            == Some("create")
+}
+
 /// Classify a `call_expression` as a `fetch`/`axios` HTTP call and pull its
 /// `(method, url)`; `None` if it is neither or the URL is non-literal.
-fn client_call(call: Node, src: &[u8]) -> Option<RawClientCall> {
+fn client_call(call: Node, src: &[u8], clients: &HashSet<String>) -> Option<RawClientCall> {
     let func = call.child_by_field_name("function")?;
     let args = call.child_by_field_name("arguments");
-    let (method, url_node) = match func.kind() {
-        "identifier" if text(func, src) == "fetch" => {
-            (fetch_method(args, src), named_arg(args, 0)?)
+    let (method, path) = match func.kind() {
+        "identifier" => {
+            let name = text(func, src);
+            if name == "fetch" {
+                let path = url_text(named_arg(args, 0)?, src)?;
+                let method = named_arg(args, 1)
+                    .map(|o| object_method(o, src))
+                    .unwrap_or(HttpMethod::Get);
+                (method, path)
+            } else if clients.contains(name.as_str()) {
+                // `axios(config)` / `instance(config)`.
+                config_call(named_arg(args, 0)?, src)?
+            } else {
+                return None;
+            }
         }
         "member_expression" => {
             let obj = func.child_by_field_name("object")?;
-            if text(obj, src) != "axios" {
+            if !clients.contains(text(obj, src).as_str()) {
                 return None;
             }
-            let verb = func.child_by_field_name("property")?;
-            (HttpMethod::parse(&text(verb, src))?, named_arg(args, 0)?)
+            let prop = text(func.child_by_field_name("property")?, src);
+            if prop == "request" {
+                // `axios.request(config)` / `instance.request(config)`.
+                config_call(named_arg(args, 0)?, src)?
+            } else {
+                // `axios.get(url)` / `instance.post(url, ...)`.
+                let method = HttpMethod::parse(&prop)?;
+                (method, url_text(named_arg(args, 0)?, src)?)
+            }
         }
         _ => return None,
     };
-    let path = url_text(url_node, src)?;
     Some(RawClientCall {
         method,
         path,
@@ -74,32 +144,42 @@ fn client_call(call: Node, src: &[u8]) -> Option<RawClientCall> {
     })
 }
 
-/// The `method` of a `fetch` call's options object, defaulting to GET.
-fn fetch_method(args: Option<Node>, src: &[u8]) -> HttpMethod {
-    let Some(opts) = named_arg(args, 1) else {
-        return HttpMethod::Get;
-    };
-    if opts.kind() != "object" {
-        return HttpMethod::Get;
+/// `(method, url)` from an axios config object: `url` is required (and must be
+/// a literal), `method` defaults to GET.
+fn config_call(config: Node, src: &[u8]) -> Option<(HttpMethod, String)> {
+    let url = url_text(object_field(config, "url", src)?, src)?;
+    Some((object_method(config, src), url))
+}
+
+/// The `method` field of an options/config object, defaulting to GET.
+fn object_method(obj: Node, src: &[u8]) -> HttpMethod {
+    object_field(obj, "method", src)
+        .and_then(|v| js_string(v, src))
+        .and_then(|s| HttpMethod::parse(&s))
+        .unwrap_or(HttpMethod::Get)
+}
+
+/// Value node of `key` in an object literal, if present.
+fn object_field<'a>(obj: Node<'a>, key: &str, src: &[u8]) -> Option<Node<'a>> {
+    if obj.kind() != "object" {
+        return None;
     }
-    let mut cursor = opts.walk();
-    for pair in opts.named_children(&mut cursor) {
+    let mut cursor = obj.walk();
+    for pair in obj.named_children(&mut cursor) {
         if pair.kind() != "pair" {
             continue;
         }
-        let (Some(key), Some(value)) = (
+        let (Some(k), Some(v)) = (
             pair.child_by_field_name("key"),
             pair.child_by_field_name("value"),
         ) else {
             continue;
         };
-        if key_name(key, src).as_deref() == Some("method") {
-            if let Some(m) = js_string(value, src).and_then(|s| HttpMethod::parse(&s)) {
-                return m;
-            }
+        if key_name(k, src).as_deref() == Some(key) {
+            return Some(v);
         }
     }
-    HttpMethod::Get
+    None
 }
 
 /// Property-key name, whether a bare identifier or a quoted string key.
@@ -223,5 +303,39 @@ mod tests {
         let src = "const f = () => fetch(\"/api/ping\");";
         let calls = extract_client_calls(src, Language::Tsx);
         assert!(call(&calls, HttpMethod::Get, "/api/ping").is_some());
+    }
+
+    #[test]
+    fn axios_config_call() {
+        let src = "axios({ url: \"/things\", method: \"PUT\" });";
+        let calls = extract_client_calls(src, Language::JavaScript);
+        assert!(call(&calls, HttpMethod::Put, "/things").is_some());
+    }
+
+    #[test]
+    fn axios_request_config_defaults_get() {
+        let src = "axios.request({ url: \"/r\" });";
+        let calls = extract_client_calls(src, Language::TypeScript);
+        assert!(call(&calls, HttpMethod::Get, "/r").is_some());
+    }
+
+    #[test]
+    fn axios_instance_verb_and_config() {
+        let src = "const api = axios.create({ baseURL: \"/api\" });\n\
+                   api.get(\"/users\");\n\
+                   api({ url: \"/things\", method: \"post\" });";
+        let calls = extract_client_calls(src, Language::TypeScript);
+        assert!(call(&calls, HttpMethod::Get, "/users").is_some());
+        assert!(call(&calls, HttpMethod::Post, "/things").is_some());
+        // The `axios.create(...)` itself is not an HTTP call.
+        assert_eq!(calls.len(), 2);
+    }
+
+    #[test]
+    fn unrelated_instance_methods_ignored() {
+        // A non-verb method on an axios instance is not a call.
+        let src = "const api = axios.create();\napi.interceptors.use(fn);";
+        let calls = extract_client_calls(src, Language::JavaScript);
+        assert!(calls.is_empty());
     }
 }
