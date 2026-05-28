@@ -2,7 +2,9 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use codegraph_core::{Confidence, Edge, EdgeKind, Node, NodeId, NodeKind, Span};
+use codegraph_core::{
+    Confidence, Edge, EdgeKind, HttpMethod, Node, NodeId, NodeKind, OperationKey, Protocol, Span,
+};
 use rusqlite::{params, Connection};
 
 /// Persistent code graph backed by SQLite (+ FTS5 search). The first storage
@@ -27,7 +29,8 @@ impl SqliteStore {
     /// Wipe all indexed data (full reindex).
     pub fn clear(&mut self) -> Result<()> {
         self.conn.execute_batch(
-            "DELETE FROM edges; DELETE FROM nodes; DELETE FROM files; DELETE FROM nodes_fts;",
+            "DELETE FROM edges; DELETE FROM nodes; DELETE FROM files; DELETE FROM nodes_fts;
+             DELETE FROM api_operations;",
         )?;
         Ok(())
     }
@@ -59,6 +62,10 @@ impl SqliteStore {
         )?;
         tx.execute(
             "DELETE FROM nodes_fts WHERE id IN (SELECT id FROM nodes WHERE file = ?1)",
+            params![path],
+        )?;
+        tx.execute(
+            "DELETE FROM api_operations WHERE node_id IN (SELECT id FROM nodes WHERE file = ?1)",
             params![path],
         )?;
         tx.execute("DELETE FROM nodes WHERE file = ?1", params![path])?;
@@ -150,6 +157,60 @@ impl SqliteStore {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Persist the API operation key for endpoint / client-call / schema-op
+    /// nodes. Upserts by node id; the precomputed signature is stored for
+    /// signature-keyed lookup and matching.
+    pub fn insert_operations(&mut self, ops: &[(NodeId, OperationKey)]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO api_operations(node_id, protocol, method, path, signature)
+                 VALUES (?1,?2,?3,?4,?5)
+                 ON CONFLICT(node_id) DO UPDATE SET
+                    protocol=?2, method=?3, path=?4, signature=?5",
+            )?;
+            for (id, key) in ops {
+                stmt.execute(params![
+                    id.0,
+                    key.protocol.as_str(),
+                    key.method.map(|m| m.as_str()),
+                    key.path,
+                    key.signature(),
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// All operation keys for nodes of a given kind (e.g. endpoints or client
+    /// calls), for feeding the cross-boundary matcher.
+    pub fn operations_by_kind(&self, kind: NodeKind) -> Result<Vec<(NodeId, OperationKey)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT o.node_id, o.protocol, o.method, o.path
+             FROM api_operations o JOIN nodes n ON n.id = o.node_id
+             WHERE n.kind = ?1
+             ORDER BY o.node_id",
+        )?;
+        let rows = stmt.query_map(params![kind.as_str()], |r| {
+            let id = NodeId(r.get::<_, String>(0)?);
+            let protocol = Protocol::parse(&r.get::<_, String>(1)?).unwrap_or(Protocol::Rest);
+            let method = r
+                .get::<_, Option<String>>(2)?
+                .and_then(|m| HttpMethod::parse(&m));
+            let path = r.get::<_, String>(3)?;
+            Ok((
+                id,
+                OperationKey {
+                    protocol,
+                    method,
+                    path,
+                },
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// (name, id) for every definition-like node, for global call resolution.

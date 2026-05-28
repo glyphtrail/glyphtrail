@@ -27,6 +27,16 @@ impl Protocol {
             Protocol::GraphQl => "graphql",
         }
     }
+
+    /// Parse a protocol from its canonical string (the inverse of [`as_str`]).
+    pub fn parse(s: &str) -> Option<Protocol> {
+        match s {
+            "rest" => Some(Protocol::Rest),
+            "grpc" => Some(Protocol::Grpc),
+            "graphql" => Some(Protocol::GraphQl),
+            _ => None,
+        }
+    }
 }
 
 /// HTTP method for REST operations. gRPC/GraphQL operations carry no method.
