@@ -6,6 +6,7 @@ pub mod error;
 pub mod lang;
 pub mod matcher;
 pub mod model;
+pub mod registry;
 pub mod rewrite;
 
 pub use api::{
@@ -16,4 +17,5 @@ pub use error::{CoreError, Result};
 pub use lang::Language;
 pub use matcher::{ClientCall, Endpoint, Match, Matcher};
 pub use model::{CodeGraph, Confidence, Edge, EdgeKind, Node, NodeId, NodeKind, PendingLink, Span};
+pub use registry::{Registry, RegistryEntry, default_registry_path};
 pub use rewrite::{PrefixRewrite, RewriteCandidate, RewriteEngine};

@@ -60,6 +60,11 @@ enum Command {
         #[arg(long, default_value = ".")]
         repo: PathBuf,
     },
+    /// Manage the global repository registry (~/.meridian/registry.json).
+    Repo {
+        #[command(subcommand)]
+        cmd: commands::repo::RepoCmd,
+    },
     /// Show index statistics.
     Status {
         #[arg(long, default_value = ".")]
@@ -91,6 +96,7 @@ fn main() -> anyhow::Result<()> {
         } => commands::viz::run(&repo, &output, limit),
         Command::Serve { repo, port } => commands::serve::run(&repo, port),
         Command::Mcp { repo } => meridian_mcp::serve_stdio(repo),
+        Command::Repo { cmd } => commands::repo::run(cmd),
         Command::Status { repo } => commands::status::run(&repo),
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
