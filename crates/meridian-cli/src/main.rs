@@ -27,6 +27,9 @@ enum Command {
         /// Only reparse files whose content changed since the last index.
         #[arg(long)]
         update: bool,
+        /// Analyze every repository in the global registry instead of `path`.
+        #[arg(long)]
+        all: bool,
     },
     /// Query the graph.
     Query {
@@ -69,6 +72,9 @@ enum Command {
     Status {
         #[arg(long, default_value = ".")]
         repo: PathBuf,
+        /// Show stats for every repository in the global registry.
+        #[arg(long)]
+        all: bool,
     },
     /// Generate a shell completion script for the given shell.
     Completions {
@@ -87,7 +93,13 @@ fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Analyze { path, update } => commands::analyze::run(&path, update),
+        Command::Analyze { path, update, all } => {
+            if all {
+                commands::repo::analyze_all(update)
+            } else {
+                commands::analyze::run(&path, update)
+            }
+        }
         Command::Query { query, repo, json } => commands::query::run(&repo, query, json),
         Command::Viz {
             repo,
@@ -97,7 +109,13 @@ fn main() -> anyhow::Result<()> {
         Command::Serve { repo, port } => commands::serve::run(&repo, port),
         Command::Mcp { repo } => meridian_mcp::serve_stdio(repo),
         Command::Repo { cmd } => commands::repo::run(cmd),
-        Command::Status { repo } => commands::status::run(&repo),
+        Command::Status { repo, all } => {
+            if all {
+                commands::repo::status_all()
+            } else {
+                commands::status::run(&repo)
+            }
+        }
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
             let name = cmd.get_name().to_string();
