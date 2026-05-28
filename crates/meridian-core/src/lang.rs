@@ -18,6 +18,7 @@ pub enum Language {
     C,
     Cpp,
     CSharp,
+    Ruby,
     /// A language identified by name but not built in (dynamically loaded).
     Other(String),
 }
@@ -35,6 +36,7 @@ impl Language {
             Language::C => "c",
             Language::Cpp => "cpp",
             Language::CSharp => "csharp",
+            Language::Ruby => "ruby",
             Language::Other(name) => name,
         }
     }
@@ -53,6 +55,7 @@ impl Language {
             "c" | "h" => Language::C,
             "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => Language::Cpp,
             "cs" => Language::CSharp,
+            "rb" => Language::Ruby,
             _ => return None,
         })
     }
@@ -69,11 +72,12 @@ impl Language {
             "c" => Language::C,
             "cpp" => Language::Cpp,
             "csharp" => Language::CSharp,
+            "ruby" => Language::Ruby,
             _ => return None,
         })
     }
 
-    pub const ALL: [Language; 10] = [
+    pub const ALL: [Language; 11] = [
         Language::Rust,
         Language::Python,
         Language::JavaScript,
@@ -84,5 +88,6 @@ impl Language {
         Language::C,
         Language::Cpp,
         Language::CSharp,
+        Language::Ruby,
     ];
 }
