@@ -73,6 +73,18 @@ impl PrefixRewrite {
     }
 }
 
+/// Validate a gateway prefix used by the heuristic: it must be a real, non-empty
+/// path prefix. Rejects `""`, whitespace, and slash-only values like `/` that
+/// would normalize to empty and silently never produce a candidate.
+pub fn validate_gateway_prefix(prefix: &str) -> std::result::Result<(), String> {
+    if normalize_prefix(prefix).is_empty() {
+        return Err(format!(
+            "gateway prefix must be a real path prefix, not {prefix:?}"
+        ));
+    }
+    Ok(())
+}
+
 /// Normalize a path prefix: trim surrounding slashes/space; empty stays empty,
 /// otherwise gets a single leading slash and no trailing slash.
 fn normalize_prefix(s: &str) -> String {

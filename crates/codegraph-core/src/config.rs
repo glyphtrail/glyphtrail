@@ -57,7 +57,7 @@ impl Config {
         match std::fs::read_to_string(&path) {
             Ok(text) => Config::parse(&text, &path),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
-            Err(e) => Err(CoreError::Io(e)),
+            Err(source) => Err(CoreError::ConfigRead { path, source }),
         }
     }
 
@@ -76,11 +76,15 @@ impl Config {
     }
 
     fn validate(&self, path: &Path) -> crate::Result<()> {
+        let invalid = |message: String| CoreError::ConfigInvalid {
+            path: path.to_path_buf(),
+            message,
+        };
         for r in &self.api.rewrites {
-            r.validate().map_err(|message| CoreError::ConfigInvalid {
-                path: path.to_path_buf(),
-                message,
-            })?;
+            r.validate().map_err(&invalid)?;
+        }
+        for p in &self.api.gateway_prefixes {
+            crate::rewrite::validate_gateway_prefix(p).map_err(&invalid)?;
         }
         Ok(())
     }
@@ -190,6 +194,20 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, crate::CoreError::ConfigInvalid { .. }));
+    }
+
+    #[test]
+    fn invalid_gateway_prefix_is_rejected() {
+        for bad in ["\"/\"", "\"\"", "\"   \""] {
+            let toml = format!("[api]\ngateway_prefixes = [{bad}]\n");
+            let err = Config::from_toml_str(&toml).unwrap_err();
+            assert!(
+                matches!(err, crate::CoreError::ConfigInvalid { .. }),
+                "expected ConfigInvalid for {bad}, got {err:?}"
+            );
+        }
+        // A real prefix is accepted.
+        assert!(Config::from_toml_str("[api]\ngateway_prefixes = [\"/api\"]\n").is_ok());
     }
 
     #[test]

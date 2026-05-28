@@ -16,6 +16,12 @@ pub enum CoreError {
     },
     #[error("invalid config at {path}: {message}")]
     ConfigInvalid { path: PathBuf, message: String },
+    #[error("failed to read config {path}: {source}")]
+    ConfigRead {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;
