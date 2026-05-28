@@ -15,6 +15,7 @@ use std::fmt;
 pub enum Protocol {
     Rest,
     Grpc,
+    #[serde(rename = "graphql")]
     GraphQl,
 }
 
@@ -347,6 +348,15 @@ mod tests {
     fn literal_numeric_prefixes_stay_literal() {
         // A version prefix is literal; only standalone numeric ids collapse.
         assert_eq!(path_signature("/v1/users/42"), "/v1/users/{}");
+    }
+
+    #[test]
+    fn protocol_serde_matches_as_str() {
+        for p in [Protocol::Rest, Protocol::Grpc, Protocol::GraphQl] {
+            let json = serde_json::to_string(&p).unwrap();
+            assert_eq!(json, format!("\"{}\"", p.as_str()));
+            assert_eq!(serde_json::from_str::<Protocol>(&json).unwrap(), p);
+        }
     }
 
     #[test]
