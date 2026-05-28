@@ -563,6 +563,41 @@ impl SqliteStore {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// The induced subgraph over `ids`: those nodes plus every edge whose both
+    /// endpoints are in the set. Used to render a focused impact subgraph.
+    pub fn subgraph(&self, ids: &[String]) -> Result<(Vec<Node>, Vec<Edge>)> {
+        if ids.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let ph = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let nsql = format!("SELECT * FROM nodes WHERE id IN ({ph})");
+        let mut nstmt = self.conn.prepare(&nsql)?;
+        let nodes: Vec<Node> = nstmt
+            .query_map(rusqlite::params_from_iter(ids), Self::row_to_node)?
+            .collect::<rusqlite::Result<_>>()?;
+        let esql = format!(
+            "SELECT src, dst, kind, confidence FROM edges
+             WHERE src IN ({ph}) AND dst IN ({ph})"
+        );
+        let mut estmt = self.conn.prepare(&esql)?;
+        let edges: Vec<Edge> = estmt
+            .query_map(
+                rusqlite::params_from_iter(ids.iter().chain(ids.iter())),
+                |r| {
+                    Ok(Edge {
+                        src: NodeId(r.get(0)?),
+                        dst: NodeId(r.get(1)?),
+                        kind: parse_edge_kind(&r.get::<_, String>(2)?),
+                        confidence: parse_conf(&r.get::<_, String>(3)?),
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok((nodes, edges))
+    }
+
     /// Drop edges whose endpoints no longer exist (e.g. after a symbol was removed).
     pub fn prune_dangling_edges(&mut self) -> Result<usize> {
         let n = self.conn.execute(

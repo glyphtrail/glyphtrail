@@ -57,6 +57,15 @@ enum Command {
         output: PathBuf,
         #[arg(long, default_value_t = 2000)]
         limit: usize,
+        /// Highlight the impact blast radius of this seed symbol.
+        #[arg(long)]
+        impact: Option<String>,
+        /// With --impact, include cross-boundary consumers.
+        #[arg(long)]
+        cross_boundary: bool,
+        /// With --impact, max traversal depth.
+        #[arg(long, default_value_t = 5)]
+        depth: usize,
     },
     /// Serve an interactive graph explorer over HTTP.
     Serve {
@@ -126,7 +135,17 @@ fn main() -> anyhow::Result<()> {
             repo,
             output,
             limit,
-        } => commands::viz::run(&repo, &output, limit),
+            impact,
+            cross_boundary,
+            depth,
+        } => commands::viz::run(
+            &repo,
+            &output,
+            limit,
+            impact.as_deref(),
+            cross_boundary,
+            depth,
+        ),
         Command::Serve { repo, port } => commands::serve::run(&repo, port),
         Command::Impact(args) => commands::impact::run(args),
         Command::Mcp { repo } => meridian_mcp::serve_stdio(repo),
