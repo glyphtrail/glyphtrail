@@ -41,6 +41,13 @@ enum Command {
         /// Emit JSON instead of text.
         #[arg(long)]
         json: bool,
+        /// Query every repository in the global registry, tagging each result.
+        #[arg(long)]
+        all: bool,
+        /// Query the named registered repositories (comma-separated), tagging
+        /// each result. Overrides `--repo`.
+        #[arg(long, value_delimiter = ',')]
+        repos: Option<Vec<String>>,
     },
     /// Export a self-contained interactive graph.html.
     Viz {
@@ -100,7 +107,19 @@ fn main() -> anyhow::Result<()> {
                 commands::analyze::run(&path, update)
             }
         }
-        Command::Query { query, repo, json } => commands::query::run(&repo, query, json),
+        Command::Query {
+            query,
+            repo,
+            json,
+            all,
+            repos,
+        } => {
+            if all || repos.is_some() {
+                commands::query::run_registry(query, json, all, repos)
+            } else {
+                commands::query::run(&repo, query, json)
+            }
+        }
         Command::Viz {
             repo,
             output,
