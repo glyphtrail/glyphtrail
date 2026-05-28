@@ -11,9 +11,10 @@ members = [
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/sunsided/codegraph"
+edition = "2024"
+license = "EUPL-1.2"
+rust-version = "1.95"
+repository = "https://github.com/sunsided/meridian"
 
 [workspace.dependencies]
 meridian-core = { path = "crates/meridian-core" }

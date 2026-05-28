@@ -8,11 +8,14 @@ vars:
   PORT: '{{ .PORT | default "7700" }}'
 
 tasks:
+  # Lists all available tasks. Default entry point when running `task` with no arguments.
   default:
     cmds:
       - task --list --sort=none
     silent: true
 
+  # Compiles all crates and targets in the workspace.
+  # Override profile: `task build PROFILE=release`
   build:
     desc: Build the workspace (PROFILE=debug|release)
     preconditions:
@@ -21,12 +24,15 @@ tasks:
     cmds:
       - cargo build --workspace --all-targets {{.PROFILE_FLAG}}
 
+  # Shorthand for `task build PROFILE=release`.
   build:release:
     desc: Build the workspace in release mode
     cmds:
       - task: build
         vars: {PROFILE: release}
 
+  # Runs the CLI binary via `cargo run`. Pass subcommands and flags after `--`.
+  # Example: `task run -- analyze ./my-repo`
   run:
     desc: Run the Meridian CLI (pass args after --)
     preconditions:
@@ -35,6 +41,8 @@ tasks:
     cmds:
       - cargo run -p meridian-cli {{.PROFILE_FLAG}} -- {{.CLI_ARGS}}
 
+  # Indexes a repository and writes the graph to `.meridian/`.
+  # Override target: `task analyze TARGET=/path/to/repo`
   analyze:
     desc: Analyze a repo path (defaults to current directory)
     vars:
@@ -42,16 +50,21 @@ tasks:
     cmds:
       - cargo run -p meridian-cli {{.PROFILE_FLAG}} -- analyze {{.TARGET}} {{.CLI_ARGS}}
 
+  # Queries the graph index. Requires a prior `task analyze` run.
+  # Example: `task query -- def main`
   query:
     desc: 'Query the graph (pass args after --, e.g. task query -- def main)'
     cmds:
       - cargo run -p meridian-cli {{.PROFILE_FLAG}} -- query {{.CLI_ARGS}}
 
+  # Starts the HTTP graph explorer. Override port: `task serve PORT=8080`
   serve:
     desc: Start the interactive graph explorer on PORT (default 7700)
     cmds:
       - cargo run -p meridian-cli {{.PROFILE_FLAG}} -- serve --port {{.PORT}} {{.CLI_ARGS}}
 
+  # Renders the graph as a single portable HTML file.
+  # Override output path: `task viz OUT=out/graph.html`
   viz:
     desc: Generate a self-contained graph.html
     vars:
@@ -59,11 +72,16 @@ tasks:
     cmds:
       - cargo run -p meridian-cli {{.PROFILE_FLAG}} -- viz --output {{.OUT}} {{.CLI_ARGS}}
 
+  # Prints node/edge counts and index metadata for the current `.meridian/` index.
   status:
     desc: Show index statistics
+    aliases:
+      - stats
     cmds:
       - cargo run -p meridian-cli {{.PROFILE_FLAG}} -- status {{.CLI_ARGS}}
 
+  # Emits a shell completion script to stdout.
+  # Override shell: `task completions SHELL_KIND=zsh`
   completions:
     desc: 'Generate a shell completion script (SHELL_KIND=bash|zsh|fish|powershell|elvish)'
     vars:
@@ -71,6 +89,7 @@ tasks:
     cmds:
       - cargo run -p meridian-cli {{.PROFILE_FLAG}} -- completions {{.SHELL_KIND}}
 
+  # Runs all unit and integration tests across the workspace.
   test:
     desc: Run the workspace test suite
     preconditions:
@@ -79,6 +98,7 @@ tasks:
     cmds:
       - cargo test --workspace {{.PROFILE_FLAG}} {{.CLI_ARGS}}
 
+  # Formats all Rust source files in place.
   fmt:
     desc: Format all code with rustfmt
     aliases: [format]
@@ -88,11 +108,13 @@ tasks:
     cmds:
       - cargo fmt --all
 
+  # Checks formatting without modifying files. Used in CI.
   fmt:check:
     desc: Check formatting without writing changes
     cmds:
       - cargo fmt --all -- --check
 
+  # Runs Clippy with `-D warnings` so any lint is a hard failure.
   lint:
     desc: Run clippy (read-only, deny warnings)
     preconditions:
@@ -101,27 +123,32 @@ tasks:
     cmds:
       - cargo clippy --workspace --all-targets -- -D warnings
 
+  # Applies Clippy's auto-fixable suggestions. Works on dirty/staged trees.
   lint:fix:
     desc: Run clippy with automatic fixes
     aliases: [fix]
     cmds:
       - cargo clippy --workspace --all-targets --fix --allow-dirty --allow-staged -- -D warnings
 
+  # Runs criterion benchmarks. Pass a filter via CLI_ARGS to target specific benches.
   bench:
     desc: Run benchmarks
     cmds:
       - cargo bench --workspace {{.CLI_ARGS}}
 
+  # Builds rustdoc for all crates, excluding their dependencies.
   docs:
     desc: Build crate documentation
     cmds:
       - cargo doc --workspace --no-deps {{.CLI_ARGS}}
 
+  # Builds rustdoc and opens it in the default browser.
   docs:open:
     desc: Build and open crate documentation
     cmds:
       - cargo doc --workspace --no-deps --open
 
+  # Runs fmt:check, lint, and cargo check in sequence. Use before committing.
   check:
     desc: Static checks — fmt, clippy, cargo check
     cmds:
@@ -129,12 +156,14 @@ tasks:
       - task: lint
       - cargo check --workspace --all-targets
 
+  # Full pre-merge gate: static checks followed by the full test suite.
   ci:
     desc: Full CI sequence (check + test)
     cmds:
       - task: check
       - task: test
 
+  # Deletes the `target/` directory. Skipped automatically if `target/` does not exist.
   clean:
     desc: Remove Cargo build output
     status:
@@ -142,12 +171,14 @@ tasks:
     cmds:
       - cargo clean
 
+  # Removes the `.meridian/` index. Prompts for confirmation before deleting.
   clean:index:
     desc: Remove the local .meridian index directory
     prompt: "Delete .meridian/ (local graph index)?"
     cmds:
       - rm -rf .meridian
 
+  # Removes the generated `graph.html` visualization file.
   clean:viz:
     desc: Remove generated graph.html
     cmds:
