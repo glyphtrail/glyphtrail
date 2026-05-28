@@ -9,7 +9,9 @@ use meridian_core::{
 };
 use meridian_parse::{
     PendingEdge, build_client_graph, build_file_graph, build_rest_graph, parse_source,
+    resolve_import,
 };
+use std::collections::HashSet;
 
 use crate::commands::schema;
 use ignore::WalkBuilder;
@@ -119,6 +121,8 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
     let mut operations: Vec<(NodeId, OperationKey)> = Vec::new();
     // (handler name, endpoint id) HANDLES links resolved against the global index.
     let mut pending_handlers: Vec<(String, NodeId)> = Vec::new();
+    // (importer rel-path, raw import, language name) resolved against the file set.
+    let mut imports: Vec<(String, String, String)> = Vec::new();
 
     for f in &changed {
         if update {
@@ -165,6 +169,11 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
                 }
                 graph.extend(fg.graph);
                 pending.extend(fg.pending);
+                imports.extend(
+                    fg.imports
+                        .into_iter()
+                        .map(|raw| (f.rel_path.clone(), raw, f.language.name().to_string())),
+                );
             }
             Err(e) => tracing::warn!("parse failed for {}: {e}", f.rel_path),
         }
@@ -187,6 +196,7 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
         .collect();
     store.insert_graph(&graph.nodes, &extracted)?;
     store.insert_operations(&operations)?;
+    store.insert_imports(&imports)?;
 
     // Persist this run's unresolved cross-file edges, then re-resolve *all*
     // persisted pending edges against the current global index. Stale pending
@@ -245,6 +255,53 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
         .collect();
     store.insert_graph(&[], &inferred)?;
 
+    // Rebuild IMPORTS edges from the persisted import set, resolving each to a
+    // real file node where determinable (exact path, then unique path-suffix)
+    // and falling back to a module placeholder otherwise. Rebuilt globally each
+    // run -- against the freshly discovered file set -- so imports in unchanged
+    // files pick up files added or removed elsewhere (#18).
+    store.delete_edges_by_kind(EdgeKind::Imports)?;
+    let file_rels: Vec<String> = files.iter().map(|f| f.rel_path.clone()).collect();
+    let file_set: HashSet<&str> = file_rels.iter().map(|s| s.as_str()).collect();
+    let mut import_nodes: Vec<Node> = Vec::new();
+    let mut import_edges: Vec<Edge> = Vec::new();
+    for (importer, raw, lang_name) in store.all_imports()? {
+        let importer_id = NodeId::derive(&["file", &importer]);
+        let target = Language::ALL
+            .into_iter()
+            .find(|l| l.name() == lang_name)
+            .map(|l| resolve_import(&importer, &raw, l))
+            .and_then(|cands| resolve_target(&cands, &file_rels, &file_set));
+        match target {
+            Some(rel) => import_edges.push(Edge {
+                src: importer_id,
+                dst: NodeId::derive(&["file", &rel]),
+                kind: EdgeKind::Imports,
+                confidence: Confidence::Inferred,
+            }),
+            None => {
+                let mod_id = NodeId::derive(&["module", &raw]);
+                import_nodes.push(Node {
+                    id: mod_id.clone(),
+                    kind: NodeKind::Module,
+                    name: raw.clone(),
+                    qualified_name: raw.clone(),
+                    file: String::new(),
+                    language: None,
+                    span: None,
+                    doc: None,
+                });
+                import_edges.push(Edge {
+                    src: importer_id,
+                    dst: mod_id,
+                    kind: EdgeKind::Imports,
+                    confidence: Confidence::Extracted,
+                });
+            }
+        }
+    }
+    store.insert_graph(&import_nodes, &import_edges)?;
+
     // Cross-boundary linking: resolve client calls and schema operations
     // against the endpoints, through the same rewrite-aware matcher. Runs over
     // the full store (endpoints, calls and schema ops commonly live in
@@ -299,6 +356,29 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
         stats.files, stats.nodes, stats.edges
     );
     Ok(())
+}
+
+/// Pick the repository file an import resolves to: an exact path match first,
+/// then a *unique* path-suffix match (so source roots like `src/` resolve),
+/// else `None`. Ambiguous suffix matches are left unresolved on purpose.
+fn resolve_target(
+    candidates: &[String],
+    files: &[String],
+    file_set: &HashSet<&str>,
+) -> Option<String> {
+    for c in candidates {
+        if file_set.contains(c.as_str()) {
+            return Some(c.clone());
+        }
+    }
+    for c in candidates {
+        let suffix = format!("/{c}");
+        let mut hits = files.iter().filter(|f| f.ends_with(&suffix));
+        if let (Some(f), None) = (hits.next(), hits.next()) {
+            return Some(f.clone());
+        }
+    }
+    None
 }
 
 /// Read the configured REST schema artifacts and add a `SchemaOp` node (with
@@ -432,6 +512,76 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "use_it should have no outgoing Calls edge after foo was removed"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Outgoing IMPORTS neighbours of a file, as (qualified_name, kind).
+    fn import_targets(dir: &Path, importer_rel: &str) -> Vec<(String, String)> {
+        let store = SqliteStore::open(&RepoPaths::new(dir).db_path).unwrap();
+        let id = NodeId::derive(&["file", importer_rel]);
+        store
+            .neighbors(&id.0, Some(EdgeKind::Imports), true)
+            .unwrap()
+            .into_iter()
+            .map(|(n, _, _)| (n.qualified_name, n.kind.as_str().to_string()))
+            .collect()
+    }
+
+    // #18: a relative import resolves to the real target file node, not a
+    // module placeholder.
+    #[test]
+    fn relative_import_resolves_to_real_file_node() {
+        let dir = temp_repo("import-resolve");
+        std::fs::create_dir_all(dir.join("web")).unwrap();
+        std::fs::write(dir.join("web/app.ts"), "import { x } from \"./util\";\n").unwrap();
+        std::fs::write(dir.join("web/util.ts"), "export const x = 1;\n").unwrap();
+        std::fs::write(dir.join("web/ext.ts"), "import \"react\";\n").unwrap();
+        run(&dir, false).unwrap();
+
+        let targets = import_targets(&dir, "web/app.ts");
+        assert!(
+            targets.contains(&("web/util.ts".to_string(), "file".to_string())),
+            "expected app.ts -> web/util.ts (file), got {targets:?}"
+        );
+        // A bare specifier stays a module placeholder.
+        let ext = import_targets(&dir, "web/ext.ts");
+        assert!(
+            ext.iter().any(|(n, k)| n == "react" && k == "module"),
+            "expected react to remain a module placeholder, got {ext:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // #18 + #20: an unresolved import in an *unchanged* file resolves once its
+    // target file is added on a later `--update`.
+    #[test]
+    fn update_resolves_import_after_target_file_added() {
+        let dir = temp_repo("import-add");
+        std::fs::create_dir_all(dir.join("web")).unwrap();
+        std::fs::write(dir.join("web/app.ts"), "import { x } from \"./util\";\n").unwrap();
+        run(&dir, false).unwrap();
+        // No util.ts yet: the import is a placeholder module.
+        assert!(
+            import_targets(&dir, "web/app.ts")
+                .iter()
+                .any(|(n, k)| n == "./util" && k == "module"),
+            "expected unresolved placeholder before the target exists"
+        );
+
+        // Add the target; app.ts is unchanged, so only the global rebuild links it.
+        std::fs::write(dir.join("web/util.ts"), "export const x = 1;\n").unwrap();
+        run(&dir, true).unwrap();
+        let targets = import_targets(&dir, "web/app.ts");
+        assert!(
+            targets.contains(&("web/util.ts".to_string(), "file".to_string())),
+            "expected app.ts -> web/util.ts after --update, got {targets:?}"
+        );
+        assert!(
+            !targets.iter().any(|(n, _)| n == "./util"),
+            "stale ./util placeholder edge should be gone, got {targets:?}"
         );
 
         std::fs::remove_dir_all(&dir).ok();

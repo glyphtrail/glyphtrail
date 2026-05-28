@@ -29,6 +29,9 @@ pub struct FileGraph {
     pub graph: CodeGraph,
     pub symbols: Vec<SymbolEntry>,
     pub pending: Vec<PendingEdge>,
+    /// Raw import targets (cleaned of quotes/brackets) for this file, resolved
+    /// to real file/module nodes by the global pass in `analyze`.
+    pub imports: Vec<String>,
 }
 
 /// Server-side API surface extracted from a router file: `Endpoint` nodes,
@@ -365,27 +368,10 @@ pub fn build_file_graph(
         }
     }
 
-    // Imports recorded on the file node as IMPORTS edges to module placeholders.
-    for imp in &parsed.imports {
-        let mod_id = NodeId::derive(&["module", imp]);
-        // Only add the module node once per import name; duplicates are merged on store.
-        fg.graph.add_node(Node {
-            id: mod_id.clone(),
-            kind: NodeKind::Module,
-            name: imp.clone(),
-            qualified_name: imp.clone(),
-            file: String::new(),
-            language: None,
-            span: None,
-            doc: None,
-        });
-        fg.graph.add_edge(
-            file_id.clone(),
-            mod_id,
-            EdgeKind::Imports,
-            Confidence::Extracted,
-        );
-    }
+    // Imports are resolved globally (against the whole file set) in `analyze`,
+    // so they can point at real file/module targets and stay correct under
+    // incremental updates. Record the raw targets here.
+    fg.imports.extend(parsed.imports.iter().cloned());
 
     // Design-rationale comments become first-class nodes linked to their scope.
     for c in &parsed.comments {
