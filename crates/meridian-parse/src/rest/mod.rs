@@ -2,6 +2,7 @@
 
 pub mod axum;
 pub mod express;
+pub mod flask;
 pub mod gin;
 pub mod spring;
 mod ts;
@@ -11,6 +12,7 @@ use meridian_core::{HttpMethod, Language, Span};
 
 pub use axum::{extract_axum, extract_axum_mounts};
 pub use express::{extract_express, extract_express_mounts};
+pub use flask::{extract_flask, extract_flask_mounts};
 pub use gin::{extract_gin, extract_gin_mounts};
 pub use spring::{extract_spring, extract_spring_mounts};
 pub use utoipa::{extract_utoipa, extract_utoipa_mounts};
@@ -114,6 +116,22 @@ impl RestServerExtractor for GinExtractor {
     }
 }
 
+struct FlaskExtractor;
+impl RestServerExtractor for FlaskExtractor {
+    fn name(&self) -> &'static str {
+        "flask"
+    }
+    fn language(&self) -> Language {
+        Language::Python
+    }
+    fn endpoints(&self, source: &str) -> Vec<RawEndpoint> {
+        extract_flask(source)
+    }
+    fn mounts(&self, source: &str) -> Vec<RawMount> {
+        extract_flask_mounts(source)
+    }
+}
+
 /// Express applies to JS, TS and TSX; the bound language selects the grammar.
 struct ExpressExtractor(Language);
 impl RestServerExtractor for ExpressExtractor {
@@ -139,6 +157,7 @@ pub fn registry() -> Vec<Box<dyn RestServerExtractor>> {
         Box::new(UtoipaExtractor),
         Box::new(SpringExtractor),
         Box::new(GinExtractor),
+        Box::new(FlaskExtractor),
         Box::new(ExpressExtractor(Language::JavaScript)),
         Box::new(ExpressExtractor(Language::TypeScript)),
         Box::new(ExpressExtractor(Language::Tsx)),
@@ -160,7 +179,13 @@ mod tests {
     #[test]
     fn registry_filters_by_language() {
         assert_eq!(extractors_for(Language::Rust).len(), 2);
-        assert!(extractors_for(Language::Python).is_empty());
+        assert_eq!(
+            extractors_for(Language::Python)
+                .iter()
+                .map(|e| e.name())
+                .collect::<Vec<_>>(),
+            ["flask"]
+        );
         let rust: Vec<_> = extractors_for(Language::Rust)
             .iter()
             .map(|e| e.name())
