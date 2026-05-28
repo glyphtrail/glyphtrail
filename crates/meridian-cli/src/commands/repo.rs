@@ -2,8 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Subcommand;
-use meridian_core::config::RepoPaths;
-use meridian_core::{Registry, default_registry_path};
+use meridian_core::{Registry, RepoHealth, default_registry_path};
 
 #[derive(Subcommand)]
 pub enum RepoCmd {
@@ -16,10 +15,16 @@ pub enum RepoCmd {
         #[arg(long)]
         name: Option<String>,
     },
-    /// List registered repositories.
+    /// List registered repositories and their health.
     List,
     /// Remove a repository from the registry by name.
     Remove { name: String },
+    /// Drop registry entries whose root has been missing for too long.
+    Prune {
+        /// Minimum age (in days) a missing entry must reach before removal.
+        #[arg(long, default_value_t = 30)]
+        older_than_days: u64,
+    },
 }
 
 fn registry_path() -> Result<PathBuf> {
@@ -39,16 +44,27 @@ pub fn status_all() -> Result<()> {
 }
 
 /// Run `op` over every registered repo, printing a per-repo header and a final
-/// success/failure summary.
+/// summary. Entries whose root is missing are skipped (not failed) so a single
+/// moved/deleted repo doesn't drown the run in errors; their `missing_since`
+/// stamp is refreshed and persisted for later `repo prune`.
 fn each_repo(verb: &str, op: impl Fn(&std::path::Path) -> Result<()>) -> Result<()> {
-    let registry = Registry::load(&registry_path()?)?;
+    let path = registry_path()?;
+    let mut registry = Registry::load(&path)?;
     if registry.repos.is_empty() {
         println!("(no repositories registered; use `meridian repo add`)");
         return Ok(());
     }
-    let (mut ok, mut failed) = (0u32, 0u32);
+    if registry.refresh_health() {
+        registry.save(&path)?;
+    }
+    let (mut ok, mut failed, mut skipped) = (0u32, 0u32, 0u32);
     for e in &registry.repos {
         println!("== {} ({}) ==", e.name, e.root.display());
+        if e.health() == RepoHealth::Missing {
+            skipped += 1;
+            println!("  skipped: root is missing");
+            continue;
+        }
         match op(&e.root) {
             Ok(()) => ok += 1,
             Err(err) => {
@@ -57,7 +73,7 @@ fn each_repo(verb: &str, op: impl Fn(&std::path::Path) -> Result<()>) -> Result<
             }
         }
     }
-    println!("{verb}: {ok} ok, {failed} failed");
+    println!("{verb}: {ok} ok, {failed} failed, {skipped} skipped");
     Ok(())
 }
 
@@ -85,17 +101,21 @@ pub fn run(cmd: RepoCmd) -> Result<()> {
             );
         }
         RepoCmd::List => {
+            if registry.refresh_health() {
+                registry.save(&path)?;
+            }
             if registry.repos.is_empty() {
                 println!("(no repositories registered)");
             }
             for e in &registry.repos {
-                let indexed = RepoPaths::new(&e.root).db_path.exists();
-                println!(
-                    "{:<20} {}{}",
-                    e.name,
-                    e.root.display(),
-                    if indexed { "" } else { "  (not indexed)" }
-                );
+                let note = match e.health() {
+                    RepoHealth::Indexed => String::new(),
+                    RepoHealth::Unindexed => "  (not indexed)".into(),
+                    RepoHealth::Missing => {
+                        format!("  (missing{})", missing_for(e.missing_since))
+                    }
+                };
+                println!("{:<20} {}{}", e.name, e.root.display(), note);
             }
         }
         RepoCmd::Remove { name } => {
@@ -106,6 +126,32 @@ pub fn run(cmd: RepoCmd) -> Result<()> {
                 bail!("no repository named '{name}' in the registry");
             }
         }
+        RepoCmd::Prune { older_than_days } => {
+            registry.refresh_health();
+            let removed = registry.prune_missing(older_than_days as i64 * 86_400);
+            registry.save(&path)?;
+            if removed.is_empty() {
+                println!("nothing to prune (no entry missing for >= {older_than_days}d)");
+            } else {
+                for name in &removed {
+                    println!("pruned '{name}'");
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// Render how long an entry has been missing, e.g. ` for 5d`. Empty when the
+/// stamp is absent (just observed missing this run).
+fn missing_for(missing_since: Option<i64>) -> String {
+    let Some(since) = missing_since else {
+        return String::new();
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(since);
+    let days = (now - since).max(0) / 86_400;
+    format!(" for {days}d")
 }
