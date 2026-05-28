@@ -1,8 +1,8 @@
 //! API schema ingestion: parse blessed schema artifacts into the operations
 //! they declare, for reconciliation against code endpoints.
 //!
-//! Supports OpenAPI (Swagger 2.0 / OpenAPI 3.x) in JSON or YAML form and gRPC
-//! `.proto` service definitions. GraphQL SDL is a follow-up.
+//! Supports OpenAPI (Swagger 2.0 / OpenAPI 3.x) in JSON or YAML form, gRPC
+//! `.proto` service definitions, and GraphQL SDL root operations.
 
 use meridian_core::HttpMethod;
 use serde_json::Value;
@@ -77,6 +77,43 @@ pub fn proto_grpc_operations(text: &str) -> Vec<String> {
                 format!("{package}.{svc}")
             };
             out.push(format!("{prefix}/{method}"));
+        }
+    }
+    out
+}
+
+/// Parse a GraphQL SDL document into the root operations it declares, as
+/// `Query.field` / `Mutation.field` / `Subscription.field`. Best-effort line
+/// scanner: enters a root operation type (`type Query { … }`, optionally
+/// `extend`ed) and takes each field's leading identifier. Object-type fields
+/// don't open braces (args use `()`), so the type's own `}` ends the block.
+pub fn graphql_operations(text: &str) -> Vec<String> {
+    const ROOTS: [&str; 3] = ["Query", "Mutation", "Subscription"];
+    let mut out = Vec::new();
+    let mut current: Option<&'static str> = None;
+    for raw in text.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        match current {
+            None => {
+                let after = line.strip_prefix("extend ").unwrap_or(line);
+                if let Some(rest) = after.strip_prefix("type ")
+                    && let Some(name) = first_ident(rest)
+                    && line.contains('{')
+                    && let Some(root) = ROOTS.iter().find(|r| **r == name)
+                {
+                    current = Some(root);
+                }
+            }
+            Some(root) => {
+                if line.starts_with('}') {
+                    current = None;
+                } else if let Some(field) = first_ident(line) {
+                    out.push(format!("{root}.{field}"));
+                }
+            }
         }
     }
     out
@@ -191,6 +228,39 @@ service AdminService {
     fn proto_without_package_uses_bare_service() {
         let proto = "service S {\n  rpc M(A) returns (B);\n}\n";
         assert_eq!(proto_grpc_operations(proto), vec!["S/M"]);
+    }
+
+    #[test]
+    fn graphql_root_fields_become_operations() {
+        let sdl = r#"
+type User { id: ID! name: String }
+
+type Query {
+  # the current user
+  me: User
+  user(id: ID!): User
+}
+
+type Mutation {
+  createUser(name: String!): User
+}
+"#;
+        let ops = graphql_operations(sdl);
+        assert!(ops.contains(&"Query.me".to_string()));
+        assert!(ops.contains(&"Query.user".to_string()));
+        assert!(ops.contains(&"Mutation.createUser".to_string()));
+        // The non-root `User` type's fields are not operations.
+        assert!(
+            !ops.iter()
+                .any(|o| o.ends_with(".id") || o.ends_with(".name"))
+        );
+        assert_eq!(ops.len(), 3);
+    }
+
+    #[test]
+    fn graphql_extend_query_is_recognized() {
+        let sdl = "extend type Query {\n  health: Boolean\n}\n";
+        assert_eq!(graphql_operations(sdl), vec!["Query.health"]);
     }
 
     #[test]
