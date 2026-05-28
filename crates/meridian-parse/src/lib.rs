@@ -71,6 +71,7 @@ mod tests {
             (Language::C, "void f() {}"),
             (Language::Cpp, "void f() {}"),
             (Language::CSharp, "class C { void f() {} }"),
+            (Language::Ruby, "def f\nend\n"),
         ];
         for (lang, src) in cases {
             let parsed = parse_source(&lang, src)

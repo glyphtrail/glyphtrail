@@ -62,7 +62,7 @@ meridian status
 ## Languages
 
 Coverage is driven by a tree-sitter grammar registry. Built in:
-Rust, Python, JavaScript, TypeScript/TSX, Go, Java, C, C++, C#. Adding a built-in
+Rust, Python, JavaScript, TypeScript/TSX, Go, Java, C, C++, C#, Ruby. Adding a built-in
 language is a grammar in `meridian-parse/src/registry.rs` plus a query file under
 `meridian-parse/queries/`.
 
