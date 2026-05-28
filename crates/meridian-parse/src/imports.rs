@@ -17,7 +17,7 @@ const JS_EXTS: [&str; 7] = [".ts", ".tsx", ".d.ts", ".js", ".jsx", ".mjs", ".cjs
 
 /// Candidate repository-relative paths an import may resolve to, best-first.
 /// Empty when the import is not locally resolvable.
-pub fn resolve_import(importer_rel: &str, raw: &str, lang: Language) -> Vec<String> {
+pub fn resolve_import(importer_rel: &str, raw: &str, lang: &Language) -> Vec<String> {
     let raw = raw.trim();
     if raw.is_empty() {
         return Vec::new();
@@ -31,7 +31,7 @@ pub fn resolve_import(importer_rel: &str, raw: &str, lang: Language) -> Vec<Stri
         Language::Java => java_candidates(raw),
         // Go import paths, Rust `use` paths and C# `using` namespaces need
         // project/module metadata, so they aren't resolved to files here.
-        Language::Go | Language::Rust | Language::CSharp => Vec::new(),
+        Language::Go | Language::Rust | Language::CSharp | Language::Other(_) => Vec::new(),
     }
 }
 
@@ -126,47 +126,49 @@ mod tests {
 
     #[test]
     fn js_relative_resolves_with_extensions_and_index() {
-        let c = resolve_import("web/app.ts", "./util", Language::TypeScript);
+        let c = resolve_import("web/app.ts", "./util", &Language::TypeScript);
         check!(c.contains(&"web/util.ts".to_string()));
         check!(c.contains(&"web/util/index.ts".to_string()));
         // Parent traversal.
-        let c = resolve_import("web/sub/app.ts", "../util", Language::TypeScript);
+        let c = resolve_import("web/sub/app.ts", "../util", &Language::TypeScript);
         check!(c.contains(&"web/util.ts".to_string()));
     }
 
     #[test]
     fn js_bare_specifier_is_external() {
-        check!(resolve_import("web/app.ts", "react", Language::TypeScript).is_empty());
-        check!(resolve_import("web/app.ts", "@scope/pkg", Language::Tsx).is_empty());
+        check!(resolve_import("web/app.ts", "react", &Language::TypeScript).is_empty());
+        check!(resolve_import("web/app.ts", "@scope/pkg", &Language::Tsx).is_empty());
     }
 
     #[test]
     fn js_escaping_root_yields_nothing() {
-        check!(resolve_import("app.ts", "../../x", Language::JavaScript).is_empty());
+        check!(resolve_import("app.ts", "../../x", &Language::JavaScript).is_empty());
     }
 
     #[test]
     fn c_include_tries_local_and_root() {
-        let c = resolve_import("src/a.c", "util.h", Language::C);
+        let c = resolve_import("src/a.c", "util.h", &Language::C);
         check!(c.contains(&"src/util.h".to_string()));
         check!(c.contains(&"util.h".to_string()));
     }
 
     #[test]
     fn python_dotted_maps_to_module_or_package() {
-        let c = resolve_import("app/main.py", "app.models", Language::Python);
+        let c = resolve_import("app/main.py", "app.models", &Language::Python);
         check!(c == vec!["app/models.py", "app/models/__init__.py"]);
     }
 
     #[test]
     fn java_fqn_maps_to_path_but_not_wildcard() {
-        check!(resolve_import("X.java", "com.foo.Bar", Language::Java) == vec!["com/foo/Bar.java"]);
-        check!(resolve_import("X.java", "com.foo.*", Language::Java).is_empty());
+        check!(
+            resolve_import("X.java", "com.foo.Bar", &Language::Java) == vec!["com/foo/Bar.java"]
+        );
+        check!(resolve_import("X.java", "com.foo.*", &Language::Java).is_empty());
     }
 
     #[test]
     fn go_and_rust_are_not_locally_resolved() {
-        check!(resolve_import("m.go", "github.com/x/y", Language::Go).is_empty());
-        check!(resolve_import("m.rs", "crate::a::b", Language::Rust).is_empty());
+        check!(resolve_import("m.go", "github.com/x/y", &Language::Go).is_empty());
+        check!(resolve_import("m.rs", "crate::a::b", &Language::Rust).is_empty());
     }
 }

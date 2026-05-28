@@ -45,7 +45,7 @@ pub fn extract_aspnet_mounts(_source: &str) -> Vec<RawMount> {
 fn parse(source: &str) -> Option<Tree> {
     let mut parser = Parser::new();
     parser
-        .set_language(&registry::grammar(Language::CSharp))
+        .set_language(&registry::grammar(&Language::CSharp).expect("built-in grammar"))
         .ok()?;
     parser.parse(source, None)
 }

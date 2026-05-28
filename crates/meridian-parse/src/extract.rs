@@ -69,8 +69,14 @@ fn clean_import(raw: &str) -> String {
 }
 
 /// Parse `source` and extract raw definitions, calls, imports, bases and comments.
-pub fn parse_source(lang: Language, source: &str) -> anyhow::Result<ParsedFile> {
-    parse_with(&grammar(lang), query_source(lang), source)
+pub fn parse_source(lang: &Language, source: &str) -> anyhow::Result<ParsedFile> {
+    let (Some(grammar), Some(query)) = (grammar(lang), query_source(lang)) else {
+        anyhow::bail!(
+            "no built-in grammar for language '{}'; use parse_with with a loaded grammar",
+            lang.name()
+        );
+    };
+    parse_with(&grammar, query, source)
 }
 
 /// Parse `source` with an explicit tree-sitter `grammar` and extraction

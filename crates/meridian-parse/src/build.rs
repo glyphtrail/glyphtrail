@@ -53,7 +53,7 @@ pub struct RestGraph {
 /// the same file. Languages with no registered extractor yield an empty graph.
 pub fn build_rest_graph(
     rel_path: &str,
-    lang: Language,
+    lang: &Language,
     symbols: &[SymbolEntry],
     source: &str,
 ) -> RestGraph {
@@ -139,7 +139,7 @@ pub struct ClientGraph {
 
 /// Build the client-call fragment for a JS/TS/TSX file. Each `fetch`/`axios`
 /// call becomes a `ClientCall` node carrying its `(method, path)` operation key.
-pub fn build_client_graph(rel_path: &str, source: &str, lang: Language) -> ClientGraph {
+pub fn build_client_graph(rel_path: &str, source: &str, lang: &Language) -> ClientGraph {
     let mut cg = ClientGraph::default();
     for call in extract_client_calls(source, lang) {
         let key = OperationKey::rest(call.method, &call.path);
@@ -238,7 +238,7 @@ impl crate::extract::RawComment {
 /// Build a file-scoped graph fragment from parsed items.
 pub fn build_file_graph(
     rel_path: &str,
-    lang: Language,
+    lang: &Language,
     file_id: &NodeId,
     parsed: &ParsedFile,
 ) -> FileGraph {

@@ -28,8 +28,8 @@ mod tests {
     #[test]
     fn all_queries_compile() {
         for lang in Language::ALL {
-            let grammar = registry::grammar(lang);
-            let src = registry::query_source(lang);
+            let grammar = registry::grammar(&lang).expect("built-in grammar");
+            let src = registry::query_source(&lang).expect("built-in query");
             Query::new(&grammar, src)
                 .unwrap_or_else(|e| panic!("query for {} failed: {e}", lang.name()));
         }
@@ -40,10 +40,10 @@ mod tests {
     #[test]
     fn parse_with_matches_parse_source_for_builtin() {
         let src = "fn helper() {}\nfn main() { helper(); }\n";
-        let via_lang = parse_source(Language::Rust, src).unwrap();
+        let via_lang = parse_source(&Language::Rust, src).unwrap();
         let via_grammar = parse_with(
-            &registry::grammar(Language::Rust),
-            registry::query_source(Language::Rust),
+            &registry::grammar(&Language::Rust).expect("built-in grammar"),
+            registry::query_source(&Language::Rust).expect("built-in query"),
             src,
         )
         .unwrap();
@@ -71,10 +71,10 @@ mod tests {
             (Language::CSharp, "class C { void f() {} }"),
         ];
         for (lang, src) in cases {
-            let parsed = parse_source(lang, src)
+            let parsed = parse_source(&lang, src)
                 .unwrap_or_else(|e| panic!("parse failed for {}: {e}", lang.name()));
             let file_id = NodeId::derive(&["file", "x"]);
-            let fg = build_file_graph("x", lang, &file_id, &parsed);
+            let fg = build_file_graph("x", &lang, &file_id, &parsed);
             check!(
                 fg.graph.nodes.iter().any(|n| n.name == "f"),
                 "{} should extract a definition named `f`, got {:?}",
@@ -93,7 +93,7 @@ fn main() {
     helper();
 }
 "#;
-        let parsed = parse_source(Language::Rust, src).unwrap();
+        let parsed = parse_source(&Language::Rust, src).unwrap();
         let names: Vec<_> = parsed.defs.iter().map(|d| d.name.as_str()).collect();
         check!(names.contains(&"helper"));
         check!(names.contains(&"main"));
@@ -121,7 +121,7 @@ fn main() {
             (Language::JavaScript, "function hi() {}\n", "hi"),
         ];
         for (lang, src, expect) in cases {
-            let parsed = parse_source(lang, src).unwrap();
+            let parsed = parse_source(&lang, src).unwrap();
             let names: Vec<_> = parsed.defs.iter().map(|d| d.name.as_str()).collect();
             check!(
                 names.contains(&expect),
@@ -143,9 +143,9 @@ class Service:
     def helper(self):
         pass
 "#;
-        let parsed = parse_source(Language::Python, src).unwrap();
+        let parsed = parse_source(&Language::Python, src).unwrap();
         let file_id = NodeId::derive(&["file", "svc.py"]);
-        let fg = build_file_graph("svc.py", Language::Python, &file_id, &parsed);
+        let fg = build_file_graph("svc.py", &Language::Python, &file_id, &parsed);
 
         // Methods nested in a class are reclassified from function to method.
         let handle = fg
@@ -184,10 +184,10 @@ fn app() -> Router {
     Router::new().route("/users", get(list))
 }
 "#;
-        let parsed = parse_source(Language::Rust, src).unwrap();
+        let parsed = parse_source(&Language::Rust, src).unwrap();
         let file_id = NodeId::derive(&["file", "r.rs"]);
-        let fg = build_file_graph("r.rs", Language::Rust, &file_id, &parsed);
-        let rg = build_rest_graph("r.rs", Language::Rust, &fg.symbols, src);
+        let fg = build_file_graph("r.rs", &Language::Rust, &file_id, &parsed);
+        let rg = build_rest_graph("r.rs", &Language::Rust, &fg.symbols, src);
 
         let ep = rg
             .graph
@@ -217,10 +217,10 @@ fn app() -> Router {
     Router::new().route("/users", get(handlers::list))
 }
 "#;
-        let parsed = parse_source(Language::Rust, src).unwrap();
+        let parsed = parse_source(&Language::Rust, src).unwrap();
         let file_id = NodeId::derive(&["file", "r.rs"]);
-        let fg = build_file_graph("r.rs", Language::Rust, &file_id, &parsed);
-        let rg = build_rest_graph("r.rs", Language::Rust, &fg.symbols, src);
+        let fg = build_file_graph("r.rs", &Language::Rust, &file_id, &parsed);
+        let rg = build_rest_graph("r.rs", &Language::Rust, &fg.symbols, src);
 
         let ep = rg
             .graph
@@ -250,10 +250,10 @@ fn app() -> Router {
     Router::new().nest("/api/users", users_router())
 }
 "#;
-        let parsed = parse_source(Language::Rust, src).unwrap();
+        let parsed = parse_source(&Language::Rust, src).unwrap();
         let file_id = NodeId::derive(&["file", "r.rs"]);
-        let fg = build_file_graph("r.rs", Language::Rust, &file_id, &parsed);
-        let rg = build_rest_graph("r.rs", Language::Rust, &fg.symbols, src);
+        let fg = build_file_graph("r.rs", &Language::Rust, &file_id, &parsed);
+        let rg = build_rest_graph("r.rs", &Language::Rust, &fg.symbols, src);
 
         let sym = |name: &str| {
             fg.symbols

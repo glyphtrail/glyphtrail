@@ -1,9 +1,11 @@
 use meridian_core::Language;
 use tree_sitter::Language as TsLanguage;
 
-/// Resolve a [`Language`] to its tree-sitter grammar.
-pub fn grammar(lang: Language) -> TsLanguage {
-    match lang {
+/// The compiled tree-sitter grammar for a built-in [`Language`], if any.
+/// `Language::Other` has no built-in grammar — it is supplied by the dynamic
+/// loader — so this returns `None` for it.
+pub fn grammar(lang: &Language) -> Option<TsLanguage> {
+    Some(match lang {
         Language::Rust => tree_sitter_rust::LANGUAGE.into(),
         Language::Python => tree_sitter_python::LANGUAGE.into(),
         Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
@@ -14,7 +16,8 @@ pub fn grammar(lang: Language) -> TsLanguage {
         Language::C => tree_sitter_c::LANGUAGE.into(),
         Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
         Language::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
-    }
+        Language::Other(_) => return None,
+    })
 }
 
 /// The extraction query for a language. Captures follow a small convention shared
@@ -24,8 +27,8 @@ pub fn grammar(lang: Language) -> TsLanguage {
 ///   `@import`                — an imported name or path
 ///   `@extends` / `@implements` — supertype identifiers
 ///   `@comment`               — a comment node (for rationale colocation)
-pub fn query_source(lang: Language) -> &'static str {
-    match lang {
+pub fn query_source(lang: &Language) -> Option<&'static str> {
+    Some(match lang {
         Language::Rust => include_str!("../queries/rust.scm"),
         Language::Python => include_str!("../queries/python.scm"),
         Language::JavaScript => include_str!("../queries/javascript.scm"),
@@ -36,5 +39,6 @@ pub fn query_source(lang: Language) -> &'static str {
         Language::C => include_str!("../queries/c.scm"),
         Language::Cpp => include_str!("../queries/cpp.scm"),
         Language::CSharp => include_str!("../queries/csharp.scm"),
-    }
+        Language::Other(_) => return None,
+    })
 }

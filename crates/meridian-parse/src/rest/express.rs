@@ -25,7 +25,7 @@ const VERBS: [&str; 7] = ["get", "post", "put", "delete", "patch", "head", "opti
 
 /// Extract Express routes from JS/TS/TSX `source`. Returns empty on parse
 /// failure or for other languages.
-pub fn extract_express(source: &str, lang: Language) -> Vec<RawEndpoint> {
+pub fn extract_express(source: &str, lang: &Language) -> Vec<RawEndpoint> {
     let Some(tree) = parse(source, lang) else {
         return Vec::new();
     };
@@ -42,11 +42,11 @@ pub fn extract_express(source: &str, lang: Language) -> Vec<RawEndpoint> {
 }
 
 /// Router mounting is a follow-up; no mounts are emitted.
-pub fn extract_express_mounts(_source: &str, _lang: Language) -> Vec<RawMount> {
+pub fn extract_express_mounts(_source: &str, _lang: &Language) -> Vec<RawMount> {
     Vec::new()
 }
 
-fn parse(source: &str, lang: Language) -> Option<Tree> {
+fn parse(source: &str, lang: &Language) -> Option<Tree> {
     if !matches!(
         lang,
         Language::JavaScript | Language::TypeScript | Language::Tsx
@@ -54,7 +54,9 @@ fn parse(source: &str, lang: Language) -> Option<Tree> {
         return None;
     }
     let mut parser = Parser::new();
-    parser.set_language(&registry::grammar(lang)).ok()?;
+    parser
+        .set_language(&registry::grammar(lang).expect("built-in grammar"))
+        .ok()?;
     parser.parse(source, None)
 }
 
@@ -162,7 +164,7 @@ app.use("/api", apiRouter);
 
     #[test]
     fn extracts_verbs_paths_and_handlers() {
-        let eps = extract_express(APP, Language::JavaScript);
+        let eps = extract_express(APP, &Language::JavaScript);
         check!(
             ep(&eps, HttpMethod::Get, "/users/:id").map(|e| e.handler.as_str()) == Some("getUser")
         );
@@ -180,7 +182,7 @@ app.use("/api", apiRouter);
 
     #[test]
     fn use_is_not_a_route() {
-        let eps = extract_express(APP, Language::JavaScript);
+        let eps = extract_express(APP, &Language::JavaScript);
         check!(eps.len() == 4);
     }
 
@@ -188,7 +190,7 @@ app.use("/api", apiRouter);
     fn axios_client_calls_are_not_routes() {
         // `.get(url)` and `.get(url, {config})` on axios have no handler arg.
         let src = "axios.get(\"/api/x\"); axios.get(\"/api/y\", { timeout: 5 });";
-        check!(extract_express(src, Language::TypeScript).is_empty());
+        check!(extract_express(src, &Language::TypeScript).is_empty());
     }
 
     #[test]
@@ -196,12 +198,12 @@ app.use("/api", apiRouter);
         let src = "app.get(\"/ping\", pong);";
         check!(
             ep(
-                &extract_express(src, Language::Tsx),
+                &extract_express(src, &Language::Tsx),
                 HttpMethod::Get,
                 "/ping"
             )
             .is_some()
         );
-        check!(extract_express(src, Language::Rust).is_empty());
+        check!(extract_express(src, &Language::Rust).is_empty());
     }
 }
