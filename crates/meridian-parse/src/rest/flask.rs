@@ -6,14 +6,19 @@
 //! - Flask `@app.route("/items", methods=["POST", "PUT"])` — one endpoint per
 //!   listed method, defaulting to GET when `methods=` is absent.
 //!
-//! The decorated function's name is the handler. Router mounting / blueprint
-//! prefixes are a follow-up; flat routes are extracted.
+//! The decorated function's name is the handler. FastAPI prefixes accumulate:
+//! a route on a `router = APIRouter(prefix="/x")` is prefixed with `/x`, and
+//! `app.include_router(router, prefix="/y")` further prefixes it with `/y`, so
+//! `@router.get("/{id}")` becomes `GET /y/x/{id}`. (Emitting `MOUNTS` edges for
+//! `include_router` needs a router-variable mount model; tracked as a follow-up.)
+
+use std::collections::HashMap;
 
 use tree_sitter::{Node, Parser, Tree};
 
 use meridian_core::{HttpMethod, Language};
 
-use super::ts::{span_of, text};
+use super::ts::{join, span_of, text};
 use super::{RawEndpoint, RawMount};
 use crate::registry;
 
@@ -25,13 +30,63 @@ pub fn extract_flask(source: &str) -> Vec<RawEndpoint> {
         return Vec::new();
     };
     let src = source.as_bytes();
+    let prefixes = router_prefixes(tree.root_node(), src);
     let mut out = Vec::new();
     super::ts::walk(tree.root_node(), &mut |n| {
         if n.kind() == "decorated_definition" {
-            collect(n, src, &mut out);
+            collect(n, src, &prefixes, &mut out);
         }
     });
     out
+}
+
+/// Map each FastAPI router variable to its accumulated path prefix: the
+/// `APIRouter(prefix=…)` declared prefix, prepended by any
+/// `include_router(router, prefix=…)` mount prefix.
+fn router_prefixes(root: Node, src: &[u8]) -> HashMap<String, String> {
+    let mut own: HashMap<String, String> = HashMap::new();
+    let mut mounted: HashMap<String, String> = HashMap::new();
+    super::ts::walk(root, &mut |n| match n.kind() {
+        "assignment" => collect_apirouter(n, src, &mut own),
+        "call" => collect_include_router(n, src, &mut mounted),
+        _ => {}
+    });
+
+    own.keys()
+        .chain(mounted.keys())
+        .cloned()
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .map(|var| {
+            let o = own.get(&var).map(String::as_str).unwrap_or("");
+            let m = mounted.get(&var).map(String::as_str).unwrap_or("");
+            (var, join(m, o))
+        })
+        .collect()
+}
+
+/// Record a `router = APIRouter(prefix="/x")` declaration.
+fn collect_apirouter(n: Node, src: &[u8], own: &mut HashMap<String, String>) {
+    if let Some(var) = n.child_by_field_name("left").map(|l| text(l, src))
+        && let Some(rhs) = n
+            .child_by_field_name("right")
+            .filter(|r| r.kind() == "call")
+        && is_call_to(rhs, "APIRouter", src)
+    {
+        let p =
+            string_kwarg(rhs.child_by_field_name("arguments"), "prefix", src).unwrap_or_default();
+        own.insert(var, p);
+    }
+}
+
+/// Record an `app.include_router(router, prefix="/y")` mount.
+fn collect_include_router(n: Node, src: &[u8], mounted: &mut HashMap<String, String>) {
+    if attr_name(n, src).as_deref() == Some("include_router")
+        && let Some(child) = first_positional_ident(n.child_by_field_name("arguments"), src)
+    {
+        let p = string_kwarg(n.child_by_field_name("arguments"), "prefix", src).unwrap_or_default();
+        mounted.insert(child, p);
+    }
 }
 
 /// Flask blueprints / mounting are a follow-up; no mounts are emitted.
@@ -47,8 +102,9 @@ fn parse(source: &str) -> Option<Tree> {
     parser.parse(source, None)
 }
 
-/// Emit endpoints for every route decorator on a decorated function.
-fn collect(node: Node, src: &[u8], out: &mut Vec<RawEndpoint>) {
+/// Emit endpoints for every route decorator on a decorated function. The
+/// decorator's receiver (`@router.get`) selects the accumulated prefix.
+fn collect(node: Node, src: &[u8], prefixes: &HashMap<String, String>, out: &mut Vec<RawEndpoint>) {
     let Some(handler) = node
         .child_by_field_name("definition")
         .filter(|d| d.kind() == "function_definition")
@@ -79,15 +135,76 @@ fn collect(node: Node, src: &[u8], out: &mut Vec<RawEndpoint>) {
         let Some(path) = first_string_arg(args, src) else {
             continue;
         };
+        // Prefix by the receiver router's accumulated prefix, if any.
+        let prefix = func
+            .child_by_field_name("object")
+            .map(|o| text(o, src))
+            .and_then(|recv| prefixes.get(&recv).cloned())
+            .unwrap_or_default();
+        let full = join(&prefix, &path);
         for method in decorator_methods(&verb, args, src) {
             out.push(RawEndpoint {
                 method,
-                path: path.clone(),
+                path: full.clone(),
                 handler: handler.clone(),
                 span: span_of(call),
             });
         }
     }
+}
+
+/// The attribute name of a `recv.attr(...)` call (e.g. `include_router`), else `None`.
+fn attr_name(call: Node, src: &[u8]) -> Option<String> {
+    let func = call.child_by_field_name("function")?;
+    (func.kind() == "attribute")
+        .then(|| func.child_by_field_name("attribute").map(|a| text(a, src)))
+        .flatten()
+}
+
+/// Whether `call`'s function is `name(...)` or `pkg.name(...)`.
+fn is_call_to(call: Node, name: &str, src: &[u8]) -> bool {
+    let Some(func) = call.child_by_field_name("function") else {
+        return false;
+    };
+    match func.kind() {
+        "identifier" => text(func, src) == name,
+        "attribute" => {
+            func.child_by_field_name("attribute")
+                .map(|a| text(a, src))
+                .as_deref()
+                == Some(name)
+        }
+        _ => false,
+    }
+}
+
+/// The first positional argument when it is a bare identifier (the child router
+/// in `include_router(router, …)`).
+fn first_positional_ident(args: Option<Node>, src: &[u8]) -> Option<String> {
+    let args = args?;
+    let mut cursor = args.walk();
+    args.named_children(&mut cursor)
+        .find(|a| a.kind() == "identifier")
+        .map(|a| text(a, src))
+}
+
+/// String value of a `name="..."` keyword argument.
+fn string_kwarg(args: Option<Node>, name: &str, src: &[u8]) -> Option<String> {
+    let args = args?;
+    let mut cursor = args.walk();
+    args.named_children(&mut cursor).find_map(|arg| {
+        (arg.kind() == "keyword_argument"
+            && arg
+                .child_by_field_name("name")
+                .map(|n| text(n, src))
+                .as_deref()
+                == Some(name))
+        .then(|| {
+            arg.child_by_field_name("value")
+                .and_then(|v| py_string(v, src))
+        })
+        .flatten()
+    })
 }
 
 /// The `call` inside a decorator (`@app.get(...)`), if the decorator is a call.
@@ -210,6 +327,38 @@ def plain(): ...
         check!(ep(&eps, HttpMethod::Put, "/items").is_some());
         // `route` without `methods=` defaults to GET.
         check!(ep(&eps, HttpMethod::Get, "/health").map(|e| e.handler.as_str()) == Some("health"));
+    }
+
+    #[test]
+    fn fastapi_router_prefix_accumulates() {
+        let src = r#"
+router = APIRouter(prefix="/users")
+
+@router.get("/{id}")
+def get_user(id): ...
+
+app.include_router(router, prefix="/api")
+"#;
+        let eps = extract_flask(src);
+        // /api (include) + /users (APIRouter) + /{id} (route)
+        check!(
+            ep(&eps, HttpMethod::Get, "/api/users/{id}").map(|e| e.handler.as_str())
+                == Some("get_user")
+        );
+    }
+
+    #[test]
+    fn fastapi_apirouter_prefix_without_include() {
+        let src = r#"
+router = APIRouter(prefix="/v1")
+
+@router.post("/items")
+def create(): ...
+"#;
+        let eps = extract_flask(src);
+        check!(
+            ep(&eps, HttpMethod::Post, "/v1/items").map(|e| e.handler.as_str()) == Some("create")
+        );
     }
 
     #[test]
