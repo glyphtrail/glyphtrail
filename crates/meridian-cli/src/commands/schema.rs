@@ -1,8 +1,8 @@
-//! API schema ingestion: parse blessed schema artifacts into the `(method,
-//! path)` operations they declare, for reconciliation against code endpoints.
+//! API schema ingestion: parse blessed schema artifacts into the operations
+//! they declare, for reconciliation against code endpoints.
 //!
-//! Supports OpenAPI (Swagger 2.0 / OpenAPI 3.x) in JSON or YAML form. gRPC and
-//! GraphQL schemas are follow-ups.
+//! Supports OpenAPI (Swagger 2.0 / OpenAPI 3.x) in JSON or YAML form and gRPC
+//! `.proto` service definitions. GraphQL SDL is a follow-up.
 
 use meridian_core::HttpMethod;
 use serde_json::Value;
@@ -48,6 +48,48 @@ fn operations_from_doc(doc: &Value) -> Vec<(HttpMethod, String)> {
         }
     }
     out
+}
+
+/// Parse a gRPC `.proto` file into the operations it declares, as canonical
+/// `package.Service/Method` paths (the gRPC wire convention). Best-effort
+/// line scanner: tracks the `package`, the enclosing `service`, and each `rpc`.
+/// Service bodies hold only rpcs/options, and `message`/`enum`/`service` start
+/// new top-level blocks, so a brace-free scan is sufficient for normal protos.
+pub fn proto_grpc_operations(text: &str) -> Vec<String> {
+    let mut package = String::new();
+    let mut service: Option<String> = None;
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        let line = raw.split("//").next().unwrap_or("").trim();
+        if let Some(rest) = line.strip_prefix("package ") {
+            package = rest.trim_end_matches(';').trim().to_string();
+        } else if let Some(rest) = line.strip_prefix("service ") {
+            service = first_ident(rest);
+        } else if line.starts_with("message ") || line.starts_with("enum ") {
+            service = None; // left the service body
+        } else if let Some(rest) = line.strip_prefix("rpc ")
+            && let Some(svc) = &service
+            && let Some(method) = first_ident(rest)
+        {
+            let prefix = if package.is_empty() {
+                svc.clone()
+            } else {
+                format!("{package}.{svc}")
+            };
+            out.push(format!("{prefix}/{method}"));
+        }
+    }
+    out
+}
+
+/// The leading identifier of `s` (up to the first whitespace, `{`, or `(`).
+fn first_ident(s: &str) -> Option<String> {
+    let name: String = s
+        .trim()
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    (!name.is_empty()).then_some(name)
 }
 
 /// The HTTP method for an OpenAPI path-item key, or `None` for non-operation
@@ -117,6 +159,38 @@ mod tests {
     fn invalid_or_empty_yields_nothing() {
         assert!(openapi_rest_operations(": : :").is_empty());
         assert!(openapi_rest_operations("{}").is_empty());
+    }
+
+    #[test]
+    fn proto_operations_use_package_service_method() {
+        let proto = r#"
+syntax = "proto3";
+package users.v1;
+
+// User management.
+service UserService {
+    rpc GetUser(GetUserRequest) returns (User);
+    rpc CreateUser(CreateUserRequest) returns (User); // inline comment
+}
+
+message GetUserRequest { string id = 1; }
+
+service AdminService {
+    rpc Ban(BanRequest) returns (BanReply);
+}
+"#;
+        let ops = proto_grpc_operations(proto);
+        assert!(ops.contains(&"users.v1.UserService/GetUser".to_string()));
+        assert!(ops.contains(&"users.v1.UserService/CreateUser".to_string()));
+        assert!(ops.contains(&"users.v1.AdminService/Ban".to_string()));
+        // The `message` block's contents are not rpcs.
+        assert_eq!(ops.len(), 3);
+    }
+
+    #[test]
+    fn proto_without_package_uses_bare_service() {
+        let proto = "service S {\n  rpc M(A) returns (B);\n}\n";
+        assert_eq!(proto_grpc_operations(proto), vec!["S/M"]);
     }
 
     #[test]
