@@ -195,8 +195,8 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
     }
     let mut inferred: Vec<Edge> = Vec::new();
     for p in &pending {
-        if let Some(candidates) = index.get(&p.name) {
-            if candidates.len() == 1 {
+        if let Some(candidates) = index.get(&p.name)
+            && candidates.len() == 1 {
                 inferred.push(Edge {
                     src: p.src.clone(),
                     dst: candidates[0].clone(),
@@ -204,12 +204,11 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
                     confidence: Confidence::Inferred,
                 });
             }
-        }
     }
     // HANDLES links whose handler is defined elsewhere: handler -> endpoint.
     for (handler, endpoint_id) in &pending_handlers {
-        if let Some(candidates) = index.get(handler) {
-            if candidates.len() == 1 {
+        if let Some(candidates) = index.get(handler)
+            && candidates.len() == 1 {
                 inferred.push(Edge {
                     src: candidates[0].clone(),
                     dst: endpoint_id.clone(),
@@ -217,7 +216,6 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
                     confidence: Confidence::Inferred,
                 });
             }
-        }
     }
     store.insert_graph(&[], &inferred)?;
 

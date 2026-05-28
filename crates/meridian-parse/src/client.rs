@@ -45,11 +45,10 @@ pub fn extract_client_calls(source: &str, lang: Language) -> Vec<RawClientCall> 
     let clients = axios_clients(root, src);
     let mut out = Vec::new();
     walk(root, &mut |n| {
-        if n.kind() == "call_expression" {
-            if let Some(call) = client_call(n, src, &clients) {
+        if n.kind() == "call_expression"
+            && let Some(call) = client_call(n, src, &clients) {
                 out.push(call);
             }
-        }
     });
     out
 }
@@ -259,8 +258,8 @@ fn walk<'a>(node: Node<'a>, f: &mut dyn FnMut(Node<'a>)) {
 fn named_arg<'a>(args: Option<Node<'a>>, i: usize) -> Option<Node<'a>> {
     let args = args?;
     let mut cursor = args.walk();
-    let nth = args.named_children(&mut cursor).nth(i);
-    nth
+    
+    args.named_children(&mut cursor).nth(i)
 }
 
 fn text(node: Node, src: &[u8]) -> String {

@@ -18,8 +18,8 @@ pub(super) fn walk<'a>(node: Node<'a>, f: &mut dyn FnMut(Node<'a>)) {
 pub(super) fn named_arg<'a>(args: Option<Node<'a>>, i: usize) -> Option<Node<'a>> {
     let args = args?;
     let mut cursor = args.walk();
-    let nth = args.named_children(&mut cursor).nth(i);
-    nth
+    
+    args.named_children(&mut cursor).nth(i)
 }
 
 /// UTF-8 source text of a node (empty on invalid UTF-8).
@@ -89,16 +89,13 @@ pub(super) fn chain_root(mut n: Node) -> Node {
     while let Some(p) = n.parent() {
         if p.kind() == "field_expression"
             && p.child_by_field_name("value").map(|v| v.id()) == Some(n.id())
-        {
-            if let Some(gp) = p.parent() {
-                if gp.kind() == "call_expression"
+            && let Some(gp) = p.parent()
+                && gp.kind() == "call_expression"
                     && gp.child_by_field_name("function").map(|f| f.id()) == Some(p.id())
                 {
                     n = gp;
                     continue;
                 }
-            }
-        }
         break;
     }
     n

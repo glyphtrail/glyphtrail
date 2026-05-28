@@ -176,12 +176,11 @@ fn expand_ref<'a>(
     if short == "new" {
         return; // Router::new()
     }
-    if let Some(chain) = builders.get(short) {
-        if visited.insert(short.to_string()) {
+    if let Some(chain) = builders.get(short)
+        && visited.insert(short.to_string()) {
             expand(*chain, prefix, src, builders, visited, out);
             visited.remove(short);
         }
-    }
 }
 
 #[cfg(test)]

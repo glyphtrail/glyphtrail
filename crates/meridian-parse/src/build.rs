@@ -102,12 +102,11 @@ pub fn build_rest_graph(rel_path: &str, symbols: &[SymbolEntry], source: &str) -
         .into_iter()
         .chain(extract_utoipa_mounts(source));
     for m in raw_mounts {
-        if let (Some(p), Some(c)) = (resolve(&m.parent), resolve(&m.child)) {
-            if mounts.insert((p.clone(), c.clone())) {
+        if let (Some(p), Some(c)) = (resolve(&m.parent), resolve(&m.child))
+            && mounts.insert((p.clone(), c.clone())) {
                 rg.graph
                     .add_edge(p, c, EdgeKind::Mounts, Confidence::Extracted);
             }
-        }
     }
     rg
 }
@@ -202,10 +201,7 @@ fn enclosing_def(defs: &[DefInfo], byte: usize) -> Option<usize> {
 fn doc_for(parsed: &ParsedFile, start_line: usize) -> Option<String> {
     let mut lines = Vec::new();
     let mut want = start_line.checked_sub(1)?;
-    loop {
-        let Some(c) = parsed.comments.iter().find(|c| c.end_line() == want) else {
-            break;
-        };
+    while let Some(c) = parsed.comments.iter().find(|c| c.end_line() == want) {
         lines.push(c.text.clone());
         if want <= 1 {
             break;
