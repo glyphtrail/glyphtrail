@@ -70,3 +70,15 @@ CREATE TABLE IF NOT EXISTS pending_edges (
 );
 
 CREATE INDEX IF NOT EXISTS idx_pending_anchor ON pending_edges(anchor);
+
+-- Raw import targets per file, persisted so IMPORTS edges can be rebuilt and
+-- re-resolved against the whole file set on every (incremental) run. `importer`
+-- is the file's repo-relative path; `raw` is the cleaned import token.
+CREATE TABLE IF NOT EXISTS pending_imports (
+    importer TEXT NOT NULL,
+    raw      TEXT NOT NULL,
+    language TEXT NOT NULL,
+    PRIMARY KEY (importer, raw, language)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_imports_importer ON pending_imports(importer);

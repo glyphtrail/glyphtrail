@@ -3,6 +3,7 @@
 pub mod build;
 pub mod client;
 pub mod extract;
+pub mod imports;
 pub mod registry;
 pub mod rest;
 
@@ -12,6 +13,7 @@ pub use build::{
 };
 pub use client::{RawClientCall, extract_client_calls};
 pub use extract::{ParsedFile, parse_source};
+pub use imports::resolve_import;
 pub use rest::{
     RawEndpoint, RawMount, extract_axum, extract_axum_mounts, extract_utoipa, extract_utoipa_mounts,
 };

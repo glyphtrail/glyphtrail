@@ -31,7 +31,7 @@ impl SqliteStore {
     pub fn clear(&mut self) -> Result<()> {
         self.conn.execute_batch(
             "DELETE FROM edges; DELETE FROM nodes; DELETE FROM files; DELETE FROM nodes_fts;
-             DELETE FROM api_operations; DELETE FROM pending_edges;",
+             DELETE FROM api_operations; DELETE FROM pending_edges; DELETE FROM pending_imports;",
         )?;
         Ok(())
     }
@@ -73,6 +73,10 @@ impl SqliteStore {
         )?;
         tx.execute(
             "DELETE FROM pending_edges WHERE anchor IN (SELECT id FROM nodes WHERE file = ?1)",
+            params![path],
+        )?;
+        tx.execute(
+            "DELETE FROM pending_imports WHERE importer = ?1",
             params![path],
         )?;
         tx.execute("DELETE FROM nodes WHERE file = ?1", params![path])?;
@@ -314,6 +318,45 @@ impl SqliteStore {
             "DELETE FROM edges WHERE confidence = ?1",
             params![confidence.as_str()],
         )?)
+    }
+
+    /// Delete every edge of a given kind. Used to rebuild all `IMPORTS` edges
+    /// each run so they re-resolve against the current file set.
+    pub fn delete_edges_by_kind(&mut self, kind: EdgeKind) -> Result<usize> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM edges WHERE kind = ?1", params![kind.as_str()])?)
+    }
+
+    /// Persist a file's raw import targets `(importer, raw, language)`.
+    pub fn insert_imports(&mut self, imports: &[(String, String, String)]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO pending_imports(importer, raw, language) VALUES (?1,?2,?3)
+                 ON CONFLICT(importer, raw, language) DO NOTHING",
+            )?;
+            for (importer, raw, language) in imports {
+                stmt.execute(params![importer, raw, language])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Every persisted import `(importer, raw, language)`, for global resolution.
+    pub fn all_imports(&self) -> Result<Vec<(String, String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT importer, raw, language FROM pending_imports")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// (name, id) for every definition-like node, for global call resolution.
