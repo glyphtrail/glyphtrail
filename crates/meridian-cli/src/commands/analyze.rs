@@ -430,9 +430,6 @@ fn ingest_schemas(
     operations: &mut Vec<(NodeId, OperationKey)>,
 ) {
     for source in &cfg.api.schemas {
-        if source.protocol != Protocol::Rest {
-            continue; // gRPC/GraphQL schema ingestion is a follow-up.
-        }
         let text = match std::fs::read_to_string(root.join(&source.path)) {
             Ok(t) => t,
             Err(e) => {
@@ -440,17 +437,39 @@ fn ingest_schemas(
                 continue;
             }
         };
-        let ops = schema::openapi_rest_operations(&text);
-        if ops.is_empty() {
-            tracing::warn!("no REST operations parsed from schema {}", source.path);
+        let keys: Vec<OperationKey> = match source.protocol {
+            Protocol::Rest => schema::openapi_rest_operations(&text)
+                .into_iter()
+                .map(|(method, path)| OperationKey::rest(method, &path))
+                .collect(),
+            Protocol::Grpc => schema::proto_grpc_operations(&text)
+                .into_iter()
+                .map(|path| OperationKey::opaque(Protocol::Grpc, path))
+                .collect(),
+            Protocol::GraphQl => {
+                tracing::warn!(
+                    "GraphQL schema ingestion is not yet supported: {}",
+                    source.path
+                );
+                continue;
+            }
+        };
+        if keys.is_empty() {
+            tracing::warn!("no operations parsed from schema {}", source.path);
         }
-        for (method, path) in ops {
-            let key = OperationKey::rest(method, &path);
-            let id = NodeId::derive(&[&source.path, "schema_op", method.as_str(), &key.path]);
+        for key in keys {
+            let method = key.method.map(|m| m.as_str()).unwrap_or("");
+            let id = NodeId::derive(&[
+                &source.path,
+                "schema_op",
+                key.protocol.as_str(),
+                method,
+                &key.path,
+            ]);
             graph.add_node(Node {
                 id: id.clone(),
                 kind: NodeKind::SchemaOp,
-                name: format!("{} {}", method.as_str(), key.path),
+                name: key.to_string(),
                 qualified_name: key.path.clone(),
                 file: source.path.clone(),
                 language: None,
