@@ -5,11 +5,13 @@ use anyhow::{Context, Result};
 use codegraph_core::config::{RepoPaths, IGNORE_FILE};
 use codegraph_core::{
     ClientCall, CodeGraph, Confidence, Config, Edge, EdgeKind, Endpoint, Language, Matcher, Node,
-    NodeId, NodeKind, OperationKey, RewriteEngine,
+    NodeId, NodeKind, OperationKey, Protocol, RewriteEngine,
 };
 use codegraph_parse::{
     build_client_graph, build_file_graph, build_rest_graph, parse_source, PendingEdge,
 };
+
+use crate::commands::schema;
 use codegraph_store::SqliteStore;
 use ignore::WalkBuilder;
 
@@ -168,6 +170,11 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
         }
     }
 
+    // Ingest blessed schema artifacts into SchemaOp nodes (reconciled with code
+    // endpoints as EXPOSES edges below).
+    let cfg = Config::load(&root)?;
+    ingest_schemas(&root, &cfg, &mut graph, &mut operations);
+
     // Persist nodes and high-confidence (extracted) edges first.
     let extracted: Vec<Edge> = graph
         .edges
@@ -211,23 +218,26 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
     }
     store.insert_graph(&[], &inferred)?;
 
-    // Cross-boundary linking: resolve client calls to the endpoints that answer
-    // them and persist INVOKES edges. Runs over the full store (endpoints and
-    // calls commonly live in different, possibly unchanged, files).
-    let cfg = Config::load(&root)?;
+    // Cross-boundary linking: resolve client calls and schema operations
+    // against the endpoints, through the same rewrite-aware matcher. Runs over
+    // the full store (endpoints, calls and schema ops commonly live in
+    // different, possibly unchanged, files/artifacts).
     let rewrite = RewriteEngine::from_config(&cfg.api);
     let endpoints: Vec<Endpoint> = store
         .operations_by_kind(NodeKind::Endpoint)?
         .into_iter()
         .map(|(id, key)| Endpoint { id, key })
         .collect();
-    let calls: Vec<ClientCall> = store
-        .operations_by_kind(NodeKind::ClientCall)?
-        .into_iter()
-        .map(|(id, key)| ClientCall { id, key })
-        .collect();
     let matcher = Matcher::build(&endpoints, &rewrite);
-    let invokes: Vec<Edge> = matcher
+
+    let as_calls = |ops: Vec<(NodeId, OperationKey)>| -> Vec<ClientCall> {
+        ops.into_iter()
+            .map(|(id, key)| ClientCall { id, key })
+            .collect()
+    };
+    // Client call -> endpoint: INVOKES.
+    let calls = as_calls(store.operations_by_kind(NodeKind::ClientCall)?);
+    let mut edges: Vec<Edge> = matcher
         .resolve_all(&calls)
         .into_iter()
         .map(|m| Edge {
@@ -237,7 +247,16 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
             confidence: m.confidence,
         })
         .collect();
-    store.insert_graph(&[], &invokes)?;
+    // Endpoint -> schema op: EXPOSES (the code endpoint implements a declared
+    // operation). Schema ops are matched like external callers.
+    let schema_ops = as_calls(store.operations_by_kind(NodeKind::SchemaOp)?);
+    edges.extend(matcher.resolve_all(&schema_ops).into_iter().map(|m| Edge {
+        src: m.endpoint,
+        dst: m.client,
+        kind: EdgeKind::Exposes,
+        confidence: m.confidence,
+    }));
+    store.insert_graph(&[], &edges)?;
 
     for f in &changed {
         store.set_file(&f.rel_path, Some(f.language.name()), &f.hash)?;
@@ -253,4 +272,46 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
         stats.files, stats.nodes, stats.edges
     );
     Ok(())
+}
+
+/// Read the configured REST schema artifacts and add a `SchemaOp` node (with
+/// its operation key) for every operation they declare. Node ids are derived
+/// from the artifact path + operation, so re-ingestion is idempotent.
+fn ingest_schemas(
+    root: &Path,
+    cfg: &Config,
+    graph: &mut CodeGraph,
+    operations: &mut Vec<(NodeId, OperationKey)>,
+) {
+    for source in &cfg.api.schemas {
+        if source.protocol != Protocol::Rest {
+            continue; // gRPC/GraphQL schema ingestion is a follow-up.
+        }
+        let text = match std::fs::read_to_string(root.join(&source.path)) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("cannot read schema {}: {e}", source.path);
+                continue;
+            }
+        };
+        let ops = schema::openapi_rest_operations(&text);
+        if ops.is_empty() {
+            tracing::warn!("no REST operations parsed from schema {}", source.path);
+        }
+        for (method, path) in ops {
+            let key = OperationKey::rest(method, &path);
+            let id = NodeId::derive(&[&source.path, "schema_op", method.as_str(), &key.path]);
+            graph.add_node(Node {
+                id: id.clone(),
+                kind: NodeKind::SchemaOp,
+                name: format!("{} {}", method.as_str(), key.path),
+                qualified_name: key.path.clone(),
+                file: source.path.clone(),
+                language: None,
+                span: None,
+                doc: None,
+            });
+            operations.push((id, key));
+        }
+    }
 }
