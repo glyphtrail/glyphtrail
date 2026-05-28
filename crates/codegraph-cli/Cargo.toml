@@ -16,6 +16,7 @@ codegraph-store.workspace = true
 codegraph-viz.workspace = true
 codegraph-server.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
 ignore.workspace = true
 blake3.workspace = true
 anyhow.workspace = true

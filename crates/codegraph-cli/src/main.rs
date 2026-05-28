@@ -1,10 +1,15 @@
 mod commands;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "codegraph", version, about = "Build and query a code knowledge graph")]
+#[command(
+    name = "codegraph",
+    version,
+    about = "Build and query a code knowledge graph"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -53,13 +58,17 @@ enum Command {
         #[arg(long, default_value = ".")]
         repo: PathBuf,
     },
+    /// Generate a shell completion script for the given shell.
+    Completions {
+        /// Target shell (bash, zsh, fish, powershell, elvish).
+        shell: Shell,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with_target(false)
         .init();
@@ -75,5 +84,11 @@ fn main() -> anyhow::Result<()> {
         } => commands::viz::run(&repo, &output, limit),
         Command::Serve { repo, port } => commands::serve::run(&repo, port),
         Command::Status { repo } => commands::status::run(&repo),
+        Command::Completions { shell } => {
+            let mut cmd = Cli::command();
+            let name = cmd.get_name().to_string();
+            clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
+            Ok(())
+        }
     }
 }
