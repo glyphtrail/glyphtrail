@@ -446,13 +446,10 @@ fn ingest_schemas(
                 .into_iter()
                 .map(|path| OperationKey::opaque(Protocol::Grpc, path))
                 .collect(),
-            Protocol::GraphQl => {
-                tracing::warn!(
-                    "GraphQL schema ingestion is not yet supported: {}",
-                    source.path
-                );
-                continue;
-            }
+            Protocol::GraphQl => schema::graphql_operations(&text)
+                .into_iter()
+                .map(|path| OperationKey::opaque(Protocol::GraphQl, path))
+                .collect(),
         };
         if keys.is_empty() {
             tracing::warn!("no operations parsed from schema {}", source.path);
