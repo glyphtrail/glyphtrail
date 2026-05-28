@@ -522,10 +522,20 @@ impl SqliteStore {
         let files: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?;
+        let mut lstmt = self.conn.prepare(
+            "SELECT COALESCE(language, '(unknown)') AS lang, COUNT(*)
+             FROM files GROUP BY lang ORDER BY COUNT(*) DESC, lang",
+        )?;
+        let languages: Vec<(String, usize)> = lstmt
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
         Ok(Stats {
             nodes: nodes as usize,
             edges: edges as usize,
             files: files as usize,
+            languages,
         })
     }
 
@@ -552,11 +562,13 @@ impl SqliteStore {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Stats {
     pub nodes: usize,
     pub edges: usize,
     pub files: usize,
+    /// Indexed file counts per language, descending by count.
+    pub languages: Vec<(String, usize)>,
 }
 
 fn parse_kind(s: &str) -> NodeKind {

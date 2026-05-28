@@ -173,7 +173,14 @@ fn dispatch(db: &Path, name: &str, args: &Value) -> Result<Value, String> {
         }
         "status" => {
             let s = store.stats().map_err(err)?;
-            Ok(json!({ "nodes": s.nodes, "edges": s.edges, "files": s.files }))
+            let languages: serde_json::Map<String, Value> = s
+                .languages
+                .into_iter()
+                .map(|(lang, n)| (lang, json!(n)))
+                .collect();
+            Ok(
+                json!({ "nodes": s.nodes, "edges": s.edges, "files": s.files, "languages": languages }),
+            )
         }
         other => Err(format!("unknown tool: {other}")),
     }
