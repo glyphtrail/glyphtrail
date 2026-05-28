@@ -145,6 +145,7 @@ fn operation_method(key: &str) -> Option<HttpMethod> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use assert2::check;
 
     fn has(ops: &[(HttpMethod, String)], m: HttpMethod, p: &str) -> bool {
         ops.iter().any(|(om, op)| *om == m && op == p)
@@ -164,38 +165,38 @@ mod tests {
             }
         }"#;
         let ops = openapi_rest_operations(json);
-        assert_eq!(ops.len(), 4);
-        assert!(has(&ops, HttpMethod::Get, "/users"));
-        assert!(has(&ops, HttpMethod::Post, "/users"));
-        assert!(has(&ops, HttpMethod::Get, "/users/{id}"));
-        assert!(has(&ops, HttpMethod::Delete, "/users/{id}"));
+        check!(ops.len() == 4);
+        check!(has(&ops, HttpMethod::Get, "/users"));
+        check!(has(&ops, HttpMethod::Post, "/users"));
+        check!(has(&ops, HttpMethod::Get, "/users/{id}"));
+        check!(has(&ops, HttpMethod::Delete, "/users/{id}"));
     }
 
     #[test]
     fn ignores_non_operation_keys() {
         let json = r#"{ "paths": { "/x": { "summary": "s", "$ref": "y", "get": {} } } }"#;
         let ops = openapi_rest_operations(json);
-        assert_eq!(ops, vec![(HttpMethod::Get, "/x".to_string())]);
+        check!(ops == vec![(HttpMethod::Get, "/x".to_string())]);
     }
 
     #[test]
     fn method_keys_are_case_insensitive() {
         let json = r#"{ "paths": { "/x": { "GET": {}, "Post": {} } } }"#;
         let ops = openapi_rest_operations(json);
-        assert!(has(&ops, HttpMethod::Get, "/x"));
-        assert!(has(&ops, HttpMethod::Post, "/x"));
+        check!(has(&ops, HttpMethod::Get, "/x"));
+        check!(has(&ops, HttpMethod::Post, "/x"));
     }
 
     #[test]
     fn ref_only_path_item_yields_no_ops() {
         let json = r##"{ "paths": { "/x": { "$ref": "#/components/pathItems/X" } } }"##;
-        assert!(openapi_rest_operations(json).is_empty());
+        check!(openapi_rest_operations(json).is_empty());
     }
 
     #[test]
     fn invalid_or_empty_yields_nothing() {
-        assert!(openapi_rest_operations(": : :").is_empty());
-        assert!(openapi_rest_operations("{}").is_empty());
+        check!(openapi_rest_operations(": : :").is_empty());
+        check!(openapi_rest_operations("{}").is_empty());
     }
 
     #[test]
@@ -217,17 +218,17 @@ service AdminService {
 }
 "#;
         let ops = proto_grpc_operations(proto);
-        assert!(ops.contains(&"users.v1.UserService/GetUser".to_string()));
-        assert!(ops.contains(&"users.v1.UserService/CreateUser".to_string()));
-        assert!(ops.contains(&"users.v1.AdminService/Ban".to_string()));
+        check!(ops.contains(&"users.v1.UserService/GetUser".to_string()));
+        check!(ops.contains(&"users.v1.UserService/CreateUser".to_string()));
+        check!(ops.contains(&"users.v1.AdminService/Ban".to_string()));
         // The `message` block's contents are not rpcs.
-        assert_eq!(ops.len(), 3);
+        check!(ops.len() == 3);
     }
 
     #[test]
     fn proto_without_package_uses_bare_service() {
         let proto = "service S {\n  rpc M(A) returns (B);\n}\n";
-        assert_eq!(proto_grpc_operations(proto), vec!["S/M"]);
+        check!(proto_grpc_operations(proto) == vec!["S/M"]);
     }
 
     #[test]
@@ -246,21 +247,21 @@ type Mutation {
 }
 "#;
         let ops = graphql_operations(sdl);
-        assert!(ops.contains(&"Query.me".to_string()));
-        assert!(ops.contains(&"Query.user".to_string()));
-        assert!(ops.contains(&"Mutation.createUser".to_string()));
+        check!(ops.contains(&"Query.me".to_string()));
+        check!(ops.contains(&"Query.user".to_string()));
+        check!(ops.contains(&"Mutation.createUser".to_string()));
         // The non-root `User` type's fields are not operations.
-        assert!(
+        check!(
             !ops.iter()
                 .any(|o| o.ends_with(".id") || o.ends_with(".name"))
         );
-        assert_eq!(ops.len(), 3);
+        check!(ops.len() == 3);
     }
 
     #[test]
     fn graphql_extend_query_is_recognized() {
         let sdl = "extend type Query {\n  health: Boolean\n}\n";
-        assert_eq!(graphql_operations(sdl), vec!["Query.health"]);
+        check!(graphql_operations(sdl) == vec!["Query.health"]);
     }
 
     #[test]
@@ -277,11 +278,11 @@ paths:
     delete: {}
 "#;
         let ops = openapi_rest_operations(yaml);
-        assert_eq!(ops.len(), 4);
-        assert!(has(&ops, HttpMethod::Get, "/users"));
-        assert!(has(&ops, HttpMethod::Post, "/users"));
-        assert!(has(&ops, HttpMethod::Get, "/users/{id}"));
-        assert!(has(&ops, HttpMethod::Delete, "/users/{id}"));
+        check!(ops.len() == 4);
+        check!(has(&ops, HttpMethod::Get, "/users"));
+        check!(has(&ops, HttpMethod::Post, "/users"));
+        check!(has(&ops, HttpMethod::Get, "/users/{id}"));
+        check!(has(&ops, HttpMethod::Delete, "/users/{id}"));
     }
 
     #[test]
@@ -293,9 +294,6 @@ paths:
             v.sort();
             v
         };
-        assert_eq!(
-            key(openapi_rest_operations(json)),
-            key(openapi_rest_operations(yaml))
-        );
+        check!(key(openapi_rest_operations(json)) == key(openapi_rest_operations(yaml)));
     }
 }

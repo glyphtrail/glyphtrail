@@ -145,6 +145,7 @@ fn js_url(node: Node, src: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use assert2::check;
 
     fn ep<'a>(eps: &'a [RawEndpoint], method: HttpMethod, path: &str) -> Option<&'a RawEndpoint> {
         eps.iter().find(|e| e.method == method && e.path == path)
@@ -162,44 +163,38 @@ app.use("/api", apiRouter);
     #[test]
     fn extracts_verbs_paths_and_handlers() {
         let eps = extract_express(APP, Language::JavaScript);
-        assert_eq!(
-            ep(&eps, HttpMethod::Get, "/users/:id").map(|e| e.handler.as_str()),
-            Some("getUser")
+        check!(
+            ep(&eps, HttpMethod::Get, "/users/:id").map(|e| e.handler.as_str()) == Some("getUser")
         );
         // Last arg is the handler, after any middleware.
-        assert_eq!(
-            ep(&eps, HttpMethod::Post, "/users").map(|e| e.handler.as_str()),
-            Some("createUser")
+        check!(
+            ep(&eps, HttpMethod::Post, "/users").map(|e| e.handler.as_str()) == Some("createUser")
         );
         // Inline handler -> no symbol.
-        assert_eq!(
-            ep(&eps, HttpMethod::Delete, "/users/:id").map(|e| e.handler.as_str()),
-            Some("")
-        );
+        check!(ep(&eps, HttpMethod::Delete, "/users/:id").map(|e| e.handler.as_str()) == Some(""));
         // `obj.handler` reference keeps the function name; works on `router` too.
-        assert_eq!(
-            ep(&eps, HttpMethod::Put, "/items/:id").map(|e| e.handler.as_str()),
-            Some("update")
+        check!(
+            ep(&eps, HttpMethod::Put, "/items/:id").map(|e| e.handler.as_str()) == Some("update")
         );
     }
 
     #[test]
     fn use_is_not_a_route() {
         let eps = extract_express(APP, Language::JavaScript);
-        assert_eq!(eps.len(), 4);
+        check!(eps.len() == 4);
     }
 
     #[test]
     fn axios_client_calls_are_not_routes() {
         // `.get(url)` and `.get(url, {config})` on axios have no handler arg.
         let src = "axios.get(\"/api/x\"); axios.get(\"/api/y\", { timeout: 5 });";
-        assert!(extract_express(src, Language::TypeScript).is_empty());
+        check!(extract_express(src, Language::TypeScript).is_empty());
     }
 
     #[test]
     fn works_in_tsx_and_skips_other_languages() {
         let src = "app.get(\"/ping\", pong);";
-        assert!(
+        check!(
             ep(
                 &extract_express(src, Language::Tsx),
                 HttpMethod::Get,
@@ -207,6 +202,6 @@ app.use("/api", apiRouter);
             )
             .is_some()
         );
-        assert!(extract_express(src, Language::Rust).is_empty());
+        check!(extract_express(src, Language::Rust).is_empty());
     }
 }

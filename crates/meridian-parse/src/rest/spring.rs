@@ -187,6 +187,7 @@ fn string_value(string_literal: Node, src: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use assert2::check;
 
     fn ep<'a>(eps: &'a [RawEndpoint], method: HttpMethod, path: &str) -> Option<&'a RawEndpoint> {
         eps.iter().find(|e| e.method == method && e.path == path)
@@ -214,33 +215,29 @@ class UserController {
     fn extracts_methods_paths_and_handlers_with_base_prefix() {
         let eps = extract_spring(CONTROLLER);
         let get = ep(&eps, HttpMethod::Get, "/api/users/{id}").expect("GET");
-        assert_eq!(get.handler, "get");
-        assert_eq!(
-            ep(&eps, HttpMethod::Post, "/api").map(|e| e.handler.as_str()),
-            Some("create")
+        check!(get.handler == "get");
+        check!(ep(&eps, HttpMethod::Post, "/api").map(|e| e.handler.as_str()) == Some("create"));
+        check!(
+            ep(&eps, HttpMethod::Put, "/api/legacy").map(|e| e.handler.as_str()) == Some("legacy")
         );
-        assert_eq!(
-            ep(&eps, HttpMethod::Put, "/api/legacy").map(|e| e.handler.as_str()),
-            Some("legacy")
-        );
-        assert!(ep(&eps, HttpMethod::Delete, "/api/users/{id}").is_some());
+        check!(ep(&eps, HttpMethod::Delete, "/api/users/{id}").is_some());
     }
 
     #[test]
     fn request_mapping_without_method_is_not_an_endpoint() {
         // Class-level @RequestMapping is a base path, not an endpoint itself.
         let eps = extract_spring(CONTROLLER);
-        assert!(!eps.iter().any(|e| e.handler.is_empty()));
-        assert_eq!(eps.len(), 4);
+        check!(!eps.iter().any(|e| e.handler.is_empty()));
+        check!(eps.len() == 4);
     }
 
     #[test]
     fn no_mounts() {
-        assert!(extract_spring_mounts(CONTROLLER).is_empty());
+        check!(extract_spring_mounts(CONTROLLER).is_empty());
     }
 
     #[test]
     fn invalid_source_yields_nothing() {
-        assert!(extract_spring("???").is_empty());
+        check!(extract_spring("???").is_empty());
     }
 }

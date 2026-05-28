@@ -21,6 +21,7 @@ pub use rest::{
 #[cfg(test)]
 mod tests {
     use super::*;
+    use assert2::check;
     use meridian_core::Language;
     use tree_sitter::Query;
 
@@ -46,10 +47,10 @@ mod tests {
             src,
         )
         .unwrap();
-        assert_eq!(via_lang.defs.len(), via_grammar.defs.len());
-        assert_eq!(via_lang.calls.len(), via_grammar.calls.len());
-        assert!(via_grammar.defs.iter().any(|d| d.name == "helper"));
-        assert!(via_grammar.calls.iter().any(|c| c.name == "helper"));
+        check!(via_lang.defs.len() == via_grammar.defs.len());
+        check!(via_lang.calls.len() == via_grammar.calls.len());
+        check!(via_grammar.defs.iter().any(|d| d.name == "helper"));
+        check!(via_grammar.calls.iter().any(|c| c.name == "helper"));
     }
 
     // #23: every supported language extracts a top-level function definition
@@ -73,7 +74,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("parse failed for {}: {e}", lang.name()));
             let file_id = NodeId::derive(&["file", "x"]);
             let fg = build_file_graph("x", lang, &file_id, &parsed);
-            assert!(
+            check!(
                 fg.graph.nodes.iter().any(|n| n.name == "f"),
                 "{} should extract a definition named `f`, got {:?}",
                 lang.name(),
@@ -93,10 +94,10 @@ fn main() {
 "#;
         let parsed = parse_source(Language::Rust, src).unwrap();
         let names: Vec<_> = parsed.defs.iter().map(|d| d.name.as_str()).collect();
-        assert!(names.contains(&"helper"));
-        assert!(names.contains(&"main"));
-        assert!(parsed.calls.iter().any(|c| c.name == "helper"));
-        assert!(parsed.comments.iter().any(|c| c.text.contains("WHY")));
+        check!(names.contains(&"helper"));
+        check!(names.contains(&"main"));
+        check!(parsed.calls.iter().any(|c| c.name == "helper"));
+        check!(parsed.comments.iter().any(|c| c.text.contains("WHY")));
     }
 
     #[test]
@@ -121,7 +122,7 @@ fn main() {
         for (lang, src, expect) in cases {
             let parsed = parse_source(lang, src).unwrap();
             let names: Vec<_> = parsed.defs.iter().map(|d| d.name.as_str()).collect();
-            assert!(
+            check!(
                 names.contains(&expect),
                 "{}: expected def '{expect}', got {names:?}",
                 lang.name()
@@ -152,11 +153,11 @@ class Service:
             .iter()
             .find(|n| n.name == "handle")
             .expect("handle node");
-        assert_eq!(handle.kind, NodeKind::Method);
-        assert_eq!(handle.qualified_name, "Service::handle");
+        check!(handle.kind == NodeKind::Method);
+        check!(handle.qualified_name == "Service::handle");
 
         // The NOTE marker becomes a comment node.
-        assert!(fg.graph.nodes.iter().any(|n| n.kind == NodeKind::Comment));
+        check!(fg.graph.nodes.iter().any(|n| n.kind == NodeKind::Comment));
         // handle() calls helper() within the same file -> resolved locally.
         let helper_id = &fg
             .graph
@@ -165,7 +166,7 @@ class Service:
             .find(|n| n.name == "helper")
             .unwrap()
             .id;
-        assert!(
+        check!(
             fg.graph
                 .edges
                 .iter()
@@ -193,18 +194,18 @@ fn app() -> Router {
             .iter()
             .find(|n| n.kind == NodeKind::Endpoint)
             .expect("endpoint node");
-        assert_eq!(ep.name, "GET /users");
-        assert_eq!(rg.operations.len(), 1);
-        assert_eq!(rg.operations[0].0, ep.id);
-        assert_eq!(rg.operations[0].1.path, "/users");
+        check!(ep.name == "GET /users");
+        check!(rg.operations.len() == 1);
+        check!(rg.operations[0].0 == ep.id);
+        check!(rg.operations[0].1.path == "/users");
 
         // HANDLES is emitted handler -> endpoint at Extracted confidence.
         let list_id = &fg.symbols.iter().find(|s| s.name == "list").unwrap().id;
-        assert!(rg.graph.edges.iter().any(|e| e.kind == EdgeKind::Handles
+        check!(rg.graph.edges.iter().any(|e| e.kind == EdgeKind::Handles
             && &e.src == list_id
             && e.dst == ep.id
             && e.confidence == Confidence::Extracted));
-        assert!(rg.pending_handlers.is_empty());
+        check!(rg.pending_handlers.is_empty());
     }
 
     #[test]
@@ -227,16 +228,13 @@ fn app() -> Router {
             .find(|n| n.kind == NodeKind::Endpoint)
             .expect("endpoint node");
         // No local def named `list`, so the handler link is deferred, not emitted.
-        assert!(
+        check!(
             !rg.graph
                 .edges
                 .iter()
                 .any(|e| e.kind == meridian_core::EdgeKind::Handles)
         );
-        assert_eq!(
-            rg.pending_handlers,
-            vec![("list".to_string(), ep.id.clone())]
-        );
+        check!(rg.pending_handlers == vec![("list".to_string(), ep.id.clone())]);
     }
 
     #[test]
@@ -264,7 +262,7 @@ fn app() -> Router {
                 .id
                 .clone()
         };
-        assert!(rg.graph.edges.iter().any(|e| e.kind == EdgeKind::Mounts
+        check!(rg.graph.edges.iter().any(|e| e.kind == EdgeKind::Mounts
             && e.src == sym("app")
             && e.dst == sym("users_router")
             && e.confidence == Confidence::Extracted));

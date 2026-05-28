@@ -349,6 +349,7 @@ fn err<E: std::fmt::Display>(e: E) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use assert2::check;
     use meridian_core::{Confidence, Edge, Span};
 
     // Build a tiny graph at a temp db path and return that path.
@@ -394,18 +395,18 @@ mod tests {
     #[test]
     fn missing_index_is_a_tool_error() {
         let res = call(Path::new("/nonexistent/meridian.db"), "status", &json!({}));
-        assert_eq!(res["isError"], json!(true));
+        check!(res["isError"] == json!(true));
     }
 
     #[test]
     fn callers_tool_returns_the_caller() {
         let db = build_db("callers");
         let res = call(&db, "callers", &json!({ "name": "callee" }));
-        assert_eq!(res["isError"], json!(false));
+        check!(res["isError"] == json!(false));
         let text = res["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
-        assert_eq!(parsed[0]["node"]["name"], json!("caller"));
-        assert_eq!(parsed[0]["edge"], json!("calls"));
+        check!(parsed[0]["node"]["name"] == json!("caller"));
+        check!(parsed[0]["edge"] == json!("calls"));
         std::fs::remove_file(&db).ok();
     }
 
@@ -415,8 +416,8 @@ mod tests {
         let res = call(&db, "status", &json!({}));
         let text = res["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
-        assert_eq!(parsed["nodes"], json!(2));
-        assert_eq!(parsed["edges"], json!(1));
+        check!(parsed["nodes"] == json!(2));
+        check!(parsed["edges"] == json!(1));
         std::fs::remove_file(&db).ok();
     }
 
@@ -424,7 +425,7 @@ mod tests {
     fn unknown_tool_errors() {
         let db = build_db("unknown");
         let res = call(&db, "nope", &json!({}));
-        assert_eq!(res["isError"], json!(true));
+        check!(res["isError"] == json!(true));
         std::fs::remove_file(&db).ok();
     }
 }

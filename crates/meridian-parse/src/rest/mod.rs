@@ -175,36 +175,37 @@ pub fn extractors_for(lang: Language) -> Vec<Box<dyn RestServerExtractor>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use assert2::check;
 
     #[test]
     fn registry_filters_by_language() {
-        assert_eq!(extractors_for(Language::Rust).len(), 2);
-        assert_eq!(
+        check!(extractors_for(Language::Rust).len() == 2);
+        check!(
             extractors_for(Language::Python)
                 .iter()
                 .map(|e| e.name())
-                .collect::<Vec<_>>(),
-            ["flask"]
+                .collect::<Vec<_>>()
+                == ["flask"]
         );
         let rust: Vec<_> = extractors_for(Language::Rust)
             .iter()
             .map(|e| e.name())
             .collect();
-        assert!(rust.contains(&"axum"));
-        assert!(rust.contains(&"utoipa-axum"));
+        check!(rust.contains(&"axum"));
+        check!(rust.contains(&"utoipa-axum"));
         let java: Vec<_> = extractors_for(Language::Java)
             .iter()
             .map(|e| e.name())
             .collect();
-        assert_eq!(java, ["spring"]);
+        check!(java == ["spring"]);
         let go: Vec<_> = extractors_for(Language::Go)
             .iter()
             .map(|e| e.name())
             .collect();
-        assert_eq!(go, ["gin"]);
+        check!(go == ["gin"]);
         for js in [Language::JavaScript, Language::TypeScript, Language::Tsx] {
             let names: Vec<_> = extractors_for(js).iter().map(|e| e.name()).collect();
-            assert_eq!(names, ["express"]);
+            check!(names == ["express"]);
         }
     }
 
@@ -212,6 +213,6 @@ mod tests {
     fn axum_extractor_trait_yields_endpoints() {
         let src = "fn app() -> Router { Router::new().route(\"/health\", get(health)) }";
         let eps = AxumExtractor.endpoints(src);
-        assert!(eps.iter().any(|e| e.path == "/health"));
+        check!(eps.iter().any(|e| e.path == "/health"));
     }
 }

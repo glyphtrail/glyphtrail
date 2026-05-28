@@ -187,6 +187,7 @@ fn expand_ref<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use assert2::check;
     use meridian_core::HttpMethod;
 
     fn ep<'a>(eps: &'a [RawEndpoint], method: HttpMethod, path: &str) -> Option<&'a RawEndpoint> {
@@ -203,16 +204,10 @@ fn build() -> Router {
 }
 "#;
         let eps = extract_axum(src);
-        assert_eq!(ep(&eps, HttpMethod::Get, "/users").unwrap().handler, "list");
-        assert_eq!(
-            ep(&eps, HttpMethod::Post, "/users").unwrap().handler,
-            "create"
-        );
+        check!(ep(&eps, HttpMethod::Get, "/users").unwrap().handler == "list");
+        check!(ep(&eps, HttpMethod::Post, "/users").unwrap().handler == "create");
         // `:id` is normalized to `{id}`.
-        assert_eq!(
-            ep(&eps, HttpMethod::Get, "/users/{id}").unwrap().handler,
-            "show"
-        );
+        check!(ep(&eps, HttpMethod::Get, "/users/{id}").unwrap().handler == "show");
     }
 
     #[test]
@@ -223,9 +218,9 @@ fn app() -> Router {
 }
 "#;
         let eps = extract_axum(src);
-        assert!(ep(&eps, HttpMethod::Get, "/api/users/{id}").is_some());
+        check!(ep(&eps, HttpMethod::Get, "/api/users/{id}").is_some());
         // The un-prefixed form is not emitted.
-        assert!(ep(&eps, HttpMethod::Get, "/users/{id}").is_none());
+        check!(ep(&eps, HttpMethod::Get, "/users/{id}").is_none());
     }
 
     #[test]
@@ -240,15 +235,15 @@ fn app() -> Router {
 }
 "#;
         let eps = extract_axum(src);
-        assert!(ep(&eps, HttpMethod::Get, "/api/users").is_some());
-        assert_eq!(
+        check!(ep(&eps, HttpMethod::Get, "/api/users").is_some());
+        check!(
             ep(&eps, HttpMethod::Get, "/api/users/{id}")
                 .unwrap()
-                .handler,
-            "show"
+                .handler
+                == "show"
         );
         // users_router is referenced via nest, so it is not also emitted unprefixed.
-        assert!(ep(&eps, HttpMethod::Get, "/").is_none());
+        check!(ep(&eps, HttpMethod::Get, "/").is_none());
     }
 
     #[test]
@@ -259,7 +254,7 @@ fn app() -> Router {
 }
 "#;
         let eps = extract_axum(src);
-        assert!(ep(&eps, HttpMethod::Get, "/api/health").is_some());
+        check!(ep(&eps, HttpMethod::Get, "/api/health").is_some());
     }
 
     #[test]
@@ -273,8 +268,8 @@ fn app() -> Router {
 }
 "#;
         let eps = extract_axum(src);
-        assert_eq!(eps.len(), 1);
-        assert_eq!(eps[0].path, "/x");
+        check!(eps.len() == 1);
+        check!(eps[0].path == "/x");
     }
 
     #[test]
@@ -285,7 +280,7 @@ fn app() -> Router {
 }
 "#;
         let eps = extract_axum(src);
-        assert_eq!(ep(&eps, HttpMethod::Get, "/u").unwrap().handler, "list");
+        check!(ep(&eps, HttpMethod::Get, "/u").unwrap().handler == "list");
     }
 
     #[test]
@@ -297,11 +292,11 @@ fn app() -> Router {
 }
 "##;
         let eps = extract_axum(src);
-        assert_eq!(
+        check!(
             ep(&eps, HttpMethod::Get, "/api/users/{id}")
                 .unwrap()
-                .handler,
-            "show"
+                .handler
+                == "show"
         );
     }
 
@@ -313,7 +308,7 @@ fn app() -> Router {
 }
 "#;
         let eps = extract_axum(src);
-        assert_eq!(ep(&eps, HttpMethod::Get, "/x").unwrap().handler, "h");
+        check!(ep(&eps, HttpMethod::Get, "/x").unwrap().handler == "h");
     }
 
     #[test]
@@ -330,16 +325,16 @@ fn app() -> Router {
 }
 "#;
         let mounts = extract_axum_mounts(src);
-        assert!(mounts.contains(&RawMount {
+        check!(mounts.contains(&RawMount {
             parent: "app".into(),
             child: "admin".into()
         }));
-        assert!(mounts.contains(&RawMount {
+        check!(mounts.contains(&RawMount {
             parent: "admin".into(),
             child: "users_router".into()
         }));
         // Inline routers (not builders) do not produce mounts.
-        assert_eq!(mounts.len(), 2);
+        check!(mounts.len() == 2);
     }
 
     #[test]
@@ -355,11 +350,11 @@ fn app() -> Router {
 }
 "#;
         let mounts = extract_axum_mounts(src);
-        assert!(mounts.contains(&RawMount {
+        check!(mounts.contains(&RawMount {
             parent: "app".into(),
             child: "child".into()
         }));
-        assert!(!mounts.iter().any(|m| m.child == "other"));
+        check!(!mounts.iter().any(|m| m.child == "other"));
     }
 
     #[test]
@@ -375,10 +370,10 @@ fn app() -> Router {
 }
 "#;
         let eps = extract_axum(src);
-        assert!(eps.iter().all(|e| e.path != "/PATH"));
-        assert!(ep(&eps, HttpMethod::Get, "/users").is_none());
+        check!(eps.iter().all(|e| e.path != "/PATH"));
+        check!(ep(&eps, HttpMethod::Get, "/users").is_none());
         // The route under the dynamic nest prefix is not emitted either.
-        assert!(eps.iter().all(|e| e.handler != "inner"));
+        check!(eps.iter().all(|e| e.handler != "inner"));
     }
 
     #[test]
@@ -393,8 +388,8 @@ fn app() -> Router {
 }
 "#;
         let eps = extract_axum(src);
-        assert_eq!(ep(&eps, HttpMethod::Get, "/a").unwrap().handler, "show");
-        assert_eq!(ep(&eps, HttpMethod::Get, "/b").unwrap().handler, "list");
-        assert_eq!(ep(&eps, HttpMethod::Post, "/b").unwrap().handler, "create");
+        check!(ep(&eps, HttpMethod::Get, "/a").unwrap().handler == "show");
+        check!(ep(&eps, HttpMethod::Get, "/b").unwrap().handler == "list");
+        check!(ep(&eps, HttpMethod::Post, "/b").unwrap().handler == "create");
     }
 }

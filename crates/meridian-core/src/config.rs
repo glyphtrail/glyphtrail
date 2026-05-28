@@ -149,13 +149,14 @@ pub struct SchemaSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use assert2::check;
 
     #[test]
     fn empty_config_uses_defaults() {
         let cfg = Config::from_toml_str("").unwrap();
-        assert!(cfg.api.heuristic_prefix_strip);
-        assert_eq!(cfg.api.gateway_prefixes, vec!["/api".to_string()]);
-        assert!(cfg.api.rewrites.is_empty());
+        check!(cfg.api.heuristic_prefix_strip);
+        check!(cfg.api.gateway_prefixes == vec!["/api".to_string()]);
+        check!(cfg.api.rewrites.is_empty());
     }
 
     #[test]
@@ -172,15 +173,15 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert!(!cfg.api.heuristic_prefix_strip);
-        assert_eq!(cfg.api.gateway_prefixes.len(), 2);
-        assert_eq!(cfg.api.rewrites.len(), 1);
-        assert_eq!(cfg.api.rewrites[0].from, "/api");
+        check!(!cfg.api.heuristic_prefix_strip);
+        check!(cfg.api.gateway_prefixes.len() == 2);
+        check!(cfg.api.rewrites.len() == 1);
+        check!(cfg.api.rewrites[0].from == "/api");
     }
 
     #[test]
     fn unknown_fields_are_rejected() {
-        assert!(Config::from_toml_str("[api]\nbogus = 1\n").is_err());
+        check!(Config::from_toml_str("[api]\nbogus = 1\n").is_err());
     }
 
     #[test]
@@ -193,7 +194,7 @@ mod tests {
             "#,
         )
         .unwrap_err();
-        assert!(matches!(err, crate::CoreError::ConfigInvalid { .. }));
+        check!(matches!(err, crate::CoreError::ConfigInvalid { .. }));
     }
 
     #[test]
@@ -201,13 +202,13 @@ mod tests {
         for bad in ["\"/\"", "\"\"", "\"   \""] {
             let toml = format!("[api]\ngateway_prefixes = [{bad}]\n");
             let err = Config::from_toml_str(&toml).unwrap_err();
-            assert!(
+            check!(
                 matches!(err, crate::CoreError::ConfigInvalid { .. }),
                 "expected ConfigInvalid for {bad}, got {err:?}"
             );
         }
         // A real prefix is accepted.
-        assert!(Config::from_toml_str("[api]\ngateway_prefixes = [\"/api\"]\n").is_ok());
+        check!(Config::from_toml_str("[api]\ngateway_prefixes = [\"/api\"]\n").is_ok());
     }
 
     #[test]
@@ -220,7 +221,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert_eq!(cfg.api.schemas[0].protocol, Protocol::Rest);
+        check!(cfg.api.schemas[0].protocol == Protocol::Rest);
         // An unknown protocol fails at parse time.
         let err = Config::from_toml_str(
             r#"
@@ -230,6 +231,6 @@ mod tests {
             "#,
         )
         .unwrap_err();
-        assert!(matches!(err, crate::CoreError::ConfigParse { .. }));
+        check!(matches!(err, crate::CoreError::ConfigParse { .. }));
     }
 }

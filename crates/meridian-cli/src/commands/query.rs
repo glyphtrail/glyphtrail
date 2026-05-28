@@ -465,6 +465,7 @@ fn print_api_impact(report: &[ApiImpactOut], json: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use assert2::check;
     use meridian_core::NodeId;
 
     fn ops() -> Vec<(NodeId, OperationKey)> {
@@ -491,13 +492,13 @@ mod tests {
     #[test]
     fn template_matches_concrete_value() {
         let matched = match_operations(&ops(), Some(HttpMethod::Get), "/users/123");
-        assert_eq!(ids(&matched), ["get"]);
+        check!(ids(&matched) == ["get"]);
     }
 
     #[test]
     fn method_discriminates() {
         let matched = match_operations(&ops(), Some(HttpMethod::Post), "/users/{id}");
-        assert_eq!(ids(&matched), ["post"]);
+        check!(ids(&matched) == ["post"]);
     }
 
     #[test]
@@ -505,32 +506,26 @@ mod tests {
         let found = match_operations(&ops(), None, "/users/{id}");
         let mut matched = ids(&found);
         matched.sort_unstable();
-        assert_eq!(matched, ["get", "post"]);
+        check!(matched == ["get", "post"]);
     }
 
     #[test]
     fn distinct_path_shape_does_not_match() {
         let matched = match_operations(&ops(), Some(HttpMethod::Get), "/users");
-        assert_eq!(ids(&matched), ["list"]);
+        check!(ids(&matched) == ["list"]);
     }
 
     #[test]
     fn protocol_filter_parses_and_rejects() {
-        assert_eq!(parse_protocol_filter(None).unwrap(), None);
-        assert_eq!(
-            parse_protocol_filter(Some("grpc")).unwrap(),
-            Some(Protocol::Grpc)
-        );
-        assert!(parse_protocol_filter(Some("soap")).is_err());
+        check!(parse_protocol_filter(None).unwrap() == None);
+        check!(parse_protocol_filter(Some("grpc")).unwrap() == Some(Protocol::Grpc));
+        check!(parse_protocol_filter(Some("soap")).is_err());
     }
 
     #[test]
     fn method_filter_parses_and_rejects() {
-        assert_eq!(parse_method_opt(None).unwrap(), None);
-        assert_eq!(
-            parse_method_opt(Some("delete")).unwrap(),
-            Some(HttpMethod::Delete)
-        );
-        assert!(parse_method_opt(Some("fetch")).is_err());
+        check!(parse_method_opt(None).unwrap() == None);
+        check!(parse_method_opt(Some("delete")).unwrap() == Some(HttpMethod::Delete));
+        check!(parse_method_opt(Some("fetch")).is_err());
     }
 }
