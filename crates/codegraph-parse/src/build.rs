@@ -4,6 +4,7 @@ use codegraph_core::{
     CodeGraph, Confidence, EdgeKind, Language, Node, NodeId, NodeKind, OperationKey, Span,
 };
 
+use crate::client::extract_client_calls;
 use crate::extract::{ParsedFile, RawDef};
 use crate::rest::{extract_axum, extract_utoipa};
 
@@ -87,6 +88,45 @@ pub fn build_rest_graph(rel_path: &str, symbols: &[SymbolEntry], source: &str) -
         }
     }
     rg
+}
+
+/// Client-side API call sites extracted from a JS/TS file: `ClientCall` nodes
+/// and their operation keys (linked to endpoints later by the matcher).
+#[derive(Debug, Default)]
+pub struct ClientGraph {
+    pub graph: CodeGraph,
+    pub operations: Vec<(NodeId, OperationKey)>,
+}
+
+/// Build the client-call fragment for a JS/TS/TSX file. Each `fetch`/`axios`
+/// call becomes a `ClientCall` node carrying its `(method, path)` operation key.
+pub fn build_client_graph(rel_path: &str, source: &str, lang: Language) -> ClientGraph {
+    let mut cg = ClientGraph::default();
+    for call in extract_client_calls(source, lang) {
+        let key = OperationKey::rest(call.method, &call.path);
+        let method = call.method.as_str();
+        // Each call site is a distinct node; the byte offset disambiguates
+        // repeated identical calls within a file.
+        let id = NodeId::derive(&[
+            rel_path,
+            "client_call",
+            method,
+            &key.path,
+            &call.span.start_byte.to_string(),
+        ]);
+        cg.graph.add_node(Node {
+            id: id.clone(),
+            kind: NodeKind::ClientCall,
+            name: format!("{method} {}", key.path),
+            qualified_name: key.path.clone(),
+            file: rel_path.to_string(),
+            language: Some(lang.name().to_string()),
+            span: Some(call.span),
+            doc: None,
+        });
+        cg.operations.push((id, key));
+    }
+    cg
 }
 
 const MARKERS: [&str; 5] = ["NOTE", "WHY", "HACK", "TODO", "FIXME"];

@@ -1,11 +1,14 @@
 pub mod build;
+pub mod client;
 pub mod extract;
 pub mod registry;
 pub mod rest;
 
 pub use build::{
-    build_file_graph, build_rest_graph, FileGraph, PendingEdge, RestGraph, SymbolEntry,
+    build_client_graph, build_file_graph, build_rest_graph, ClientGraph, FileGraph, PendingEdge,
+    RestGraph, SymbolEntry,
 };
+pub use client::{extract_client_calls, RawClientCall};
 pub use extract::{parse_source, ParsedFile};
 pub use rest::{extract_axum, extract_utoipa, RawEndpoint};
 

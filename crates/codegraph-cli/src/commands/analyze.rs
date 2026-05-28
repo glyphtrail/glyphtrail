@@ -4,9 +4,12 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use codegraph_core::config::{RepoPaths, IGNORE_FILE};
 use codegraph_core::{
-    CodeGraph, Confidence, Edge, EdgeKind, Language, Node, NodeId, NodeKind, OperationKey,
+    ClientCall, CodeGraph, Confidence, Config, Edge, EdgeKind, Endpoint, Language, Matcher, Node,
+    NodeId, NodeKind, OperationKey, RewriteEngine,
 };
-use codegraph_parse::{build_file_graph, build_rest_graph, parse_source, PendingEdge};
+use codegraph_parse::{
+    build_client_graph, build_file_graph, build_rest_graph, parse_source, PendingEdge,
+};
 use codegraph_store::SqliteStore;
 use ignore::WalkBuilder;
 
@@ -150,6 +153,14 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
                     operations.extend(rg.operations);
                     pending_handlers.extend(rg.pending_handlers);
                 }
+                if matches!(
+                    f.language,
+                    Language::JavaScript | Language::TypeScript | Language::Tsx
+                ) {
+                    let cg = build_client_graph(&f.rel_path, &source, f.language);
+                    graph.extend(cg.graph);
+                    operations.extend(cg.operations);
+                }
                 graph.extend(fg.graph);
                 pending.extend(fg.pending);
             }
@@ -199,6 +210,34 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
         }
     }
     store.insert_graph(&[], &inferred)?;
+
+    // Cross-boundary linking: resolve client calls to the endpoints that answer
+    // them and persist INVOKES edges. Runs over the full store (endpoints and
+    // calls commonly live in different, possibly unchanged, files).
+    let cfg = Config::load(&root)?;
+    let rewrite = RewriteEngine::from_config(&cfg.api);
+    let endpoints: Vec<Endpoint> = store
+        .operations_by_kind(NodeKind::Endpoint)?
+        .into_iter()
+        .map(|(id, key)| Endpoint { id, key })
+        .collect();
+    let calls: Vec<ClientCall> = store
+        .operations_by_kind(NodeKind::ClientCall)?
+        .into_iter()
+        .map(|(id, key)| ClientCall { id, key })
+        .collect();
+    let matcher = Matcher::build(&endpoints, &rewrite);
+    let invokes: Vec<Edge> = matcher
+        .resolve_all(&calls)
+        .into_iter()
+        .map(|m| Edge {
+            src: m.client,
+            dst: m.endpoint,
+            kind: EdgeKind::Invokes,
+            confidence: m.confidence,
+        })
+        .collect();
+    store.insert_graph(&[], &invokes)?;
 
     for f in &changed {
         store.set_file(&f.rel_path, Some(f.language.name()), &f.hash)?;
