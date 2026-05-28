@@ -4,7 +4,7 @@ vars:
   PROFILE: '{{ .PROFILE | default "debug" }}'
   PROFILE_FLAG: '{{ if eq .PROFILE "release" }}--release{{ end }}'
   PROFILE_DIR: '{{ if eq .PROFILE "release" }}release{{ else }}debug{{ end }}'
-  BIN: codegraph
+  BIN: meridian
   PORT: '{{ .PORT | default "7700" }}'
 
 tasks:
@@ -28,48 +28,48 @@ tasks:
         vars: {PROFILE: release}
 
   run:
-    desc: Run the codegraph CLI (pass args after --)
+    desc: Run the Meridian CLI (pass args after --)
     preconditions:
       - sh: command -v cargo
         msg: "cargo not found — install Rust from https://rustup.rs/"
     cmds:
-      - cargo run -p codegraph-cli {{.PROFILE_FLAG}} -- {{.CLI_ARGS}}
+      - cargo run -p meridian-cli {{.PROFILE_FLAG}} -- {{.CLI_ARGS}}
 
   analyze:
     desc: Analyze a repo path (defaults to current directory)
     vars:
       TARGET: '{{ .TARGET | default "." }}'
     cmds:
-      - cargo run -p codegraph-cli {{.PROFILE_FLAG}} -- analyze {{.TARGET}} {{.CLI_ARGS}}
+      - cargo run -p meridian-cli {{.PROFILE_FLAG}} -- analyze {{.TARGET}} {{.CLI_ARGS}}
 
   query:
     desc: 'Query the graph (pass args after --, e.g. task query -- def main)'
     cmds:
-      - cargo run -p codegraph-cli {{.PROFILE_FLAG}} -- query {{.CLI_ARGS}}
+      - cargo run -p meridian-cli {{.PROFILE_FLAG}} -- query {{.CLI_ARGS}}
 
   serve:
     desc: Start the interactive graph explorer on PORT (default 7700)
     cmds:
-      - cargo run -p codegraph-cli {{.PROFILE_FLAG}} -- serve --port {{.PORT}} {{.CLI_ARGS}}
+      - cargo run -p meridian-cli {{.PROFILE_FLAG}} -- serve --port {{.PORT}} {{.CLI_ARGS}}
 
   viz:
     desc: Generate a self-contained graph.html
     vars:
       OUT: '{{ .OUT | default "graph.html" }}'
     cmds:
-      - cargo run -p codegraph-cli {{.PROFILE_FLAG}} -- viz --output {{.OUT}} {{.CLI_ARGS}}
+      - cargo run -p meridian-cli {{.PROFILE_FLAG}} -- viz --output {{.OUT}} {{.CLI_ARGS}}
 
   status:
     desc: Show index statistics
     cmds:
-      - cargo run -p codegraph-cli {{.PROFILE_FLAG}} -- status {{.CLI_ARGS}}
+      - cargo run -p meridian-cli {{.PROFILE_FLAG}} -- status {{.CLI_ARGS}}
 
   completions:
     desc: 'Generate a shell completion script (SHELL_KIND=bash|zsh|fish|powershell|elvish)'
     vars:
       SHELL_KIND: '{{ .SHELL_KIND | default "bash" }}'
     cmds:
-      - cargo run -p codegraph-cli {{.PROFILE_FLAG}} -- completions {{.SHELL_KIND}}
+      - cargo run -p meridian-cli {{.PROFILE_FLAG}} -- completions {{.SHELL_KIND}}
 
   test:
     desc: Run the workspace test suite
@@ -143,10 +143,10 @@ tasks:
       - cargo clean
 
   clean:index:
-    desc: Remove the local .codegraph index directory
-    prompt: "Delete .codegraph/ (local graph index)?"
+    desc: Remove the local .meridian index directory
+    prompt: "Delete .meridian/ (local graph index)?"
     cmds:
-      - rm -rf .codegraph
+      - rm -rf .meridian
 
   clean:viz:
     desc: Remove generated graph.html
