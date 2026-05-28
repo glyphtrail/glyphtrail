@@ -119,10 +119,11 @@ pub fn parse_source(lang: Language, source: &str) -> anyhow::Result<ParsedFile> 
                 }),
                 other => {
                     if let Some(suffix) = other.strip_prefix("def.")
-                        && let Some(k) = kind_from_suffix(suffix) {
-                            def_kind = Some(k);
-                            def_node = Some(node);
-                        }
+                        && let Some(k) = kind_from_suffix(suffix)
+                    {
+                        def_kind = Some(k);
+                        def_node = Some(node);
+                    }
                 }
             }
         }

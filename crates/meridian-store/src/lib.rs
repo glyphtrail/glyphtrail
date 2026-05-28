@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 pub mod sqlite;
 
 pub use sqlite::{SqliteStore, Stats};
@@ -93,8 +95,19 @@ mod tests {
 
         // Incremental re-index of the endpoint's file drops its operation row.
         store.delete_file_data("routes.rs").unwrap();
-        assert!(store.operations_by_kind(NodeKind::Endpoint).unwrap().is_empty());
-        assert_eq!(store.operations_by_kind(NodeKind::ClientCall).unwrap().len(), 1);
+        assert!(
+            store
+                .operations_by_kind(NodeKind::Endpoint)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .operations_by_kind(NodeKind::ClientCall)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -124,10 +137,12 @@ mod tests {
 
         // The schema op node, its operation row and the EXPOSES edge are gone;
         // the endpoint (a different kind) is untouched.
-        assert!(store
-            .operations_by_kind(NodeKind::SchemaOp)
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .operations_by_kind(NodeKind::SchemaOp)
+                .unwrap()
+                .is_empty()
+        );
         assert!(store.get_node("s1").unwrap().is_none());
         assert!(store.get_node("e1").unwrap().is_some());
         assert_eq!(store.stats().unwrap().edges, 0);

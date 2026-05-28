@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use meridian_core::{normalize_path, HttpMethod, Span};
+use meridian_core::{HttpMethod, Span, normalize_path};
 use tree_sitter::Node;
 
 /// Visit `node` and all of its descendants, pre-order.
@@ -18,7 +18,7 @@ pub(super) fn walk<'a>(node: Node<'a>, f: &mut dyn FnMut(Node<'a>)) {
 pub(super) fn named_arg<'a>(args: Option<Node<'a>>, i: usize) -> Option<Node<'a>> {
     let args = args?;
     let mut cursor = args.walk();
-    
+
     args.named_children(&mut cursor).nth(i)
 }
 
@@ -90,12 +90,12 @@ pub(super) fn chain_root(mut n: Node) -> Node {
         if p.kind() == "field_expression"
             && p.child_by_field_name("value").map(|v| v.id()) == Some(n.id())
             && let Some(gp) = p.parent()
-                && gp.kind() == "call_expression"
-                    && gp.child_by_field_name("function").map(|f| f.id()) == Some(p.id())
-                {
-                    n = gp;
-                    continue;
-                }
+            && gp.kind() == "call_expression"
+            && gp.child_by_field_name("function").map(|f| f.id()) == Some(p.id())
+        {
+            n = gp;
+            continue;
+        }
         break;
     }
     n

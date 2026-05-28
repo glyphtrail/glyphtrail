@@ -5,7 +5,7 @@ use anyhow::Result;
 use meridian_core::{
     Confidence, Edge, EdgeKind, HttpMethod, Node, NodeId, NodeKind, OperationKey, Protocol, Span,
 };
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 /// Persistent code graph backed by SQLite (+ FTS5 search). The first storage
 /// backend; a LadybugDB backend implementing the same surface comes later.
@@ -37,7 +37,9 @@ impl SqliteStore {
 
     /// Persisted hash for a file, if indexed before.
     pub fn file_hash(&self, path: &str) -> Result<Option<String>> {
-        let mut stmt = self.conn.prepare("SELECT hash FROM files WHERE path = ?1")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT hash FROM files WHERE path = ?1")?;
         let mut rows = stmt.query(params![path])?;
         if let Some(row) = rows.next()? {
             Ok(Some(row.get(0)?))
@@ -343,8 +345,18 @@ impl SqliteStore {
     }
 
     /// Transitive closure of dependents/dependencies up to `depth` (impact analysis).
-    pub fn reachable(&self, id: &str, kind: EdgeKind, outgoing: bool, depth: usize) -> Result<Vec<Node>> {
-        let (from_col, to_col) = if outgoing { ("src", "dst") } else { ("dst", "src") };
+    pub fn reachable(
+        &self,
+        id: &str,
+        kind: EdgeKind,
+        outgoing: bool,
+        depth: usize,
+    ) -> Result<Vec<Node>> {
+        let (from_col, to_col) = if outgoing {
+            ("src", "dst")
+        } else {
+            ("dst", "src")
+        };
         let sql = format!(
             "WITH RECURSIVE reach(id, d) AS (
                  SELECT ?1, 0
@@ -373,9 +385,15 @@ impl SqliteStore {
     }
 
     pub fn stats(&self) -> Result<Stats> {
-        let nodes: i64 = self.conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
-        let edges: i64 = self.conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
-        let files: i64 = self.conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?;
+        let nodes: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
+        let edges: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
+        let files: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?;
         Ok(Stats {
             nodes: nodes as usize,
             edges: edges as usize,
@@ -389,7 +407,9 @@ impl SqliteStore {
         let nodes: Vec<Node> = nstmt
             .query_map(params![limit as i64], Self::row_to_node)?
             .collect::<rusqlite::Result<_>>()?;
-        let mut estmt = self.conn.prepare("SELECT src, dst, kind, confidence FROM edges")?;
+        let mut estmt = self
+            .conn
+            .prepare("SELECT src, dst, kind, confidence FROM edges")?;
         let edges: Vec<Edge> = estmt
             .query_map([], |r| {
                 Ok(Edge {

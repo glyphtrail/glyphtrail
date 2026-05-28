@@ -1,5 +1,7 @@
 # Meridian
 
+[![unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)](https://github.com/rust-secure-code/safety-dance/)
+
 Meridian maps codebases as **semantic and historical graphs**, so you can query
 structure, trace lineage, and discover recurring ideas across time.
 
@@ -74,6 +76,40 @@ A Cargo workspace:
 Storage is SQLite-first behind a store layer so a LadybugDB (Cypher) backend can
 be added later. An MCP server and multi-repo support are planned.
 
+## Development
+
+### Prerequisites
+
+- Rust toolchain: install from [rustup.rs](https://rustup.rs/)
+- [`task`](https://taskfile.dev/#/installation) - task runner (`Taskfile.dist.yaml`)
+- `prek` - fast Rust-native pre-commit hook runner (`cargo install prek`)
+
+### Setup
+
+```sh
+# Clone and build
+git clone https://github.com/sunsided/meridian
+cd meridian
+cargo build --workspace
+
+# Install pre-commit hooks (runs on every `git commit`)
+prek install
+```
+
+### Checks
+
+```sh
+task fmt        # format in place
+task lint       # clippy -D warnings
+task test       # full test suite
+task ci         # fmt:check + lint + test (mirrors CI)
+
+# Run hooks manually against all files
+prek run --all-files
+```
+
+The CI matrix runs against `stable` and the MSRV (`1.95`).
+
 ## License
 
-MIT OR Apache-2.0.
+[European Union Public Licence 1.2](LICENSE-EUPL-1.2)

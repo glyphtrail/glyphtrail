@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 pub mod build;
 pub mod client;
 pub mod extract;
@@ -5,13 +7,13 @@ pub mod registry;
 pub mod rest;
 
 pub use build::{
-    build_client_graph, build_file_graph, build_rest_graph, ClientGraph, FileGraph, PendingEdge,
-    RestGraph, SymbolEntry,
+    ClientGraph, FileGraph, PendingEdge, RestGraph, SymbolEntry, build_client_graph,
+    build_file_graph, build_rest_graph,
 };
-pub use client::{extract_client_calls, RawClientCall};
-pub use extract::{parse_source, ParsedFile};
+pub use client::{RawClientCall, extract_client_calls};
+pub use extract::{ParsedFile, parse_source};
 pub use rest::{
-    extract_axum, extract_axum_mounts, extract_utoipa, extract_utoipa_mounts, RawEndpoint, RawMount,
+    RawEndpoint, RawMount, extract_axum, extract_axum_mounts, extract_utoipa, extract_utoipa_mounts,
 };
 
 #[cfg(test)]
@@ -50,12 +52,20 @@ fn main() {
     #[test]
     fn extracts_definitions_per_language() {
         let cases = [
-            (Language::Python, "class Foo:\n    def bar(self):\n        pass\n", "bar"),
+            (
+                Language::Python,
+                "class Foo:\n    def bar(self):\n        pass\n",
+                "bar",
+            ),
             (Language::Go, "package m\nfunc Run() {}\n", "Run"),
             (Language::Java, "class A { void go() {} }", "go"),
             (Language::TypeScript, "function f(): void {}\n", "f"),
             (Language::C, "int add(int a) { return a; }\n", "add"),
-            (Language::Cpp, "struct S {}; int main() { return 0; }\n", "main"),
+            (
+                Language::Cpp,
+                "struct S {}; int main() { return 0; }\n",
+                "main",
+            ),
             (Language::JavaScript, "function hi() {}\n", "hi"),
         ];
         for (lang, src, expect) in cases {
@@ -105,11 +115,12 @@ class Service:
             .find(|n| n.name == "helper")
             .unwrap()
             .id;
-        assert!(fg
-            .graph
-            .edges
-            .iter()
-            .any(|e| &e.dst == helper_id && e.kind == meridian_core::EdgeKind::Calls));
+        assert!(
+            fg.graph
+                .edges
+                .iter()
+                .any(|e| &e.dst == helper_id && e.kind == meridian_core::EdgeKind::Calls)
+        );
     }
 
     #[test]
@@ -166,11 +177,12 @@ fn app() -> Router {
             .find(|n| n.kind == NodeKind::Endpoint)
             .expect("endpoint node");
         // No local def named `list`, so the handler link is deferred, not emitted.
-        assert!(!rg
-            .graph
-            .edges
-            .iter()
-            .any(|e| e.kind == meridian_core::EdgeKind::Handles));
+        assert!(
+            !rg.graph
+                .edges
+                .iter()
+                .any(|e| e.kind == meridian_core::EdgeKind::Handles)
+        );
         assert_eq!(
             rg.pending_handlers,
             vec![("list".to_string(), ep.id.clone())]

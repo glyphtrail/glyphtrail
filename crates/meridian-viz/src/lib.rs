@@ -1,5 +1,7 @@
+#![forbid(unsafe_code)]
+
 use meridian_core::{Edge, Node};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub const TEMPLATE: &str = include_str!("../assets/index.html");
 

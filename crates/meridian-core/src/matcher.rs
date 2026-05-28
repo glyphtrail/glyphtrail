@@ -170,12 +170,14 @@ mod tests {
             &[ep("e1", HttpMethod::Get, "/api/users/{id}")],
             &default_engine(),
         );
-        assert!(m
-            .resolve(&call("c1", HttpMethod::Post, "/users/1"))
-            .is_empty());
-        assert!(m
-            .resolve(&call("c2", HttpMethod::Get, "/orders/1"))
-            .is_empty());
+        assert!(
+            m.resolve(&call("c1", HttpMethod::Post, "/users/1"))
+                .is_empty()
+        );
+        assert!(
+            m.resolve(&call("c2", HttpMethod::Get, "/orders/1"))
+                .is_empty()
+        );
     }
 
     #[test]

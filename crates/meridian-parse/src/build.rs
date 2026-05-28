@@ -103,10 +103,11 @@ pub fn build_rest_graph(rel_path: &str, symbols: &[SymbolEntry], source: &str) -
         .chain(extract_utoipa_mounts(source));
     for m in raw_mounts {
         if let (Some(p), Some(c)) = (resolve(&m.parent), resolve(&m.child))
-            && mounts.insert((p.clone(), c.clone())) {
-                rg.graph
-                    .add_edge(p, c, EdgeKind::Mounts, Confidence::Extracted);
-            }
+            && mounts.insert((p.clone(), c.clone()))
+        {
+            rg.graph
+                .add_edge(p, c, EdgeKind::Mounts, Confidence::Extracted);
+        }
     }
     rg
 }
@@ -160,11 +161,7 @@ fn has_marker(text: &str) -> bool {
 fn type_like(kind: NodeKind) -> bool {
     matches!(
         kind,
-        NodeKind::Class
-            | NodeKind::Struct
-            | NodeKind::Trait
-            | NodeKind::Interface
-            | NodeKind::Enum
+        NodeKind::Class | NodeKind::Struct | NodeKind::Trait | NodeKind::Interface | NodeKind::Enum
     )
 }
 
@@ -260,7 +257,12 @@ pub fn build_file_graph(
         .collect();
 
     // Compute qualified names (memoized by walking the parent chain).
-    fn qualify(i: usize, raw: &[RawDef], parents: &[Option<usize>], memo: &mut [Option<String>]) -> String {
+    fn qualify(
+        i: usize,
+        raw: &[RawDef],
+        parents: &[Option<usize>],
+        memo: &mut [Option<String>],
+    ) -> String {
         if let Some(q) = &memo[i] {
             return q.clone();
         }
@@ -313,8 +315,12 @@ pub fn build_file_graph(
             Some(p) => defs[p].id.clone(),
             None => file_id.clone(),
         };
-        fg.graph
-            .add_edge(parent_id, d.id.clone(), EdgeKind::Contains, Confidence::Extracted);
+        fg.graph.add_edge(
+            parent_id,
+            d.id.clone(),
+            EdgeKind::Contains,
+            Confidence::Extracted,
+        );
         let _ = i;
     }
 

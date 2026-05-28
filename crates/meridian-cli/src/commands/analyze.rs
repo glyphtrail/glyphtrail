@@ -2,18 +2,18 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use meridian_core::config::{RepoPaths, IGNORE_FILE};
+use meridian_core::config::{IGNORE_FILE, RepoPaths};
 use meridian_core::{
     ClientCall, CodeGraph, Confidence, Config, Edge, EdgeKind, Endpoint, Language, Matcher, Node,
     NodeId, NodeKind, OperationKey, Protocol, RewriteEngine,
 };
 use meridian_parse::{
-    build_client_graph, build_file_graph, build_rest_graph, parse_source, PendingEdge,
+    PendingEdge, build_client_graph, build_file_graph, build_rest_graph, parse_source,
 };
 
 use crate::commands::schema;
-use meridian_store::SqliteStore;
 use ignore::WalkBuilder;
+use meridian_store::SqliteStore;
 
 struct DiscoveredFile {
     rel_path: String,
@@ -196,26 +196,28 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
     let mut inferred: Vec<Edge> = Vec::new();
     for p in &pending {
         if let Some(candidates) = index.get(&p.name)
-            && candidates.len() == 1 {
-                inferred.push(Edge {
-                    src: p.src.clone(),
-                    dst: candidates[0].clone(),
-                    kind: p.kind,
-                    confidence: Confidence::Inferred,
-                });
-            }
+            && candidates.len() == 1
+        {
+            inferred.push(Edge {
+                src: p.src.clone(),
+                dst: candidates[0].clone(),
+                kind: p.kind,
+                confidence: Confidence::Inferred,
+            });
+        }
     }
     // HANDLES links whose handler is defined elsewhere: handler -> endpoint.
     for (handler, endpoint_id) in &pending_handlers {
         if let Some(candidates) = index.get(handler)
-            && candidates.len() == 1 {
-                inferred.push(Edge {
-                    src: candidates[0].clone(),
-                    dst: endpoint_id.clone(),
-                    kind: EdgeKind::Handles,
-                    confidence: Confidence::Inferred,
-                });
-            }
+            && candidates.len() == 1
+        {
+            inferred.push(Edge {
+                src: candidates[0].clone(),
+                dst: endpoint_id.clone(),
+                kind: EdgeKind::Handles,
+                confidence: Confidence::Inferred,
+            });
+        }
     }
     store.insert_graph(&[], &inferred)?;
 

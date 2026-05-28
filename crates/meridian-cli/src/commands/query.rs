@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use clap::Subcommand;
 use meridian_core::config::RepoPaths;
 use meridian_core::{EdgeKind, Node};
@@ -64,7 +64,10 @@ fn print_nodes(nodes: &[Node], json: bool) -> Result<()> {
     Ok(())
 }
 
-fn print_neighbors(items: &[(Node, EdgeKind, meridian_core::Confidence)], json: bool) -> Result<()> {
+fn print_neighbors(
+    items: &[(Node, EdgeKind, meridian_core::Confidence)],
+    json: bool,
+) -> Result<()> {
     if json {
         let out: Vec<NeighborOut> = items
             .iter()
@@ -99,7 +102,10 @@ fn print_neighbors(items: &[(Node, EdgeKind, meridian_core::Confidence)], json: 
 pub fn run(repo: &Path, cmd: QueryCmd, json: bool) -> Result<()> {
     let paths = RepoPaths::new(repo);
     if !paths.db_path.exists() {
-        bail!("no index found at {} — run `meridian analyze` first", paths.db_path.display());
+        bail!(
+            "no index found at {} — run `meridian analyze` first",
+            paths.db_path.display()
+        );
     }
     let store = SqliteStore::open(&paths.db_path)?;
 

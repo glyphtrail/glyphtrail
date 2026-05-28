@@ -1,13 +1,16 @@
 use std::path::Path;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use meridian_core::config::RepoPaths;
 use meridian_store::SqliteStore;
 
 pub fn run(repo: &Path, output: &Path, limit: usize) -> Result<()> {
     let paths = RepoPaths::new(repo);
     if !paths.db_path.exists() {
-        bail!("no index found at {} — run `meridian analyze` first", paths.db_path.display());
+        bail!(
+            "no index found at {} — run `meridian analyze` first",
+            paths.db_path.display()
+        );
     }
     let store = SqliteStore::open(&paths.db_path)?;
     let (nodes, edges) = store.export_graph(limit)?;

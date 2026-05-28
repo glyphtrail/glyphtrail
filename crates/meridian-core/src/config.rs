@@ -2,9 +2,9 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::CoreError;
 use crate::api::Protocol;
 use crate::rewrite::PrefixRewrite;
-use crate::CoreError;
 
 /// Per-repo layout. The index lives in `<repo>/.meridian/`.
 pub const INDEX_DIR: &str = ".meridian";

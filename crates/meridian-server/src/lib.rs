@@ -1,16 +1,18 @@
+#![forbid(unsafe_code)]
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use axum::{
+    Router,
     extract::{Query, State},
     response::{Html, Json},
     routing::get,
-    Router,
 };
 use meridian_store::SqliteStore;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 #[derive(Clone)]
 struct AppState {

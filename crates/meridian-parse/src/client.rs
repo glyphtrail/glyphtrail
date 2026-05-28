@@ -46,9 +46,10 @@ pub fn extract_client_calls(source: &str, lang: Language) -> Vec<RawClientCall> 
     let mut out = Vec::new();
     walk(root, &mut |n| {
         if n.kind() == "call_expression"
-            && let Some(call) = client_call(n, src, &clients) {
-                out.push(call);
-            }
+            && let Some(call) = client_call(n, src, &clients)
+        {
+            out.push(call);
+        }
     });
     out
 }
@@ -258,7 +259,7 @@ fn walk<'a>(node: Node<'a>, f: &mut dyn FnMut(Node<'a>)) {
 fn named_arg<'a>(args: Option<Node<'a>>, i: usize) -> Option<Node<'a>> {
     let args = args?;
     let mut cursor = args.walk();
-    
+
     args.named_children(&mut cursor).nth(i)
 }
 
@@ -374,8 +375,7 @@ mod tests {
     fn instance_binding_is_scope_sensitive() {
         // `api` is an axios instance only inside `withClient`; the same-named
         // parameter in `other` must not be treated as an axios client.
-        let src =
-            "function withClient() { const api = axios.create(); return api.get(\"/in\"); }\n\
+        let src = "function withClient() { const api = axios.create(); return api.get(\"/in\"); }\n\
                    function other(api) { return api.get(\"/out\"); }";
         let calls = extract_client_calls(src, Language::JavaScript);
         assert!(call(&calls, HttpMethod::Get, "/in").is_some());

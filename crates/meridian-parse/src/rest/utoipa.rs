@@ -213,10 +213,11 @@ fn expand_ref<'a>(
         return; // OpenApiRouter::new()
     }
     if let Some(chain) = builders.get(short)
-        && visited.insert(short.to_string()) {
-            expand(*chain, prefix, src, builders, attrs, visited, out);
-            visited.remove(short);
-        }
+        && visited.insert(short.to_string())
+    {
+        expand(*chain, prefix, src, builders, attrs, visited, out);
+        visited.remove(short);
+    }
 }
 
 /// Handler names listed in a `routes!(a, b, ...)` macro invocation.
@@ -282,9 +283,8 @@ fn collect_path_attrs(root: Node, src: &[u8]) -> AttrMap {
 /// Whether an `attribute` node names `utoipa::path`.
 fn is_utoipa_path(attr: Node, src: &[u8]) -> bool {
     let mut cursor = attr.walk();
-    
-    attr
-        .named_children(&mut cursor)
+
+    attr.named_children(&mut cursor)
         .next()
         .map(|p| text(p, src) == "utoipa::path")
         .unwrap_or(false)
@@ -306,9 +306,10 @@ fn parse_path_attr(tt: Node, src: &[u8]) -> (Vec<HttpMethod>, Option<String>) {
             methods.push(m);
         } else if t == "path"
             && let Some(next) = children.get(i + 1)
-                && matches!(next.kind(), "string_literal" | "raw_string_literal") {
-                    path = Some(string_text(*next, src));
-                }
+            && matches!(next.kind(), "string_literal" | "raw_string_literal")
+        {
+            path = Some(string_text(*next, src));
+        }
     }
     (methods, path)
 }
