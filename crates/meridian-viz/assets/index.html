@@ -14,6 +14,8 @@
   }
   #toolbar input { background: #0d1117; color: #e6e6e6; border: 1px solid #444;
     padding: 5px 8px; border-radius: 4px; width: 240px; }
+  #toolbar select { background: #0d1117; color: #e6e6e6; border: 1px solid #444;
+    padding: 5px 8px; border-radius: 4px; }
   #toolbar label { font-size: 12px; opacity: 0.8; }
   #cy { position: absolute; top: 44px; bottom: 0; left: 0; right: 0; background: #0d1117; }
   #info {
@@ -30,6 +32,12 @@
 <div id="toolbar">
   <strong>meridian</strong>
   <input id="filter" placeholder="filter by name…" />
+  <select id="protoFilter" title="isolate an API protocol">
+    <option value="">all protocols</option>
+    <option value="rest">REST</option>
+    <option value="grpc">gRPC</option>
+    <option value="graphql">GraphQL</option>
+  </select>
   <label><input type="checkbox" id="hideContains" /> hide containment</label>
   <span id="counts"></span>
 </div>
@@ -46,7 +54,25 @@ const EDGE_COLOR = {
   contains: "#3a3f44", calls: "#b5bd68", imports: "#81a2be",
   extends: "#de935f", implements: "#cc6666", documents: "#969896",
   defines: "#3a3f44", references: "#666",
+  handles: "#56b6c2", mounts: "#abb2bf", invokes: "#e5c07b", exposes: "#c678dd",
 };
+// Cross-boundary (API) edges render dashed and, where a protocol is known,
+// colored per protocol rather than by edge kind.
+const CROSS_BOUNDARY = new Set(["invokes", "exposes", "handles", "mounts"]);
+const PROTOCOL_COLOR = { rest: "#56b6c2", grpc: "#c678dd", graphql: "#e06c75" };
+
+// The protocol an edge belongs to, taken from whichever endpoint it touches.
+function edgeProtocol(e) {
+  return e.source().data("protocol") || e.target().data("protocol") || null;
+}
+function edgeColor(e) {
+  const k = e.data("kind");
+  if (CROSS_BOUNDARY.has(k)) {
+    const p = edgeProtocol(e);
+    return (p && PROTOCOL_COLOR[p]) || EDGE_COLOR[k] || "#999";
+  }
+  return EDGE_COLOR[k] || "#555";
+}
 
 async function loadData() {
   if (window.MERIDIAN_DATA) return window.MERIDIAN_DATA;
@@ -68,10 +94,12 @@ loadData().then((data) => {
         "text-valign": "bottom", "text-wrap": "ellipsis", "text-max-width": 90,
         "width": 14, "height": 14 } },
       { selector: "edge", style: {
-        "width": 1, "line-color": (e) => EDGE_COLOR[e.data("kind")] || "#555",
-        "target-arrow-color": (e) => EDGE_COLOR[e.data("kind")] || "#555",
+        "width": (e) => CROSS_BOUNDARY.has(e.data("kind")) ? 2 : 1,
+        "line-color": edgeColor,
+        "target-arrow-color": edgeColor,
         "target-arrow-shape": "triangle", "arrow-scale": 0.7,
-        "curve-style": "bezier", "line-style": (e) => e.data("confidence") === "inferred" ? "dashed" : "solid" } },
+        "curve-style": "bezier",
+        "line-style": (e) => CROSS_BOUNDARY.has(e.data("kind")) || e.data("confidence") === "inferred" ? "dashed" : "solid" } },
       { selector: ".faded", style: { "opacity": 0.08 } },
       { selector: ":selected", style: { "border-width": 3, "border-color": "#fff" } },
     ],
@@ -81,18 +109,51 @@ loadData().then((data) => {
   document.getElementById("counts").textContent =
     cy.nodes().length + " nodes, " + cy.edges().length + " edges";
 
+  const nodeTitle = (d) =>
+    d.protocol ? ((d.method ? d.method + " " : "") + (d.path || d.label)) : (d.qualified_name || d.label);
+
+  // Cross-boundary links of `n`, grouped for the detail panel.
+  function apiLinks(n) {
+    let h = "";
+    const rows = [];
+    n.connectedEdges().forEach((e) => {
+      const k = e.data("kind");
+      if (!CROSS_BOUNDARY.has(k)) return;
+      const outgoing = e.source().id() === n.id();
+      const other = outgoing ? e.target() : e.source();
+      const od = other.data();
+      rows.push({
+        kind: k, dir: outgoing ? "→" : "←",
+        label: (od.method ? od.method + " " : "") + (od.path || od.qualified_name || od.label),
+        loc: (od.file || "") + (od.line ? ":" + od.line : ""),
+        conf: e.data("confidence"),
+      });
+    });
+    if (rows.length) {
+      h += "<h3>links</h3>";
+      rows.forEach((r) => {
+        h += "<p><span class='tag'>" + esc(r.kind) + " " + r.dir + "</span> " +
+          esc(r.label) + " <small>(" + esc(r.loc) + ", " + esc(r.conf) + ")</small></p>";
+      });
+    }
+    return h;
+  }
+
   cy.on("tap", "node", (evt) => {
-    const d = evt.target.data();
+    const n = evt.target;
+    const d = n.data();
     const info = document.getElementById("info");
     info.style.display = "block";
-    info.innerHTML = "<h3>" + esc(d.qualified_name || d.label) + "</h3>" +
+    info.innerHTML = "<h3>" + esc(nodeTitle(d)) + "</h3>" +
       "<span class='tag'>" + esc(d.kind) + "</span> " +
+      (d.protocol ? "<span class='tag'>" + esc(d.protocol) + "</span> " : "") +
       (d.language ? "<span class='tag'>" + esc(d.language) + "</span>" : "") +
       "<p>" + esc(d.file || "") + (d.line ? ":" + esc(d.line) : "") + "</p>" +
+      (d.protocol ? apiLinks(n) : "") +
       (d.doc ? "<pre>" + esc(d.doc) + "</pre>" : "");
     cy.elements().addClass("faded");
-    evt.target.removeClass("faded");
-    evt.target.neighborhood().removeClass("faded");
+    n.removeClass("faded");
+    n.neighborhood().removeClass("faded");
   });
   cy.on("tap", (evt) => { if (evt.target === cy) {
     cy.elements().removeClass("faded");
@@ -108,6 +169,17 @@ loadData().then((data) => {
       (n.data("qualified_name") || "").toLowerCase().includes(q));
     hit.removeClass("faded");
     hit.neighborhood().removeClass("faded");
+  });
+
+  document.getElementById("protoFilter").addEventListener("change", (e) => {
+    const p = e.target.value;
+    if (!p) { cy.elements().removeClass("faded"); return; }
+    cy.elements().addClass("faded");
+    const api = cy.nodes().filter((n) => n.data("protocol") === p);
+    api.removeClass("faded");
+    const inc = api.connectedEdges();
+    inc.removeClass("faded");
+    inc.connectedNodes().removeClass("faded");
   });
 
   document.getElementById("hideContains").addEventListener("change", (e) => {

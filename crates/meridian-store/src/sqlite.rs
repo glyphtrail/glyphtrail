@@ -239,6 +239,31 @@ impl SqliteStore {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Every persisted API operation, regardless of node kind. Used to attach
+    /// protocol/method/path metadata to graph nodes for visualization.
+    pub fn all_operations(&self) -> Result<Vec<(NodeId, OperationKey)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT node_id, protocol, method, path FROM api_operations ORDER BY node_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let id = NodeId(r.get::<_, String>(0)?);
+            let protocol = Protocol::parse(&r.get::<_, String>(1)?).unwrap_or(Protocol::Rest);
+            let method = r
+                .get::<_, Option<String>>(2)?
+                .and_then(|m| HttpMethod::parse(&m));
+            let path = r.get::<_, String>(3)?;
+            Ok((
+                id,
+                OperationKey {
+                    protocol,
+                    method,
+                    path,
+                },
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// (name, id) for every definition-like node, for global call resolution.
     pub fn definition_index(&self) -> Result<Vec<(String, NodeId)>> {
         let mut stmt = self.conn.prepare(
