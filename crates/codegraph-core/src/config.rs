@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::api::Protocol;
 use crate::rewrite::PrefixRewrite;
+use crate::CoreError;
 
 /// Per-repo layout. The index lives in `<repo>/.codegraph/`.
 pub const INDEX_DIR: &str = ".codegraph";
@@ -53,22 +55,45 @@ impl Config {
     pub fn load(repo_root: impl AsRef<Path>) -> crate::Result<Config> {
         let path = RepoPaths::new(repo_root).config_path();
         match std::fs::read_to_string(&path) {
-            Ok(text) => Config::from_toml_str(&text),
+            Ok(text) => Config::parse(&text, &path),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
-            Err(e) => Err(crate::CoreError::Io(e)),
+            Err(e) => Err(CoreError::Io(e)),
         }
     }
 
     pub fn from_toml_str(text: &str) -> crate::Result<Config> {
-        toml::from_str(text).map_err(|e| crate::CoreError::Config(e.to_string()))
+        Config::parse(text, Path::new("config.toml"))
+    }
+
+    /// Parse and validate config, attaching `path` to any error for diagnostics.
+    fn parse(text: &str, path: &Path) -> crate::Result<Config> {
+        let cfg: Config = toml::from_str(text).map_err(|source| CoreError::ConfigParse {
+            path: path.to_path_buf(),
+            source: Box::new(source),
+        })?;
+        cfg.validate(path)?;
+        Ok(cfg)
+    }
+
+    fn validate(&self, path: &Path) -> crate::Result<()> {
+        for r in &self.api.rewrites {
+            r.validate().map_err(|message| CoreError::ConfigInvalid {
+                path: path.to_path_buf(),
+                message,
+            })?;
+        }
+        Ok(())
     }
 }
 
 /// Cross-boundary API-linking configuration.
 ///
-/// Precedence: explicit [`ApiConfig::rewrites`] describe the real gateway
+/// Confidence: explicit [`ApiConfig::rewrites`] describe the real gateway
 /// mapping and produce high-confidence (`Extracted`) matches; the
-/// `heuristic_prefix_strip` fallback produces low-confidence (`Inferred`) ones.
+/// `heuristic_prefix_strip` fallback contributes low-confidence (`Inferred`)
+/// candidates. The two are additive — the heuristic still runs alongside
+/// explicit rewrites, and when both yield the same path the `Extracted`
+/// confidence wins.
 ///
 /// ```toml
 /// [api]
@@ -83,7 +108,8 @@ impl Config {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ApiConfig {
-    /// Strip well-known gateway prefixes when no explicit rewrite matches.
+    /// Additionally strip well-known gateway prefixes as a low-confidence
+    /// fallback. Runs independently of (alongside) explicit rewrites.
     pub heuristic_prefix_strip: bool,
     /// Prefixes the heuristic may strip (segment-boundary matched).
     pub gateway_prefixes: Vec<String>,
@@ -112,7 +138,8 @@ impl Default for ApiConfig {
 #[serde(deny_unknown_fields)]
 pub struct SchemaSource {
     pub path: String,
-    pub protocol: String,
+    /// Validated at parse time against the known protocols (rest/grpc/graphql).
+    pub protocol: Protocol,
 }
 
 #[cfg(test)]
@@ -150,5 +177,41 @@ mod tests {
     #[test]
     fn unknown_fields_are_rejected() {
         assert!(Config::from_toml_str("[api]\nbogus = 1\n").is_err());
+    }
+
+    #[test]
+    fn root_prefix_rewrite_is_rejected() {
+        let err = Config::from_toml_str(
+            r#"
+            [[api.rewrites]]
+            from = "/"
+            to = "/x"
+            "#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, crate::CoreError::ConfigInvalid { .. }));
+    }
+
+    #[test]
+    fn schema_protocol_is_validated() {
+        let cfg = Config::from_toml_str(
+            r#"
+            [[api.schemas]]
+            path = "openapi.json"
+            protocol = "rest"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.api.schemas[0].protocol, Protocol::Rest);
+        // An unknown protocol fails at parse time.
+        let err = Config::from_toml_str(
+            r#"
+            [[api.schemas]]
+            path = "x.proto"
+            protocol = "soap"
+            "#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, crate::CoreError::ConfigParse { .. }));
     }
 }

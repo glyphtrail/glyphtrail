@@ -37,12 +37,18 @@ impl PrefixRewrite {
     /// Apply this rewrite to `path`, returning the rewritten path or `None` if
     /// `from` does not match on a segment boundary.
     pub fn apply(&self, path: &str) -> Option<String> {
-        let from = normalize_prefix(&self.from);
         let to = normalize_prefix(&self.to);
         let p = normalize_path(path);
 
-        if from.is_empty() {
+        // An empty `from` is the "prepend `to`" rule.
+        if self.from.trim().is_empty() {
             return Some(normalize_path(&format!("{to}{p}")));
+        }
+        let from = normalize_prefix(&self.from);
+        // `from` was only slashes (e.g. "/"): an ambiguous root prefix. Don't
+        // silently turn it into a prepend; config validation rejects it.
+        if from.is_empty() {
+            return None;
         }
         if p == from {
             return Some(if to.is_empty() { "/".to_string() } else { to });
@@ -52,6 +58,18 @@ impl PrefixRewrite {
             return Some(normalize_path(&format!("{to}/{rest}")));
         }
         None
+    }
+
+    /// Reject a non-empty `from` that is only slashes (e.g. `/`), which would be
+    /// an ambiguous root prefix. An empty `from` (prepend) is valid.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if !self.from.trim().is_empty() && normalize_prefix(&self.from).is_empty() {
+            return Err(format!(
+                "rewrite `from` must be a real path prefix, not {:?}",
+                self.from
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -230,6 +248,24 @@ mod tests {
         // because the rewrite is explicit (the prefix is kept, not removed).
         assert_eq!(conf("/api/users/{id}"), Some(Confidence::Extracted));
         assert_eq!(conf("/users/{id}"), Some(Confidence::Extracted));
+    }
+
+    #[test]
+    fn root_prefix_from_is_invalid_and_never_matches() {
+        let root = PrefixRewrite {
+            from: "/".into(),
+            to: "/x".into(),
+        };
+        assert!(root.validate().is_err());
+        // It must not silently behave like a prepend.
+        assert_eq!(root.apply("/users"), None);
+        // An empty `from` is a valid prepend rule.
+        let prepend = PrefixRewrite {
+            from: "".into(),
+            to: "/api".into(),
+        };
+        assert!(prepend.validate().is_ok());
+        assert_eq!(prepend.apply("/users").as_deref(), Some("/api/users"));
     }
 
     #[test]
