@@ -22,7 +22,7 @@ use tree_sitter::{Node, Parser};
 
 use super::ts::{
     collect_builders, collect_referenced_builders, func_name, join, last_segment, method_router,
-    named_arg, router_chain_roots, span_of, string_text, text,
+    named_arg, router_chain_roots, span_of, string_literal_text, text,
 };
 use super::RawEndpoint;
 use crate::registry::grammar;
@@ -100,21 +100,27 @@ fn expand<'a>(
                 match method.as_str() {
                     "route" | "route_service" => {
                         if let (Some(path), Some(mr)) = (named_arg(args, 0), named_arg(args, 1)) {
-                            let p = join(prefix, &string_text(path, src));
-                            for (m, h) in method_router(mr, src) {
-                                out.push(RawEndpoint {
-                                    method: m,
-                                    path: p.clone(),
-                                    handler: h,
-                                    span: span_of(expr),
-                                });
+                            // Dynamic (non-literal) paths are out of scope.
+                            if let Some(path) = string_literal_text(path, src) {
+                                let p = join(prefix, &path);
+                                for (m, h) in method_router(mr, src) {
+                                    out.push(RawEndpoint {
+                                        method: m,
+                                        path: p.clone(),
+                                        handler: h,
+                                        span: span_of(expr),
+                                    });
+                                }
                             }
                         }
                     }
                     "nest" | "nest_service" => {
                         if let (Some(pre), Some(inner)) = (named_arg(args, 0), named_arg(args, 1)) {
-                            let p = join(prefix, &string_text(pre, src));
-                            expand(inner, &p, src, builders, visited, out);
+                            // Dynamic (non-literal) prefixes are out of scope.
+                            if let Some(pre) = string_literal_text(pre, src) {
+                                let p = join(prefix, &pre);
+                                expand(inner, &p, src, builders, visited, out);
+                            }
                         }
                     }
                     "merge" => {
@@ -278,6 +284,36 @@ fn app() -> Router {
                 .handler,
             "show"
         );
+    }
+
+    #[test]
+    fn turbofish_constructor_is_a_root() {
+        let src = r#"
+fn app() -> Router {
+    Router::<AppState>::new().route("/x", get(h))
+}
+"#;
+        let eps = extract_axum(src);
+        assert_eq!(ep(&eps, HttpMethod::Get, "/x").unwrap().handler, "h");
+    }
+
+    #[test]
+    fn non_literal_path_and_prefix_are_skipped() {
+        // Dynamically-built paths/prefixes (consts, idents) are out of scope:
+        // they must be skipped, not emitted as literal `"/PATH"` routes.
+        let src = r#"
+const PATH: &str = "/users";
+fn app() -> Router {
+    Router::new()
+        .route(PATH, get(list))
+        .nest(PREFIX, Router::new().route("/inner", get(inner)))
+}
+"#;
+        let eps = extract_axum(src);
+        assert!(eps.iter().all(|e| e.path != "/PATH"));
+        assert!(ep(&eps, HttpMethod::Get, "/users").is_none());
+        // The route under the dynamic nest prefix is not emitted either.
+        assert!(eps.iter().all(|e| e.handler != "inner"));
     }
 
     #[test]

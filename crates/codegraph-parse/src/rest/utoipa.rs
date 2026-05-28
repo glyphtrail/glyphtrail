@@ -21,7 +21,7 @@ use tree_sitter::{Node, Parser};
 
 use super::ts::{
     collect_builders, collect_referenced_builders, func_name, join, last_segment, method_router,
-    named_arg, router_chain_roots, span_of, string_text, text, walk,
+    named_arg, router_chain_roots, span_of, string_literal_text, string_text, text, walk,
 };
 use super::RawEndpoint;
 use crate::registry::grammar;
@@ -128,21 +128,27 @@ fn expand<'a>(
                     // Undocumented routes still use the axum `.route` surface.
                     "route" | "route_service" => {
                         if let (Some(path), Some(mr)) = (named_arg(args, 0), named_arg(args, 1)) {
-                            let p = join(prefix, &string_text(path, src));
-                            for (m, h) in method_router(mr, src) {
-                                out.push(RawEndpoint {
-                                    method: m,
-                                    path: p.clone(),
-                                    handler: h,
-                                    span: span_of(expr),
-                                });
+                            // Dynamic (non-literal) paths are out of scope.
+                            if let Some(path) = string_literal_text(path, src) {
+                                let p = join(prefix, &path);
+                                for (m, h) in method_router(mr, src) {
+                                    out.push(RawEndpoint {
+                                        method: m,
+                                        path: p.clone(),
+                                        handler: h,
+                                        span: span_of(expr),
+                                    });
+                                }
                             }
                         }
                     }
                     "nest" | "nest_service" => {
                         if let (Some(pre), Some(inner)) = (named_arg(args, 0), named_arg(args, 1)) {
-                            let p = join(prefix, &string_text(pre, src));
-                            expand(inner, &p, src, builders, attrs, visited, out);
+                            // Dynamic (non-literal) prefixes are out of scope.
+                            if let Some(pre) = string_literal_text(pre, src) {
+                                let p = join(prefix, &pre);
+                                expand(inner, &p, src, builders, attrs, visited, out);
+                            }
                         }
                     }
                     "merge" => {
@@ -428,5 +434,35 @@ fn app() -> OpenApiRouter {
 "##;
         let eps = extract_utoipa(src);
         assert!(ep(&eps, HttpMethod::Get, "/raw/{id}").is_some());
+    }
+
+    #[test]
+    fn turbofish_constructor_is_a_root() {
+        let src = r#"
+#[utoipa::path(get, path = "/ping")]
+async fn ping() {}
+
+fn app() -> OpenApiRouter {
+    OpenApiRouter::<AppState>::new().routes(routes!(ping))
+}
+"#;
+        let eps = extract_utoipa(src);
+        assert_eq!(ep(&eps, HttpMethod::Get, "/ping").unwrap().handler, "ping");
+    }
+
+    #[test]
+    fn non_literal_route_path_and_nest_prefix_are_skipped() {
+        // Dynamic paths/prefixes on the plain `.route`/`.nest` surface are out
+        // of scope and must be skipped rather than emitted as `"/PATH"`.
+        let src = r#"
+fn app() -> OpenApiRouter {
+    OpenApiRouter::new()
+        .route(PATH, get(legacy))
+        .nest(PREFIX, OpenApiRouter::new().route("/inner", get(inner)))
+}
+"#;
+        let eps = extract_utoipa(src);
+        assert!(eps.iter().all(|e| e.path != "/PATH"));
+        assert!(eps.iter().all(|e| e.handler != "inner"));
     }
 }

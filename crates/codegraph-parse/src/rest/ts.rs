@@ -57,6 +57,13 @@ pub(super) fn string_text(node: Node, src: &[u8]) -> String {
         .to_string()
 }
 
+/// Inner text of `node`, but only when it is a string literal (plain or raw).
+/// Returns `None` for dynamic paths (idents, consts, `format!`/`concat!`, …),
+/// which are out of scope and must not be emitted as literal routes.
+pub(super) fn string_literal_text(node: Node, src: &[u8]) -> Option<String> {
+    matches!(node.kind(), "string_literal" | "raw_string_literal").then(|| string_text(node, src))
+}
+
 /// Join an accumulated prefix with a path segment and normalize.
 pub(super) fn join(prefix: &str, path: &str) -> String {
     let combined = format!(
@@ -170,12 +177,14 @@ pub(super) fn router_chain_roots<'a>(root: Node<'a>, src: &[u8], type_name: &str
 }
 
 /// Whether `callee` (e.g. `OpenApiRouter::with_openapi`) is an associated fn of
-/// `type_name`, i.e. the segment just before the final `::method` matches.
+/// `type_name`, i.e. the segment just before the final `::method` matches. A
+/// turbofish (`Router::<State>::new`) is tolerated by dropping the `<...>`.
 fn constructs(callee: &str, type_name: &str) -> bool {
-    callee
-        .rsplit_once("::")
-        .map(|(ty, _method)| last_segment(ty) == type_name)
-        .unwrap_or(false)
+    let Some((ty, _method)) = callee.rsplit_once("::") else {
+        return false;
+    };
+    let ty = ty.split('<').next().unwrap_or(ty).trim_end_matches(':');
+    last_segment(ty) == type_name
 }
 
 /// Index `fn NAME(...) -> Ret { ... }` builders whose return type mentions
