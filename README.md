@@ -14,9 +14,15 @@ Built native in Rust — fast and dependency-light.
 
 ## Install
 
+Prebuilt binaries for Linux, macOS (Intel + Apple Silicon) and Windows are
+attached to each [tagged release](https://github.com/sunsided/meridian/releases).
+
+Or build from source:
+
 ```sh
-cargo build --release
-# binary at target/release/meridian
+cargo install --git https://github.com/sunsided/meridian meridian-cli
+# or, from a checkout:
+cargo build --release   # binary at target/release/meridian
 ```
 
 ## Usage

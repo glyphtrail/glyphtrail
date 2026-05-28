@@ -1,0 +1,65 @@
+name: release
+
+# Build cross-platform `meridian` binaries on a version tag and attach them to
+# the GitHub Release. Publishing to crates.io is intentionally left manual.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked -p meridian-cli --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          staging="meridian-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir "$staging"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/meridian.exe" "$staging/"
+          else
+            cp "target/${{ matrix.target }}/release/meridian" "$staging/"
+          fi
+          cp README.md LICENSE-EUPL-1.2 "$staging/"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a "$staging.zip" "$staging" >/dev/null
+            echo "ASSET=$staging.zip" >> "$GITHUB_ENV"
+          else
+            tar czf "$staging.tar.gz" "$staging"
+            echo "ASSET=$staging.tar.gz" >> "$GITHUB_ENV"
+          fi
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ASSET }}
