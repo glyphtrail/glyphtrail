@@ -4,12 +4,12 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use meridian_core::config::{IGNORE_FILE, RepoPaths};
 use meridian_core::{
-    ClientCall, CodeGraph, Confidence, Config, Edge, EdgeKind, Endpoint, Language, Matcher, Node,
-    NodeId, NodeKind, OperationKey, PendingLink, Protocol, RewriteEngine,
+    ClientCall, CodeGraph, Confidence, Config, DynamicLanguage, Edge, EdgeKind, Endpoint, Language,
+    Matcher, Node, NodeId, NodeKind, OperationKey, PendingLink, Protocol, RewriteEngine,
 };
 use meridian_parse::{
-    PendingEdge, build_client_graph, build_file_graph, build_rest_graph, parse_source,
-    resolve_import,
+    DynamicGrammar, PendingEdge, build_client_graph, build_file_graph, build_rest_graph,
+    load_dynamic, parse_source, resolve_import,
 };
 use std::collections::HashSet;
 
@@ -24,7 +24,7 @@ struct DiscoveredFile {
     hash: String,
 }
 
-fn discover(root: &Path) -> Result<Vec<DiscoveredFile>> {
+fn discover(root: &Path, dyn_langs: &[DynamicLanguage]) -> Result<Vec<DiscoveredFile>> {
     let mut walker = WalkBuilder::new(root);
     walker
         .hidden(true)
@@ -42,8 +42,19 @@ fn discover(root: &Path) -> Result<Vec<DiscoveredFile>> {
             continue;
         }
         let path = entry.path();
-        let Some(language) = Language::from_path(path) else {
-            continue;
+        // Built-in language by extension, else a configured dynamic language.
+        let language = match Language::from_path(path) {
+            Some(l) => l,
+            None => {
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                match dyn_langs
+                    .iter()
+                    .find(|d| d.extensions.iter().any(|e| e == ext))
+                {
+                    Some(d) => Language::Other(d.name.clone()),
+                    None => continue,
+                }
+            }
         };
         let Ok(bytes) = std::fs::read(path) else {
             continue;
@@ -68,8 +79,12 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
     paths.ensure_index_dir()?;
     let mut store = SqliteStore::open(&paths.db_path)?;
 
-    let files = discover(&root)?;
+    let cfg = Config::load(&root)?;
+    let files = discover(&root, &cfg.languages)?;
     tracing::info!("discovered {} source files", files.len());
+    // Lazily-loaded dynamic grammars, keyed by language name. `None` records a
+    // load failure so we warn once and skip that language's files thereafter.
+    let mut dyn_grammars: HashMap<String, Option<meridian_parse::DynamicGrammar>> = HashMap::new();
 
     // Determine which files to (re)parse and which to drop.
     let current: HashMap<&str, &DiscoveredFile> =
@@ -150,7 +165,18 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
             Confidence::Extracted,
         );
 
-        match parse_source(&f.language, &source) {
+        // Built-in languages parse via the compiled-in registry; a dynamic
+        // `Language::Other` is parsed with its runtime-loaded grammar + query.
+        let parsed = match &f.language {
+            Language::Other(name) => {
+                match dynamic_grammar(name, &cfg.languages, &mut dyn_grammars, &root) {
+                    Some(dg) => meridian_parse::parse_with(&dg.grammar, &dg.query, &source),
+                    None => continue,
+                }
+            }
+            builtin => parse_source(builtin, &source),
+        };
+        match parsed {
             Ok(parsed) => {
                 let fg = build_file_graph(&f.rel_path, &f.language, &file_id, &parsed);
                 // REST server-route extraction runs for any language with a
@@ -180,7 +206,6 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
     // endpoints as EXPOSES edges below). Schema ops are derived entirely from
     // config, so rebuild them from scratch each run: this drops entries whose
     // artifact or config line was removed or whose spec changed.
-    let cfg = Config::load(&root)?;
     store.delete_nodes_by_kind(NodeKind::SchemaOp)?;
     ingest_schemas(&root, &cfg, &mut graph, &mut operations);
 
@@ -369,6 +394,30 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
         stats.files, stats.nodes, stats.edges
     );
     Ok(())
+}
+
+/// Lazily compile + load the grammar for a dynamic language by name, caching the
+/// result (including a failed load, so we warn only once). Returns `None` when
+/// the language isn't configured or its grammar fails to load.
+fn dynamic_grammar<'a>(
+    name: &str,
+    langs: &[DynamicLanguage],
+    cache: &'a mut HashMap<String, Option<DynamicGrammar>>,
+    root: &Path,
+) -> Option<&'a DynamicGrammar> {
+    if !cache.contains_key(name) {
+        let loaded = langs.iter().find(|d| d.name == name).and_then(|d| {
+            match load_dynamic(&root.join(&d.grammar), &root.join(&d.query)) {
+                Ok(g) => Some(g),
+                Err(e) => {
+                    tracing::warn!("dynamic language '{name}' not loaded: {e}");
+                    None
+                }
+            }
+        });
+        cache.insert(name.to_string(), loaded);
+    }
+    cache.get(name).and_then(|o| o.as_ref())
 }
 
 /// Pick the repository file an import resolves to: an exact path match first,

@@ -48,6 +48,31 @@ impl RepoPaths {
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub api: ApiConfig,
+    /// Extra languages to load at runtime (the dynamic half of hybrid language
+    /// support). Each names a grammar + query the analyzer compiles on demand.
+    #[serde(rename = "languages")]
+    pub languages: Vec<DynamicLanguage>,
+}
+
+/// A language identified by file extension but not built in: its tree-sitter
+/// grammar is compiled from `grammar` at runtime and paired with `query`.
+///
+/// ```toml
+/// [[languages]]
+/// name = "ruby"
+/// extensions = ["rb"]
+/// grammar = "grammars/tree-sitter-ruby/src"  # dir with parser.c + grammar.json
+/// query = "queries/ruby.scm"                 # @def.<kind>/@call/@import/...
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DynamicLanguage {
+    pub name: String,
+    pub extensions: Vec<String>,
+    /// Path (relative to the repo root) to the grammar's tree-sitter `src` dir.
+    pub grammar: PathBuf,
+    /// Path (relative to the repo root) to the `.scm` extraction query.
+    pub query: PathBuf,
 }
 
 impl Config {
@@ -209,6 +234,26 @@ mod tests {
         }
         // A real prefix is accepted.
         check!(Config::from_toml_str("[api]\ngateway_prefixes = [\"/api\"]\n").is_ok());
+    }
+
+    #[test]
+    fn parses_dynamic_languages() {
+        let cfg = Config::from_toml_str(
+            r#"
+            [[languages]]
+            name = "ruby"
+            extensions = ["rb", "rake"]
+            grammar = "grammars/tree-sitter-ruby/src"
+            query = "queries/ruby.scm"
+            "#,
+        )
+        .unwrap();
+        check!(cfg.languages.len() == 1);
+        let lang = &cfg.languages[0];
+        check!(lang.name == "ruby");
+        check!(lang.extensions == ["rb", "rake"]);
+        check!(lang.grammar == std::path::Path::new("grammars/tree-sitter-ruby/src"));
+        check!(lang.query == std::path::Path::new("queries/ruby.scm"));
     }
 
     #[test]

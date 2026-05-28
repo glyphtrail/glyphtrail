@@ -2,6 +2,7 @@
 
 pub mod build;
 pub mod client;
+pub mod dynamic;
 pub mod extract;
 pub mod imports;
 pub mod registry;
@@ -12,6 +13,7 @@ pub use build::{
     build_file_graph, build_rest_graph,
 };
 pub use client::{RawClientCall, extract_client_calls};
+pub use dynamic::{DynamicGrammar, load_dynamic};
 pub use extract::{ParsedFile, parse_source, parse_with};
 pub use imports::resolve_import;
 pub use rest::{

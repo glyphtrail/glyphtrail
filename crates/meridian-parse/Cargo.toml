@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 meridian-core.workspace = true
 tree-sitter.workspace = true
+tree-sitter-loader.workspace = true
 tree-sitter-language.workspace = true
 tree-sitter-rust.workspace = true
 tree-sitter-python.workspace = true

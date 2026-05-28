@@ -57,10 +57,22 @@ meridian status
 
 ## Languages
 
-Coverage is driven by a tree-sitter grammar registry. Currently:
-Rust, Python, JavaScript, TypeScript/TSX, Go, Java, C, C++, C#. Adding a language is
-a grammar in `meridian-parse/src/registry.rs` plus a query file under
+Coverage is driven by a tree-sitter grammar registry. Built in:
+Rust, Python, JavaScript, TypeScript/TSX, Go, Java, C, C++, C#. Adding a built-in
+language is a grammar in `meridian-parse/src/registry.rs` plus a query file under
 `meridian-parse/queries/`.
+
+Extra languages can also be loaded at runtime without rebuilding — point
+`.meridian/config.toml` at a tree-sitter grammar and a query (the grammar is
+compiled on demand; needs a C toolchain):
+
+```toml
+[[languages]]
+name = "ruby"
+extensions = ["rb"]
+grammar = "grammars/tree-sitter-ruby/src"   # dir with parser.c + grammar.json
+query = "queries/ruby.scm"                   # @def.<kind>/@call/@import/…
+```
 
 ## Graph model
 
