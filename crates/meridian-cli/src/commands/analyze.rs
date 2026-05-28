@@ -153,12 +153,12 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
         match parse_source(f.language, &source) {
             Ok(parsed) => {
                 let fg = build_file_graph(&f.rel_path, f.language, &file_id, &parsed);
-                if f.language == Language::Rust {
-                    let rg = build_rest_graph(&f.rel_path, &fg.symbols, &source);
-                    graph.extend(rg.graph);
-                    operations.extend(rg.operations);
-                    pending_handlers.extend(rg.pending_handlers);
-                }
+                // REST server-route extraction runs for any language with a
+                // registered extractor (registry decides; no-op otherwise).
+                let rg = build_rest_graph(&f.rel_path, f.language, &fg.symbols, &source);
+                graph.extend(rg.graph);
+                operations.extend(rg.operations);
+                pending_handlers.extend(rg.pending_handlers);
                 if matches!(
                     f.language,
                     Language::JavaScript | Language::TypeScript | Language::Tsx

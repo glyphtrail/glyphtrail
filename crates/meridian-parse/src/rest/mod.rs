@@ -4,7 +4,7 @@ pub mod axum;
 mod ts;
 pub mod utoipa;
 
-use meridian_core::{HttpMethod, Span};
+use meridian_core::{HttpMethod, Language, Span};
 
 pub use axum::{extract_axum, extract_axum_mounts};
 pub use utoipa::{extract_utoipa, extract_utoipa_mounts};
@@ -27,4 +27,89 @@ pub struct RawEndpoint {
 pub struct RawMount {
     pub parent: String,
     pub child: String,
+}
+
+/// A per-framework REST server-route extractor. Each implementation is a
+/// self-contained module that turns source for one framework into endpoints
+/// and router-composition mounts. Implementations share the prefix-accumulation
+/// helper (`ts::join`) so nested-router prefixes are handled uniformly.
+pub trait RestServerExtractor {
+    /// Short framework identifier (e.g. "axum").
+    fn name(&self) -> &'static str;
+    /// Source language this extractor applies to.
+    fn language(&self) -> Language;
+    /// Endpoints declared in `source`.
+    fn endpoints(&self, source: &str) -> Vec<RawEndpoint>;
+    /// Router-composition mounts (`parent` nests/merges builder `child`).
+    fn mounts(&self, source: &str) -> Vec<RawMount>;
+}
+
+struct AxumExtractor;
+impl RestServerExtractor for AxumExtractor {
+    fn name(&self) -> &'static str {
+        "axum"
+    }
+    fn language(&self) -> Language {
+        Language::Rust
+    }
+    fn endpoints(&self, source: &str) -> Vec<RawEndpoint> {
+        extract_axum(source)
+    }
+    fn mounts(&self, source: &str) -> Vec<RawMount> {
+        extract_axum_mounts(source)
+    }
+}
+
+struct UtoipaExtractor;
+impl RestServerExtractor for UtoipaExtractor {
+    fn name(&self) -> &'static str {
+        "utoipa-axum"
+    }
+    fn language(&self) -> Language {
+        Language::Rust
+    }
+    fn endpoints(&self, source: &str) -> Vec<RawEndpoint> {
+        extract_utoipa(source)
+    }
+    fn mounts(&self, source: &str) -> Vec<RawMount> {
+        extract_utoipa_mounts(source)
+    }
+}
+
+/// All registered REST server extractors. New frameworks slot in here as
+/// additional self-contained modules implementing [`RestServerExtractor`].
+pub fn registry() -> Vec<Box<dyn RestServerExtractor>> {
+    vec![Box::new(AxumExtractor), Box::new(UtoipaExtractor)]
+}
+
+/// The registered extractors that apply to `lang`.
+pub fn extractors_for(lang: Language) -> Vec<Box<dyn RestServerExtractor>> {
+    registry()
+        .into_iter()
+        .filter(|e| e.language() == lang)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_filters_by_language() {
+        assert_eq!(extractors_for(Language::Rust).len(), 2);
+        assert!(extractors_for(Language::Python).is_empty());
+        let names: Vec<_> = extractors_for(Language::Rust)
+            .iter()
+            .map(|e| e.name())
+            .collect();
+        assert!(names.contains(&"axum"));
+        assert!(names.contains(&"utoipa-axum"));
+    }
+
+    #[test]
+    fn axum_extractor_trait_yields_endpoints() {
+        let src = "fn app() -> Router { Router::new().route(\"/health\", get(health)) }";
+        let eps = AxumExtractor.endpoints(src);
+        assert!(eps.iter().any(|e| e.path == "/health"));
+    }
 }
