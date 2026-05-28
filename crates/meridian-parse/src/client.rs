@@ -22,9 +22,13 @@
 //!   verbs `client.Get(url)` / `.Post(...)`, and
 //!   `http.NewRequest[WithContext](method, url, …)`. Same URL-shape guard.
 //!
-//! Python (requests / httpx):
+//! Python (requests / httpx / aiohttp):
 //! - attribute verbs `requests.get(url)` / `client.post(url, …)` and
-//!   `requests.request(method, url)`. Same URL-shape guard.
+//!   `requests.request(method, url)`. The URL-shape guard makes this
+//!   receiver-agnostic, so module calls (`requests.get`), client/session
+//!   instances (`httpx.Client().get`, `aiohttp` `session.post`, a `requests`
+//!   `Session`) all match without per-instance tracking. f-string URLs keep
+//!   their interpolation (`f"/users/{id}"` -> `/users/{id}`).
 //!
 //! Only string-literal and template-literal URLs are extracted; fully dynamic
 //! URLs (bare variables, concatenations) are out of scope. Template
@@ -334,18 +338,23 @@ fn py_string_args(args: Option<Node>, src: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// Inner text of a Python `string` literal, else `None`.
+/// Inner text of a Python `string` literal, else `None`. f-strings are
+/// reconstructed with their interpolations kept verbatim (`f"/users/{id}"` ->
+/// `/users/{id}`), mirroring the JS template-literal handling, so the dynamic
+/// segment collapses during `OperationKey` signature normalization.
 fn py_string(node: Node, src: &[u8]) -> Option<String> {
     if node.kind() != "string" {
         return None;
     }
     let mut cursor = node.walk();
-    Some(
-        node.named_children(&mut cursor)
-            .find(|c| c.kind() == "string_content")
-            .map(|c| text(c, src))
-            .unwrap_or_default(),
-    )
+    let mut s = String::new();
+    for c in node.named_children(&mut cursor) {
+        match c.kind() {
+            "string_content" | "interpolation" => s.push_str(&text(c, src)),
+            _ => {}
+        }
+    }
+    Some(s)
 }
 
 /// A same-file `axios.create(...)` instance binding and the byte range of the
@@ -743,6 +752,25 @@ requests.request("DELETE", "/z")
         check!(call(&calls, HttpMethod::Get, "https://api.example.com/x/1").is_some());
         check!(call(&calls, HttpMethod::Post, "/y").is_some());
         check!(call(&calls, HttpMethod::Delete, "/z").is_some());
+    }
+
+    #[test]
+    fn python_httpx_aiohttp_instances_and_fstrings() {
+        // Receiver-agnostic: httpx client instances, aiohttp sessions, and
+        // requests Sessions all match via the verb + URL-shape guard; f-string
+        // URLs keep their interpolation so `{id}` collapses to a dynamic segment.
+        let src = r#"
+client = httpx.Client()
+client.get(f"/users/{id}")
+async def f(session):
+    await session.post("/items")
+s = requests.Session()
+s.put(f"/users/{user_id}/profile")
+"#;
+        let calls = extract_client_calls(src, &Language::Python);
+        check!(call(&calls, HttpMethod::Get, "/users/{id}").is_some());
+        check!(call(&calls, HttpMethod::Post, "/items").is_some());
+        check!(call(&calls, HttpMethod::Put, "/users/{user_id}/profile").is_some());
     }
 
     #[test]
