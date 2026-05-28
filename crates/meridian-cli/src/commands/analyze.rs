@@ -198,12 +198,9 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
     store.insert_operations(&operations)?;
     store.insert_imports(&imports)?;
 
-    // Persist this run's unresolved cross-file edges, then re-resolve *all*
-    // persisted pending edges against the current global index. Stale pending
-    // rows for changed files were already dropped (full clear / delete_file_data),
-    // so the table reflects the whole current graph. Re-resolving everything --
-    // not just this run's pending -- fixes inferred edges in unchanged files
-    // that point at symbols added, removed or renamed elsewhere (#20).
+    // Persist this run's unresolved cross-file edges (calls / inheritance /
+    // handlers). They are re-resolved globally below, so edits anywhere keep
+    // inferred edges in unchanged files correct (#20).
     let mut pending_links: Vec<PendingLink> = pending
         .iter()
         .map(|p| PendingLink {
@@ -226,20 +223,47 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
     );
     store.insert_pending(&pending_links)?;
 
+    // Resolve imports against the discovered file set (exact path, then unique
+    // suffix). Done before edge insertion so the importer -> target map can also
+    // disambiguate ambiguous call/inheritance names below (#18, #19).
+    let file_rels: Vec<String> = files.iter().map(|f| f.rel_path.clone()).collect();
+    let file_set: HashSet<&str> = file_rels.iter().map(|s| s.as_str()).collect();
+    let mut resolved_imports: Vec<(String, String, Option<String>)> = Vec::new();
+    let mut import_map: HashMap<String, HashSet<String>> = HashMap::new();
+    for (importer, raw, lang_name) in store.all_imports()? {
+        let target = Language::ALL
+            .into_iter()
+            .find(|l| l.name() == lang_name)
+            .and_then(|l| {
+                resolve_target(&resolve_import(&importer, &raw, l), &file_rels, &file_set)
+            });
+        if let Some(t) = &target {
+            import_map
+                .entry(importer.clone())
+                .or_default()
+                .insert(t.clone());
+        }
+        resolved_imports.push((importer, raw, target));
+    }
+
+    // Re-resolve all persisted pending edges against the current global index.
+    // A uniquely-named target resolves directly; an ambiguous name resolves
+    // only if exactly one candidate sits in a file the anchor's file imports (#19).
     store.delete_edges_by_confidence(Confidence::Inferred)?;
     let mut index: HashMap<String, Vec<NodeId>> = HashMap::new();
     for (name, id) in store.definition_index()? {
         index.entry(name).or_default().push(id);
     }
+    let node_file: HashMap<String, String> = store.node_files()?.into_iter().collect();
     let inferred: Vec<Edge> = store
         .all_pending()?
         .into_iter()
         .filter_map(|l| {
             let candidates = index.get(&l.name)?;
-            if candidates.len() != 1 {
-                return None;
-            }
-            let other = candidates[0].clone();
+            let other = match candidates.as_slice() {
+                [one] => one.clone(),
+                _ => disambiguate_import(&l.anchor, candidates, &node_file, &import_map)?,
+            };
             let (src, dst) = if l.name_is_src {
                 (other, l.anchor)
             } else {
@@ -255,23 +279,15 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
         .collect();
     store.insert_graph(&[], &inferred)?;
 
-    // Rebuild IMPORTS edges from the persisted import set, resolving each to a
-    // real file node where determinable (exact path, then unique path-suffix)
-    // and falling back to a module placeholder otherwise. Rebuilt globally each
-    // run -- against the freshly discovered file set -- so imports in unchanged
-    // files pick up files added or removed elsewhere (#18).
+    // Rebuild IMPORTS edges from the resolved import set: real file targets
+    // become file -> file (Inferred); the rest fall back to a module placeholder
+    // (Extracted). Rebuilt globally each run so imports in unchanged files pick
+    // up files added or removed elsewhere (#18).
     store.delete_edges_by_kind(EdgeKind::Imports)?;
-    let file_rels: Vec<String> = files.iter().map(|f| f.rel_path.clone()).collect();
-    let file_set: HashSet<&str> = file_rels.iter().map(|s| s.as_str()).collect();
     let mut import_nodes: Vec<Node> = Vec::new();
     let mut import_edges: Vec<Edge> = Vec::new();
-    for (importer, raw, lang_name) in store.all_imports()? {
+    for (importer, raw, target) in resolved_imports {
         let importer_id = NodeId::derive(&["file", &importer]);
-        let target = Language::ALL
-            .into_iter()
-            .find(|l| l.name() == lang_name)
-            .map(|l| resolve_import(&importer, &raw, l))
-            .and_then(|cands| resolve_target(&cands, &file_rels, &file_set));
         match target {
             Some(rel) => import_edges.push(Edge {
                 src: importer_id,
@@ -285,7 +301,7 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
                     id: mod_id.clone(),
                     kind: NodeKind::Module,
                     name: raw.clone(),
-                    qualified_name: raw.clone(),
+                    qualified_name: raw,
                     file: String::new(),
                     language: None,
                     span: None,
@@ -379,6 +395,32 @@ fn resolve_target(
         }
     }
     None
+}
+
+/// Disambiguate an ambiguous name match using import context: pick the single
+/// candidate defined in a file that the anchor's file imports. Returns `None`
+/// when zero or more than one candidate qualifies (so the edge is left dropped
+/// rather than guessed).
+fn disambiguate_import(
+    anchor: &NodeId,
+    candidates: &[NodeId],
+    node_file: &HashMap<String, String>,
+    import_map: &HashMap<String, HashSet<String>>,
+) -> Option<NodeId> {
+    let anchor_file = node_file.get(&anchor.0)?;
+    let imported = import_map.get(anchor_file)?;
+    let mut hit: Option<&NodeId> = None;
+    for c in candidates {
+        if let Some(f) = node_file.get(&c.0)
+            && imported.contains(f)
+        {
+            if hit.is_some() {
+                return None; // ambiguous even within imported files
+            }
+            hit = Some(c);
+        }
+    }
+    hit.cloned()
 }
 
 /// Read the configured REST schema artifacts and add a `SchemaOp` node (with
@@ -582,6 +624,50 @@ mod tests {
         assert!(
             !targets.iter().any(|(n, _)| n == "./util"),
             "stale ./util placeholder edge should be gone, got {targets:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Incoming Calls neighbour names of the `helper` definition in `file`.
+    fn callers_of_def_in(dir: &Path, name: &str, file: &str) -> Vec<String> {
+        let store = SqliteStore::open(&RepoPaths::new(dir).db_path).unwrap();
+        let def = store
+            .find_by_name(name)
+            .unwrap()
+            .into_iter()
+            .find(|n| n.file == file)
+            .unwrap_or_else(|| panic!("'{name}' should be defined in {file}"));
+        store
+            .neighbors(&def.id.0, Some(EdgeKind::Calls), false)
+            .unwrap()
+            .into_iter()
+            .map(|(n, _, _)| n.name)
+            .collect()
+    }
+
+    // #19: when two files define the same name, a call resolves to the one in
+    // the file the caller imports -- not the other, and not dropped.
+    #[test]
+    fn ambiguous_call_resolves_via_import_context() {
+        let dir = temp_repo("disambiguate");
+        std::fs::write(dir.join("b.ts"), "export function helper() { return 1; }\n").unwrap();
+        std::fs::write(dir.join("c.ts"), "export function helper() { return 2; }\n").unwrap();
+        std::fs::write(
+            dir.join("a.ts"),
+            "import { helper } from \"./b\";\nexport function use() { helper(); }\n",
+        )
+        .unwrap();
+        run(&dir, false).unwrap();
+
+        // The call resolves to b.ts (imported), not c.ts.
+        assert!(
+            callers_of_def_in(&dir, "helper", "b.ts").contains(&"use".to_string()),
+            "use() should resolve to the imported helper in b.ts"
+        );
+        assert!(
+            callers_of_def_in(&dir, "helper", "c.ts").is_empty(),
+            "the un-imported helper in c.ts should have no caller"
         );
 
         std::fs::remove_dir_all(&dir).ok();

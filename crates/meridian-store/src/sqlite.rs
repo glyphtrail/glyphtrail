@@ -359,6 +359,14 @@ impl SqliteStore {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// `(node id, file)` for every node, for resolving which file a definition
+    /// (or call site) lives in during cross-file disambiguation.
+    pub fn node_files(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare("SELECT id, file FROM nodes")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// (name, id) for every definition-like node, for global call resolution.
     pub fn definition_index(&self) -> Result<Vec<(String, NodeId)>> {
         let mut stmt = self.conn.prepare(
