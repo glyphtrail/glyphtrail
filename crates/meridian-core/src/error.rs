@@ -22,6 +22,12 @@ pub enum CoreError {
         #[source]
         source: std::io::Error,
     },
+    #[error("invalid repo registry at {path}: {source}")]
+    RegistryParse {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;
