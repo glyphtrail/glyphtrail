@@ -1,17 +1,28 @@
 //! API schema ingestion: parse blessed schema artifacts into the `(method,
 //! path)` operations they declare, for reconciliation against code endpoints.
 //!
-//! Currently supports OpenAPI (Swagger 2.0 / OpenAPI 3.x) in JSON form. YAML
-//! specs and gRPC/GraphQL schemas are follow-ups.
+//! Supports OpenAPI (Swagger 2.0 / OpenAPI 3.x) in JSON or YAML form. gRPC and
+//! GraphQL schemas are follow-ups.
 
 use meridian_core::HttpMethod;
+use serde_json::Value;
 
-/// Parse an OpenAPI JSON document into the REST operations it declares.
-/// Unparseable input yields no operations (the caller warns and skips).
-pub fn openapi_rest_operations(json: &str) -> Vec<(HttpMethod, String)> {
-    let Ok(doc) = serde_json::from_str::<serde_json::Value>(json) else {
+/// Parse an OpenAPI document (JSON or YAML) into the REST operations it
+/// declares. Unparseable input yields no operations (the caller warns and
+/// skips). JSON is attempted first, then YAML — every JSON document is also
+/// valid YAML, but the JSON parser is faster and gives better errors.
+pub fn openapi_rest_operations(text: &str) -> Vec<(HttpMethod, String)> {
+    let doc = serde_json::from_str::<Value>(text)
+        .ok()
+        .or_else(|| serde_norway::from_str::<Value>(text).ok());
+    let Some(doc) = doc else {
         return Vec::new();
     };
+    operations_from_doc(&doc)
+}
+
+/// Extract `(method, path)` pairs from a parsed OpenAPI document's `paths`.
+fn operations_from_doc(doc: &Value) -> Vec<(HttpMethod, String)> {
     let Some(paths) = doc.get("paths").and_then(|p| p.as_object()) else {
         return Vec::new();
     };
@@ -104,7 +115,43 @@ mod tests {
 
     #[test]
     fn invalid_or_empty_yields_nothing() {
-        assert!(openapi_rest_operations("not json").is_empty());
+        assert!(openapi_rest_operations(": : :").is_empty());
         assert!(openapi_rest_operations("{}").is_empty());
+    }
+
+    #[test]
+    fn parses_yaml_specs() {
+        let yaml = r#"
+openapi: 3.0.0
+paths:
+  /users:
+    get: {}
+    post: {}
+  /users/{id}:
+    parameters: []
+    get: {}
+    delete: {}
+"#;
+        let ops = openapi_rest_operations(yaml);
+        assert_eq!(ops.len(), 4);
+        assert!(has(&ops, HttpMethod::Get, "/users"));
+        assert!(has(&ops, HttpMethod::Post, "/users"));
+        assert!(has(&ops, HttpMethod::Get, "/users/{id}"));
+        assert!(has(&ops, HttpMethod::Delete, "/users/{id}"));
+    }
+
+    #[test]
+    fn json_and_yaml_agree() {
+        let json = r#"{ "paths": { "/x": { "get": {}, "put": {} } } }"#;
+        let yaml = "paths:\n  /x:\n    get: {}\n    put: {}\n";
+        let key = |ops: Vec<(HttpMethod, String)>| {
+            let mut v: Vec<String> = ops.iter().map(|(m, p)| format!("{m} {p}")).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            key(openapi_rest_operations(json)),
+            key(openapi_rest_operations(yaml))
+        );
     }
 }
