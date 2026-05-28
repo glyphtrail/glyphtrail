@@ -93,6 +93,12 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, NodeId("c1".into()));
 
+        // all_operations returns every row regardless of node kind.
+        let all = store.all_operations().unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|(id, _)| id == &NodeId("e1".into())));
+        assert!(all.iter().any(|(id, _)| id == &NodeId("c1".into())));
+
         // Incremental re-index of the endpoint's file drops its operation row.
         store.delete_file_data("routes.rs").unwrap();
         assert!(
