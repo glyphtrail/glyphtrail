@@ -3,10 +3,10 @@
 use std::path::Path;
 
 use meridian_core::{
-    Confidence, EdgeKind, HttpMethod, Node, NodeId, NodeKind, OperationKey, Protocol,
-    operations_matching,
+    Confidence, EdgeKind, HttpMethod, ImpactPolicy, ImpactReport, Node, NodeId, NodeKind,
+    OperationKey, Protocol, operations_matching,
 };
-use meridian_store::SqliteStore;
+use meridian_store::{ChangeSpec, SqliteStore, changed_files, seed_nodes};
 use serde_json::{Value, json};
 
 /// The advertised tool set (`tools/list`).
@@ -50,12 +50,6 @@ pub fn definitions() -> Vec<Value> {
             &["name"],
         ),
         tool(
-            "impact",
-            "Transitive set of symbols affected if the named symbol changes.",
-            json!({ "name": { "type": "string" }, "depth": { "type": "integer" } }),
-            &["name"],
-        ),
-        tool(
             "endpoints",
             "List server-side API endpoints (routes) with their handlers.",
             proto_arg.clone(),
@@ -84,6 +78,25 @@ pub fn definitions() -> Vec<Value> {
             "Cross-boundary view of an endpoint: invoking clients, handler(s), schema op(s).",
             path_method,
             &["path"],
+        ),
+        tool(
+            "impact",
+            "Blast radius of a change: seed from a symbol, a file, or a git \
+             change set, and report classified, confidence-aware impacted nodes \
+             (tests, API surface, cross-boundary consumers, internal).",
+            json!({
+                "name": { "type": "string", "description": "Seed symbol name." },
+                "file": { "type": "string", "description": "Seed every symbol in this repo-relative file." },
+                "files": { "type": "array", "items": { "type": "string" }, "description": "Seed every symbol in these files." },
+                "since": { "type": "string", "description": "Seed symbols changed since a git rev/range (e.g. main..HEAD)." },
+                "staged": { "type": "boolean", "description": "Seed from staged changes." },
+                "diff": { "type": "boolean", "description": "Seed from unstaged working-tree changes." },
+                "edges": { "type": "array", "items": { "type": "string" }, "description": "Edge sets: calls, imports, impl, api." },
+                "depth": { "type": "integer", "description": "Max hops from a seed (default 5)." },
+                "min_confidence": { "type": "string", "enum": ["extracted", "inferred"] },
+                "cross_boundary": { "type": "boolean", "description": "Include HANDLES/INVOKES/EXPOSES/MOUNTS consumers." }
+            }),
+            &[],
         ),
         tool(
             "status",
@@ -124,14 +137,6 @@ fn dispatch(db: &Path, name: &str, args: &Value) -> Result<Value, String> {
             items.extend(store.neighbors(&node.id.0, None, false).map_err(err)?);
             Ok(neighbors_json(&items))
         }
-        "impact" => {
-            let node = resolve_one(&store, req_str(args, "name")?)?;
-            let depth = opt_usize(args, "depth").unwrap_or(5);
-            let nodes = store
-                .reachable(&node.id.0, EdgeKind::Calls, false, depth)
-                .map_err(err)?;
-            Ok(nodes_json(&nodes))
-        }
         "endpoints" => operations_list(&store, NodeKind::Endpoint, args, true),
         "clients" => operations_list(&store, NodeKind::ClientCall, args, false),
         "serves" => {
@@ -171,6 +176,7 @@ fn dispatch(db: &Path, name: &str, args: &Value) -> Result<Value, String> {
             }
             Ok(Value::Array(report))
         }
+        "impact" => impact_tool(db, &store, args),
         "status" => {
             let s = store.stats().map_err(err)?;
             let languages: serde_json::Map<String, Value> = s
@@ -233,6 +239,69 @@ fn operations_list(
         out.push(operation_json(&key, node.as_ref(), handler));
     }
     Ok(Value::Array(out))
+}
+
+/// Impact-analysis tool: resolve seeds (symbol / file / change set), run the
+/// shared engine via `store.classify_impact`, and return the `ImpactReport`
+/// JSON — the same report the `meridian impact` CLI emits.
+fn impact_tool(db: &Path, store: &SqliteStore, args: &Value) -> Result<Value, String> {
+    // The DB lives at <repo>/.meridian/graph.db; git seed modes need the repo root.
+    let repo = db
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or_else(|| Path::new("."));
+
+    let (seeds, removed, unresolved) = if let Some(name) = opt_str(args, "name") {
+        let ids: Vec<NodeId> = store
+            .find_by_name(name)
+            .map_err(err)?
+            .into_iter()
+            .map(|n| n.id)
+            .collect();
+        if ids.is_empty() {
+            return Err(format!("no symbol named '{name}' in the index"));
+        }
+        (ids, Vec::new(), Vec::new())
+    } else {
+        let spec = if let Some(f) = opt_str(args, "file") {
+            ChangeSpec::Files(vec![f.to_string()])
+        } else if let Some(fs) = str_array(args, "files") {
+            ChangeSpec::Files(fs)
+        } else if let Some(rev) = opt_str(args, "since") {
+            ChangeSpec::Since(rev.to_string())
+        } else if args.get("staged").and_then(Value::as_bool).unwrap_or(false) {
+            ChangeSpec::Staged
+        } else if args.get("diff").and_then(Value::as_bool).unwrap_or(false) {
+            ChangeSpec::WorkingTree
+        } else {
+            return Err("provide 'name' or one of file/files/since/staged/diff".into());
+        };
+        let files = changed_files(repo, &spec).map_err(err)?;
+        let set = seed_nodes(store, &files).map_err(err)?;
+        (set.seeds, set.removed_files, set.unresolved_files)
+    };
+
+    let depth = opt_usize(args, "depth").unwrap_or(5);
+    let cross_boundary = args
+        .get("cross_boundary")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut policy = if cross_boundary {
+        ImpactPolicy::cross_boundary(depth)
+    } else {
+        ImpactPolicy::in_process(depth)
+    };
+    if let Some(tokens) = str_array(args, "edges") {
+        let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+        policy.edges = meridian_core::edge_rules(&refs)?;
+    }
+    if let Some(mc) = opt_str(args, "min_confidence") {
+        policy.min_confidence = meridian_core::parse_confidence(mc)?;
+    }
+
+    let items = store.classify_impact(&seeds, &policy).map_err(err)?;
+    let report = ImpactReport::new(items, removed, unresolved);
+    serde_json::to_value(&report).map_err(err)
 }
 
 /// Endpoints matching the `path` (+ optional `method`) arguments.
@@ -347,6 +416,16 @@ fn opt_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 
 fn opt_usize(args: &Value, key: &str) -> Option<usize> {
     args.get(key).and_then(Value::as_u64).map(|v| v as usize)
+}
+
+/// A non-empty array-of-strings argument, e.g. `files` or `edges`.
+fn str_array(args: &Value, key: &str) -> Option<Vec<String>> {
+    let arr = args.get(key)?.as_array()?;
+    let out: Vec<String> = arr
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    (!out.is_empty()).then_some(out)
 }
 
 fn err<E: std::fmt::Display>(e: E) -> String {

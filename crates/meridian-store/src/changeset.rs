@@ -4,14 +4,16 @@
 //! into changed files + new-side line ranges by parsing `git diff
 //! --unified=0`. Those ranges are intersected with indexed node spans to yield
 //! seed node ids for the traversal engine. Git is invoked as a subprocess to
-//! keep the dependency surface light.
+//! keep the dependency surface light. Shared by the CLI `impact` command and the
+//! MCP `impact` tool so neither duplicates seeding logic.
 
 use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use meridian_core::NodeId;
-use meridian_store::SqliteStore;
+
+use crate::SqliteStore;
 
 /// What change to seed the impact analysis from.
 #[derive(Debug, Clone)]
@@ -255,7 +257,6 @@ index 333..000
             .insert_graph(&[mk("f1", 1, 10), mk("f2", 20, 30)], &[])
             .unwrap();
 
-        // A change at lines 5-6 hits f1 only.
         let files = vec![ChangedFile {
             path: "src/lib.rs".into(),
             ranges: vec![(5, 6)],
@@ -264,7 +265,6 @@ index 333..000
         let set = seed_nodes(&store, &files).unwrap();
         check!(set.seeds == vec![NodeId("f1".into())]);
 
-        // Unknown file is unresolved.
         let files = vec![ChangedFile {
             path: "nope.rs".into(),
             ranges: vec![(1, 1)],

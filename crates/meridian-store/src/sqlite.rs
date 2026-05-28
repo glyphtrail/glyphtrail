@@ -3,8 +3,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use meridian_core::{
-    Adjacency, Confidence, Direction, Edge, EdgeKind, HttpMethod, Node, NodeId, NodeKind,
-    OperationKey, PendingLink, Protocol, Span,
+    Adjacency, ClassifiedItem, Confidence, Direction, Edge, EdgeKind, HttpMethod, ImpactPolicy,
+    Node, NodeId, NodeKind, OperationKey, PendingLink, Protocol, Span, classify, compute_impact,
+    is_cross_boundary_path,
 };
 use rusqlite::{Connection, params};
 
@@ -637,6 +638,39 @@ impl Adjacency for SqliteStore {
         // neighbours rather than aborting the whole traversal.
         self.edge_step(&node.0, kind, matches!(dir, Direction::Outgoing))
             .unwrap_or_default()
+    }
+}
+
+impl SqliteStore {
+    /// Run the impact engine from `seeds` under `policy`, resolve each impacted
+    /// node and classify it. Shared by the CLI `impact` command and the MCP
+    /// `impact` tool so the report has a single source of truth.
+    pub fn classify_impact(
+        &self,
+        seeds: &[NodeId],
+        policy: &ImpactPolicy,
+    ) -> Result<Vec<ClassifiedItem>> {
+        let items = compute_impact(seeds, policy, self);
+        let mut out = Vec::with_capacity(items.len());
+        for it in items {
+            let Some(node) = self.get_node(&it.node.0)? else {
+                continue; // vanished between traversal and lookup
+            };
+            out.push(ClassifiedItem {
+                id: node.id.0,
+                name: node.name,
+                qualified_name: node.qualified_name.clone(),
+                kind: node.kind,
+                file: node.file.clone(),
+                line: node.span.map(|s| s.start_line),
+                class: classify(node.kind, &node.file, &node.qualified_name),
+                distance: it.distance,
+                min_confidence: it.min_confidence,
+                cross_boundary: is_cross_boundary_path(&it.path),
+                path: it.path.iter().map(|k| k.as_str().to_string()).collect(),
+            });
+        }
+        Ok(out)
     }
 }
 

@@ -51,6 +51,45 @@ impl EdgeRule {
     }
 }
 
+/// Map user edge-set tokens (`calls`, `imports`, `impl`, `api`) to rules.
+/// Shared by the CLI `impact` command and the MCP `impact` tool.
+pub fn edge_rules(tokens: &[&str]) -> Result<Vec<EdgeRule>, String> {
+    let mut rules = Vec::new();
+    for t in tokens {
+        match *t {
+            "calls" => rules.push(EdgeRule::incoming(EdgeKind::Calls)),
+            "imports" => rules.push(EdgeRule::incoming(EdgeKind::Imports)),
+            "impl" => {
+                rules.push(EdgeRule::incoming(EdgeKind::Implements));
+                rules.push(EdgeRule::incoming(EdgeKind::Extends));
+            }
+            "api" => {
+                rules.push(EdgeRule::outgoing(EdgeKind::Handles));
+                rules.push(EdgeRule::outgoing(EdgeKind::Exposes));
+                rules.push(EdgeRule::incoming(EdgeKind::Invokes));
+                rules.push(EdgeRule::incoming(EdgeKind::Mounts));
+            }
+            other => {
+                return Err(format!(
+                    "unknown edge set '{other}' (expected calls, imports, impl, api)"
+                ));
+            }
+        }
+    }
+    Ok(rules)
+}
+
+/// Parse a confidence token (`extracted` | `inferred`).
+pub fn parse_confidence(s: &str) -> Result<Confidence, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "extracted" => Ok(Confidence::Extracted),
+        "inferred" => Ok(Confidence::Inferred),
+        other => Err(format!(
+            "unknown confidence '{other}' (expected extracted or inferred)"
+        )),
+    }
+}
+
 /// Traversal configuration.
 #[derive(Debug, Clone)]
 pub struct ImpactPolicy {

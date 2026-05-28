@@ -7,13 +7,8 @@
 use anyhow::{Result, anyhow, bail};
 use clap::Args;
 use meridian_core::config::RepoPaths;
-use meridian_core::{
-    ClassifiedItem, Confidence, EdgeKind, ImpactClass, ImpactPolicy, ImpactReport, Node, classify,
-    compute_impact, is_cross_boundary_path,
-};
-use meridian_store::SqliteStore;
-
-use super::changeset::{ChangeSpec, SeedSet, changed_files, seed_nodes};
+use meridian_core::{ClassifiedItem, Confidence, ImpactClass, ImpactPolicy, ImpactReport};
+use meridian_store::{ChangeSpec, SeedSet, SqliteStore, changed_files, seed_nodes};
 
 #[derive(Args)]
 pub struct ImpactArgs {
@@ -85,28 +80,14 @@ pub fn run(args: ImpactArgs) -> Result<()> {
         ImpactPolicy::in_process(args.depth)
     };
     if let Some(edges) = &args.edges {
-        policy.edges = parse_edges(edges)?;
+        let tokens: Vec<&str> = edges.iter().map(String::as_str).collect();
+        policy.edges = meridian_core::edge_rules(&tokens).map_err(|e| anyhow!(e))?;
     }
     if let Some(mc) = &args.min_confidence {
-        policy.min_confidence = parse_confidence(mc)?;
+        policy.min_confidence = meridian_core::parse_confidence(mc).map_err(|e| anyhow!(e))?;
     }
 
-    let items = compute_impact(&seed_set.seeds, &policy, &store);
-
-    // Resolve + classify each impacted node.
-    let mut classified = Vec::with_capacity(items.len());
-    for it in items {
-        let Some(node) = store.get_node(&it.node.0)? else {
-            continue; // node vanished between traversal and lookup; skip
-        };
-        classified.push(to_classified(
-            &node,
-            &it.path,
-            it.distance,
-            it.min_confidence,
-        ));
-    }
-
+    let classified = store.classify_impact(&seed_set.seeds, &policy)?;
     let report = ImpactReport::new(
         classified,
         seed_set.removed_files,
@@ -143,60 +124,6 @@ fn resolve_seeds(store: &SqliteStore, args: &ImpactArgs) -> Result<SeedSet> {
     };
     let files = changed_files(&args.repo, &spec)?;
     seed_nodes(store, &files)
-}
-
-fn to_classified(
-    node: &Node,
-    path: &[EdgeKind],
-    distance: usize,
-    min_confidence: Confidence,
-) -> ClassifiedItem {
-    ClassifiedItem {
-        id: node.id.0.clone(),
-        name: node.name.clone(),
-        qualified_name: node.qualified_name.clone(),
-        kind: node.kind,
-        file: node.file.clone(),
-        line: node.span.map(|s| s.start_line),
-        class: classify(node.kind, &node.file, &node.qualified_name),
-        distance,
-        min_confidence,
-        cross_boundary: is_cross_boundary_path(path),
-        path: path.iter().map(|k| k.as_str().to_string()).collect(),
-    }
-}
-
-fn parse_edges(tokens: &[String]) -> Result<Vec<meridian_core::EdgeRule>> {
-    use meridian_core::EdgeRule;
-    let mut rules = Vec::new();
-    for t in tokens {
-        match t.as_str() {
-            "calls" => rules.push(EdgeRule::incoming(EdgeKind::Calls)),
-            "imports" => rules.push(EdgeRule::incoming(EdgeKind::Imports)),
-            "impl" => {
-                rules.push(EdgeRule::incoming(EdgeKind::Implements));
-                rules.push(EdgeRule::incoming(EdgeKind::Extends));
-            }
-            "api" => {
-                rules.push(EdgeRule::outgoing(EdgeKind::Handles));
-                rules.push(EdgeRule::outgoing(EdgeKind::Exposes));
-                rules.push(EdgeRule::incoming(EdgeKind::Invokes));
-                rules.push(EdgeRule::incoming(EdgeKind::Mounts));
-            }
-            other => bail!("unknown edge set '{other}' (expected calls, imports, impl, api)"),
-        }
-    }
-    Ok(rules)
-}
-
-fn parse_confidence(s: &str) -> Result<Confidence> {
-    match s.to_ascii_lowercase().as_str() {
-        "extracted" => Ok(Confidence::Extracted),
-        "inferred" => Ok(Confidence::Inferred),
-        other => Err(anyhow!(
-            "unknown confidence '{other}' (expected extracted or inferred)"
-        )),
-    }
 }
 
 fn emit(report: &ImpactReport, json: bool) -> Result<()> {
