@@ -54,6 +54,9 @@ async function loadData() {
   return await res.json();
 }
 
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
 loadData().then((data) => {
   const cy = cytoscape({
     container: document.getElementById("cy"),
@@ -82,15 +85,14 @@ loadData().then((data) => {
     const d = evt.target.data();
     const info = document.getElementById("info");
     info.style.display = "block";
-    info.innerHTML = "<h3>" + (d.qualified_name || d.label) + "</h3>" +
-      "<span class='tag'>" + d.kind + "</span> " +
-      (d.language ? "<span class='tag'>" + d.language + "</span>" : "") +
-      "<p>" + (d.file || "") + (d.line ? ":" + d.line : "") + "</p>" +
-      (d.doc ? "<pre>" + d.doc.replace(/[<>]/g, "") + "</pre>" : "");
+    info.innerHTML = "<h3>" + esc(d.qualified_name || d.label) + "</h3>" +
+      "<span class='tag'>" + esc(d.kind) + "</span> " +
+      (d.language ? "<span class='tag'>" + esc(d.language) + "</span>" : "") +
+      "<p>" + esc(d.file || "") + (d.line ? ":" + esc(d.line) : "") + "</p>" +
+      (d.doc ? "<pre>" + esc(d.doc) + "</pre>" : "");
     cy.elements().addClass("faded");
     evt.target.removeClass("faded");
     evt.target.neighborhood().removeClass("faded");
-    evt.target.removeClass("faded");
   });
   cy.on("tap", (evt) => { if (evt.target === cy) {
     cy.elements().removeClass("faded");

@@ -33,7 +33,7 @@ async fn index() -> Html<&'static str> {
 }
 
 async fn api_graph(State(state): State<AppState>) -> Json<Value> {
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
     let (nodes, edges) = store.export_graph(5000).unwrap_or_default();
     Json(codegraph_viz::to_elements(&nodes, &edges))
 }
@@ -42,7 +42,7 @@ async fn api_search(
     State(state): State<AppState>,
     Query(params): Query<SearchParams>,
 ) -> Json<Value> {
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
     let nodes = store.search(&params.q, params.limit).unwrap_or_default();
     Json(json!(nodes))
 }

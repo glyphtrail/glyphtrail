@@ -81,8 +81,9 @@ impl SqliteStore {
     }
 
     /// Insert nodes and edges. Existing rows are merged (nodes by id, edges by
-    /// (src,dst,kind)); `Extracted` edges should be inserted before `Inferred`
-    /// ones so the higher-confidence edge wins on conflict.
+    /// (src,dst,kind)). On an edge conflict an `Extracted` row always wins over
+    /// an `Inferred` one regardless of insertion order, so an inferred edge
+    /// already in the DB cannot mask a later extracted edge.
     pub fn insert_graph(&mut self, nodes: &[Node], edges: &[Edge]) -> Result<()> {
         let tx = self.conn.transaction()?;
         {
@@ -94,6 +95,10 @@ impl SqliteStore {
                     kind=?2, name=?3, qualified_name=?4, file=?5, language=?6,
                     start_byte=?7, end_byte=?8, start_line=?9, end_line=?10, doc=?11",
             )?;
+            // nodes_fts is a virtual table without a unique constraint, so an
+            // upsert is not possible; clear any prior row for this id first to
+            // keep FTS in sync with the (upserted) nodes row and avoid dupes.
+            let mut fts_del = tx.prepare("DELETE FROM nodes_fts WHERE id = ?1")?;
             let mut fts_stmt = tx.prepare(
                 "INSERT INTO nodes_fts(id, name, qualified_name, doc) VALUES (?1,?2,?3,?4)",
             )?;
@@ -120,6 +125,7 @@ impl SqliteStore {
                     el,
                     n.doc,
                 ])?;
+                fts_del.execute(params![n.id.0])?;
                 fts_stmt.execute(params![
                     n.id.0,
                     n.name,
@@ -130,7 +136,8 @@ impl SqliteStore {
 
             let mut edge_stmt = tx.prepare(
                 "INSERT INTO edges(src, dst, kind, confidence) VALUES (?1,?2,?3,?4)
-                 ON CONFLICT(src,dst,kind) DO NOTHING",
+                 ON CONFLICT(src,dst,kind) DO UPDATE SET confidence='extracted'
+                 WHERE excluded.confidence='extracted'",
             )?;
             for e in edges {
                 edge_stmt.execute(params![
@@ -198,13 +205,17 @@ impl SqliteStore {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Full-text search over names and docs.
+    /// Full-text search over names and docs. The user input is treated as a
+    /// literal FTS5 phrase (wrapped in double quotes, internal quotes doubled)
+    /// so ordinary identifiers like `Foo::bar`, `c++` or `i18n-utils` don't get
+    /// parsed as FTS5 operators and error out.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<Node>> {
+        let phrase = format!("\"{}\"", query.replace('"', "\"\""));
         let mut stmt = self.conn.prepare(
             "SELECT n.* FROM nodes_fts f JOIN nodes n ON n.id = f.id
              WHERE nodes_fts MATCH ?1 LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![query, limit as i64], Self::row_to_node)?;
+        let rows = stmt.query_map(params![phrase, limit as i64], Self::row_to_node)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
