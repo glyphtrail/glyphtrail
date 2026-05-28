@@ -74,6 +74,30 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Remove every node of `kind` along with its edges, operations and FTS
+    /// rows. Used to fully rebuild config-derived nodes (e.g. schema ops) on
+    /// each run, so entries removed from config/specs don't linger.
+    pub fn delete_nodes_by_kind(&mut self, kind: NodeKind) -> Result<()> {
+        let k = kind.as_str();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM edges WHERE src IN (SELECT id FROM nodes WHERE kind = ?1)
+                OR dst IN (SELECT id FROM nodes WHERE kind = ?1)",
+            params![k],
+        )?;
+        tx.execute(
+            "DELETE FROM api_operations WHERE node_id IN (SELECT id FROM nodes WHERE kind = ?1)",
+            params![k],
+        )?;
+        tx.execute(
+            "DELETE FROM nodes_fts WHERE id IN (SELECT id FROM nodes WHERE kind = ?1)",
+            params![k],
+        )?;
+        tx.execute("DELETE FROM nodes WHERE kind = ?1", params![k])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn set_file(&mut self, path: &str, language: Option<&str>, hash: &str) -> Result<()> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)

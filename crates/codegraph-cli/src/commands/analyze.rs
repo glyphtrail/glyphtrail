@@ -171,8 +171,11 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
     }
 
     // Ingest blessed schema artifacts into SchemaOp nodes (reconciled with code
-    // endpoints as EXPOSES edges below).
+    // endpoints as EXPOSES edges below). Schema ops are derived entirely from
+    // config, so rebuild them from scratch each run: this drops entries whose
+    // artifact or config line was removed or whose spec changed.
     let cfg = Config::load(&root)?;
+    store.delete_nodes_by_kind(NodeKind::SchemaOp)?;
     ingest_schemas(&root, &cfg, &mut graph, &mut operations);
 
     // Persist nodes and high-confidence (extracted) edges first.

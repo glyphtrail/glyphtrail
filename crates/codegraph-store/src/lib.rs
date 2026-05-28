@@ -96,4 +96,40 @@ mod tests {
         assert!(store.operations_by_kind(NodeKind::Endpoint).unwrap().is_empty());
         assert_eq!(store.operations_by_kind(NodeKind::ClientCall).unwrap().len(), 1);
     }
+
+    #[test]
+    fn delete_nodes_by_kind_removes_nodes_edges_and_ops() {
+        use codegraph_core::{HttpMethod, OperationKey};
+
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let endpoint = node("e1", "get_user", NodeKind::Endpoint);
+        let schema_op = node("s1", "GET /users", NodeKind::SchemaOp);
+        let exposes = Edge {
+            src: NodeId("e1".into()),
+            dst: NodeId("s1".into()),
+            kind: EdgeKind::Exposes,
+            confidence: Confidence::Extracted,
+        };
+        store
+            .insert_graph(&[endpoint, schema_op], &[exposes])
+            .unwrap();
+        store
+            .insert_operations(&[(
+                NodeId("s1".into()),
+                OperationKey::rest(HttpMethod::Get, "/users"),
+            )])
+            .unwrap();
+
+        store.delete_nodes_by_kind(NodeKind::SchemaOp).unwrap();
+
+        // The schema op node, its operation row and the EXPOSES edge are gone;
+        // the endpoint (a different kind) is untouched.
+        assert!(store
+            .operations_by_kind(NodeKind::SchemaOp)
+            .unwrap()
+            .is_empty());
+        assert!(store.get_node("s1").unwrap().is_none());
+        assert!(store.get_node("e1").unwrap().is_some());
+        assert_eq!(store.stats().unwrap().edges, 0);
+    }
 }
