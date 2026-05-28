@@ -1,8 +1,11 @@
+use std::collections::HashSet;
+
 use codegraph_core::{
-    CodeGraph, Confidence, EdgeKind, Language, Node, NodeId, NodeKind, Span,
+    CodeGraph, Confidence, EdgeKind, Language, Node, NodeId, NodeKind, OperationKey, Span,
 };
 
 use crate::extract::{ParsedFile, RawDef};
+use crate::rest::{extract_axum, extract_utoipa};
 
 /// A symbol exported from a file for cross-file resolution.
 #[derive(Debug, Clone)]
@@ -25,6 +28,65 @@ pub struct FileGraph {
     pub graph: CodeGraph,
     pub symbols: Vec<SymbolEntry>,
     pub pending: Vec<PendingEdge>,
+}
+
+/// Server-side API surface extracted from a router file: `Endpoint` nodes,
+/// their operation keys, and `HANDLES` links (handler symbol -> endpoint).
+#[derive(Debug, Default)]
+pub struct RestGraph {
+    pub graph: CodeGraph,
+    /// `(endpoint id, operation key)` for persistence and cross-boundary matching.
+    pub operations: Vec<(NodeId, OperationKey)>,
+    /// `(handler name, endpoint id)` for handlers that were not a unique local
+    /// definition; resolved against the global index as `handler -> endpoint`.
+    pub pending_handlers: Vec<(String, NodeId)>,
+}
+
+/// Build the REST endpoint fragment for a Rust router file. `symbols` are the
+/// file's own definitions (from [`build_file_graph`]), used to resolve a
+/// handler to a `HANDLES` edge when it is uniquely defined in the same file.
+pub fn build_rest_graph(rel_path: &str, symbols: &[SymbolEntry], source: &str) -> RestGraph {
+    let mut rg = RestGraph::default();
+    let mut raws = extract_axum(source);
+    raws.extend(extract_utoipa(source));
+
+    let mut seen: HashSet<NodeId> = HashSet::new();
+    for ep in raws {
+        let key = OperationKey::rest(ep.method, &ep.path);
+        let method = ep.method.as_str();
+        let ep_id = NodeId::derive(&[rel_path, "endpoint", method, &key.path]);
+        // Distinct (method, path) per file; identical routes collapse to one node.
+        if !seen.insert(ep_id.clone()) {
+            continue;
+        }
+        rg.graph.add_node(Node {
+            id: ep_id.clone(),
+            kind: NodeKind::Endpoint,
+            name: format!("{method} {}", key.path),
+            qualified_name: key.path.clone(),
+            file: rel_path.to_string(),
+            language: Some(Language::Rust.name().to_string()),
+            span: Some(ep.span),
+            doc: None,
+        });
+        rg.operations.push((ep_id.clone(), key));
+
+        if ep.handler.is_empty() {
+            continue; // closure handler: no symbol to link.
+        }
+        let local: Vec<&SymbolEntry> = symbols.iter().filter(|s| s.name == ep.handler).collect();
+        if local.len() == 1 {
+            rg.graph.add_edge(
+                local[0].id.clone(),
+                ep_id,
+                EdgeKind::Handles,
+                Confidence::Extracted,
+            );
+        } else {
+            rg.pending_handlers.push((ep.handler, ep_id));
+        }
+    }
+    rg
 }
 
 const MARKERS: [&str; 5] = ["NOTE", "WHY", "HACK", "TODO", "FIXME"];
