@@ -62,6 +62,21 @@ mod tests {
     }
 
     #[test]
+    fn meta_and_file_hashes_roundtrip() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        check!(store.get_meta("tool_version").unwrap() == None);
+        store.set_meta("tool_version", "9.9.9").unwrap();
+        store.set_meta("tool_version", "1.2.3").unwrap(); // upsert
+        check!(store.get_meta("tool_version").unwrap().as_deref() == Some("1.2.3"));
+
+        store.set_file("a.rs", Some("rust"), "h1").unwrap();
+        store.set_file("b.py", Some("python"), "h2").unwrap();
+        let mut got = store.files_with_hashes().unwrap();
+        got.sort();
+        check!(got == vec![("a.rs".into(), "h1".into()), ("b.py".into(), "h2".into())]);
+    }
+
+    #[test]
     fn api_operations_persist_and_filter_by_kind() {
         use meridian_core::{HttpMethod, OperationKey};
 
