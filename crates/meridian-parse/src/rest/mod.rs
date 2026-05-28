@@ -1,12 +1,14 @@
 //! REST server-side route extraction (per-framework).
 
 pub mod axum;
+pub mod spring;
 mod ts;
 pub mod utoipa;
 
 use meridian_core::{HttpMethod, Language, Span};
 
 pub use axum::{extract_axum, extract_axum_mounts};
+pub use spring::{extract_spring, extract_spring_mounts};
 pub use utoipa::{extract_utoipa, extract_utoipa_mounts};
 
 /// A server endpoint extracted from router code.
@@ -76,10 +78,30 @@ impl RestServerExtractor for UtoipaExtractor {
     }
 }
 
+struct SpringExtractor;
+impl RestServerExtractor for SpringExtractor {
+    fn name(&self) -> &'static str {
+        "spring"
+    }
+    fn language(&self) -> Language {
+        Language::Java
+    }
+    fn endpoints(&self, source: &str) -> Vec<RawEndpoint> {
+        extract_spring(source)
+    }
+    fn mounts(&self, source: &str) -> Vec<RawMount> {
+        extract_spring_mounts(source)
+    }
+}
+
 /// All registered REST server extractors. New frameworks slot in here as
 /// additional self-contained modules implementing [`RestServerExtractor`].
 pub fn registry() -> Vec<Box<dyn RestServerExtractor>> {
-    vec![Box::new(AxumExtractor), Box::new(UtoipaExtractor)]
+    vec![
+        Box::new(AxumExtractor),
+        Box::new(UtoipaExtractor),
+        Box::new(SpringExtractor),
+    ]
 }
 
 /// The registered extractors that apply to `lang`.
@@ -98,12 +120,17 @@ mod tests {
     fn registry_filters_by_language() {
         assert_eq!(extractors_for(Language::Rust).len(), 2);
         assert!(extractors_for(Language::Python).is_empty());
-        let names: Vec<_> = extractors_for(Language::Rust)
+        let rust: Vec<_> = extractors_for(Language::Rust)
             .iter()
             .map(|e| e.name())
             .collect();
-        assert!(names.contains(&"axum"));
-        assert!(names.contains(&"utoipa-axum"));
+        assert!(rust.contains(&"axum"));
+        assert!(rust.contains(&"utoipa-axum"));
+        let java: Vec<_> = extractors_for(Language::Java)
+            .iter()
+            .map(|e| e.name())
+            .collect();
+        assert_eq!(java, ["spring"]);
     }
 
     #[test]
