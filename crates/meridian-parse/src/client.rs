@@ -1,7 +1,7 @@
-//! Client-side HTTP call extraction (fetch / axios) for JS, TS, and TSX.
+//! Client-side HTTP call extraction, so outgoing calls can be linked to the
+//! server endpoints that answer them (the `INVOKES` edge).
 //!
-//! Detects the `(method, url)` of outgoing HTTP calls so they can be linked to
-//! the server endpoints that answer them (the `INVOKES` edge). Recognizes:
+//! JS / TS / TSX (fetch / axios):
 //! - `fetch(url, { method })` — the method defaults to GET;
 //! - `axios.get(url)` / `axios.post(url, ...)` — verb taken from the call;
 //! - `axios(config)` / `axios.request(config)` — `url`/`method` from the config
@@ -9,6 +9,13 @@
 //! - instance clients created in the same file via `const api = axios.create(…)`
 //!   — `api.get(url)`, `api(config)`, `api.request(config)` are treated like
 //!   their `axios` equivalents.
+//!
+//! Rust (reqwest):
+//! - `reqwest::get(url)` and builder verbs `client.get(url)` / `.post(...)` /
+//!   `.put` / `.delete` / `.patch` / `.head`, where `url` is a string literal
+//!   that looks like a URL or path. Type inference is out of scope, so the
+//!   URL-shape check is what separates a request builder from an unrelated
+//!   `.get(...)`.
 //!
 //! Only string-literal and template-literal URLs are extracted; fully dynamic
 //! URLs (bare variables, concatenations) are out of scope. Template
@@ -20,7 +27,7 @@ use tree_sitter::{Node, Parser};
 
 use crate::registry::grammar;
 
-/// A client-side HTTP call extracted from JS/TS source.
+/// A client-side HTTP call extracted from source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawClientCall {
     pub method: HttpMethod,
@@ -30,9 +37,20 @@ pub struct RawClientCall {
     pub span: Span,
 }
 
-/// Extract client HTTP calls from JS/TS/TSX `source`. Returns empty on parse
-/// failure or for non-JS languages.
+/// Extract client HTTP calls from `source`, dispatching by language. Returns
+/// empty on parse failure or for languages with no client extractor.
 pub fn extract_client_calls(source: &str, lang: Language) -> Vec<RawClientCall> {
+    match lang {
+        Language::JavaScript | Language::TypeScript | Language::Tsx => {
+            js_client_calls(source, lang)
+        }
+        Language::Rust => rust_client_calls(source),
+        _ => Vec::new(),
+    }
+}
+
+/// fetch / axios calls in JS/TS/TSX source.
+fn js_client_calls(source: &str, lang: Language) -> Vec<RawClientCall> {
     let mut parser = Parser::new();
     if parser.set_language(&grammar(lang)).is_err() {
         return Vec::new();
@@ -52,6 +70,74 @@ pub fn extract_client_calls(source: &str, lang: Language) -> Vec<RawClientCall> 
         }
     });
     out
+}
+
+/// reqwest calls in Rust source.
+fn rust_client_calls(source: &str) -> Vec<RawClientCall> {
+    let mut parser = Parser::new();
+    if parser.set_language(&grammar(Language::Rust)).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+    let src = source.as_bytes();
+    let mut out = Vec::new();
+    walk(tree.root_node(), &mut |n| {
+        if n.kind() == "call_expression"
+            && let Some(call) = reqwest_call(n, src)
+        {
+            out.push(call);
+        }
+    });
+    out
+}
+
+/// Classify a Rust `call_expression` as a reqwest request and pull its
+/// `(method, url)`. The HTTP verb is the called method/function name; the URL
+/// must be a string-literal argument that looks like a URL or path.
+fn reqwest_call(call: Node, src: &[u8]) -> Option<RawClientCall> {
+    let func = call.child_by_field_name("function")?;
+    let verb = match func.kind() {
+        // `client.get(url)` / `Client::new().post(url)`
+        "field_expression" => text(func.child_by_field_name("field")?, src),
+        // `reqwest::get(url)`
+        "scoped_identifier" => text(func.child_by_field_name("name")?, src),
+        _ => return None,
+    };
+    let method = HttpMethod::parse(&verb)?;
+    let arg = named_arg(call.child_by_field_name("arguments"), 0)?;
+    let url = rust_string(arg, src)?;
+    if !is_url_like(&url) {
+        return None;
+    }
+    Some(RawClientCall {
+        method,
+        path: url,
+        span: span_of(call),
+    })
+}
+
+/// Inner text of a Rust `string_literal`, or `None` for non-literals.
+fn rust_string(node: Node, src: &[u8]) -> Option<String> {
+    if node.kind() != "string_literal" {
+        return None;
+    }
+    let mut cursor = node.walk();
+    if let Some(content) = node
+        .named_children(&mut cursor)
+        .find(|c| c.kind() == "string_content")
+    {
+        return Some(text(content, src));
+    }
+    // Empty string literal: no `string_content` child.
+    Some(String::new())
+}
+
+/// Whether a literal looks like an HTTP URL or absolute path worth linking.
+/// Guards the type-free verb heuristic against unrelated getters/setters.
+fn is_url_like(s: &str) -> bool {
+    s.starts_with("http://") || s.starts_with("https://") || s.starts_with('/')
 }
 
 /// A same-file `axios.create(...)` instance binding and the byte range of the
@@ -380,5 +466,40 @@ mod tests {
         let calls = extract_client_calls(src, Language::JavaScript);
         assert!(call(&calls, HttpMethod::Get, "/in").is_some());
         assert!(call(&calls, HttpMethod::Get, "/out").is_none());
+    }
+
+    #[test]
+    fn reqwest_free_function_and_builder_verbs() {
+        let src = r#"
+            async fn run(client: reqwest::Client) {
+                let _ = reqwest::get("https://api.example.com/users").await;
+                let _ = client.post("/api/items").send().await;
+                let _ = client.delete("/api/items/42").send().await;
+            }
+        "#;
+        let calls = extract_client_calls(src, Language::Rust);
+        assert!(call(&calls, HttpMethod::Get, "https://api.example.com/users").is_some());
+        assert!(call(&calls, HttpMethod::Post, "/api/items").is_some());
+        assert!(call(&calls, HttpMethod::Delete, "/api/items/42").is_some());
+    }
+
+    #[test]
+    fn reqwest_skips_non_url_and_dynamic_args() {
+        // `.get` with a non-URL literal or a bare variable is not a request.
+        let src = r#"
+            fn f(map: std::collections::HashMap<String, u32>, url: &str) {
+                let _ = map.get("key");
+                let _ = client.get(url);
+            }
+        "#;
+        let calls = extract_client_calls(src, Language::Rust);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn reqwest_ignores_client_construction() {
+        // `reqwest::Client::new()` is not a request (verb `new` is not a method).
+        let src = "fn f() { let _c = reqwest::Client::new(); }";
+        assert!(extract_client_calls(src, Language::Rust).is_empty());
     }
 }
