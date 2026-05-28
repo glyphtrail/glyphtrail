@@ -15,8 +15,6 @@
 //! interpolations (`/users/${id}`) are preserved verbatim so they collapse to a
 //! dynamic segment in the operation signature.
 
-use std::collections::HashSet;
-
 use codegraph_core::{HttpMethod, Language, Span};
 use tree_sitter::{Node, Parser};
 
@@ -56,11 +54,19 @@ pub fn extract_client_calls(source: &str, lang: Language) -> Vec<RawClientCall> 
     out
 }
 
-/// Names that behave like an axios client: `axios` itself plus same-file
-/// instances bound via `const NAME = axios.create(...)`.
-fn axios_clients(root: Node, src: &[u8]) -> HashSet<String> {
-    let mut names = HashSet::new();
-    names.insert("axios".to_string());
+/// A same-file `axios.create(...)` instance binding and the byte range of the
+/// scope it is visible in (its enclosing block / the module), used to keep
+/// instance detection scope-sensitive rather than promoting the name globally.
+struct AxiosBinding {
+    name: String,
+    scope: std::ops::Range<usize>,
+}
+
+/// Axios client bindings in `root`: same-file `const NAME = axios.create(...)`
+/// declarations, each scoped to its enclosing block. `axios` itself is always a
+/// client (handled separately, in every scope).
+fn axios_clients(root: Node, src: &[u8]) -> Vec<AxiosBinding> {
+    let mut bindings = Vec::new();
     walk(root, &mut |n| {
         if n.kind() != "variable_declarator" {
             return;
@@ -72,10 +78,36 @@ fn axios_clients(root: Node, src: &[u8]) -> HashSet<String> {
             return;
         };
         if name.kind() == "identifier" && is_axios_create(value, src) {
-            names.insert(text(name, src));
+            let scope = enclosing_scope(n);
+            bindings.push(AxiosBinding {
+                name: text(name, src),
+                scope: scope.start_byte()..scope.end_byte(),
+            });
         }
     });
-    names
+    bindings
+}
+
+/// The nearest enclosing lexical scope of `node`: its containing block, or the
+/// whole program for a top-level declaration.
+fn enclosing_scope(node: Node) -> Node {
+    let mut n = node;
+    while let Some(p) = n.parent() {
+        if matches!(p.kind(), "statement_block" | "program") {
+            return p;
+        }
+        n = p;
+    }
+    n
+}
+
+/// Whether `name` used at byte offset `at` refers to an axios client: either
+/// the global `axios`, or an instance binding whose scope covers `at`.
+fn is_axios_client(clients: &[AxiosBinding], name: &str, at: usize) -> bool {
+    name == "axios"
+        || clients
+            .iter()
+            .any(|b| b.name == name && b.scope.contains(&at))
 }
 
 /// Whether `node` is an `axios.create(...)` call.
@@ -101,7 +133,7 @@ fn is_axios_create(node: Node, src: &[u8]) -> bool {
 
 /// Classify a `call_expression` as a `fetch`/`axios` HTTP call and pull its
 /// `(method, url)`; `None` if it is neither or the URL is non-literal.
-fn client_call(call: Node, src: &[u8], clients: &HashSet<String>) -> Option<RawClientCall> {
+fn client_call(call: Node, src: &[u8], clients: &[AxiosBinding]) -> Option<RawClientCall> {
     let func = call.child_by_field_name("function")?;
     let args = call.child_by_field_name("arguments");
     let (method, path) = match func.kind() {
@@ -113,7 +145,7 @@ fn client_call(call: Node, src: &[u8], clients: &HashSet<String>) -> Option<RawC
                     .map(|o| object_method(o, src))
                     .unwrap_or(HttpMethod::Get);
                 (method, path)
-            } else if clients.contains(name.as_str()) {
+            } else if is_axios_client(clients, &name, func.start_byte()) {
                 // `axios(config)` / `instance(config)`.
                 config_call(named_arg(args, 0)?, src)?
             } else {
@@ -122,7 +154,7 @@ fn client_call(call: Node, src: &[u8], clients: &HashSet<String>) -> Option<RawC
         }
         "member_expression" => {
             let obj = func.child_by_field_name("object")?;
-            if !clients.contains(text(obj, src).as_str()) {
+            if !is_axios_client(clients, &text(obj, src), obj.start_byte()) {
                 return None;
             }
             let prop = text(func.child_by_field_name("property")?, src);
@@ -337,5 +369,17 @@ mod tests {
         let src = "const api = axios.create();\napi.interceptors.use(fn);";
         let calls = extract_client_calls(src, Language::JavaScript);
         assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn instance_binding_is_scope_sensitive() {
+        // `api` is an axios instance only inside `withClient`; the same-named
+        // parameter in `other` must not be treated as an axios client.
+        let src =
+            "function withClient() { const api = axios.create(); return api.get(\"/in\"); }\n\
+                   function other(api) { return api.get(\"/out\"); }";
+        let calls = extract_client_calls(src, Language::JavaScript);
+        assert!(call(&calls, HttpMethod::Get, "/in").is_some());
+        assert!(call(&calls, HttpMethod::Get, "/out").is_none());
     }
 }
