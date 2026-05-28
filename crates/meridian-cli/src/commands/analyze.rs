@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use meridian_core::config::{IGNORE_FILE, RepoPaths};
 use meridian_core::{
     ClientCall, CodeGraph, Confidence, Config, Edge, EdgeKind, Endpoint, Language, Matcher, Node,
-    NodeId, NodeKind, OperationKey, Protocol, RewriteEngine,
+    NodeId, NodeKind, OperationKey, PendingLink, Protocol, RewriteEngine,
 };
 use meridian_parse::{
     PendingEdge, build_client_graph, build_file_graph, build_rest_graph, parse_source,
@@ -188,37 +188,61 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
     store.insert_graph(&graph.nodes, &extracted)?;
     store.insert_operations(&operations)?;
 
-    // Resolve deferred edges against the global symbol index.
+    // Persist this run's unresolved cross-file edges, then re-resolve *all*
+    // persisted pending edges against the current global index. Stale pending
+    // rows for changed files were already dropped (full clear / delete_file_data),
+    // so the table reflects the whole current graph. Re-resolving everything --
+    // not just this run's pending -- fixes inferred edges in unchanged files
+    // that point at symbols added, removed or renamed elsewhere (#20).
+    let mut pending_links: Vec<PendingLink> = pending
+        .iter()
+        .map(|p| PendingLink {
+            anchor: p.src.clone(),
+            name: p.name.clone(),
+            kind: p.kind,
+            name_is_src: false,
+        })
+        .collect();
+    // HANDLES links whose handler is defined elsewhere: handler -> endpoint.
+    pending_links.extend(
+        pending_handlers
+            .iter()
+            .map(|(handler, endpoint_id)| PendingLink {
+                anchor: endpoint_id.clone(),
+                name: handler.clone(),
+                kind: EdgeKind::Handles,
+                name_is_src: true,
+            }),
+    );
+    store.insert_pending(&pending_links)?;
+
+    store.delete_edges_by_confidence(Confidence::Inferred)?;
     let mut index: HashMap<String, Vec<NodeId>> = HashMap::new();
     for (name, id) in store.definition_index()? {
         index.entry(name).or_default().push(id);
     }
-    let mut inferred: Vec<Edge> = Vec::new();
-    for p in &pending {
-        if let Some(candidates) = index.get(&p.name)
-            && candidates.len() == 1
-        {
-            inferred.push(Edge {
-                src: p.src.clone(),
-                dst: candidates[0].clone(),
-                kind: p.kind,
+    let inferred: Vec<Edge> = store
+        .all_pending()?
+        .into_iter()
+        .filter_map(|l| {
+            let candidates = index.get(&l.name)?;
+            if candidates.len() != 1 {
+                return None;
+            }
+            let other = candidates[0].clone();
+            let (src, dst) = if l.name_is_src {
+                (other, l.anchor)
+            } else {
+                (l.anchor, other)
+            };
+            Some(Edge {
+                src,
+                dst,
+                kind: l.kind,
                 confidence: Confidence::Inferred,
-            });
-        }
-    }
-    // HANDLES links whose handler is defined elsewhere: handler -> endpoint.
-    for (handler, endpoint_id) in &pending_handlers {
-        if let Some(candidates) = index.get(handler)
-            && candidates.len() == 1
-        {
-            inferred.push(Edge {
-                src: candidates[0].clone(),
-                dst: endpoint_id.clone(),
-                kind: EdgeKind::Handles,
-                confidence: Confidence::Inferred,
-            });
-        }
-    }
+            })
+        })
+        .collect();
     store.insert_graph(&[], &inferred)?;
 
     // Cross-boundary linking: resolve client calls and schema operations
@@ -316,5 +340,100 @@ fn ingest_schemas(
             });
             operations.push((id, key));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_repo(tag: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("meridian-it-{tag}-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn callers_of(dir: &Path, name: &str) -> Vec<String> {
+        let store = SqliteStore::open(&RepoPaths::new(dir).db_path).unwrap();
+        let target = store
+            .find_by_name(name)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("'{name}' should be defined"));
+        store
+            .neighbors(&target.id.0, Some(EdgeKind::Calls), false)
+            .unwrap()
+            .into_iter()
+            .map(|(n, _, _)| n.name)
+            .collect()
+    }
+
+    // #20: a pending cross-file edge in an *unchanged* file must be re-resolved
+    // when its target definition is added elsewhere on a later `--update`.
+    #[test]
+    fn update_reresolves_inferred_edge_to_newly_added_definition() {
+        let dir = temp_repo("reresolve-add");
+        std::fs::write(dir.join("caller.rs"), "fn use_it() { foo(); }\n").unwrap();
+        std::fs::write(dir.join("def.rs"), "\n").unwrap();
+
+        // Full index: foo is undefined, so the call cannot resolve yet.
+        run(&dir, false).unwrap();
+        {
+            let store = SqliteStore::open(&RepoPaths::new(&dir).db_path).unwrap();
+            assert!(store.find_by_name("foo").unwrap().is_empty());
+        }
+
+        // Add the definition; caller.rs is unchanged, so only a global
+        // re-resolution of persisted pending edges can create the link.
+        std::fs::write(dir.join("def.rs"), "fn foo() {}\n").unwrap();
+        run(&dir, true).unwrap();
+        assert!(
+            callers_of(&dir, "foo").contains(&"use_it".to_string()),
+            "expected use_it -> foo after adding the definition on --update"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // The converse: removing the definition must drop the now-stale inferred
+    // edge rather than leaving it dangling.
+    #[test]
+    fn update_drops_inferred_edge_when_definition_removed() {
+        let dir = temp_repo("reresolve-remove");
+        std::fs::write(dir.join("caller.rs"), "fn use_it() { foo(); }\n").unwrap();
+        std::fs::write(dir.join("def.rs"), "fn foo() {}\n").unwrap();
+        run(&dir, false).unwrap();
+        assert!(callers_of(&dir, "foo").contains(&"use_it".to_string()));
+
+        // Remove foo; the inferred use_it -> foo edge must disappear.
+        std::fs::write(dir.join("def.rs"), "fn other() {}\n").unwrap();
+        run(&dir, true).unwrap();
+        let store = SqliteStore::open(&RepoPaths::new(&dir).db_path).unwrap();
+        assert!(
+            store.find_by_name("foo").unwrap().is_empty(),
+            "foo should be gone after the edit"
+        );
+        // The previously-inferred use_it -> foo edge must be gone, not dangling.
+        let use_it = store
+            .find_by_name("use_it")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(
+            store
+                .neighbors(&use_it.id.0, Some(EdgeKind::Calls), true)
+                .unwrap()
+                .is_empty(),
+            "use_it should have no outgoing Calls edge after foo was removed"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

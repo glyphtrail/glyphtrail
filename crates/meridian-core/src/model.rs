@@ -167,6 +167,19 @@ pub struct Edge {
     pub confidence: Confidence,
 }
 
+/// An unresolved cross-file edge: one endpoint (`anchor`) is a known node, the
+/// other is identified only by `name` and resolved against the global symbol
+/// index. Persisted so edits anywhere can be re-resolved incrementally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingLink {
+    pub anchor: NodeId,
+    pub name: String,
+    pub kind: EdgeKind,
+    /// When true the resolved node is the edge *source* (`name -> anchor`);
+    /// otherwise it is the *destination* (`anchor -> name`).
+    pub name_is_src: bool,
+}
+
 /// In-memory graph accumulated by the parser before being persisted.
 #[derive(Debug, Default, Clone)]
 pub struct CodeGraph {

@@ -13,5 +13,5 @@ pub use config::{ApiConfig, Config, SchemaSource};
 pub use error::{CoreError, Result};
 pub use lang::Language;
 pub use matcher::{ClientCall, Endpoint, Match, Matcher};
-pub use model::{CodeGraph, Confidence, Edge, EdgeKind, Node, NodeId, NodeKind, Span};
+pub use model::{CodeGraph, Confidence, Edge, EdgeKind, Node, NodeId, NodeKind, PendingLink, Span};
 pub use rewrite::{PrefixRewrite, RewriteCandidate, RewriteEngine};

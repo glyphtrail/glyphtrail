@@ -7,7 +7,7 @@ pub use sqlite::{SqliteStore, Stats};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use meridian_core::{Confidence, Edge, EdgeKind, Node, NodeId, NodeKind, Span};
+    use meridian_core::{Confidence, Edge, EdgeKind, Node, NodeId, NodeKind, PendingLink, Span};
 
     fn node(id: &str, name: &str, kind: NodeKind) -> Node {
         Node {
@@ -114,6 +114,62 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn pending_edges_persist_and_clear_with_their_anchor_file() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let caller = node("caller", "use_it", NodeKind::Function); // file a.rs
+        store.insert_graph(&[caller], &[]).unwrap();
+        let link = PendingLink {
+            anchor: NodeId("caller".into()),
+            name: "foo".into(),
+            kind: EdgeKind::Calls,
+            name_is_src: false,
+        };
+        store.insert_pending(std::slice::from_ref(&link)).unwrap();
+        assert_eq!(store.all_pending().unwrap(), vec![link.clone()]);
+        // Re-inserting the same link is idempotent.
+        store.insert_pending(&[link]).unwrap();
+        assert_eq!(store.all_pending().unwrap().len(), 1);
+        // Deleting the anchor's file drops its pending rows.
+        store.delete_file_data("a.rs").unwrap();
+        assert!(store.all_pending().unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_edges_by_confidence_removes_only_that_confidence() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store
+            .insert_graph(
+                &[
+                    node("a", "a", NodeKind::Function),
+                    node("b", "b", NodeKind::Function),
+                ],
+                &[
+                    Edge {
+                        src: NodeId("a".into()),
+                        dst: NodeId("b".into()),
+                        kind: EdgeKind::Calls,
+                        confidence: Confidence::Inferred,
+                    },
+                    Edge {
+                        src: NodeId("b".into()),
+                        dst: NodeId("a".into()),
+                        kind: EdgeKind::Calls,
+                        confidence: Confidence::Extracted,
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(store.stats().unwrap().edges, 2);
+        assert_eq!(
+            store
+                .delete_edges_by_confidence(Confidence::Inferred)
+                .unwrap(),
+            1
+        );
+        assert_eq!(store.stats().unwrap().edges, 1);
     }
 
     #[test]
