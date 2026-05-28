@@ -11,6 +11,12 @@
 //!   tagged [`Confidence::Extracted`].
 //! - A **heuristic** that strips well-known gateway prefixes (e.g. `/api`) runs
 //!   by default and is tagged [`Confidence::Inferred`].
+//!
+//! The endpoint's own (prefixed) path is always retained *alongside* the
+//! rewritten forms — the prefix is added-as-optional, never removed. A service
+//! mounted under `/api` locally still answers `/api/users` for in-cluster
+//! callers even though external clients use `/users`, so both paths are
+//! equivalent candidates for the same endpoint.
 
 use serde::Deserialize;
 
@@ -204,6 +210,26 @@ mod tests {
         let cands = eng.external_candidates("/api/users");
         let users = cands.iter().find(|c| c.path == "/users").unwrap();
         assert_eq!(users.confidence, Confidence::Extracted);
+    }
+
+    #[test]
+    fn prefixed_and_stripped_forms_are_equivalent_candidates() {
+        // The service mounts under /api locally, but the gateway scrubs it
+        // externally, so /api/users/{id} and /users/{id} hit the same code.
+        let eng = RewriteEngine::new(
+            vec![PrefixRewrite {
+                from: "/api".into(),
+                to: "".into(),
+            }],
+            vec!["/api".into()],
+            true,
+        );
+        let cands = eng.external_candidates("/api/users/{id}");
+        let conf = |path: &str| cands.iter().find(|c| c.path == path).map(|c| c.confidence);
+        // Both equivalent forms are present, and both are high-confidence
+        // because the rewrite is explicit (the prefix is kept, not removed).
+        assert_eq!(conf("/api/users/{id}"), Some(Confidence::Extracted));
+        assert_eq!(conf("/users/{id}"), Some(Confidence::Extracted));
     }
 
     #[test]
