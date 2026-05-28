@@ -274,6 +274,11 @@ fn python_client_calls(source: &str) -> Vec<RawClientCall> {
 /// (`requests.get`, `client.post`) or `requests.request(method, url)`. A
 /// URL-shaped string argument is required, since the receiver isn't typed.
 fn python_call(call: Node, src: &[u8]) -> Option<RawClientCall> {
+    // A decorator call like `@app.get("/users")` is a route declaration, not an
+    // outgoing client request — leave it to the Flask/FastAPI server extractor.
+    if call.parent().map(|p| p.kind()) == Some("decorator") {
+        return None;
+    }
     let func = call.child_by_field_name("function")?;
     if func.kind() != "attribute" {
         return None;
@@ -731,6 +736,13 @@ requests.request("DELETE", "/z")
     fn python_skips_non_url_calls() {
         // `.get` with a non-URL literal (dict access) is not a request.
         let src = "d.get(\"key\")\nfetchData(url)\n";
+        assert!(extract_client_calls(src, Language::Python).is_empty());
+    }
+
+    #[test]
+    fn python_decorator_routes_are_not_client_calls() {
+        // `@app.get("/users")` is a FastAPI route, not an outgoing request.
+        let src = "@app.get(\"/users/{id}\")\ndef get_user(id): ...\n";
         assert!(extract_client_calls(src, Language::Python).is_empty());
     }
 
