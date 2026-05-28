@@ -70,7 +70,7 @@ pub fn extract_spring_mounts(_source: &str) -> Vec<RawMount> {
 fn parse(source: &str) -> Option<Tree> {
     let mut parser = Parser::new();
     parser
-        .set_language(&registry::grammar(Language::Java))
+        .set_language(&registry::grammar(&Language::Java).expect("built-in grammar"))
         .ok()?;
     parser.parse(source, None)
 }

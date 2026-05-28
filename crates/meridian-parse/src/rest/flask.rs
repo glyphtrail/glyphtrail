@@ -42,7 +42,7 @@ pub fn extract_flask_mounts(_source: &str) -> Vec<RawMount> {
 fn parse(source: &str) -> Option<Tree> {
     let mut parser = Parser::new();
     parser
-        .set_language(&registry::grammar(Language::Python))
+        .set_language(&registry::grammar(&Language::Python).expect("built-in grammar"))
         .ok()?;
     parser.parse(source, None)
 }

@@ -45,7 +45,9 @@ pub fn extract_gin_mounts(_source: &str) -> Vec<RawMount> {
 
 fn parse(source: &str) -> Option<Tree> {
     let mut parser = Parser::new();
-    parser.set_language(&registry::grammar(Language::Go)).ok()?;
+    parser
+        .set_language(&registry::grammar(&Language::Go).expect("built-in grammar"))
+        .ok()?;
     parser.parse(source, None)
 }
 

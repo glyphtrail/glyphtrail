@@ -32,7 +32,10 @@ const ROUTER: &str = "Router";
 /// Extract axum endpoints from Rust `source`. Returns empty on parse failure.
 pub fn extract_axum(source: &str) -> Vec<RawEndpoint> {
     let mut parser = Parser::new();
-    if parser.set_language(&grammar(Language::Rust)).is_err() {
+    if parser
+        .set_language(&grammar(&Language::Rust).expect("built-in grammar"))
+        .is_err()
+    {
         return Vec::new();
     }
     let Some(tree) = parser.parse(source, None) else {
@@ -76,7 +79,10 @@ pub fn extract_axum(source: &str) -> Vec<RawEndpoint> {
 /// from axum router code. Returns empty on parse failure.
 pub fn extract_axum_mounts(source: &str) -> Vec<RawMount> {
     let mut parser = Parser::new();
-    if parser.set_language(&grammar(Language::Rust)).is_err() {
+    if parser
+        .set_language(&grammar(&Language::Rust).expect("built-in grammar"))
+        .is_err()
+    {
         return Vec::new();
     }
     let Some(tree) = parser.parse(source, None) else {

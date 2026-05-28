@@ -150,18 +150,18 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
             Confidence::Extracted,
         );
 
-        match parse_source(f.language, &source) {
+        match parse_source(&f.language, &source) {
             Ok(parsed) => {
-                let fg = build_file_graph(&f.rel_path, f.language, &file_id, &parsed);
+                let fg = build_file_graph(&f.rel_path, &f.language, &file_id, &parsed);
                 // REST server-route extraction runs for any language with a
                 // registered extractor (registry decides; no-op otherwise).
-                let rg = build_rest_graph(&f.rel_path, f.language, &fg.symbols, &source);
+                let rg = build_rest_graph(&f.rel_path, &f.language, &fg.symbols, &source);
                 graph.extend(rg.graph);
                 operations.extend(rg.operations);
                 pending_handlers.extend(rg.pending_handlers);
                 // Client-call extraction runs for any language with a client
                 // extractor (the extractor decides; no-op otherwise).
-                let cg = build_client_graph(&f.rel_path, &source, f.language);
+                let cg = build_client_graph(&f.rel_path, &source, &f.language);
                 graph.extend(cg.graph);
                 operations.extend(cg.operations);
                 graph.extend(fg.graph);
@@ -232,7 +232,7 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
             .into_iter()
             .find(|l| l.name() == lang_name)
             .and_then(|l| {
-                resolve_target(&resolve_import(&importer, &raw, l), &file_rels, &file_set)
+                resolve_target(&resolve_import(&importer, &raw, &l), &file_rels, &file_set)
             });
         if let Some(t) = &target {
             import_map

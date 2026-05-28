@@ -157,13 +157,13 @@ impl RestServerExtractor for ExpressExtractor {
         "express"
     }
     fn language(&self) -> Language {
-        self.0
+        self.0.clone()
     }
     fn endpoints(&self, source: &str) -> Vec<RawEndpoint> {
-        extract_express(source, self.0)
+        extract_express(source, &self.0)
     }
     fn mounts(&self, source: &str) -> Vec<RawMount> {
-        extract_express_mounts(source, self.0)
+        extract_express_mounts(source, &self.0)
     }
 }
 
@@ -184,10 +184,10 @@ pub fn registry() -> Vec<Box<dyn RestServerExtractor>> {
 }
 
 /// The registered extractors that apply to `lang`.
-pub fn extractors_for(lang: Language) -> Vec<Box<dyn RestServerExtractor>> {
+pub fn extractors_for(lang: &Language) -> Vec<Box<dyn RestServerExtractor>> {
     registry()
         .into_iter()
-        .filter(|e| e.language() == lang)
+        .filter(|e| &e.language() == lang)
         .collect()
 }
 
@@ -198,37 +198,37 @@ mod tests {
 
     #[test]
     fn registry_filters_by_language() {
-        check!(extractors_for(Language::Rust).len() == 2);
+        check!(extractors_for(&Language::Rust).len() == 2);
         check!(
-            extractors_for(Language::Python)
+            extractors_for(&Language::Python)
                 .iter()
                 .map(|e| e.name())
                 .collect::<Vec<_>>()
                 == ["flask"]
         );
-        let rust: Vec<_> = extractors_for(Language::Rust)
+        let rust: Vec<_> = extractors_for(&Language::Rust)
             .iter()
             .map(|e| e.name())
             .collect();
         check!(rust.contains(&"axum"));
         check!(rust.contains(&"utoipa-axum"));
-        let java: Vec<_> = extractors_for(Language::Java)
+        let java: Vec<_> = extractors_for(&Language::Java)
             .iter()
             .map(|e| e.name())
             .collect();
         check!(java == ["spring"]);
-        let go: Vec<_> = extractors_for(Language::Go)
+        let go: Vec<_> = extractors_for(&Language::Go)
             .iter()
             .map(|e| e.name())
             .collect();
         check!(go == ["gin"]);
-        let cs: Vec<_> = extractors_for(Language::CSharp)
+        let cs: Vec<_> = extractors_for(&Language::CSharp)
             .iter()
             .map(|e| e.name())
             .collect();
         check!(cs == ["aspnet"]);
         for js in [Language::JavaScript, Language::TypeScript, Language::Tsx] {
-            let names: Vec<_> = extractors_for(js).iter().map(|e| e.name()).collect();
+            let names: Vec<_> = extractors_for(&js).iter().map(|e| e.name()).collect();
             check!(names == ["express"]);
         }
     }

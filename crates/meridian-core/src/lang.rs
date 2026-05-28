@@ -1,10 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// Languages the analyzer can parse. Adding one is: a variant here, a grammar in
-/// the parse registry, and a query file — mirroring the breadth of tree-sitter's
-/// language packs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Languages the analyzer can parse. The built-in variants each have a grammar
+/// in the parse registry and a query file; [`Language::Other`] names a language
+/// identified at runtime whose grammar is supplied by the dynamic loader rather
+/// than compiled in.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Language {
     Rust,
@@ -17,10 +18,12 @@ pub enum Language {
     C,
     Cpp,
     CSharp,
+    /// A language identified by name but not built in (dynamically loaded).
+    Other(String),
 }
 
 impl Language {
-    pub fn name(self) -> &'static str {
+    pub fn name(&self) -> &str {
         match self {
             Language::Rust => "rust",
             Language::Python => "python",
@@ -32,6 +35,7 @@ impl Language {
             Language::C => "c",
             Language::Cpp => "cpp",
             Language::CSharp => "csharp",
+            Language::Other(name) => name,
         }
     }
 
