@@ -5,10 +5,23 @@
 //! or a stable JSON `ImpactReport`.
 
 use anyhow::{Result, anyhow, bail};
-use clap::Args;
+use clap::{Args, ValueEnum};
 use meridian_core::config::RepoPaths;
 use meridian_core::{ClassifiedItem, Confidence, ImpactClass, ImpactPolicy, ImpactReport};
 use meridian_store::{ChangeSpec, SeedSet, SqliteStore, changed_files, seed_nodes};
+
+/// Exit code used by `--gate` when a change touches the API/contract surface.
+const GATE_EXIT_CODE: i32 = 2;
+
+/// Output format for the impact report.
+#[derive(Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum Format {
+    #[default]
+    Text,
+    Json,
+    /// Markdown for a PR comment or CI job summary.
+    Md,
+}
 
 #[derive(Args)]
 pub struct ImpactArgs {
@@ -48,9 +61,15 @@ pub struct ImpactArgs {
     #[arg(long)]
     pub cross_boundary: bool,
 
-    /// Emit the JSON ImpactReport instead of text.
+    /// Output format: text, json, or md (Markdown for CI / PR comments).
+    #[arg(long, value_enum, default_value_t = Format::Text)]
+    pub format: Format,
+    /// Shorthand for `--format json`.
     #[arg(long)]
     pub json: bool,
+    /// Exit non-zero (code 2) when the change touches the API/contract surface.
+    #[arg(long)]
+    pub gate: bool,
 }
 
 pub fn run(args: ImpactArgs) -> Result<()> {
@@ -63,37 +82,49 @@ pub fn run(args: ImpactArgs) -> Result<()> {
     }
     let store = SqliteStore::open(&paths.db_path)?;
 
+    let format = if args.json && args.format == Format::Text {
+        Format::Json
+    } else {
+        args.format
+    };
+
     let seed_set = resolve_seeds(&store, &args)?;
-    if seed_set.seeds.is_empty() {
+    let report = if seed_set.seeds.is_empty() {
         // Still emit (possibly noting removed/unresolved files) rather than error.
-        let report = ImpactReport::new(
+        ImpactReport::new(
             Vec::new(),
             seed_set.removed_files,
             seed_set.unresolved_files,
-        );
-        return emit(&report, args.json);
-    }
-
-    let mut policy = if args.cross_boundary {
-        ImpactPolicy::cross_boundary(args.depth)
+        )
     } else {
-        ImpactPolicy::in_process(args.depth)
+        let mut policy = if args.cross_boundary {
+            ImpactPolicy::cross_boundary(args.depth)
+        } else {
+            ImpactPolicy::in_process(args.depth)
+        };
+        if let Some(edges) = &args.edges {
+            let tokens: Vec<&str> = edges.iter().map(String::as_str).collect();
+            policy.edges = meridian_core::edge_rules(&tokens).map_err(|e| anyhow!(e))?;
+        }
+        if let Some(mc) = &args.min_confidence {
+            policy.min_confidence = meridian_core::parse_confidence(mc).map_err(|e| anyhow!(e))?;
+        }
+        let classified = store.classify_impact(&seed_set.seeds, &policy)?;
+        ImpactReport::new(
+            classified,
+            seed_set.removed_files,
+            seed_set.unresolved_files,
+        )
     };
-    if let Some(edges) = &args.edges {
-        let tokens: Vec<&str> = edges.iter().map(String::as_str).collect();
-        policy.edges = meridian_core::edge_rules(&tokens).map_err(|e| anyhow!(e))?;
-    }
-    if let Some(mc) = &args.min_confidence {
-        policy.min_confidence = meridian_core::parse_confidence(mc).map_err(|e| anyhow!(e))?;
-    }
 
-    let classified = store.classify_impact(&seed_set.seeds, &policy)?;
-    let report = ImpactReport::new(
-        classified,
-        seed_set.removed_files,
-        seed_set.unresolved_files,
-    );
-    emit(&report, args.json)
+    emit(&report, format)?;
+
+    // Drift gate: a PR touching the API/contract surface exits non-zero so CI
+    // can flag it loudly. Default is report-only.
+    if args.gate && report.touches_contract() {
+        std::process::exit(GATE_EXIT_CODE);
+    }
+    Ok(())
 }
 
 fn resolve_seeds(store: &SqliteStore, args: &ImpactArgs) -> Result<SeedSet> {
@@ -126,12 +157,12 @@ fn resolve_seeds(store: &SqliteStore, args: &ImpactArgs) -> Result<SeedSet> {
     seed_nodes(store, &files)
 }
 
-fn emit(report: &ImpactReport, json: bool) -> Result<()> {
-    if json {
-        println!("{}", serde_json::to_string_pretty(report)?);
-        return Ok(());
+fn emit(report: &ImpactReport, format: Format) -> Result<()> {
+    match format {
+        Format::Json => println!("{}", serde_json::to_string_pretty(report)?),
+        Format::Md => print!("{}", report.to_markdown()),
+        Format::Text => print_text(report),
     }
-    print_text(report);
     Ok(())
 }
 
