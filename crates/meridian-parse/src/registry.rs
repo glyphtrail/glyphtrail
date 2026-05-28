@@ -13,6 +13,7 @@ pub fn grammar(lang: Language) -> TsLanguage {
         Language::Java => tree_sitter_java::LANGUAGE.into(),
         Language::C => tree_sitter_c::LANGUAGE.into(),
         Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+        Language::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
     }
 }
 
@@ -34,5 +35,6 @@ pub fn query_source(lang: Language) -> &'static str {
         Language::Java => include_str!("../queries/java.scm"),
         Language::C => include_str!("../queries/c.scm"),
         Language::Cpp => include_str!("../queries/cpp.scm"),
+        Language::CSharp => include_str!("../queries/csharp.scm"),
     }
 }

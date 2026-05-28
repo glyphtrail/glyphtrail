@@ -29,8 +29,9 @@ pub fn resolve_import(importer_rel: &str, raw: &str, lang: Language) -> Vec<Stri
         Language::C | Language::Cpp => c_candidates(importer_rel, raw),
         Language::Python => python_candidates(raw),
         Language::Java => java_candidates(raw),
-        // Go import paths and Rust `use` paths need project/module metadata.
-        Language::Go | Language::Rust => Vec::new(),
+        // Go import paths, Rust `use` paths and C# `using` namespaces need
+        // project/module metadata, so they aren't resolved to files here.
+        Language::Go | Language::Rust | Language::CSharp => Vec::new(),
     }
 }
 

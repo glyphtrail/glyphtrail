@@ -68,6 +68,7 @@ mod tests {
             (Language::Java, "class C { void f() {} }"),
             (Language::C, "void f() {}"),
             (Language::Cpp, "void f() {}"),
+            (Language::CSharp, "class C { void f() {} }"),
         ];
         for (lang, src) in cases {
             let parsed = parse_source(lang, src)

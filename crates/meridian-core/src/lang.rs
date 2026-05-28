@@ -16,6 +16,7 @@ pub enum Language {
     Java,
     C,
     Cpp,
+    CSharp,
 }
 
 impl Language {
@@ -30,6 +31,7 @@ impl Language {
             Language::Java => "java",
             Language::C => "c",
             Language::Cpp => "cpp",
+            Language::CSharp => "csharp",
         }
     }
 
@@ -46,6 +48,7 @@ impl Language {
             "java" => Language::Java,
             "c" | "h" => Language::C,
             "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => Language::Cpp,
+            "cs" => Language::CSharp,
             _ => return None,
         })
     }
@@ -61,11 +64,12 @@ impl Language {
             "java" => Language::Java,
             "c" => Language::C,
             "cpp" => Language::Cpp,
+            "csharp" => Language::CSharp,
             _ => return None,
         })
     }
 
-    pub const ALL: [Language; 9] = [
+    pub const ALL: [Language; 10] = [
         Language::Rust,
         Language::Python,
         Language::JavaScript,
@@ -75,5 +79,6 @@ impl Language {
         Language::Java,
         Language::C,
         Language::Cpp,
+        Language::CSharp,
     ];
 }
