@@ -61,6 +61,9 @@ pub enum QueryCmd {
         #[arg(long)]
         method: Option<String>,
     },
+    /// Reconcile code endpoints against ingested schema operations and report
+    /// drift: endpoints absent from the schema, and schema ops with no handler.
+    Drift,
 }
 
 #[derive(Serialize)]
@@ -155,6 +158,14 @@ struct ApiImpactOut {
     handlers: Vec<Node>,
     callers: Vec<Node>,
     schema_ops: Vec<Node>,
+}
+
+#[derive(Serialize)]
+struct DriftReport {
+    /// Code endpoints with no matching schema operation (undocumented).
+    undocumented_endpoints: Vec<OperationOut>,
+    /// Schema operations with no implementing endpoint (unimplemented).
+    unimplemented_schema_ops: Vec<OperationOut>,
 }
 
 fn parse_method_opt(s: Option<&str>) -> Result<Option<HttpMethod>> {
@@ -352,6 +363,69 @@ pub fn run(repo: &Path, cmd: QueryCmd, json: bool) -> Result<()> {
                 });
             }
             print_api_impact(&report, json)?;
+        }
+        QueryCmd::Drift => {
+            // EXPOSES links a code endpoint (src) to the schema op it implements
+            // (dst). An endpoint with no outgoing EXPOSES is absent from the
+            // schema; a schema op with no incoming EXPOSES has no handler.
+            let mut undocumented_endpoints = Vec::new();
+            for (id, key) in store.operations_by_kind(NodeKind::Endpoint)? {
+                if store
+                    .neighbors(&id.0, Some(EdgeKind::Exposes), true)?
+                    .is_empty()
+                {
+                    let node = store.get_node(&id.0)?;
+                    let handler = endpoint_handler(&store, &id.0)?;
+                    undocumented_endpoints.push(operation_out(&key, node.as_ref(), handler));
+                }
+            }
+            let mut unimplemented_schema_ops = Vec::new();
+            for (id, key) in store.operations_by_kind(NodeKind::SchemaOp)? {
+                if store
+                    .neighbors(&id.0, Some(EdgeKind::Exposes), false)?
+                    .is_empty()
+                {
+                    let node = store.get_node(&id.0)?;
+                    unimplemented_schema_ops.push(operation_out(&key, node.as_ref(), None));
+                }
+            }
+            print_drift(
+                &DriftReport {
+                    undocumented_endpoints,
+                    unimplemented_schema_ops,
+                },
+                json,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn print_drift(report: &DriftReport, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+    if report.undocumented_endpoints.is_empty() && report.unimplemented_schema_ops.is_empty() {
+        println!("no drift: every endpoint and schema operation is reconciled");
+        return Ok(());
+    }
+    if !report.undocumented_endpoints.is_empty() {
+        println!("endpoints absent from the schema:");
+        for o in &report.undocumented_endpoints {
+            let verb = o.method.as_deref().unwrap_or(&o.protocol);
+            let loc = match o.line {
+                Some(l) => format!("{}:{}", o.file, l),
+                None => o.file.clone(),
+            };
+            println!("  {verb} {} ({loc})", o.path);
+        }
+    }
+    if !report.unimplemented_schema_ops.is_empty() {
+        println!("schema operations with no handler:");
+        for o in &report.unimplemented_schema_ops {
+            let verb = o.method.as_deref().unwrap_or(&o.protocol);
+            println!("  {verb} {} ({})", o.path, o.file);
         }
     }
     Ok(())
