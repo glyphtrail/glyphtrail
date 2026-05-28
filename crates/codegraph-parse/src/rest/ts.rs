@@ -252,14 +252,7 @@ pub(super) fn collect_referenced_builders(
         let args = n.child_by_field_name("arguments");
         for i in 0..2 {
             if let Some(a) = named_arg(args, i) {
-                let name = match a.kind() {
-                    "call_expression" => a
-                        .child_by_field_name("function")
-                        .map(|f| func_name(f, src))
-                        .unwrap_or_default(),
-                    "identifier" | "scoped_identifier" => text(a, src),
-                    _ => String::new(),
-                };
+                let name = arg_ref_name(a, src);
                 let short = last_segment(&name);
                 if builders.contains_key(short) {
                     referenced.insert(short.to_string());
@@ -268,4 +261,64 @@ pub(super) fn collect_referenced_builders(
         }
     });
     referenced
+}
+
+/// The referenced name of a `.nest`/`.merge` argument: the callee of a builder
+/// call (`users_router()`), or a bare router identifier (`users_router`).
+fn arg_ref_name(arg: Node, src: &[u8]) -> String {
+    match arg.kind() {
+        "call_expression" => arg
+            .child_by_field_name("function")
+            .map(|f| func_name(f, src))
+            .unwrap_or_default(),
+        "identifier" | "scoped_identifier" => text(arg, src),
+        _ => String::new(),
+    }
+}
+
+/// `(parent builder, child builder)` mount relationships: a `.nest`/`.merge`
+/// within builder `F`'s composed router chain that targets another builder `G`
+/// yields `(F, G)`. Both ends are same-file builders, so they resolve to local
+/// `Function` nodes.
+///
+/// Collection is constrained to each builder's stored chain root (the actually
+/// returned/composed router, including inline nested routers) rather than the
+/// whole function body, so unused local routers don't produce phantom mounts.
+pub(super) fn collect_mounts(
+    src: &[u8],
+    builders: &HashMap<String, Node>,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (parent, chain_root) in builders {
+        walk(*chain_root, &mut |n| {
+            if n.kind() != "call_expression" {
+                return;
+            }
+            let Some(func) = n.child_by_field_name("function") else {
+                return;
+            };
+            if func.kind() != "field_expression" {
+                return;
+            }
+            let method = func
+                .child_by_field_name("field")
+                .map(|x| text(x, src))
+                .unwrap_or_default();
+            if method != "nest" && method != "merge" && method != "nest_service" {
+                return;
+            }
+            let args = n.child_by_field_name("arguments");
+            for i in 0..2 {
+                if let Some(a) = named_arg(args, i) {
+                    let name = arg_ref_name(a, src);
+                    let short = last_segment(&name);
+                    // Skip self-references; only same-file builders are mounts.
+                    if short != parent && builders.contains_key(short) {
+                        out.push((parent.clone(), short.to_string()));
+                    }
+                }
+            }
+        });
+    }
+    out
 }

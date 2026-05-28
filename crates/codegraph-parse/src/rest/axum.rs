@@ -21,10 +21,10 @@ use codegraph_core::Language;
 use tree_sitter::{Node, Parser};
 
 use super::ts::{
-    collect_builders, collect_referenced_builders, func_name, join, last_segment, method_router,
-    named_arg, router_chain_roots, span_of, string_literal_text, text,
+    collect_builders, collect_mounts, collect_referenced_builders, func_name, join, last_segment,
+    method_router, named_arg, router_chain_roots, span_of, string_literal_text, text,
 };
-use super::RawEndpoint;
+use super::{RawEndpoint, RawMount};
 use crate::registry::grammar;
 
 const ROUTER: &str = "Router";
@@ -70,6 +70,25 @@ pub fn extract_axum(source: &str) -> Vec<RawEndpoint> {
     }
 
     out
+}
+
+/// Extract router-composition mounts (`fn parent` nests/merges builder `child`)
+/// from axum router code. Returns empty on parse failure.
+pub fn extract_axum_mounts(source: &str) -> Vec<RawMount> {
+    let mut parser = Parser::new();
+    if parser.set_language(&grammar(Language::Rust)).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+    let src = source.as_bytes();
+    let root = tree.root_node();
+    let builders = collect_builders(root, src, ROUTER);
+    collect_mounts(src, &builders)
+        .into_iter()
+        .map(|(parent, child)| RawMount { parent, child })
+        .collect()
 }
 
 /// Recursively expand a router expression, accumulating `prefix`.
@@ -295,6 +314,52 @@ fn app() -> Router {
 "#;
         let eps = extract_axum(src);
         assert_eq!(ep(&eps, HttpMethod::Get, "/x").unwrap().handler, "h");
+    }
+
+    #[test]
+    fn mounts_link_parent_builder_to_child() {
+        let src = r#"
+fn users_router() -> Router {
+    Router::new().route("/", get(list))
+}
+fn admin() -> Router {
+    Router::new().merge(users_router())
+}
+fn app() -> Router {
+    Router::new().nest("/api", admin())
+}
+"#;
+        let mounts = extract_axum_mounts(src);
+        assert!(mounts.contains(&RawMount {
+            parent: "app".into(),
+            child: "admin".into()
+        }));
+        assert!(mounts.contains(&RawMount {
+            parent: "admin".into(),
+            child: "users_router".into()
+        }));
+        // Inline routers (not builders) do not produce mounts.
+        assert_eq!(mounts.len(), 2);
+    }
+
+    #[test]
+    fn mounts_ignore_routers_outside_the_returned_chain() {
+        // A local router that is built but not part of the returned/composed
+        // chain must not produce a phantom mount.
+        let src = r#"
+fn other() -> Router { Router::new().route("/o", get(o)) }
+fn child() -> Router { Router::new().route("/c", get(c)) }
+fn app() -> Router {
+    let _unused = Router::new().merge(other());
+    Router::new().nest("/api", child())
+}
+"#;
+        let mounts = extract_axum_mounts(src);
+        assert!(mounts.contains(&RawMount {
+            parent: "app".into(),
+            child: "child".into()
+        }));
+        assert!(!mounts.iter().any(|m| m.child == "other"));
     }
 
     #[test]
