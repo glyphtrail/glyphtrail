@@ -13,7 +13,7 @@ pub mod rewrite;
 pub use api::{
     HttpMethod, OperationKey, Protocol, normalize_path, operations_matching, path_signature,
 };
-pub use config::{ApiConfig, Config, DynamicLanguage, SchemaSource};
+pub use config::{ApiConfig, Config, DynamicLanguage, SchemaFormat, SchemaSource};
 pub use error::{CoreError, Result};
 pub use impact::{
     Adjacency, ClassifiedItem, Direction, EdgeRule, ImpactClass, ImpactItem, ImpactPolicy,

@@ -162,13 +162,32 @@ impl Default for ApiConfig {
     }
 }
 
+/// How to parse a blessed schema artifact. `Auto` (default) dispatches by
+/// `protocol`; `Hasura` parses Hasura metadata (tables + RESTified endpoints).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaFormat {
+    #[default]
+    Auto,
+    Hasura,
+}
+
 /// A local API schema file blessed for reconciliation against extracted endpoints.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SchemaSource {
     pub path: String,
     /// Validated at parse time against the known protocols (rest/grpc/graphql).
+    /// Ignored when `format = "hasura"`.
+    #[serde(default = "default_protocol")]
     pub protocol: Protocol,
+    /// Parser to use; defaults to dispatching by `protocol`.
+    #[serde(default)]
+    pub format: SchemaFormat,
+}
+
+fn default_protocol() -> Protocol {
+    Protocol::Rest
 }
 
 #[cfg(test)]

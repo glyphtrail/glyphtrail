@@ -4,7 +4,7 @@
 //! Supports OpenAPI (Swagger 2.0 / OpenAPI 3.x) in JSON or YAML form, gRPC
 //! `.proto` service definitions, and GraphQL SDL root operations.
 
-use meridian_core::HttpMethod;
+use meridian_core::{HttpMethod, OperationKey, Protocol};
 use serde_json::Value;
 
 /// Parse an OpenAPI document (JSON or YAML) into the REST operations it
@@ -119,6 +119,94 @@ pub fn graphql_operations(text: &str) -> Vec<String> {
     out
 }
 
+/// Parse Hasura metadata (JSON or YAML) into the operations it exposes:
+/// per tracked table the auto-generated GraphQL CRUD fields (keyed
+/// `OpType.field`, matching SDL ops), plus any RESTified endpoints as REST
+/// operations. Tables are read from `sources[].tables[]` (v2/v3 export) and a
+/// top-level `tables:` list (split-file `tables.yaml`).
+pub fn hasura_operations(text: &str) -> Vec<OperationKey> {
+    let doc = serde_json::from_str::<Value>(text)
+        .ok()
+        .or_else(|| serde_norway::from_str::<Value>(text).ok());
+    let Some(doc) = doc else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for table in hasura_tables(&doc) {
+        for (op, field) in [
+            ("Query", table.clone()),
+            ("Query", format!("{table}_by_pk")),
+            ("Query", format!("{table}_aggregate")),
+            ("Mutation", format!("insert_{table}")),
+            ("Mutation", format!("update_{table}")),
+            ("Mutation", format!("delete_{table}")),
+            ("Subscription", table.clone()),
+        ] {
+            out.push(OperationKey::opaque(
+                Protocol::GraphQl,
+                format!("{op}.{field}"),
+            ));
+        }
+    }
+
+    if let Some(eps) = doc.get("rest_endpoints").and_then(Value::as_array) {
+        for ep in eps {
+            let Some(url) = ep.get("url").and_then(Value::as_str) else {
+                continue;
+            };
+            let path = format!("/api/rest/{}", url.trim_start_matches('/'));
+            let methods = ep.get("methods").and_then(Value::as_array);
+            match methods {
+                Some(ms) => {
+                    for m in ms.iter().filter_map(Value::as_str) {
+                        if let Some(method) = HttpMethod::parse(m) {
+                            out.push(OperationKey::rest(method, &path));
+                        }
+                    }
+                }
+                None => out.push(OperationKey::rest(HttpMethod::Get, &path)),
+            }
+        }
+    }
+    out
+}
+
+/// Tracked table names from Hasura metadata, across the layouts Hasura emits.
+fn hasura_tables(doc: &Value) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut collect = |tables: &Value| {
+        if let Some(arr) = tables.as_array() {
+            for t in arr {
+                // `table` is either a bare name or `{ name, schema }`.
+                let name = match t.get("table") {
+                    Some(Value::String(s)) => Some(s.clone()),
+                    Some(obj) => obj.get("name").and_then(Value::as_str).map(str::to_string),
+                    None => None,
+                };
+                if let Some(n) = name {
+                    names.push(n);
+                }
+            }
+        }
+    };
+    if let Some(sources) = doc.get("sources").and_then(Value::as_array) {
+        for src in sources {
+            if let Some(tables) = src.get("tables") {
+                collect(tables);
+            }
+        }
+    }
+    if let Some(tables) = doc.get("tables") {
+        collect(tables);
+    }
+    // Split-file `tables.yaml` is a bare top-level list of table entries.
+    if doc.is_array() {
+        collect(doc);
+    }
+    names
+}
+
 /// The leading identifier of `s` (up to the first whitespace, `{`, or `(`).
 fn first_ident(s: &str) -> Option<String> {
     let name: String = s
@@ -149,6 +237,48 @@ mod tests {
 
     fn has(ops: &[(HttpMethod, String)], m: HttpMethod, p: &str) -> bool {
         ops.iter().any(|(om, op)| *om == m && op == p)
+    }
+
+    #[test]
+    fn hasura_tables_yield_crud_ops_and_rest_endpoints() {
+        let yaml = r#"
+version: 3
+sources:
+  - name: default
+    tables:
+      - table:
+          name: users
+          schema: public
+rest_endpoints:
+  - url: get_user
+    methods: [GET, POST]
+"#;
+        let ops = hasura_operations(yaml);
+        let paths: Vec<&str> = ops.iter().map(|k| k.path.as_str()).collect();
+        check!(paths.contains(&"Query.users"));
+        check!(paths.contains(&"Query.users_by_pk"));
+        check!(paths.contains(&"Mutation.insert_users"));
+        check!(paths.contains(&"Mutation.delete_users"));
+        check!(paths.contains(&"Subscription.users"));
+        // RESTified endpoint, both methods, under /api/rest/.
+        check!(
+            ops.iter()
+                .any(|k| k.method == Some(HttpMethod::Get) && k.path == "/api/rest/get_user")
+        );
+        check!(
+            ops.iter()
+                .any(|k| k.method == Some(HttpMethod::Post) && k.path == "/api/rest/get_user")
+        );
+    }
+
+    #[test]
+    fn hasura_top_level_tables_list_and_bare_names() {
+        // Split-file `tables.yaml`: a top-level list; `table` may be a bare name.
+        let yaml = "- table: posts\n- table: { name: tags, schema: public }\n";
+        let ops = hasura_operations(yaml);
+        let paths: Vec<&str> = ops.iter().map(|k| k.path.as_str()).collect();
+        check!(paths.contains(&"Query.posts"));
+        check!(paths.contains(&"Query.tags"));
     }
 
     #[test]
