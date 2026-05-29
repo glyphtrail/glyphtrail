@@ -18,6 +18,12 @@ pub enum Protocol {
     Grpc,
     #[serde(rename = "graphql")]
     GraphQl,
+    /// A WebSocket connection. The handshake is a path-based HTTP GET upgrade, so
+    /// for connection-boundary matching a WebSocket key shares a REST `GET`
+    /// signature (see [`OperationKey::signature`]); event/channel message
+    /// boundaries are a separate concern (#51).
+    #[serde(rename = "websocket")]
+    WebSocket,
 }
 
 impl Protocol {
@@ -26,6 +32,7 @@ impl Protocol {
             Protocol::Rest => "rest",
             Protocol::Grpc => "grpc",
             Protocol::GraphQl => "graphql",
+            Protocol::WebSocket => "websocket",
         }
     }
 
@@ -35,6 +42,7 @@ impl Protocol {
             "rest" => Some(Protocol::Rest),
             "grpc" => Some(Protocol::Grpc),
             "graphql" => Some(Protocol::GraphQl),
+            "websocket" => Some(Protocol::WebSocket),
             _ => None,
         }
     }
@@ -114,6 +122,17 @@ impl OperationKey {
         }
     }
 
+    /// Build a WebSocket connection key from a connection URL/path. The
+    /// handshake is an HTTP `GET` upgrade, so the key carries `GET` + the
+    /// normalized path and matches a REST `GET` upgrade route by signature.
+    pub fn websocket(raw_path: &str) -> Self {
+        OperationKey {
+            protocol: Protocol::WebSocket,
+            method: Some(HttpMethod::Get),
+            path: normalize_path(raw_path),
+        }
+    }
+
     /// A protocol-agnostic key whose `path` is taken verbatim (already canonical).
     pub fn opaque(protocol: Protocol, path: impl Into<String>) -> Self {
         OperationKey {
@@ -135,6 +154,12 @@ impl OperationKey {
         }
         if self.protocol == Protocol::GraphQl {
             return format!("graphql|{}", graphql_signature(&self.path));
+        }
+        // A WebSocket connection handshake is a REST `GET` upgrade, so it shares
+        // the REST `GET` signature of its upgrade route — a client `new
+        // WebSocket("/ws")` links to the server's `GET /ws` route (#51).
+        if self.protocol == Protocol::WebSocket {
+            return format!("rest|GET|{}", path_signature(&self.path));
         }
         let method = self.method.map(|m| m.as_str()).unwrap_or("*");
         format!(
@@ -374,6 +399,23 @@ mod tests {
         check!(normalize_path("/users/[id]") == "/users/{id}");
         check!(normalize_path("/docs/[...slug]") == "/docs/{slug}");
         check!(normalize_path("/assets/*path") == "/assets/{path}");
+    }
+
+    #[test]
+    fn websocket_connection_matches_rest_get_upgrade_route() {
+        // A `new WebSocket("/ws")` connection links to the server's `GET /ws`
+        // upgrade route: identical signatures (#51).
+        let route = OperationKey::rest(HttpMethod::Get, "/ws");
+        let connect = OperationKey::websocket("/ws");
+        check!(connect.signature() == route.signature());
+        check!(connect.protocol == Protocol::WebSocket);
+        // Path params collapse like REST, and the method discriminates: a POST
+        // route does not answer a WS handshake.
+        check!(
+            OperationKey::websocket("/rooms/42").signature()
+                == OperationKey::rest(HttpMethod::Get, "/rooms/{id}").signature()
+        );
+        check!(connect.signature() != OperationKey::rest(HttpMethod::Post, "/ws").signature());
     }
 
     #[test]

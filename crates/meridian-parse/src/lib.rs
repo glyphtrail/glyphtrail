@@ -9,11 +9,12 @@ pub mod grpc;
 pub mod imports;
 pub mod registry;
 pub mod rest;
+pub mod ws;
 
 pub use build::{
     ClientGraph, FileGraph, PendingEdge, RestGraph, SymbolEntry, build_client_graph,
     build_file_graph, build_graphql_client_graph, build_graphql_graph, build_grpc_client_graph,
-    build_grpc_graph, build_rest_graph, enclosing_call_edges,
+    build_grpc_graph, build_rest_graph, build_ws_client_graph, enclosing_call_edges,
 };
 pub use client::{RawClientCall, extract_client_calls};
 pub use dynamic::{DynamicGrammar, load_dynamic};
@@ -22,6 +23,7 @@ pub use imports::resolve_import;
 pub use rest::{
     RawEndpoint, RawMount, extract_axum, extract_axum_mounts, extract_utoipa, extract_utoipa_mounts,
 };
+pub use ws::{RawWsConnect, extract_ws_connections};
 
 #[cfg(test)]
 mod tests {
