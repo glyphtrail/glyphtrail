@@ -79,6 +79,9 @@ mod tests {
             (Language::CSharp, "class C { void f() {} }"),
             (Language::Ruby, "def f\nend\n"),
             (Language::Kotlin, "fun f() {}\n"),
+            (Language::Bash, "f() { :; }\n"),
+            (Language::Php, "<?php\nfunction f() {}\n"),
+            (Language::Scala, "def f(): Unit = {}\n"),
         ];
         for (lang, src) in cases {
             let parsed = parse_source(&lang, src)
@@ -110,6 +113,36 @@ mod tests {
         );
         // The macro name itself is still captured as a call/reference.
         check!(parsed.calls.iter().any(|c| c.name == "println"));
+    }
+
+    // #21: the newly added languages extract a call and a comment, exercising
+    // each new grammar + query beyond the bare definition check above.
+    #[test]
+    fn extracts_calls_and_comments_for_new_languages() {
+        let cases = [
+            (Language::Bash, "# note\nf() { g; }\n", "g"),
+            (
+                Language::Php,
+                "<?php\n// note\nfunction f() { g(); }\n",
+                "g",
+            ),
+            (Language::Scala, "// note\ndef f(): Unit = { g() }\n", "g"),
+        ];
+        for (lang, src, call) in cases {
+            let parsed = parse_source(&lang, src)
+                .unwrap_or_else(|e| panic!("parse failed for {}: {e}", lang.name()));
+            check!(
+                parsed.calls.iter().any(|c| c.name == call),
+                "{}: expected call '{call}', got {:?}",
+                lang.name(),
+                parsed.calls.iter().map(|c| &c.name).collect::<Vec<_>>()
+            );
+            check!(
+                !parsed.comments.is_empty(),
+                "{}: expected a comment node",
+                lang.name()
+            );
+        }
     }
 
     #[test]
