@@ -6,6 +6,7 @@ use meridian_core::config::{IGNORE_FILE, RepoPaths};
 use meridian_core::{
     ClientCall, CodeGraph, Confidence, Config, DynamicLanguage, Edge, EdgeKind, Endpoint, Language,
     Matcher, Node, NodeId, NodeKind, OperationKey, PendingLink, Protocol, RewriteEngine,
+    SchemaFormat,
 };
 use meridian_parse::{
     DynamicGrammar, PendingEdge, build_client_graph, build_file_graph, build_rest_graph,
@@ -517,19 +518,22 @@ fn ingest_schemas(
                 continue;
             }
         };
-        let keys: Vec<OperationKey> = match source.protocol {
-            Protocol::Rest => schema::openapi_rest_operations(&text)
-                .into_iter()
-                .map(|(method, path)| OperationKey::rest(method, &path))
-                .collect(),
-            Protocol::Grpc => schema::proto_grpc_operations(&text)
-                .into_iter()
-                .map(|path| OperationKey::opaque(Protocol::Grpc, path))
-                .collect(),
-            Protocol::GraphQl => schema::graphql_operations(&text)
-                .into_iter()
-                .map(|path| OperationKey::opaque(Protocol::GraphQl, path))
-                .collect(),
+        let keys: Vec<OperationKey> = match source.format {
+            SchemaFormat::Hasura => schema::hasura_operations(&text),
+            SchemaFormat::Auto => match source.protocol {
+                Protocol::Rest => schema::openapi_rest_operations(&text)
+                    .into_iter()
+                    .map(|(method, path)| OperationKey::rest(method, &path))
+                    .collect(),
+                Protocol::Grpc => schema::proto_grpc_operations(&text)
+                    .into_iter()
+                    .map(|path| OperationKey::opaque(Protocol::Grpc, path))
+                    .collect(),
+                Protocol::GraphQl => schema::graphql_operations(&text)
+                    .into_iter()
+                    .map(|path| OperationKey::opaque(Protocol::GraphQl, path))
+                    .collect(),
+            },
         };
         if keys.is_empty() {
             tracing::warn!("no operations parsed from schema {}", source.path);
