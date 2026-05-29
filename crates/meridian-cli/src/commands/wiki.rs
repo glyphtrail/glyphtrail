@@ -1,0 +1,286 @@
+//! `meridian wiki` — generate a docs wiki from the knowledge graph via an LLM
+//! (#52). Facts are extracted from the graph (offline, deterministic), composed
+//! into per-page prompts, and sent to a configurable provider (Anthropic /
+//! OpenAI / OpenRouter). `--dry-run` writes the prompts instead of calling the
+//! API, so the graph→prompt pipeline is fully testable without network or keys.
+
+use std::path::PathBuf;
+
+use anyhow::{Context, Result, anyhow, bail};
+use clap::{Args, ValueEnum};
+use meridian_core::NodeKind;
+use meridian_core::config::RepoPaths;
+use meridian_store::GraphStore;
+use serde_json::{Value, json};
+
+use super::backend::{self, BackendKind};
+
+#[derive(Args)]
+pub struct WikiArgs {
+    /// Repository root.
+    #[arg(long, default_value = ".")]
+    pub repo: PathBuf,
+    /// Storage backend to read from.
+    #[arg(long, value_enum, default_value_t)]
+    pub backend: BackendKind,
+    /// LLM provider.
+    #[arg(long, value_enum, default_value_t)]
+    pub provider: Provider,
+    /// Model id (defaults to a sensible per-provider model).
+    #[arg(long)]
+    pub model: Option<String>,
+    /// Override the API base URL (for OpenAI-compatible gateways, e.g. Kilo).
+    #[arg(long)]
+    pub base_url: Option<String>,
+    /// Output directory for the generated pages.
+    #[arg(long, default_value = "wiki")]
+    pub output: PathBuf,
+    /// Write the composed prompts instead of calling the LLM (no network/keys).
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum Provider {
+    /// Anthropic Claude (`ANTHROPIC_API_KEY`).
+    #[default]
+    Claude,
+    /// OpenAI (`OPENAI_API_KEY`).
+    Openai,
+    /// OpenRouter, OpenAI-compatible (`OPENROUTER_API_KEY`).
+    Openrouter,
+}
+
+pub fn run(args: WikiArgs) -> Result<()> {
+    let paths = RepoPaths::new(&args.repo);
+    if !args.backend.exists(&paths) {
+        bail!(
+            "no index found at {} — run `meridian analyze` first",
+            args.backend.location(&paths).display()
+        );
+    }
+    let store = backend::open(&paths, args.backend)?;
+    let pages = build_pages(store.as_ref())?;
+
+    std::fs::create_dir_all(&args.output)
+        .with_context(|| format!("cannot create {}", args.output.display()))?;
+
+    if args.dry_run {
+        for p in &pages {
+            let path = args.output.join(format!("{}.prompt.txt", p.slug));
+            std::fs::write(
+                &path,
+                format!("# SYSTEM\n{}\n\n# USER\n{}\n", p.system, p.user),
+            )?;
+            println!("wrote {}", path.display());
+        }
+        println!("(dry run: {} prompt(s); no LLM called)", pages.len());
+        return Ok(());
+    }
+
+    let llm = Llm::new(args.provider, args.model, args.base_url)?;
+    for p in &pages {
+        let md = llm
+            .complete(&p.system, &p.user)
+            .with_context(|| format!("generating page '{}'", p.slug))?;
+        let path = args.output.join(format!("{}.md", p.slug));
+        std::fs::write(&path, md)?;
+        println!("wrote {}", path.display());
+    }
+    Ok(())
+}
+
+/// A wiki page: a slug, a system prompt, and a user prompt of graph facts.
+struct Page {
+    slug: &'static str,
+    system: String,
+    user: String,
+}
+
+const SYSTEM: &str = "You are a precise technical writer documenting a software repository. \
+Using only the structured facts provided, write clear, well-structured GitHub-flavored \
+Markdown. Do not invent files, symbols, or endpoints that are not in the facts. Be concise.";
+
+fn build_pages(store: &dyn GraphStore) -> Result<Vec<Page>> {
+    let stats = store.stats()?;
+    let langs = stats
+        .languages
+        .iter()
+        .map(|(l, n)| format!("{l}: {n}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let overview = format!(
+        "Repository facts:\n- files: {}\n- graph nodes: {}\n- graph edges: {}\n- languages: {}\n\n\
+         Write an `Overview` page: a short paragraph on what the codebase contains, \
+         a languages section, and an at-a-glance stats table.",
+        stats.files, stats.nodes, stats.edges, langs
+    );
+
+    let endpoints = operations_facts(store, NodeKind::Endpoint, "Server endpoints", true)?;
+    let clients = operations_facts(store, NodeKind::ClientCall, "Client call sites", false)?;
+    let api = format!(
+        "API surface facts:\n{endpoints}\n{clients}\n\n\
+         Write an `API surface` page describing the service's HTTP endpoints and the \
+         client call sites that consume APIs. If a section has no entries, say so briefly.",
+    );
+
+    Ok(vec![
+        Page {
+            slug: "index",
+            system: SYSTEM.into(),
+            user: overview,
+        },
+        Page {
+            slug: "api",
+            system: SYSTEM.into(),
+            user: api,
+        },
+    ])
+}
+
+/// A bulleted fact list of operations of `kind`, with handlers for endpoints.
+fn operations_facts(
+    store: &dyn GraphStore,
+    kind: NodeKind,
+    title: &str,
+    with_handler: bool,
+) -> Result<String> {
+    let mut lines = vec![format!("## {title}")];
+    let ops = store.operations_by_kind(kind)?;
+    if ops.is_empty() {
+        lines.push("(none)".into());
+    }
+    for (id, key) in ops {
+        let method = key
+            .method
+            .map(|m| m.as_str())
+            .unwrap_or(key.protocol.as_str());
+        let handler = if with_handler {
+            store
+                .neighbors(&id.0, Some(meridian_core::EdgeKind::Handles), false)?
+                .into_iter()
+                .next()
+                .map(|(n, _, _)| format!(" -> {}", n.qualified_name))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        lines.push(format!("- {method} {}{handler}", key.path));
+    }
+    Ok(lines.join("\n"))
+}
+
+struct Llm {
+    provider: Provider,
+    model: String,
+    key: String,
+    base_url: Option<String>,
+}
+
+impl Llm {
+    fn new(provider: Provider, model: Option<String>, base_url: Option<String>) -> Result<Self> {
+        let (env, default_model) = match provider {
+            Provider::Claude => ("ANTHROPIC_API_KEY", "claude-sonnet-4-6"),
+            Provider::Openai => ("OPENAI_API_KEY", "gpt-4o"),
+            Provider::Openrouter => ("OPENROUTER_API_KEY", "anthropic/claude-3.5-sonnet"),
+        };
+        let key = std::env::var(env)
+            .map_err(|_| anyhow!("set {env} (or use --dry-run) to generate the wiki"))?;
+        Ok(Self {
+            provider,
+            model: model.unwrap_or_else(|| default_model.to_string()),
+            key,
+            base_url,
+        })
+    }
+
+    fn complete(&self, system: &str, user: &str) -> Result<String> {
+        match self.provider {
+            Provider::Claude => self.anthropic(system, user),
+            Provider::Openai | Provider::Openrouter => self.openai_compatible(system, user),
+        }
+    }
+
+    fn anthropic(&self, system: &str, user: &str) -> Result<String> {
+        let body = json!({
+            "model": self.model,
+            "max_tokens": 4096,
+            "system": system,
+            "messages": [{ "role": "user", "content": user }],
+        });
+        let resp: Value = ureq::post("https://api.anthropic.com/v1/messages")
+            .set("x-api-key", &self.key)
+            .set("anthropic-version", "2023-06-01")
+            .set("content-type", "application/json")
+            .send_json(body)?
+            .into_json()?;
+        resp["content"][0]["text"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("unexpected Anthropic response: {resp}"))
+    }
+
+    fn openai_compatible(&self, system: &str, user: &str) -> Result<String> {
+        let url = self.base_url.clone().unwrap_or_else(|| {
+            match self.provider {
+                Provider::Openai => "https://api.openai.com/v1/chat/completions",
+                _ => "https://openrouter.ai/api/v1/chat/completions",
+            }
+            .to_string()
+        });
+        let body = json!({
+            "model": self.model,
+            "messages": [
+                { "role": "system", "content": system },
+                { "role": "user", "content": user },
+            ],
+        });
+        let resp: Value = ureq::post(&url)
+            .set("Authorization", &format!("Bearer {}", self.key))
+            .set("content-type", "application/json")
+            .send_json(body)?
+            .into_json()?;
+        resp["choices"][0]["message"]["content"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("unexpected response: {resp}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use assert2::check;
+    use meridian_store::SqliteStore;
+
+    #[test]
+    fn pages_compose_from_graph_facts() {
+        use meridian_core::{Edge, Node, NodeId, Span};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let n = Node {
+            id: NodeId("f".into()),
+            kind: NodeKind::Function,
+            name: "main".into(),
+            qualified_name: "main".into(),
+            file: "src/main.rs".into(),
+            language: Some("rust".into()),
+            span: Some(Span {
+                start_byte: 0,
+                end_byte: 1,
+                start_line: 1,
+                end_line: 1,
+            }),
+            doc: None,
+        };
+        store.insert_graph(&[n], &[] as &[Edge]).unwrap();
+        store.set_file("src/main.rs", Some("rust"), "h").unwrap();
+
+        let pages = build_pages(&store).unwrap();
+        check!(pages.len() == 2);
+        check!(pages[0].slug == "index");
+        check!(pages[0].user.contains("languages: rust: 1"));
+        check!(pages[1].slug == "api");
+        check!(pages[1].user.contains("Server endpoints"));
+    }
+}

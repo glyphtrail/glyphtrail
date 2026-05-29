@@ -29,6 +29,7 @@ serde_norway.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tokio.workspace = true
+ureq = { version = "2", features = ["json"] }
 
 [features]
 # LadybugDB is the default backend (more capable: Cypher + native graph
