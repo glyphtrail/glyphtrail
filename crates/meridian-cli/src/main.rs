@@ -82,6 +82,10 @@ enum Command {
         repo: PathBuf,
         #[arg(long, default_value_t = 7700)]
         port: u16,
+        /// Storage backend: sqlite or ladybug (default). The web UI works with
+        /// either; the `/mcp` endpoint requires the sqlite backend.
+        #[arg(long, value_enum, default_value_t = commands::backend::BackendKind::default())]
+        backend: commands::backend::BackendKind,
     },
     /// Compute the blast radius of a change (symbol, file, or git change set).
     Impact(commands::impact::ImpactArgs),
@@ -173,7 +177,11 @@ fn main() -> anyhow::Result<()> {
             cross_boundary,
             depth,
         ),
-        Command::Serve { repo, port } => commands::serve::run(&repo, port),
+        Command::Serve {
+            repo,
+            port,
+            backend,
+        } => commands::serve::run(&repo, port, backend),
         Command::Impact(args) => commands::impact::run(args),
         Command::Cypher { query, repo } => commands::cypher::run(&repo, &query),
         Command::Wiki(args) => commands::wiki::run(args),

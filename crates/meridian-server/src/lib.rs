@@ -11,14 +11,16 @@ use axum::{
     response::{Html, IntoResponse, Json, Response},
     routing::{get, post},
 };
-use meridian_store::SqliteStore;
+use meridian_store::GraphStore;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 #[derive(Clone)]
 struct AppState {
-    store: Arc<Mutex<SqliteStore>>,
-    db_path: PathBuf,
+    store: Arc<Mutex<Box<dyn GraphStore + Send>>>,
+    /// SQLite index path for the `/mcp` endpoint; `None` for backends the MCP
+    /// layer can't open yet (e.g. LadybugDB), where `/mcp` returns 501.
+    mcp_db: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -56,17 +58,29 @@ async fn api_search(
 /// Notifications (no `id`) yield `204 No Content`. Each call queries the graph
 /// through the shared MCP dispatch, so the tool surface matches `meridian mcp`.
 async fn mcp(State(state): State<AppState>, Json(msg): Json<Value>) -> Response {
-    match meridian_mcp::handle_request(&state.db_path, &msg) {
+    let Some(db) = &state.mcp_db else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "the /mcp endpoint requires the sqlite backend (serve with --backend sqlite)",
+        )
+            .into_response();
+    };
+    match meridian_mcp::handle_request(db, &msg) {
         Some(resp) => Json(resp).into_response(),
         None => StatusCode::NO_CONTENT.into_response(),
     }
 }
 
-pub async fn serve(db_path: PathBuf, port: u16) -> Result<()> {
-    let store = SqliteStore::open(&db_path)?;
+/// Serve the web explorer (and, for the sqlite backend, the `/mcp` endpoint)
+/// over HTTP, backed by an already-opened graph store.
+pub async fn serve(
+    store: Box<dyn GraphStore + Send>,
+    mcp_db: Option<PathBuf>,
+    port: u16,
+) -> Result<()> {
     let state = AppState {
         store: Arc::new(Mutex::new(store)),
-        db_path,
+        mcp_db,
     };
     let app = Router::new()
         .route("/", get(index))
