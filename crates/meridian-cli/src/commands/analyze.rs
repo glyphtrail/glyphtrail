@@ -72,6 +72,28 @@ const DEFAULT_IGNORE_DIRS: &[&str] = &[
     ".cvs",
     ".bzr",
 ];
+
+/// Credential/key-material file globs never walked during discovery (#136), so
+/// their contents stay out of the index and any agent-facing output. Kept to
+/// unambiguous secret/key files to avoid excluding legitimate source.
+const DEFAULT_SENSITIVE_FILES: &[&str] = &[
+    ".env",
+    ".env.*",
+    "*.pem",
+    "*.key",
+    "*.pfx",
+    "*.p12",
+    "*.pkcs12",
+    "*.keystore",
+    "*.jks",
+    "*.kdbx",
+    "*.ppk",
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+    "*.tfvars",
+];
 #[cfg(test)]
 use meridian_store::SqliteStore;
 
@@ -241,6 +263,15 @@ fn discover(
         overrides
             .add(&glob)
             .with_context(|| format!("invalid ignore_dirs entry {dir:?}"))?;
+    }
+    // Never walk credential/key material (#136). These are not source languages,
+    // so they aren't parsed today, but excluding them at the walk step keeps
+    // their contents out of the index entirely — robust even if a config/secret
+    // language is added later, and auditable as an explicit secret-exclusion set.
+    for glob in DEFAULT_SENSITIVE_FILES {
+        overrides
+            .add(&format!("!{glob}"))
+            .with_context(|| format!("invalid sensitive-file glob {glob:?}"))?;
     }
     walker.overrides(overrides.build().context("building ignore overrides")?);
 
@@ -904,6 +935,25 @@ mod tests {
                 .any(|(n, _, _)| n.name.starts_with("ws emit ")),
             "emit should INVOKES the on handler, got {:?}",
             invokers.iter().map(|(n, _, _)| &n.name).collect::<Vec<_>>()
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // #136: credential/key-material files are never discovered, so their
+    // contents stay out of the index and any agent-facing output.
+    #[test]
+    fn discovery_excludes_sensitive_files() {
+        let dir = temp_repo("sensitive");
+        std::fs::write(dir.join("main.rs"), "fn f() {}\n").unwrap();
+        for s in [".env", "id_rsa", "server.pem", "prod.tfvars", "app.key"] {
+            std::fs::write(dir.join(s), "SECRET=value\n").unwrap();
+        }
+        let found = discover(&dir, &[], &[]).unwrap();
+        let rels: Vec<&str> = found.iter().map(|f| f.rel_path.as_str()).collect();
+        check!(
+            rels == ["main.rs"],
+            "sensitive files must be excluded, got {rels:?}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
