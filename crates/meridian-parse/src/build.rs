@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use meridian_core::{
-    CodeGraph, Confidence, EdgeKind, Language, Node, NodeId, NodeKind, OperationKey, Span,
+    CodeGraph, Confidence, EdgeKind, Language, Node, NodeId, NodeKind, OperationKey, Protocol, Span,
 };
 
 use crate::client::extract_client_calls;
@@ -124,6 +124,56 @@ pub fn build_rest_graph(
         {
             rg.graph
                 .add_edge(p, c, EdgeKind::Mounts, Confidence::Extracted);
+        }
+    }
+    rg
+}
+
+/// Build the gRPC endpoint fragment for a file: one `Endpoint` per tonic
+/// service method (`Service/method`), with a `HANDLES` edge to the impl method
+/// when it resolves to a unique local symbol. gRPC is Rust/tonic-only for now;
+/// other languages yield an empty graph. Reuses [`RestGraph`] (endpoints +
+/// pending handlers).
+pub fn build_grpc_graph(
+    rel_path: &str,
+    lang: &Language,
+    symbols: &[SymbolEntry],
+    source: &str,
+) -> RestGraph {
+    let mut rg = RestGraph::default();
+    if *lang != Language::Rust {
+        return rg;
+    }
+    let mut seen: HashSet<NodeId> = HashSet::new();
+    for ep in crate::grpc::extract_grpc_endpoints(source) {
+        let path = format!("{}/{}", ep.service, ep.method);
+        let ep_id = NodeId::derive(&[rel_path, "endpoint", "grpc", &path]);
+        if !seen.insert(ep_id.clone()) {
+            continue;
+        }
+        rg.graph.add_node(Node {
+            id: ep_id.clone(),
+            kind: NodeKind::Endpoint,
+            name: format!("grpc {path}"),
+            qualified_name: path.clone(),
+            file: rel_path.to_string(),
+            language: Some(lang.name().to_string()),
+            span: Some(ep.span),
+            doc: None,
+        });
+        rg.operations
+            .push((ep_id.clone(), OperationKey::opaque(Protocol::Grpc, path)));
+
+        let local: Vec<&SymbolEntry> = symbols.iter().filter(|s| s.name == ep.handler).collect();
+        if local.len() == 1 {
+            rg.graph.add_edge(
+                local[0].id.clone(),
+                ep_id,
+                EdgeKind::Handles,
+                Confidence::Extracted,
+            );
+        } else {
+            rg.pending_handlers.push((ep.handler, ep_id));
         }
     }
     rg

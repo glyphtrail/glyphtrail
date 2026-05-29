@@ -9,8 +9,8 @@ use meridian_core::{
     SchemaFormat,
 };
 use meridian_parse::{
-    DynamicGrammar, PendingEdge, build_client_graph, build_file_graph, build_rest_graph,
-    load_dynamic, parse_source, resolve_import,
+    DynamicGrammar, PendingEdge, build_client_graph, build_file_graph, build_grpc_graph,
+    build_rest_graph, load_dynamic, parse_source, resolve_import,
 };
 use std::collections::HashSet;
 
@@ -215,6 +215,12 @@ pub fn run(path: &Path, update: bool, backend: BackendKind) -> Result<()> {
                 graph.extend(rg.graph);
                 operations.extend(rg.operations);
                 pending_handlers.extend(rg.pending_handlers);
+                // gRPC server-impl extraction (tonic/Rust): Service/method
+                // endpoints, linked to proto SchemaOps via EXPOSES.
+                let gg = build_grpc_graph(&f.rel_path, &f.language, &fg.symbols, &source);
+                graph.extend(gg.graph);
+                operations.extend(gg.operations);
+                pending_handlers.extend(gg.pending_handlers);
                 // Client-call extraction runs for any language with a client
                 // extractor (the extractor decides; no-op otherwise).
                 let cg = build_client_graph(&f.rel_path, &source, &f.language);
