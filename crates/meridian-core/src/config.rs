@@ -56,6 +56,23 @@ pub struct Config {
     /// defaults (build/output/VCS dirs). A bare name (`vendor`) matches at any
     /// depth; a gitignore-style glob (`gitnexus/vendor/**/build`) is honored too.
     pub ignore_dirs: Vec<String>,
+    /// Impact-analysis tuning.
+    pub impact: ImpactConfig,
+}
+
+/// Impact-analysis configuration.
+///
+/// ```toml
+/// [impact]
+/// test_globs = ["it/**", "*_it.rs"]
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ImpactConfig {
+    /// Extra glob patterns (repo-relative, gitignore-style) whose matching files
+    /// classify as tests, on top of the built-in heuristics. Built-in detection
+    /// is unchanged when this is empty.
+    pub test_globs: Vec<String>,
 }
 
 /// A language identified by file extension but not built in: its tree-sitter
@@ -277,6 +294,21 @@ mod tests {
         check!(lang.extensions == ["rb", "rake"]);
         check!(lang.grammar == std::path::Path::new("grammars/tree-sitter-ruby/src"));
         check!(lang.query == std::path::Path::new("queries/ruby.scm"));
+    }
+
+    #[test]
+    fn parses_impact_test_globs() {
+        let cfg =
+            Config::from_toml_str("[impact]\ntest_globs = [\"it/**\", \"*_it.rs\"]\n").unwrap();
+        check!(cfg.impact.test_globs == ["it/**", "*_it.rs"]);
+        // Absent by default.
+        check!(
+            Config::from_toml_str("")
+                .unwrap()
+                .impact
+                .test_globs
+                .is_empty()
+        );
     }
 
     #[test]
