@@ -49,13 +49,15 @@ pub fn status_all() -> Result<()> {
 /// stamp is refreshed and persisted for later `repo prune`.
 fn each_repo(verb: &str, op: impl Fn(&std::path::Path) -> Result<()>) -> Result<()> {
     let path = registry_path()?;
-    let mut registry = Registry::load(&path)?;
+    // Refresh + persist health under the lock, then release it before the long
+    // per-repo work below (analysis must never run while holding the lock).
+    let registry = Registry::mutate(&path, |reg| {
+        reg.refresh_health();
+        reg.clone()
+    })?;
     if registry.repos.is_empty() {
         println!("(no repositories registered; use `meridian repo add`)");
         return Ok(());
-    }
-    if registry.refresh_health() {
-        registry.save(&path)?;
     }
     let (mut ok, mut failed, mut skipped) = (0u32, 0u32, 0u32);
     for e in &registry.repos {
@@ -79,8 +81,10 @@ fn each_repo(verb: &str, op: impl Fn(&std::path::Path) -> Result<()>) -> Result<
 
 pub fn run(cmd: RepoCmd) -> Result<()> {
     let path = registry_path()?;
-    let mut registry = Registry::load(&path)?;
 
+    // Every arm that mutates the registry runs its load → modify → save under
+    // an exclusive advisory lock (#129), so concurrent `repo` processes can't
+    // clobber each other's update.
     match cmd {
         RepoCmd::Add { path: repo, name } => {
             let root = repo
@@ -91,8 +95,7 @@ pub fn run(cmd: RepoCmd) -> Result<()> {
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_else(|| "repo".into())
             });
-            let added = registry.add(name.clone(), root.clone());
-            registry.save(&path)?;
+            let added = Registry::mutate(&path, |reg| reg.add(name.clone(), root.clone()))?;
             println!(
                 "{} '{}' -> {}",
                 if added { "registered" } else { "updated" },
@@ -101,9 +104,10 @@ pub fn run(cmd: RepoCmd) -> Result<()> {
             );
         }
         RepoCmd::List => {
-            if registry.refresh_health() {
-                registry.save(&path)?;
-            }
+            let registry = Registry::mutate(&path, |reg| {
+                reg.refresh_health();
+                reg.clone()
+            })?;
             if registry.repos.is_empty() {
                 println!("(no repositories registered)");
             }
@@ -119,17 +123,17 @@ pub fn run(cmd: RepoCmd) -> Result<()> {
             }
         }
         RepoCmd::Remove { name } => {
-            if registry.remove(&name) {
-                registry.save(&path)?;
+            if Registry::mutate(&path, |reg| reg.remove(&name))? {
                 println!("removed '{name}'");
             } else {
                 bail!("no repository named '{name}' in the registry");
             }
         }
         RepoCmd::Prune { older_than_days } => {
-            registry.refresh_health();
-            let removed = registry.prune_missing(older_than_days as i64 * 86_400);
-            registry.save(&path)?;
+            let removed = Registry::mutate(&path, |reg| {
+                reg.refresh_health();
+                reg.prune_missing(older_than_days as i64 * 86_400)
+            })?;
             if removed.is_empty() {
                 println!("nothing to prune (no entry missing for >= {older_than_days}d)");
             } else {
