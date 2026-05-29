@@ -37,6 +37,28 @@ mod tests {
     }
 
     #[test]
+    fn stale_schema_version_rebuilds_on_open() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("meridian-schemaver-{nanos}.db"));
+        {
+            let mut s = SqliteStore::open(&path).unwrap();
+            s.insert_graph(&[node("a", "x", NodeKind::Function)], &[])
+                .unwrap();
+            check!(s.stats().unwrap().nodes == 1);
+            // Simulate an index written by a build with a different schema.
+            s.set_meta("schema_version", "0").unwrap();
+        }
+        // Reopen: the version mismatch wipes + recreates; analyze would rebuild.
+        let s2 = SqliteStore::open(&path).unwrap();
+        check!(s2.stats().unwrap().nodes == 0);
+        check!(s2.get_meta("schema_version").unwrap().as_deref() == Some(sqlite::SCHEMA_VERSION));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn roundtrip_and_traversal() {
         let mut store = SqliteStore::open_in_memory().unwrap();
         let nodes = vec![

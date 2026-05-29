@@ -15,17 +15,43 @@ pub struct SqliteStore {
     conn: Connection,
 }
 
+/// Bump when `schema.sql` changes shape (columns/tables). On open, a stored
+/// version other than this triggers a wipe + recreate (#135), since SQLite's
+/// `CREATE TABLE IF NOT EXISTS` never adds new columns to an existing table.
+/// The subsequent `analyze` rebuilds the index from source.
+pub const SCHEMA_VERSION: &str = "1";
+
 impl SqliteStore {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch(include_str!("schema.sql"))?;
-        Ok(Self { conn })
+        let mut store = Self { conn };
+        store.migrate_schema()?;
+        Ok(store)
     }
 
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(include_str!("schema.sql"))?;
         Ok(Self { conn })
+    }
+
+    /// Drop and recreate the schema if the stored `schema_version` differs from
+    /// [`SCHEMA_VERSION`] (a legacy/unversioned DB, or one written by a build
+    /// with a different schema). The index is rebuilt on the next `analyze`.
+    fn migrate_schema(&mut self) -> Result<()> {
+        if self.get_meta("schema_version")?.as_deref() == Some(SCHEMA_VERSION) {
+            return Ok(());
+        }
+        self.conn.execute_batch(
+            "DROP TABLE IF EXISTS edges; DROP TABLE IF EXISTS nodes_fts;
+             DROP TABLE IF EXISTS nodes; DROP TABLE IF EXISTS files;
+             DROP TABLE IF EXISTS api_operations; DROP TABLE IF EXISTS pending_edges;
+             DROP TABLE IF EXISTS pending_imports; DROP TABLE IF EXISTS meta;",
+        )?;
+        self.conn.execute_batch(include_str!("schema.sql"))?;
+        self.set_meta("schema_version", SCHEMA_VERSION)?;
+        Ok(())
     }
 
     /// Wipe all indexed data (full reindex).

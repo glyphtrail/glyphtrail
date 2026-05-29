@@ -40,7 +40,8 @@ pub struct LadybugStore {
 }
 
 impl LadybugStore {
-    /// Open (or create) a LadybugDB database at `path` and ensure the schema.
+    /// Open (or create) a LadybugDB database at `path` and ensure the schema,
+    /// rebuilding it if the stored schema version is stale (#135).
     pub fn open(path: &Path) -> Result<Self> {
         let db = Database::new(path, SystemConfig::default())?;
         {
@@ -49,7 +50,30 @@ impl LadybugStore {
                 conn.query(ddl)?;
             }
         }
-        Ok(Self { db })
+        let mut store = Self { db };
+        store.migrate_schema()?;
+        Ok(store)
+    }
+
+    /// Drop + recreate the LadybugDB schema when the stored `schema_version`
+    /// differs from the current one. The index is rebuilt on the next `analyze`.
+    fn migrate_schema(&mut self) -> Result<()> {
+        if self.get_meta("schema_version")?.as_deref() == Some(crate::sqlite::SCHEMA_VERSION) {
+            return Ok(());
+        }
+        {
+            let conn = self.conn()?;
+            // Drop the rel table before its node tables. Ignore "missing table"
+            // on a partial DB; the schema is recreated immediately after.
+            for tbl in ["Edge", "Node", "File", "ApiOp", "Pending", "Import", "Meta"] {
+                let _ = conn.query(&format!("DROP TABLE {tbl}"));
+            }
+            for ddl in SCHEMA {
+                conn.query(ddl)?;
+            }
+        }
+        self.set_meta("schema_version", crate::sqlite::SCHEMA_VERSION)?;
+        Ok(())
     }
 
     fn conn(&self) -> Result<Connection<'_>> {
