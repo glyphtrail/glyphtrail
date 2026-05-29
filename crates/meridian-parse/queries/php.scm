@@ -13,3 +13,7 @@
 
 ; Comments
 (comment) @comment
+
+; Inheritance — `extends B` / `implements I`.
+(base_clause (name) @extends)
+(class_interface_clause (name) @implements)

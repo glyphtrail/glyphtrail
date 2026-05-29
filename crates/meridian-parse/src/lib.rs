@@ -189,6 +189,37 @@ mod tests {
         }
     }
 
+    // #5: class inheritance/conformance is captured as base references, so a
+    // subtype links to its supertype(s) across languages.
+    #[test]
+    fn captures_inheritance_bases() {
+        let cases = [
+            (Language::Ruby, "class A < B\nend\n", vec!["B"]),
+            (
+                Language::Scala,
+                "class A extends B with T\n",
+                vec!["B", "T"],
+            ),
+            (Language::Swift, "class A: B, P {}\n", vec!["B", "P"]),
+            (
+                Language::Php,
+                "<?php\nclass A extends B implements I {}\n",
+                vec!["B", "I"],
+            ),
+        ];
+        for (lang, src, want) in cases {
+            let parsed = parse_source(&lang, src).unwrap();
+            let bases: Vec<&str> = parsed.bases.iter().map(|b| b.name.as_str()).collect();
+            for w in want {
+                check!(
+                    bases.contains(&w),
+                    "{}: expected base '{w}', got {bases:?}",
+                    lang.name()
+                );
+            }
+        }
+    }
+
     #[test]
     fn extracts_rust_function_and_call() {
         let src = r#"
