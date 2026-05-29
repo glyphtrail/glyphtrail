@@ -104,6 +104,28 @@ impl LadybugStore {
         Ok(())
     }
 
+    /// Prepare `cypher` **once** and execute it for each parameter row, reusing
+    /// the statement — far faster than re-preparing per row, which dominated the
+    /// insert hot paths (#170). Only valid when the query text is identical for
+    /// every row (no inlined values) and each bound parameter keeps a consistent
+    /// type by name across rows, so lbug's param-type cache never collides.
+    fn exec_prepared(
+        &self,
+        conn: &Connection,
+        cypher: &str,
+        rows: Vec<Vec<(&str, Value)>>,
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut st = conn.prepare(cypher).with_context(|| cypher.to_string())?;
+        for params in rows {
+            conn.execute(&mut st, params)
+                .with_context(|| cypher.to_string())?;
+        }
+        Ok(())
+    }
+
     fn run_nodes(&self, cypher: &str, params: Vec<(&str, Value)>) -> Result<Vec<Node>> {
         Ok(self
             .run(cypher, params)?
@@ -115,6 +137,21 @@ impl LadybugStore {
 
 fn s(v: &str) -> Value {
     Value::String(v.to_string())
+}
+
+/// Open an explicit transaction so a batch of writes commits once instead of
+/// per-statement (lbug auto-commits each statement, one fsync each — #170).
+fn begin(conn: &Connection) -> Result<()> {
+    conn.query("BEGIN TRANSACTION")
+        .context("begin transaction")?;
+    Ok(())
+}
+
+/// Commit the transaction opened by [`begin`]. On an error path the `?` skips
+/// this and the open transaction is rolled back when the connection drops.
+fn commit(conn: &Connection) -> Result<()> {
+    conn.query("COMMIT").context("commit transaction")?;
+    Ok(())
 }
 fn get_str(row: &[Value], idx: usize) -> String {
     match row.get(idx) {
@@ -301,9 +338,10 @@ impl GraphStore for LadybugStore {
 
     fn insert_graph(&mut self, nodes: &[Node], edges: &[Edge]) -> Result<()> {
         let conn = self.conn()?;
-        // lbug caches a parameter's type by name within a connection, so each
-        // statement uses its own freshly-prepared connection (via `exec`) to keep
-        // INT64 and STRING params from colliding across the analyze flow.
+        // Batch all row writes into one transaction: lbug otherwise auto-commits
+        // (one fsync) per statement, which dominated insert time on a real repo
+        // (#170). One commit per call is roughly 2x faster.
+        begin(&conn)?;
         for n in nodes {
             let (sb, eb, sl, el) = n
                 .span
@@ -337,44 +375,56 @@ impl GraphStore for LadybugStore {
                 ],
             )?;
         }
-        for e in edges {
-            self.exec(
-                &conn,
-                "MATCH (a:Node {id:$src}), (b:Node {id:$dst}) \
-                 MERGE (a)-[e:Edge {kind:$ekind}]->(b) \
-                 ON CREATE SET e.confidence=$conf \
-                 ON MATCH SET e.confidence = CASE WHEN $conf = 'extracted' THEN 'extracted' ELSE e.confidence END",
+        // The edge query text is constant and all params are strings, so prepare
+        // it once and execute per edge (#170). Edges dominate insert volume.
+        let edge_rows: Vec<Vec<(&str, Value)>> = edges
+            .iter()
+            .map(|e| {
                 vec![
                     ("src", s(&e.src.0)),
                     ("dst", s(&e.dst.0)),
                     ("ekind", s(e.kind.as_str())),
                     ("conf", s(e.confidence.as_str())),
-                ],
-            )?;
-        }
-        Ok(())
+                ]
+            })
+            .collect();
+        self.exec_prepared(
+            &conn,
+            "MATCH (a:Node {id:$src}), (b:Node {id:$dst}) \
+             MERGE (a)-[e:Edge {kind:$ekind}]->(b) \
+             ON CREATE SET e.confidence=$conf \
+             ON MATCH SET e.confidence = CASE WHEN $conf = 'extracted' THEN 'extracted' ELSE e.confidence END",
+            edge_rows,
+        )?;
+        commit(&conn)
     }
 
     fn insert_operations(&mut self, ops: &[(NodeId, OperationKey)]) -> Result<()> {
         let conn = self.conn()?;
-        for (id, key) in ops {
-            self.exec(
-                &conn,
-                "MERGE (o:ApiOp {node_id:$id}) SET o.protocol=$p, o.method=$m, o.path=$path, o.signature=$sig",
+        let rows: Vec<Vec<(&str, Value)>> = ops
+            .iter()
+            .map(|(id, key)| {
                 vec![
                     ("id", s(&id.0)),
                     ("p", s(key.protocol.as_str())),
                     ("m", s(key.method.map(|m| m.as_str()).unwrap_or(""))),
                     ("path", s(&key.path)),
                     ("sig", s(&key.signature())),
-                ],
-            )?;
-        }
-        Ok(())
+                ]
+            })
+            .collect();
+        begin(&conn)?;
+        self.exec_prepared(
+            &conn,
+            "MERGE (o:ApiOp {node_id:$id}) SET o.protocol=$p, o.method=$m, o.path=$path, o.signature=$sig",
+            rows,
+        )?;
+        commit(&conn)
     }
 
     fn insert_pending(&mut self, links: &[PendingLink]) -> Result<()> {
         let conn = self.conn()?;
+        begin(&conn)?;
         for l in links {
             let rowid = format!(
                 "{}|{}|{}|{}",
@@ -398,25 +448,30 @@ impl GraphStore for LadybugStore {
                 ],
             )?;
         }
-        Ok(())
+        commit(&conn)
     }
 
     fn insert_imports(&mut self, imports: &[(String, String, String)]) -> Result<()> {
         let conn = self.conn()?;
-        for (importer, raw, language) in imports {
-            let rowid = format!("{importer}|{raw}|{language}");
-            self.exec(
-                &conn,
-                "MERGE (i:Import {pk:$im_rowid}) SET i.importer=$im_importer, i.raw=$im_raw, i.language=$im_lang",
+        let rows: Vec<Vec<(&str, Value)>> = imports
+            .iter()
+            .map(|(importer, raw, language)| {
+                let rowid = format!("{importer}|{raw}|{language}");
                 vec![
                     ("im_rowid", s(&rowid)),
                     ("im_importer", s(importer)),
                     ("im_raw", s(raw)),
                     ("im_lang", s(language)),
-                ],
-            )?;
-        }
-        Ok(())
+                ]
+            })
+            .collect();
+        begin(&conn)?;
+        self.exec_prepared(
+            &conn,
+            "MERGE (i:Import {pk:$im_rowid}) SET i.importer=$im_importer, i.raw=$im_raw, i.language=$im_lang",
+            rows,
+        )?;
+        commit(&conn)
     }
 
     fn delete_edges_by_confidence(&mut self, confidence: Confidence) -> Result<usize> {
