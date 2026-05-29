@@ -133,6 +133,9 @@ impl OperationKey {
         if self.protocol == Protocol::Grpc {
             return format!("grpc|{}", grpc_signature(&self.path));
         }
+        if self.protocol == Protocol::GraphQl {
+            return format!("graphql|{}", graphql_signature(&self.path));
+        }
         let method = self.method.map(|m| m.as_str()).unwrap_or("*");
         format!(
             "{}|{}|{}",
@@ -149,13 +152,24 @@ impl OperationKey {
 fn grpc_signature(path: &str) -> String {
     let (svc_part, method) = path.rsplit_once('/').unwrap_or(("", path));
     let service = svc_part.rsplit('.').next().unwrap_or(svc_part);
-    let norm = |s: &str| -> String {
-        s.chars()
-            .filter(|c| *c != '_')
-            .flat_map(char::to_lowercase)
-            .collect()
-    };
-    format!("{}/{}", norm(service), norm(method))
+    format!("{}/{}", fold(service), fold(method))
+}
+
+/// Normalize a GraphQL `OpType.field` path to `optype.field` with case and
+/// underscores folded, so a resolver's `Query.get_user` matches the schema's
+/// `Query.getUser` (async-graphql converts snake_case methods to camelCase).
+fn graphql_signature(path: &str) -> String {
+    let (op, field) = path.split_once('.').unwrap_or(("query", path));
+    format!("{}.{}", fold(op), fold(field))
+}
+
+/// Lowercase and drop underscores — collapses camelCase/snake_case/PascalCase
+/// spellings of the same identifier for signature matching.
+fn fold(s: &str) -> String {
+    s.chars()
+        .filter(|c| *c != '_')
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 impl fmt::Display for OperationKey {
@@ -421,6 +435,16 @@ mod tests {
         check!(k.to_string() == "DELETE /users/{id}");
         let g = OperationKey::opaque(Protocol::Grpc, "users.UserService/GetUser");
         check!(g.to_string() == "grpc users.UserService/GetUser");
+    }
+
+    #[test]
+    fn graphql_signature_folds_case_and_underscores() {
+        // async-graphql resolver `Query.get_user` ≡ SDL `Query.getUser`.
+        let code = OperationKey::opaque(Protocol::GraphQl, "Query.get_user");
+        let sdl = OperationKey::opaque(Protocol::GraphQl, "Query.getUser");
+        check!(code.signature() == sdl.signature());
+        let mutation = OperationKey::opaque(Protocol::GraphQl, "Mutation.getUser");
+        check!(code.signature() != mutation.signature());
     }
 
     #[test]

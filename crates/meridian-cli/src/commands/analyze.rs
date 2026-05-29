@@ -9,8 +9,8 @@ use meridian_core::{
     SchemaFormat,
 };
 use meridian_parse::{
-    DynamicGrammar, PendingEdge, build_client_graph, build_file_graph, build_grpc_graph,
-    build_rest_graph, load_dynamic, parse_source, resolve_import,
+    DynamicGrammar, PendingEdge, build_client_graph, build_file_graph, build_graphql_graph,
+    build_grpc_graph, build_rest_graph, load_dynamic, parse_source, resolve_import,
 };
 use std::collections::HashSet;
 
@@ -221,6 +221,12 @@ pub fn run(path: &Path, update: bool, backend: BackendKind) -> Result<()> {
                 graph.extend(gg.graph);
                 operations.extend(gg.operations);
                 pending_handlers.extend(gg.pending_handlers);
+                // GraphQL resolver extraction (async-graphql/Rust): OpType.field
+                // endpoints, linked to SDL/Hasura SchemaOps via EXPOSES.
+                let qg = build_graphql_graph(&f.rel_path, &f.language, &fg.symbols, &source);
+                graph.extend(qg.graph);
+                operations.extend(qg.operations);
+                pending_handlers.extend(qg.pending_handlers);
                 // Client-call extraction runs for any language with a client
                 // extractor (the extractor decides; no-op otherwise).
                 let cg = build_client_graph(&f.rel_path, &source, &f.language);
