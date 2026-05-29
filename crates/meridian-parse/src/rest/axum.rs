@@ -216,6 +216,45 @@ fn build() -> Router {
         check!(ep(&eps, HttpMethod::Get, "/users/{id}").unwrap().handler == "show");
     }
 
+    // #55: `on(MethodFilter::X, h)` resolves to verb X; `any(h)` resolves to
+    // every method. Both flow through the shared MethodRouter parser.
+    #[test]
+    fn on_filter_and_any_method_routers() {
+        let src = r#"
+fn build() -> Router {
+    Router::new()
+        .route("/post-only", on(MethodFilter::POST, submit))
+        .route("/catch-all", any(catch))
+}
+"#;
+        let eps = extract_axum(src);
+        check!(ep(&eps, HttpMethod::Post, "/post-only").unwrap().handler == "submit");
+        // `on` declares only the listed verb, not others.
+        check!(ep(&eps, HttpMethod::Get, "/post-only").is_none());
+        // `any` registers the handler under every method.
+        for m in [
+            HttpMethod::Get,
+            HttpMethod::Post,
+            HttpMethod::Delete,
+            HttpMethod::Patch,
+        ] {
+            check!(ep(&eps, m, "/catch-all").map(|e| e.handler.as_str()) == Some("catch"));
+        }
+    }
+
+    #[test]
+    fn on_filter_with_multiple_verbs() {
+        let src = r#"
+fn build() -> Router {
+    Router::new().route("/multi", on(MethodFilter::GET.or(MethodFilter::POST), h))
+}
+"#;
+        let eps = extract_axum(src);
+        check!(ep(&eps, HttpMethod::Get, "/multi").map(|e| e.handler.as_str()) == Some("h"));
+        check!(ep(&eps, HttpMethod::Post, "/multi").map(|e| e.handler.as_str()) == Some("h"));
+        check!(ep(&eps, HttpMethod::Delete, "/multi").is_none());
+    }
+
     #[test]
     fn inline_nesting_accumulates_prefix() {
         let src = r#"
