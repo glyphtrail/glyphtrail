@@ -93,20 +93,22 @@ mod tests {
         }
     }
 
-    // #131: the call-edge extraction boundary. Calls in an async fn body are
-    // captured; a call nested inside a macro invocation is not, because
-    // tree-sitter parses a macro body as a raw token tree, not expressions. This
-    // pins the documented boundary so a future grammar/query change is noticed.
+    // #5/#131: calls in an async fn body and calls nested inside a macro
+    // invocation (e.g. `helper()` in `println!("{}", helper())`) are both
+    // captured. The macro body is a raw token tree, so a macro-arg callee is
+    // matched as an identifier immediately followed by a parenthesized token
+    // tree (see rust.scm).
     #[test]
-    fn call_extraction_boundary_async_vs_macro() {
+    fn captures_calls_in_async_and_macro_bodies() {
         let src = "async fn a() { helper().await; }\nfn m() { println!(\"{}\", helper()); }\n";
         let parsed = parse_source(&Language::Rust, src).unwrap();
         let helper_calls = parsed.calls.iter().filter(|c| c.name == "helper").count();
-        // Async-body call captured; macro-argument call is the known gap.
         check!(
-            helper_calls == 1,
-            "expected only the async-body call, got {helper_calls}"
+            helper_calls == 2,
+            "expected the async-body and macro-arg calls, got {helper_calls}"
         );
+        // The macro name itself is still captured as a call/reference.
+        check!(parsed.calls.iter().any(|c| c.name == "println"));
     }
 
     #[test]
