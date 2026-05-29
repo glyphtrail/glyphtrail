@@ -104,17 +104,32 @@ fn get_i64(row: &[Value], idx: usize) -> i64 {
         _ => -1,
     }
 }
+fn get_opt_i64(row: &[Value], idx: usize) -> Option<i64> {
+    match row.get(idx) {
+        Some(Value::Int64(n)) => Some(*n),
+        _ => None,
+    }
+}
+fn get_opt_str(row: &[Value], idx: usize) -> Option<String> {
+    match row.get(idx) {
+        Some(Value::String(s)) => Some(s.clone()),
+        _ => None,
+    }
+}
 fn opt(s: String) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
 fn row_to_node(row: &[Value]) -> Node {
-    let sl = get_i64(row, 8);
-    let span = (sl >= 0).then(|| Span {
-        start_byte: get_i64(row, 6).max(0) as usize,
-        end_byte: get_i64(row, 7).max(0) as usize,
+    // Use get_opt_i64 so that a missing/non-INT64 column (None) and the
+    // explicit -1 "no span" sentinel are both treated as "no span", without
+    // the two cases colliding when get_i64 would return -1 for both.
+    let sl = get_opt_i64(row, 8);
+    let span = sl.filter(|&v| v >= 0).map(|sl| Span {
+        start_byte: get_opt_i64(row, 6).unwrap_or(-1).max(0) as usize,
+        end_byte: get_opt_i64(row, 7).unwrap_or(-1).max(0) as usize,
         start_line: sl as usize,
-        end_line: get_i64(row, 9).max(0) as usize,
+        end_line: get_opt_i64(row, 9).unwrap_or(-1).max(0) as usize,
     });
     Node {
         id: NodeId(get_str(row, 0)),
@@ -251,6 +266,17 @@ impl GraphStore for LadybugStore {
     }
 
     fn delete_file_data(&mut self, path: &str) -> Result<()> {
+        // Remove ApiOp and Pending side-table rows whose node belongs to this
+        // file before DETACH-deleting the nodes themselves, to mirror the SQLite
+        // backend (sqlite.rs:98-109).
+        self.run(
+            "MATCH (n:Node {file:$f}), (o:ApiOp) WHERE o.node_id = n.id DELETE o",
+            vec![("f", s(path))],
+        )?;
+        self.run(
+            "MATCH (n:Node {file:$f}), (p:Pending) WHERE p.anchor = n.id DELETE p",
+            vec![("f", s(path))],
+        )?;
         self.run(
             "MATCH (n:Node {file:$f}) DETACH DELETE n",
             vec![("f", s(path))],
@@ -264,6 +290,12 @@ impl GraphStore for LadybugStore {
     }
 
     fn delete_nodes_by_kind(&mut self, kind: NodeKind) -> Result<()> {
+        // Remove ApiOp side-table rows for these nodes first, mirroring the
+        // SQLite backend (sqlite.rs:127-130).
+        self.run(
+            "MATCH (n:Node {kind:$k}), (o:ApiOp) WHERE o.node_id = n.id DELETE o",
+            vec![("k", s(kind.as_str()))],
+        )?;
         self.run(
             "MATCH (n:Node {kind:$k}) DETACH DELETE n",
             vec![("k", s(kind.as_str()))],
@@ -392,19 +424,40 @@ impl GraphStore for LadybugStore {
     }
 
     fn delete_edges_by_confidence(&mut self, confidence: Confidence) -> Result<usize> {
+        let c = confidence.as_str();
+        // Count before delete: LadybugDB Cypher does not support RETURN after
+        // DELETE, so we run two queries to satisfy the contract of returning the
+        // number of edges removed (mirrors sqlite.rs:344-348).
+        let count = self
+            .run(
+                "MATCH ()-[e:Edge {confidence:$c}]->() RETURN count(e)",
+                vec![("c", s(c))],
+            )?
+            .first()
+            .map(|r| get_i64(r, 0).max(0) as usize)
+            .unwrap_or(0);
         self.run(
             "MATCH ()-[e:Edge {confidence:$c}]->() DELETE e",
-            vec![("c", s(confidence.as_str()))],
+            vec![("c", s(c))],
         )?;
-        Ok(0)
+        Ok(count)
     }
 
     fn delete_edges_by_kind(&mut self, kind: EdgeKind) -> Result<usize> {
+        let k = kind.as_str();
+        let count = self
+            .run(
+                "MATCH ()-[e:Edge {kind:$k}]->() RETURN count(e)",
+                vec![("k", s(k))],
+            )?
+            .first()
+            .map(|r| get_i64(r, 0).max(0) as usize)
+            .unwrap_or(0);
         self.run(
             "MATCH ()-[e:Edge {kind:$k}]->() DELETE e",
-            vec![("k", s(kind.as_str()))],
+            vec![("k", s(k))],
         )?;
-        Ok(0)
+        Ok(count)
     }
 
     fn prune_dangling_edges(&mut self) -> Result<usize> {
@@ -428,7 +481,7 @@ impl GraphStore for LadybugStore {
                 vec![("p", s(path))],
             )?
             .first()
-            .map(|r| get_str(r, 0)))
+            .and_then(|r| get_opt_str(r, 0)))
     }
 
     fn all_files(&self) -> Result<Vec<String>> {
@@ -454,13 +507,13 @@ impl GraphStore for LadybugStore {
                 vec![("k", s(key))],
             )?
             .first()
-            .map(|r| get_str(r, 0)))
+            .and_then(|r| get_opt_str(r, 0)))
     }
 
     fn operations_by_kind(&self, kind: NodeKind) -> Result<Vec<(NodeId, OperationKey)>> {
         Ok(self
             .run(
-                "MATCH (n:Node {kind:$k}), (o:ApiOp {node_id:n.id}) \
+                "MATCH (n:Node {kind:$k}), (o:ApiOp) WHERE o.node_id = n.id \
                  RETURN o.node_id, o.protocol, o.method, o.path, o.signature",
                 vec![("k", s(kind.as_str()))],
             )?
@@ -817,6 +870,85 @@ mod tests {
         check!(lb.all_pending().unwrap().len() == 1);
         check!(lb.operations_by_kind(NodeKind::Function).unwrap().len() == 1);
 
+    #[test]
+    fn delete_edges_by_confidence_returns_count() {
+        let dir = tmp_dir("del_conf");
+        let mut lb = LadybugStore::open(&dir).unwrap();
+        let nodes = vec![node("a", "a"), node("b", "b")];
+        let edges = vec![
+            Edge {
+                src: NodeId("a".into()),
+                dst: NodeId("b".into()),
+                kind: EdgeKind::Calls,
+                confidence: Confidence::Inferred,
+            },
+            Edge {
+                src: NodeId("b".into()),
+                dst: NodeId("a".into()),
+                kind: EdgeKind::Calls,
+                confidence: Confidence::Extracted,
+            },
+        ];
+        lb.insert_graph(&nodes, &edges).unwrap();
+        let removed = lb
+            .delete_edges_by_confidence(Confidence::Inferred)
+            .unwrap();
+        check!(removed == 1);
+        check!(lb.stats().unwrap().edges == 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn delete_edges_by_kind_returns_count() {
+        let dir = tmp_dir("del_kind");
+        let mut lb = LadybugStore::open(&dir).unwrap();
+        let nodes = vec![node("a", "a"), node("b", "b")];
+        let edges = vec![
+            Edge {
+                src: NodeId("a".into()),
+                dst: NodeId("b".into()),
+                kind: EdgeKind::Calls,
+                confidence: Confidence::Extracted,
+            },
+            Edge {
+                src: NodeId("b".into()),
+                dst: NodeId("a".into()),
+                kind: EdgeKind::Imports,
+                confidence: Confidence::Extracted,
+            },
+        ];
+        lb.insert_graph(&nodes, &edges).unwrap();
+        let removed = lb.delete_edges_by_kind(EdgeKind::Calls).unwrap();
+        check!(removed == 1);
+        check!(lb.stats().unwrap().edges == 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn delete_file_data_cleans_up_side_tables() {
+        let dir = tmp_dir("del_file");
+        let mut lb = LadybugStore::open(&dir).unwrap();
+        let nodes = vec![node("a", "handler")];
+        lb.insert_graph(&nodes, &[]).unwrap();
+        lb.insert_operations(&[(
+            NodeId("a".into()),
+            meridian_core::OperationKey::rest(meridian_core::HttpMethod::Get, "/x"),
+        )])
+        .unwrap();
+        lb.insert_pending(&[meridian_core::PendingLink {
+            anchor: NodeId("a".into()),
+            name: "dep".into(),
+            kind: EdgeKind::Calls,
+            name_is_src: false,
+        }])
+        .unwrap();
+        lb.set_file("a.rs", Some("rust"), "h1").unwrap();
+        check!(lb.all_operations().unwrap().len() == 1);
+        check!(lb.all_pending().unwrap().len() == 1);
+        lb.delete_file_data("a.rs").unwrap();
+        check!(lb.all_operations().unwrap().is_empty());
+        check!(lb.all_pending().unwrap().is_empty());
+        check!(lb.stats().unwrap().nodes == 0);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
