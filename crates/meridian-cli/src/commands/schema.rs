@@ -121,8 +121,9 @@ pub fn graphql_operations(text: &str) -> Vec<String> {
 
 /// Parse Hasura metadata (JSON or YAML) into the operations it exposes:
 /// per tracked table the auto-generated GraphQL CRUD fields (keyed
-/// `OpType.field`, matching SDL ops), plus any RESTified endpoints as REST
-/// operations. Tables are read from `sources[].tables[]` (v2/v3 export) and a
+/// `OpType.field`, matching SDL ops), RESTified endpoints as REST operations,
+/// actions as a GraphQL op plus a POST handler-URL REST op, and remote schemas
+/// keyed by name. Tables are read from `sources[].tables[]` (v2/v3 export) and a
 /// top-level `tables:` list (split-file `tables.yaml`).
 pub fn hasura_operations(text: &str) -> Vec<OperationKey> {
     let doc = serde_json::from_str::<Value>(text)
@@ -169,7 +170,69 @@ pub fn hasura_operations(text: &str) -> Vec<OperationKey> {
             }
         }
     }
+
+    // Actions: a custom GraphQL query/mutation backed by a webhook handler URL.
+    // Emit the GraphQL operation (client gql ops link to it via INVOKES) and the
+    // handler's path as a POST REST op (a code endpoint serving the webhook links
+    // via EXPOSES). Hasura POSTs the action payload to the handler.
+    for action in hasura_list(&doc, "actions") {
+        let Some(name) = action.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let def = action.get("definition");
+        let root = match def.and_then(|d| d.get("type")).and_then(Value::as_str) {
+            Some("query") => "Query",
+            _ => "Mutation",
+        };
+        out.push(OperationKey::opaque(
+            Protocol::GraphQl,
+            format!("{root}.{name}"),
+        ));
+        if let Some(path) = def
+            .and_then(|d| d.get("handler"))
+            .and_then(Value::as_str)
+            .and_then(webhook_path)
+        {
+            out.push(OperationKey::rest(HttpMethod::Post, &path));
+        }
+    }
+
+    // Remote schemas: an external GraphQL service stitched into the API. Its
+    // fields aren't in the metadata, so key the schema itself by name as an
+    // opaque GraphQL op (marks the external boundary; client ops can't be
+    // field-matched without an introspection import — tracked as a follow-up).
+    for remote in hasura_list(&doc, "remote_schemas") {
+        if let Some(name) = remote.get("name").and_then(Value::as_str) {
+            out.push(OperationKey::opaque(
+                Protocol::GraphQl,
+                format!("RemoteSchema.{name}"),
+            ));
+        }
+    }
     out
+}
+
+/// A top-level Hasura metadata list (`actions`, `remote_schemas`, …), read from
+/// either the unified `metadata.json` object or a split-file document whose
+/// whole body is the list.
+fn hasura_list<'a>(doc: &'a Value, key: &str) -> Vec<&'a Value> {
+    if let Some(arr) = doc.get(key).and_then(Value::as_array) {
+        return arr.iter().collect();
+    }
+    Vec::new()
+}
+
+/// The path component of a Hasura action handler URL. Handles absolute URLs
+/// (`http://host:8080/x` → `/x`), env-templated bases
+/// (`{{ACTION_BASE_URL}}/x` → `/x`) and already-relative handlers (`/x`).
+fn webhook_path(handler: &str) -> Option<String> {
+    let h = handler.trim();
+    if let Some((_, rest)) = h.split_once("://") {
+        let idx = rest.find('/')?;
+        return Some(rest[idx..].to_string());
+    }
+    let idx = h.find('/')?;
+    Some(h[idx..].to_string())
 }
 
 /// Tracked table names from Hasura metadata, across the layouts Hasura emits.
@@ -269,6 +332,50 @@ rest_endpoints:
             ops.iter()
                 .any(|k| k.method == Some(HttpMethod::Post) && k.path == "/api/rest/get_user")
         );
+    }
+
+    #[test]
+    fn hasura_actions_yield_graphql_op_and_handler_endpoint() {
+        let yaml = r#"
+actions:
+  - name: createUser
+    definition:
+      kind: synchronous
+      type: mutation
+      handler: http://handler:3000/create_user
+  - name: currentTime
+    definition:
+      type: query
+      handler: "{{ACTION_BASE_URL}}/now"
+remote_schemas:
+  - name: payments
+    definition:
+      url: https://pay.example.com/graphql
+"#;
+        let ops = hasura_operations(yaml);
+        let paths: Vec<&str> = ops.iter().map(|k| k.path.as_str()).collect();
+        // GraphQL op per action, op type from `definition.type`.
+        check!(paths.contains(&"Mutation.createUser"));
+        check!(paths.contains(&"Query.currentTime"));
+        // Handler URL path becomes a POST REST op (absolute + env-templated).
+        check!(
+            ops.iter()
+                .any(|k| k.method == Some(HttpMethod::Post) && k.path == "/create_user")
+        );
+        check!(
+            ops.iter()
+                .any(|k| k.method == Some(HttpMethod::Post) && k.path == "/now")
+        );
+        // Remote schema keyed by name.
+        check!(paths.contains(&"RemoteSchema.payments"));
+    }
+
+    #[test]
+    fn webhook_path_forms() {
+        check!(webhook_path("http://h:3000/x/y").as_deref() == Some("/x/y"));
+        check!(webhook_path("{{BASE}}/create").as_deref() == Some("/create"));
+        check!(webhook_path("/already").as_deref() == Some("/already"));
+        check!(webhook_path("noslash").is_none());
     }
 
     #[test]
