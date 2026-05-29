@@ -11,7 +11,7 @@ use meridian_core::{
 use meridian_parse::{
     DynamicGrammar, PendingEdge, build_client_graph, build_file_graph, build_graphql_client_graph,
     build_graphql_graph, build_grpc_client_graph, build_grpc_graph, build_rest_graph,
-    build_ws_client_graph, load_dynamic, parse_source, resolve_import,
+    build_ws_client_graph, build_ws_server_graph, load_dynamic, parse_source, resolve_import,
 };
 use std::collections::HashSet;
 
@@ -163,6 +163,11 @@ fn parse_file(
     out.graph.extend(qg.graph);
     out.operations.extend(qg.operations);
     out.pending_handlers.extend(qg.pending_handlers);
+    // WebSocket server events (socket.io `on`) → Endpoint + HANDLES (#51).
+    let wg = build_ws_server_graph(&f.rel_path, &f.language, &fg.symbols, &source);
+    out.graph.extend(wg.graph);
+    out.operations.extend(wg.operations);
+    out.pending_handlers.extend(wg.pending_handlers);
     // Client-call extraction (fetch/axios/reqwest/...).
     let cg = build_client_graph(&f.rel_path, &source, &f.language);
     // GraphQL client operations (gql-tagged docs) → INVOKES.
@@ -859,6 +864,45 @@ mod tests {
         check!(
             invokers.iter().any(|(n, _, _)| n.name.starts_with("ws ")),
             "WebSocket client should INVOKES the /ws route, got {:?}",
+            invokers.iter().map(|(n, _, _)| &n.name).collect::<Vec<_>>()
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // #51 message boundary: a socket.io client `emit("e")` links to the server
+    // `on("e")` event handler via INVOKES, matched by event name.
+    #[test]
+    fn socketio_emit_invokes_on_handler() {
+        let dir = temp_repo("ws-events");
+        std::fs::write(
+            dir.join("server.js"),
+            "function onMsg() {}\nsocket.on(\"chat:message\", onMsg);\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("client.js"),
+            "socket.emit(\"chat:message\", payload);\n",
+        )
+        .unwrap();
+        run(&dir, false, BackendKind::Sqlite).unwrap();
+
+        let store = SqliteStore::open(&RepoPaths::new(&dir).db_path).unwrap();
+        let endpoint = store
+            .operations_by_kind(NodeKind::Endpoint)
+            .unwrap()
+            .into_iter()
+            .find(|(_, k)| k.path == "event:chat:message")
+            .map(|(id, _)| id)
+            .expect("ws event endpoint");
+        let invokers = store
+            .neighbors(&endpoint.0, Some(EdgeKind::Invokes), false)
+            .unwrap();
+        check!(
+            invokers
+                .iter()
+                .any(|(n, _, _)| n.name.starts_with("ws emit ")),
+            "emit should INVOKES the on handler, got {:?}",
             invokers.iter().map(|(n, _, _)| &n.name).collect::<Vec<_>>()
         );
 

@@ -1,14 +1,18 @@
-//! WebSocket client-connection extraction (#51, connection boundary).
+//! WebSocket boundary extraction (#51), both boundaries:
 //!
-//! Browser-native `new WebSocket(url)` (JS/TS/TSX) opens a connection via an
-//! HTTP `GET` upgrade at `url`. We extract the connection path so it can link to
-//! the server's upgrade route (a REST `GET` endpoint) via the existing matcher
-//! — a WebSocket [`OperationKey`](meridian_core::OperationKey) shares a REST
-//! `GET` signature. Event/channel *message* boundaries (socket.io, Centrifugo,
-//! SignalR, …) are a separate concern tracked on the epic.
+//! - **Connection** — browser-native `new WebSocket(url)` (JS/TS/TSX) opens via
+//!   an HTTP `GET` upgrade at `url`; the connection path links to the server's
+//!   upgrade route (a REST `GET` endpoint) since a WebSocket connection
+//!   [`OperationKey`](meridian_core::OperationKey) shares a REST `GET` signature.
+//! - **Message** — socket.io `socket.on("event", handler)` (a server handler)
+//!   and `socket.emit("event", …)` (a client call), matched by event name. To
+//!   avoid matching unrelated `.on`/`.emit` emitters, only socket-like receiver
+//!   identifiers ([`SOCKET_RECEIVERS`]) are considered and reserved lifecycle
+//!   events are skipped.
 //!
-//! Only string/template-literal URLs are extracted; dynamic URLs are out of
-//! scope (they collapse to a dynamic segment when present in a template).
+//! Only string/template-literal URLs and string-literal event names are
+//! extracted; dynamic values are out of scope. Centrifugo / SignalR / native
+//! `send`/`onmessage` framing remain follow-ups.
 
 use meridian_core::{Language, Span};
 use tree_sitter::{Node, Parser};
@@ -21,6 +25,138 @@ pub struct RawWsConnect {
     /// Connection URL as written (literal or template); canonicalized later.
     pub path: String,
     pub span: Span,
+}
+
+/// Whether a socket.io call receives an event (`on`, a server-side handler) or
+/// sends one (`emit`, a client-side call site).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WsEventKind {
+    On,
+    Emit,
+}
+
+/// A socket.io message-boundary site: `socket.on("ev", handler)` /
+/// `socket.emit("ev", …)` (#51). Keyed later by event name so an emit links to
+/// the matching `on` handler via INVOKES.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawWsEvent {
+    pub kind: WsEventKind,
+    /// Event/channel name (string literal).
+    pub event: String,
+    /// Handler symbol for `on` (empty for an inline closure or for `emit`).
+    pub handler: String,
+    pub span: Span,
+}
+
+/// Receiver identifiers treated as socket.io sockets, to keep `.on`/`.emit` from
+/// matching unrelated event emitters (DOM nodes, generic EventEmitters). A tight
+/// allowlist trades recall for precision; reserved socket.io events are skipped.
+const SOCKET_RECEIVERS: [&str; 6] = ["socket", "io", "sock", "ws", "nsp", "namespace"];
+
+/// socket.io reserved/lifecycle events that are not user message channels.
+const RESERVED_EVENTS: [&str; 6] = [
+    "connect",
+    "connection",
+    "disconnect",
+    "disconnecting",
+    "error",
+    "reconnect",
+];
+
+/// Extract socket.io `on`/`emit` event sites from JS/TS/TSX `source`. Empty on
+/// parse failure or for other languages.
+pub fn extract_ws_events(source: &str, lang: &Language) -> Vec<RawWsEvent> {
+    if !matches!(
+        lang,
+        Language::JavaScript | Language::TypeScript | Language::Tsx
+    ) {
+        return Vec::new();
+    }
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&grammar(lang).expect("built-in grammar"))
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+    let src = source.as_bytes();
+    let mut out = Vec::new();
+    walk(tree.root_node(), &mut |n| {
+        if n.kind() == "call_expression"
+            && let Some(ev) = ws_event(n, src)
+        {
+            out.push(ev);
+        }
+    });
+    out
+}
+
+/// A `socket.on("ev", handler)` / `socket.emit("ev", …)` call as a [`RawWsEvent`],
+/// else `None`. Gated on a socket-like receiver and a string-literal event name.
+fn ws_event(call: Node, src: &[u8]) -> Option<RawWsEvent> {
+    let func = call.child_by_field_name("function")?;
+    if func.kind() != "member_expression" {
+        return None;
+    }
+    let receiver = text(func.child_by_field_name("object")?, src);
+    if !SOCKET_RECEIVERS.contains(&receiver.as_str()) {
+        return None;
+    }
+    let kind = match text(func.child_by_field_name("property")?, src).as_str() {
+        "on" => WsEventKind::On,
+        "emit" => WsEventKind::Emit,
+        _ => return None,
+    };
+    let args = call.child_by_field_name("arguments")?;
+    let mut cursor = args.walk();
+    let named: Vec<Node> = args.named_children(&mut cursor).collect();
+    let event = string_literal(*named.first()?, src)?;
+    if RESERVED_EVENTS.contains(&event.as_str()) {
+        return None;
+    }
+    let handler = match kind {
+        WsEventKind::On => named
+            .get(1)
+            .map(|h| handler_name(*h, src))
+            .unwrap_or_default(),
+        WsEventKind::Emit => String::new(),
+    };
+    Some(RawWsEvent {
+        kind,
+        event,
+        handler,
+        span: span_of(call),
+    })
+}
+
+/// Inner text of a plain string-literal argument (not a template), else `None`.
+fn string_literal(node: Node, src: &[u8]) -> Option<String> {
+    if node.kind() != "string" {
+        return None;
+    }
+    let mut cursor = node.walk();
+    Some(
+        node.named_children(&mut cursor)
+            .filter(|ch| ch.kind() == "string_fragment")
+            .map(|ch| text(ch, src))
+            .collect::<String>(),
+    )
+}
+
+/// Handler symbol named by an `on` argument: a bare identifier or `obj.method`,
+/// empty for an inline function/arrow.
+fn handler_name(node: Node, src: &[u8]) -> String {
+    match node.kind() {
+        "identifier" => text(node, src),
+        "member_expression" => node
+            .child_by_field_name("property")
+            .map(|p| text(p, src))
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
 }
 
 /// Extract `new WebSocket(url)` connections from JS/TS/TSX `source`. Empty on
@@ -127,5 +263,37 @@ const tmpl = new WebSocket(`/live/${id}`); // template: kept verbatim
     #[test]
     fn skips_other_languages() {
         check!(extract_ws_connections("new WebSocket(\"/ws\")", &Language::Rust).is_empty());
+    }
+
+    #[test]
+    fn extracts_socketio_on_and_emit_events() {
+        let src = r#"
+socket.on("chat:message", onMessage);
+socket.emit("chat:message", payload);
+io.on("connection", (s) => {});      // reserved: skipped
+button.on("click", handleClick);      // non-socket receiver: skipped
+socket.emit("typing", { user });
+"#;
+        let evs = extract_ws_events(src, &Language::JavaScript);
+        let on = evs.iter().find(|e| e.kind == WsEventKind::On).expect("on");
+        check!(on.event == "chat:message");
+        check!(on.handler == "onMessage");
+        let emits: Vec<&str> = evs
+            .iter()
+            .filter(|e| e.kind == WsEventKind::Emit)
+            .map(|e| e.event.as_str())
+            .collect();
+        check!(emits.contains(&"chat:message"));
+        check!(emits.contains(&"typing"));
+        // Reserved `connection` and non-socket `button.on` are excluded.
+        check!(
+            !evs.iter()
+                .any(|e| e.event == "connection" || e.event == "click")
+        );
+    }
+
+    #[test]
+    fn ws_events_skip_other_languages() {
+        check!(extract_ws_events("socket.emit(\"x\", y)", &Language::Rust).is_empty());
     }
 }

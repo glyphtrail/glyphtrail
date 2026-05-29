@@ -363,7 +363,83 @@ pub fn build_ws_client_graph(rel_path: &str, source: &str, lang: &Language) -> C
         });
         cg.operations.push((id, key));
     }
+    // socket.io `emit("event", …)` sites: each is a ClientCall keyed by event,
+    // linking to a matching server `on("event")` handler via INVOKES (#51).
+    for ev in crate::ws::extract_ws_events(source, lang) {
+        if ev.kind != crate::ws::WsEventKind::Emit {
+            continue;
+        }
+        let key = OperationKey::ws_event(&ev.event);
+        let id = NodeId::derive(&[
+            rel_path,
+            "client_call",
+            "ws_event",
+            &ev.event,
+            &ev.span.start_byte.to_string(),
+        ]);
+        cg.graph.add_node(Node {
+            id: id.clone(),
+            kind: NodeKind::ClientCall,
+            name: format!("ws emit {}", ev.event),
+            qualified_name: key.path.clone(),
+            file: rel_path.to_string(),
+            language: Some(lang.name().to_string()),
+            span: Some(ev.span),
+            doc: None,
+        });
+        cg.operations.push((id, key));
+    }
     cg
+}
+
+/// Build the WebSocket server-event fragment for a JS/TS file: each socket.io
+/// `on("event", handler)` becomes an `Endpoint` keyed by event, with a `HANDLES`
+/// edge to the handler when it resolves to a unique local symbol (#51). A client
+/// `emit` of the same event links to it via INVOKES through the matcher.
+pub fn build_ws_server_graph(
+    rel_path: &str,
+    lang: &Language,
+    symbols: &[SymbolEntry],
+    source: &str,
+) -> RestGraph {
+    let mut rg = RestGraph::default();
+    let mut seen: HashSet<NodeId> = HashSet::new();
+    for ev in crate::ws::extract_ws_events(source, lang) {
+        if ev.kind != crate::ws::WsEventKind::On {
+            continue;
+        }
+        let key = OperationKey::ws_event(&ev.event);
+        let ep_id = NodeId::derive(&[rel_path, "endpoint", "ws_event", &ev.event]);
+        if !seen.insert(ep_id.clone()) {
+            continue;
+        }
+        rg.graph.add_node(Node {
+            id: ep_id.clone(),
+            kind: NodeKind::Endpoint,
+            name: format!("ws on {}", ev.event),
+            qualified_name: key.path.clone(),
+            file: rel_path.to_string(),
+            language: Some(lang.name().to_string()),
+            span: Some(ev.span),
+            doc: None,
+        });
+        rg.operations.push((ep_id.clone(), key));
+        if ev.handler.is_empty() {
+            continue;
+        }
+        let local: Vec<&SymbolEntry> = symbols.iter().filter(|s| s.name == ev.handler).collect();
+        if local.len() == 1 {
+            rg.graph.add_edge(
+                local[0].id.clone(),
+                ep_id,
+                EdgeKind::Handles,
+                Confidence::Extracted,
+            );
+        } else {
+            rg.pending_handlers.push((ev.handler, ep_id));
+        }
+    }
+    rg
 }
 
 /// Build the GraphQL client-op fragment for a JS/TS file: each `gql`/`graphql`
