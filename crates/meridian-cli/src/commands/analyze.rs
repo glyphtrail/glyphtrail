@@ -315,17 +315,34 @@ pub fn run(path: &Path, update: bool, backend: BackendKind) -> Result<()> {
                 // Client-call extraction runs for any language with a client
                 // extractor (the extractor decides; no-op otherwise).
                 let cg = build_client_graph(&f.rel_path, &source, &f.language);
-                graph.extend(cg.graph);
-                operations.extend(cg.operations);
                 // GraphQL client operations (gql-tagged docs) → INVOKES.
                 let qc = build_graphql_client_graph(&f.rel_path, &source, &f.language);
-                graph.extend(qc.graph);
-                operations.extend(qc.operations);
                 // gRPC client stub calls (tonic) → INVOKES.
                 let gc = build_grpc_client_graph(&f.rel_path, &source, &f.language);
+                // Link each client call site to its enclosing function so impact
+                // can propagate from a reached ClientCall up to local callers
+                // across the wire (#130). Computed before the graphs are moved.
+                let client_call_nodes: Vec<Node> = cg
+                    .graph
+                    .nodes
+                    .iter()
+                    .chain(&qc.graph.nodes)
+                    .chain(&gc.graph.nodes)
+                    .filter(|n| n.kind == NodeKind::ClientCall)
+                    .cloned()
+                    .collect();
+                let enclosing_edges =
+                    meridian_parse::enclosing_call_edges(&fg.graph.nodes, &client_call_nodes);
+                graph.extend(cg.graph);
+                operations.extend(cg.operations);
+                graph.extend(qc.graph);
+                operations.extend(qc.operations);
                 graph.extend(gc.graph);
                 operations.extend(gc.operations);
                 graph.extend(fg.graph);
+                for e in enclosing_edges {
+                    graph.add_edge(e.src, e.dst, e.kind, e.confidence);
+                }
                 pending.extend(fg.pending);
                 imports.extend(
                     fg.imports
@@ -706,6 +723,48 @@ mod tests {
         let found = discover(&dir, &[], &["generated".to_string()]).unwrap();
         let rels: Vec<&str> = found.iter().map(|f| f.rel_path.as_str()).collect();
         check!(rels == ["main.rs"], "expected only main.rs, got {rels:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // #130: a changed server handler propagates across the wire not just to the
+    // client call site but to the function that makes the call and its callers.
+    #[test]
+    fn impact_propagates_through_client_call_to_callers() {
+        use meridian_core::{ImpactPolicy, compute_impact};
+        let dir = temp_repo("impact-transitive");
+        std::fs::write(
+            dir.join("server.rs"),
+            "async fn list() {}\nfn app() -> Router { Router::new().route(\"/users\", get(list)) }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("client.ts"),
+            "function consume() { return fetch(\"/users\"); }\nfunction caller() { return consume(); }\n",
+        )
+        .unwrap();
+        run(&dir, false, BackendKind::Sqlite).unwrap();
+
+        let store = SqliteStore::open(&RepoPaths::new(&dir).db_path).unwrap();
+        let handler = store
+            .find_by_name("list")
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("handler `list`");
+        let impacted = compute_impact(&[handler.id], &ImpactPolicy::cross_boundary(8), &store);
+        let names: Vec<String> = impacted
+            .iter()
+            .filter_map(|i| store.get_node(&i.node.0).ok().flatten().map(|n| n.name))
+            .collect();
+        check!(
+            names.iter().any(|n| n == "consume"),
+            "enclosing fn should be impacted across the wire, got {names:?}"
+        );
+        check!(
+            names.iter().any(|n| n == "caller"),
+            "caller of the call site should be impacted, got {names:?}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
