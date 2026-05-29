@@ -21,6 +21,8 @@ pub fn grammar(lang: &Language) -> Option<TsLanguage> {
         Language::Bash => tree_sitter_bash::LANGUAGE.into(),
         Language::Php => tree_sitter_php::LANGUAGE_PHP.into(),
         Language::Scala => tree_sitter_scala::LANGUAGE.into(),
+        Language::OCaml => tree_sitter_ocaml::LANGUAGE_OCAML.into(),
+        Language::Haskell => tree_sitter_haskell::LANGUAGE.into(),
         Language::Other(_) => return None,
     })
 }
@@ -49,6 +51,8 @@ pub fn query_source(lang: &Language) -> Option<&'static str> {
         Language::Bash => include_str!("../queries/bash.scm"),
         Language::Php => include_str!("../queries/php.scm"),
         Language::Scala => include_str!("../queries/scala.scm"),
+        Language::OCaml => include_str!("../queries/ocaml.scm"),
+        Language::Haskell => include_str!("../queries/haskell.scm"),
         Language::Other(_) => return None,
     })
 }
