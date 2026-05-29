@@ -1,7 +1,8 @@
 use std::collections::HashSet;
 
 use meridian_core::{
-    CodeGraph, Confidence, EdgeKind, Language, Node, NodeId, NodeKind, OperationKey, Protocol, Span,
+    CodeGraph, Confidence, Edge, EdgeKind, Language, Node, NodeId, NodeKind, OperationKey,
+    Protocol, Span,
 };
 
 use crate::client::extract_client_calls;
@@ -267,6 +268,39 @@ pub fn build_graphql_graph(
 pub struct ClientGraph {
     pub graph: CodeGraph,
     pub operations: Vec<(NodeId, OperationKey)>,
+}
+
+/// `Calls` edges from the function/method that encloses each client call site to
+/// the `ClientCall` node (#130). This lets impact traversal continue past a
+/// reached `ClientCall` to the enclosing symbol and on to its in-process callers
+/// across the wire. `symbols` are the file's symbol nodes (only `Function` /
+/// `Method` with a span participate); `client_calls` are the file's `ClientCall`
+/// nodes. The innermost (smallest) span that contains the call wins.
+pub fn enclosing_call_edges(symbols: &[Node], client_calls: &[Node]) -> Vec<Edge> {
+    let fns: Vec<(&NodeId, Span)> = symbols
+        .iter()
+        .filter(|n| matches!(n.kind, NodeKind::Function | NodeKind::Method))
+        .filter_map(|n| n.span.map(|s| (&n.id, s)))
+        .collect();
+    let mut edges = Vec::new();
+    for cc in client_calls {
+        let Some(cs) = cc.span else {
+            continue;
+        };
+        let enclosing = fns
+            .iter()
+            .filter(|(_, s)| s.start_byte <= cs.start_byte && cs.end_byte <= s.end_byte)
+            .min_by_key(|(_, s)| s.end_byte - s.start_byte);
+        if let Some((id, _)) = enclosing {
+            edges.push(Edge {
+                src: (*id).clone(),
+                dst: cc.id.clone(),
+                kind: EdgeKind::Calls,
+                confidence: Confidence::Extracted,
+            });
+        }
+    }
+    edges
 }
 
 /// Build the gRPC client-call fragment for a file: each tonic stub call
@@ -606,4 +640,51 @@ pub fn build_file_graph(
     }
 
     fg
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use assert2::check;
+
+    fn node(id: &str, kind: NodeKind, start_byte: usize, end_byte: usize) -> Node {
+        Node {
+            id: NodeId(id.into()),
+            kind,
+            name: id.into(),
+            qualified_name: id.into(),
+            file: "f".into(),
+            language: None,
+            span: Some(Span {
+                start_byte,
+                end_byte,
+                start_line: 0,
+                end_line: 0,
+            }),
+            doc: None,
+        }
+    }
+
+    // #130: a client call links to the innermost function/method that contains
+    // its byte span.
+    #[test]
+    fn links_client_call_to_innermost_enclosing_fn() {
+        let outer = node("outer", NodeKind::Function, 0, 100);
+        let inner = node("inner", NodeKind::Method, 20, 60);
+        let cc = node("cc", NodeKind::ClientCall, 30, 40);
+        let edges = enclosing_call_edges(&[outer, inner], &[cc]);
+        check!(edges.len() == 1);
+        check!(edges[0].src == NodeId("inner".into()));
+        check!(edges[0].dst == NodeId("cc".into()));
+        check!(edges[0].kind == EdgeKind::Calls);
+        check!(edges[0].confidence == Confidence::Extracted);
+    }
+
+    // A call site outside every function span yields no edge.
+    #[test]
+    fn no_edge_when_call_outside_any_fn() {
+        let f = node("f", NodeKind::Function, 0, 10);
+        let cc = node("cc", NodeKind::ClientCall, 50, 60);
+        check!(enclosing_call_edges(&[f], &[cc]).is_empty());
+    }
 }

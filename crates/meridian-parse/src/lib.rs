@@ -13,7 +13,7 @@ pub mod rest;
 pub use build::{
     ClientGraph, FileGraph, PendingEdge, RestGraph, SymbolEntry, build_client_graph,
     build_file_graph, build_graphql_client_graph, build_graphql_graph, build_grpc_client_graph,
-    build_grpc_graph, build_rest_graph,
+    build_grpc_graph, build_rest_graph, enclosing_call_edges,
 };
 pub use client::{RawClientCall, extract_client_calls};
 pub use dynamic::{DynamicGrammar, load_dynamic};
