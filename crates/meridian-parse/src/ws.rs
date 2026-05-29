@@ -4,14 +4,16 @@
 //!   an HTTP `GET` upgrade at `url`; the connection path links to the server's
 //!   upgrade route (a REST `GET` endpoint) since a WebSocket connection
 //!   [`OperationKey`](meridian_core::OperationKey) shares a REST `GET` signature.
-//! - **Message** — socket.io `socket.on("event", handler)` (a server handler)
-//!   and `socket.emit("event", …)` (a client call), matched by event name. To
-//!   avoid matching unrelated `.on`/`.emit` emitters, only socket-like receiver
-//!   identifiers ([`SOCKET_RECEIVERS`]) are considered and reserved lifecycle
-//!   events are skipped.
+//! - **Message** — matched by event/method name across the wire: socket.io
+//!   `socket.on("event", h)` (handler) and `socket.emit("event", …)` (client),
+//!   plus SignalR `connection.on("Method", h)` (handler) and
+//!   `connection.invoke("Method", …)` / `.send(...)` (client). To avoid matching
+//!   unrelated `.on`/`.emit` emitters, only socket-like ([`SOCKETIO_RECEIVERS`])
+//!   and SignalR ([`SIGNALR_RECEIVERS`]) receiver identifiers are considered,
+//!   with verbs gated per family and reserved lifecycle events skipped.
 //!
 //! Only string/template-literal URLs and string-literal event names are
-//! extracted; dynamic values are out of scope. Centrifugo / SignalR / native
+//! extracted; dynamic values are out of scope. Centrifugo channels and native
 //! `send`/`onmessage` framing remain follow-ups.
 
 use meridian_core::{Language, Span};
@@ -48,10 +50,14 @@ pub struct RawWsEvent {
     pub span: Span,
 }
 
-/// Receiver identifiers treated as socket.io sockets, to keep `.on`/`.emit` from
-/// matching unrelated event emitters (DOM nodes, generic EventEmitters). A tight
-/// allowlist trades recall for precision; reserved socket.io events are skipped.
-const SOCKET_RECEIVERS: [&str; 6] = ["socket", "io", "sock", "ws", "nsp", "namespace"];
+/// Receiver identifiers treated as socket.io sockets (verbs `on`/`emit`). Tight
+/// allowlists trade recall for precision so unrelated event emitters (DOM nodes,
+/// generic EventEmitters, raw WebSockets) aren't matched.
+const SOCKETIO_RECEIVERS: [&str; 5] = ["socket", "io", "sock", "nsp", "namespace"];
+
+/// Receiver identifiers treated as SignalR hub connections (verbs `invoke`/
+/// `send` to call a hub method, `on` to register a client handler) (#51).
+const SIGNALR_RECEIVERS: [&str; 4] = ["connection", "hubConnection", "conn", "hub"];
 
 /// socket.io reserved/lifecycle events that are not user message channels.
 const RESERVED_EVENTS: [&str; 6] = [
@@ -63,8 +69,8 @@ const RESERVED_EVENTS: [&str; 6] = [
     "reconnect",
 ];
 
-/// Extract socket.io `on`/`emit` event sites from JS/TS/TSX `source`. Empty on
-/// parse failure or for other languages.
+/// Extract socket.io (`on`/`emit`) and SignalR (`on`/`invoke`/`send`) event
+/// sites from JS/TS/TSX `source`. Empty on parse failure or other languages.
 pub fn extract_ws_events(source: &str, lang: &Language) -> Vec<RawWsEvent> {
     if !matches!(
         lang,
@@ -102,13 +108,23 @@ fn ws_event(call: Node, src: &[u8]) -> Option<RawWsEvent> {
         return None;
     }
     let receiver = text(func.child_by_field_name("object")?, src);
-    if !SOCKET_RECEIVERS.contains(&receiver.as_str()) {
+    let property = text(func.child_by_field_name("property")?, src);
+    // Allowed verbs depend on the receiver family: socket.io uses on/emit;
+    // SignalR uses on plus invoke/send (call a hub method).
+    let kind = if SOCKETIO_RECEIVERS.contains(&receiver.as_str()) {
+        match property.as_str() {
+            "on" => WsEventKind::On,
+            "emit" => WsEventKind::Emit,
+            _ => return None,
+        }
+    } else if SIGNALR_RECEIVERS.contains(&receiver.as_str()) {
+        match property.as_str() {
+            "on" => WsEventKind::On,
+            "invoke" | "send" => WsEventKind::Emit,
+            _ => return None,
+        }
+    } else {
         return None;
-    }
-    let kind = match text(func.child_by_field_name("property")?, src).as_str() {
-        "on" => WsEventKind::On,
-        "emit" => WsEventKind::Emit,
-        _ => return None,
     };
     let args = call.child_by_field_name("arguments")?;
     let mut cursor = args.walk();
@@ -295,5 +311,27 @@ socket.emit("typing", { user });
     #[test]
     fn ws_events_skip_other_languages() {
         check!(extract_ws_events("socket.emit(\"x\", y)", &Language::Rust).is_empty());
+    }
+
+    #[test]
+    fn extracts_signalr_invoke_send_and_on() {
+        let src = r#"
+connection.on("ReceiveMessage", onReceive);
+connection.invoke("SendMessage", user, msg);
+hubConnection.send("Notify", payload);
+connection.start();                  // not a verb we track
+widget.invoke("x", 1);               // non-signalr receiver: skipped
+"#;
+        let evs = extract_ws_events(src, &Language::TypeScript);
+        let on = evs.iter().find(|e| e.kind == WsEventKind::On).expect("on");
+        check!(on.event == "ReceiveMessage" && on.handler == "onReceive");
+        let emits: Vec<&str> = evs
+            .iter()
+            .filter(|e| e.kind == WsEventKind::Emit)
+            .map(|e| e.event.as_str())
+            .collect();
+        check!(emits.contains(&"SendMessage")); // invoke
+        check!(emits.contains(&"Notify")); // send
+        check!(!evs.iter().any(|e| e.event == "x")); // non-signalr receiver excluded
     }
 }
