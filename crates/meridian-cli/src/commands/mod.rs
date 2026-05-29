@@ -1,4 +1,6 @@
 pub mod analyze;
+pub mod backend;
+pub mod cypher;
 pub mod impact;
 pub mod query;
 pub mod repo;

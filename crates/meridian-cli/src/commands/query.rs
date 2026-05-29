@@ -8,8 +8,10 @@ use meridian_core::{
     EdgeKind, HttpMethod, Node, NodeKind, OperationKey, Protocol, Registry, RegistryEntry,
     default_registry_path,
 };
-use meridian_store::{GraphStore, SqliteStore};
+use meridian_store::GraphStore;
 use serde::Serialize;
+
+use crate::commands::backend::{self, BackendKind};
 
 #[derive(Subcommand)]
 pub enum QueryCmd {
@@ -275,15 +277,15 @@ fn collect_operations(
     Ok(out)
 }
 
-fn open_store(repo: &Path) -> Result<Box<dyn GraphStore>> {
+fn open_store(repo: &Path, backend: BackendKind) -> Result<Box<dyn GraphStore>> {
     let paths = RepoPaths::new(repo);
-    if !paths.db_path.exists() {
+    if !backend.exists(&paths) {
         bail!(
             "no index found at {} — run `meridian analyze` first",
-            paths.db_path.display()
+            backend.location(&paths).display()
         );
     }
-    Ok(Box::new(SqliteStore::open(&paths.db_path)?))
+    backend::open(&paths, backend)
 }
 
 /// Compute a query answer against one open store. Pure of output so the same
@@ -454,8 +456,8 @@ fn print_value(value: &serde_json::Value, emit: Emit) -> Result<()> {
     Ok(())
 }
 
-pub fn run(repo: &Path, cmd: QueryCmd, emit: Emit) -> Result<()> {
-    let store = open_store(repo)?;
+pub fn run(repo: &Path, cmd: QueryCmd, emit: Emit, backend: BackendKind) -> Result<()> {
+    let store = open_store(repo, backend)?;
     let result = execute(&*store, &cmd)?;
     match emit {
         Emit::Text => result.print_text(),
@@ -500,7 +502,7 @@ pub fn run_registry(
     if emit == Emit::Text {
         for e in &selected {
             println!("== {} ({}) ==", e.name, e.root.display());
-            match open_store(&e.root).and_then(|s| execute(s.as_ref(), &cmd)) {
+            match open_store(&e.root, BackendKind::Sqlite).and_then(|s| execute(s.as_ref(), &cmd)) {
                 Ok(r) => r.print_text(),
                 Err(err) => println!("  error: {err:#}"),
             }
@@ -510,7 +512,9 @@ pub fn run_registry(
 
     let mut arr = Vec::new();
     for e in &selected {
-        let value = match open_store(&e.root).and_then(|s| execute(s.as_ref(), &cmd)) {
+        let value = match open_store(&e.root, BackendKind::Sqlite)
+            .and_then(|s| execute(s.as_ref(), &cmd))
+        {
             Ok(r) => r.to_value(),
             Err(err) => serde_json::json!({ "error": format!("{err:#}") }),
         };

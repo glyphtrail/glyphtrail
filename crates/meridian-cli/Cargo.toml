@@ -30,5 +30,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 tokio.workspace = true
 
+[features]
+# Build the LadybugDB backend + `cypher` subcommand (pulls the lbug C++ build).
+ladybug = ["meridian-store/ladybug"]
+
 [dev-dependencies]
 assert2.workspace = true
