@@ -52,6 +52,10 @@ pub struct Config {
     /// support). Each names a grammar + query the analyzer compiles on demand.
     #[serde(rename = "languages")]
     pub languages: Vec<DynamicLanguage>,
+    /// Extra directory names to skip during discovery, on top of the built-in
+    /// defaults (build/output/VCS dirs). A bare name (`vendor`) matches at any
+    /// depth; a gitignore-style glob (`gitnexus/vendor/**/build`) is honored too.
+    pub ignore_dirs: Vec<String>,
 }
 
 /// A language identified by file extension but not built in: its tree-sitter
@@ -273,6 +277,14 @@ mod tests {
         check!(lang.extensions == ["rb", "rake"]);
         check!(lang.grammar == std::path::Path::new("grammars/tree-sitter-ruby/src"));
         check!(lang.query == std::path::Path::new("queries/ruby.scm"));
+    }
+
+    #[test]
+    fn parses_extra_ignore_dirs() {
+        let cfg = Config::from_toml_str("ignore_dirs = [\"vendor\", \"gen/**/out\"]\n").unwrap();
+        check!(cfg.ignore_dirs == ["vendor", "gen/**/out"]);
+        // Absent by default.
+        check!(Config::from_toml_str("").unwrap().ignore_dirs.is_empty());
     }
 
     #[test]

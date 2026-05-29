@@ -18,6 +18,45 @@ use std::collections::HashSet;
 use crate::commands::backend::{self, BackendKind};
 use crate::commands::schema;
 use ignore::WalkBuilder;
+use ignore::overrides::OverrideBuilder;
+
+/// Build/output/dependency/VCS directories skipped during discovery regardless
+/// of `.gitignore` (#144). Bare names match at any depth (gitignore semantics).
+/// Repos can add more via `ignore_dirs` in `.meridian/config.toml`.
+const DEFAULT_IGNORE_DIRS: &[&str] = &[
+    "node_modules",
+    "bower_components",
+    "vendor",
+    "target",
+    "build",
+    "bin",
+    "obj",
+    "dist",
+    "out",
+    "coverage",
+    ".next",
+    "turbo",
+    ".turbo",
+    ".gradle",
+    ".nuget",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".idea",
+    ".vs",
+    ".vscode",
+    ".meridian",
+    ".gitnexus",
+    "gitnexus",
+    ".git",
+    ".hg",
+    ".svn",
+    ".cvs",
+    ".bzr",
+];
 #[cfg(test)]
 use meridian_store::SqliteStore;
 
@@ -28,7 +67,11 @@ struct DiscoveredFile {
     hash: String,
 }
 
-fn discover(root: &Path, dyn_langs: &[DynamicLanguage]) -> Result<Vec<DiscoveredFile>> {
+fn discover(
+    root: &Path,
+    dyn_langs: &[DynamicLanguage],
+    extra_ignore_dirs: &[String],
+) -> Result<Vec<DiscoveredFile>> {
     let mut walker = WalkBuilder::new(root);
     walker
         .hidden(true)
@@ -41,6 +84,23 @@ fn discover(root: &Path, dyn_langs: &[DynamicLanguage]) -> Result<Vec<Discovered
     for ignore_file in [".aiignore", ".aiexclude", ".claudeignore"] {
         walker.add_custom_ignore_filename(ignore_file);
     }
+
+    // Prune build/output/dependency dirs even when not gitignored (#144). An
+    // override glob is matched gitignore-style but inverted, so a leading `!`
+    // means "ignore"; a pure-ignore set keeps everything else. Bare names match
+    // at any depth. A repo can extend the defaults via `ignore_dirs` in config.
+    let mut overrides = OverrideBuilder::new(root);
+    for dir in DEFAULT_IGNORE_DIRS
+        .iter()
+        .copied()
+        .chain(extra_ignore_dirs.iter().map(String::as_str))
+    {
+        let glob = format!("!{}", dir.trim_start_matches('!'));
+        overrides
+            .add(&glob)
+            .with_context(|| format!("invalid ignore_dirs entry {dir:?}"))?;
+    }
+    walker.overrides(overrides.build().context("building ignore overrides")?);
 
     let mut out = Vec::new();
     for entry in walker.build() {
@@ -90,7 +150,7 @@ pub fn run(path: &Path, update: bool, backend: BackendKind) -> Result<()> {
     let mut store = backend::open(&paths, backend)?;
 
     let cfg = Config::load(&root)?;
-    let files = discover(&root, &cfg.languages)?;
+    let files = discover(&root, &cfg.languages, &cfg.ignore_dirs)?;
     tracing::info!("discovered {} source files", files.len());
 
     // Fast path (#110): when every discovered file matches the stored
@@ -603,6 +663,23 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("meridian-it-{tag}-{nanos}"));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    // #144: build/output/dependency dirs are pruned from discovery; an extra
+    // dir named in `ignore_dirs` is skipped too, while real source survives.
+    #[test]
+    fn discovery_skips_build_and_configured_dirs() {
+        let dir = temp_repo("ignore-dirs");
+        std::fs::write(dir.join("main.rs"), "fn f() {}\n").unwrap();
+        for d in ["node_modules", "target", "dist", "__pycache__", "generated"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+            std::fs::write(dir.join(d).join("x.rs"), "fn g() {}\n").unwrap();
+        }
+        let found = discover(&dir, &[], &["generated".to_string()]).unwrap();
+        let rels: Vec<&str> = found.iter().map(|f| f.rel_path.as_str()).collect();
+        check!(rels == ["main.rs"], "expected only main.rs, got {rels:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     fn callers_of(dir: &Path, name: &str) -> Vec<String> {
