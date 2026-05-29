@@ -235,6 +235,36 @@ pub struct ClientGraph {
     pub operations: Vec<(NodeId, OperationKey)>,
 }
 
+/// Build the GraphQL client-op fragment for a JS/TS file: each `gql`/`graphql`
+/// document becomes a `ClientCall` keyed `OpType.field`, linked to a resolver
+/// endpoint / schema op by the matcher (INVOKES) via the GraphQL signature.
+pub fn build_graphql_client_graph(rel_path: &str, source: &str, lang: &Language) -> ClientGraph {
+    let mut cg = ClientGraph::default();
+    for op in crate::graphql::extract_graphql_client_ops(source, lang) {
+        let path = format!("{}.{}", op.op_type, op.field);
+        let id = NodeId::derive(&[
+            rel_path,
+            "client_call",
+            "graphql",
+            &path,
+            &op.span.start_byte.to_string(),
+        ]);
+        cg.graph.add_node(Node {
+            id: id.clone(),
+            kind: NodeKind::ClientCall,
+            name: format!("graphql {path}"),
+            qualified_name: path.clone(),
+            file: rel_path.to_string(),
+            language: Some(lang.name().to_string()),
+            span: Some(op.span),
+            doc: None,
+        });
+        cg.operations
+            .push((id, OperationKey::opaque(Protocol::GraphQl, path)));
+    }
+    cg
+}
+
 /// Build the client-call fragment for a JS/TS/TSX file. Each `fetch`/`axios`
 /// call becomes a `ClientCall` node carrying its `(method, path)` operation key.
 pub fn build_client_graph(rel_path: &str, source: &str, lang: &Language) -> ClientGraph {
