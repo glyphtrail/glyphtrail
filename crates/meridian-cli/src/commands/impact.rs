@@ -4,9 +4,10 @@
 //! propagation (#71) and classification (#72) into one report, rendered as text
 //! or a stable JSON `ImpactReport`.
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, ValueEnum};
-use meridian_core::config::RepoPaths;
+use globset::{Glob, GlobSetBuilder};
+use meridian_core::config::{Config, RepoPaths};
 use meridian_core::{ClassifiedItem, Confidence, ImpactClass, ImpactPolicy, ImpactReport};
 use meridian_store::{ChangeSpec, SeedSet, SqliteStore, changed_files, seed_nodes};
 
@@ -111,7 +112,11 @@ pub fn run(args: ImpactArgs) -> Result<()> {
         if let Some(mc) = &args.min_confidence {
             policy.min_confidence = meridian_core::parse_confidence(mc).map_err(|e| anyhow!(e))?;
         }
-        let classified = store.classify_impact(&seed_set.seeds, &policy)?;
+        let mut classified = store.classify_impact(&seed_set.seeds, &policy)?;
+        // Apply config-tunable test classification (#131) before the report
+        // recomputes its summary, so configured test files count as tests.
+        let cfg = Config::load(&args.repo)?;
+        retag_configured_tests(&mut classified, &cfg.impact.test_globs)?;
         ImpactReport::new(
             classified,
             seed_set.removed_files,
@@ -125,6 +130,30 @@ pub fn run(args: ImpactArgs) -> Result<()> {
     // can flag it loudly. Default is report-only.
     if args.gate && report.touches_contract() {
         std::process::exit(GATE_EXIT_CODE);
+    }
+    Ok(())
+}
+
+/// Re-tag any impacted item whose file matches a configured `test_globs`
+/// pattern as a [`ImpactClass::Test`] (#131). A user-declared test path wins
+/// over the built-in class. No-op when `globs` is empty, so default behavior is
+/// unchanged.
+fn retag_configured_tests(items: &mut [ClassifiedItem], globs: &[String]) -> Result<()> {
+    if globs.is_empty() {
+        return Ok(());
+    }
+    let mut builder = GlobSetBuilder::new();
+    for g in globs {
+        builder
+            .add(Glob::new(g).with_context(|| format!("invalid impact.test_globs entry {g:?}"))?);
+    }
+    let set = builder
+        .build()
+        .context("building impact.test_globs matcher")?;
+    for item in items.iter_mut() {
+        if set.is_match(&item.file) {
+            item.class = ImpactClass::Test;
+        }
     }
     Ok(())
 }
@@ -234,4 +263,53 @@ fn print_item(i: &ClassifiedItem) {
         ""
     };
     println!("  {} ({loc}) d{}{conf}{path}", i.qualified_name, i.distance);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use assert2::check;
+    use meridian_core::NodeKind;
+
+    fn item(file: &str, class: ImpactClass) -> ClassifiedItem {
+        ClassifiedItem {
+            id: "x".into(),
+            name: "n".into(),
+            qualified_name: "n".into(),
+            kind: NodeKind::Function,
+            file: file.into(),
+            line: None,
+            class,
+            distance: 1,
+            min_confidence: Confidence::Extracted,
+            cross_boundary: false,
+            path: Vec::new(),
+        }
+    }
+
+    // #131: files matching a configured glob are re-tagged as tests; others keep
+    // their built-in class.
+    #[test]
+    fn test_globs_retag_matching_files() {
+        let mut items = vec![
+            item("it/login_it.rs", ImpactClass::Internal),
+            item("src/util.rs", ImpactClass::Internal),
+        ];
+        retag_configured_tests(&mut items, &["it/**".to_string()]).unwrap();
+        check!(items[0].class == ImpactClass::Test);
+        check!(items[1].class == ImpactClass::Internal);
+    }
+
+    #[test]
+    fn empty_globs_change_nothing() {
+        let mut items = vec![item("src/util.rs", ImpactClass::Internal)];
+        retag_configured_tests(&mut items, &[]).unwrap();
+        check!(items[0].class == ImpactClass::Internal);
+    }
+
+    #[test]
+    fn invalid_glob_is_an_error() {
+        let mut items = vec![item("a.rs", ImpactClass::Internal)];
+        check!(retag_configured_tests(&mut items, &["[".to_string()]).is_err());
+    }
 }
