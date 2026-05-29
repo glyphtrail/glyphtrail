@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::config::RepoPaths;
@@ -93,6 +94,36 @@ impl Registry {
         std::fs::write(&tmp, json)?;
         std::fs::rename(&tmp, path)?;
         Ok(())
+    }
+
+    /// Serialize a load → modify → save cycle under an exclusive OS advisory
+    /// lock on a sibling `registry.lock` file, so concurrent `repo` writers in
+    /// separate processes can't lose an update (last-rename-wins, #129). The
+    /// registry is (re)loaded *inside* the lock so each writer sees the latest
+    /// state, and persisted before the lock drops. Returns the closure's value.
+    ///
+    /// Hold the lock only for the quick mutation; never run long work (analysis)
+    /// inside `f`.
+    pub fn mutate<R>(path: &Path, f: impl FnOnce(&mut Registry) -> R) -> Result<R> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let lock_path = path.with_extension("lock");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        // Blocks until the exclusive lock is acquired; released on drop too.
+        FileExt::lock_exclusive(&lock)?;
+        let outcome = (|| {
+            let mut reg = Registry::load(path)?;
+            let value = f(&mut reg);
+            reg.save(path)?;
+            Ok(value)
+        })();
+        let _ = FileExt::unlock(&lock);
+        outcome
     }
 
     /// Register a repo, replacing any existing entry with the same name.
@@ -233,6 +264,39 @@ mod tests {
         check!(reg.remove("api"));
         check!(!reg.remove("api"));
         check!(reg.repos.is_empty());
+    }
+
+    // #129: many processes (here, threads — each opens its own fd, so the OS
+    // advisory lock still serializes them) racing on `mutate` must not lose any
+    // update. Without the lock the load→modify→save RMW would drop writes and
+    // the final count would fall short of N.
+    #[test]
+    fn mutate_serializes_concurrent_writers() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("meridian-reg-lock-{nanos}"));
+        let path = dir.join("registry.json");
+        const N: usize = 16;
+        std::thread::scope(|s| {
+            for i in 0..N {
+                let path = path.clone();
+                s.spawn(move || {
+                    Registry::mutate(&path, |reg| {
+                        reg.add(format!("r{i}"), PathBuf::from(format!("/p/{i}")));
+                    })
+                    .unwrap();
+                });
+            }
+        });
+        let reg = Registry::load(&path).unwrap();
+        check!(
+            reg.repos.len() == N,
+            "expected {N} repos, got {}",
+            reg.repos.len()
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
