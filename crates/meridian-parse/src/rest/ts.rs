@@ -120,6 +120,19 @@ pub(super) fn method_router(node: Node, src: &[u8]) -> Vec<(HttpMethod, String)>
     out
 }
 
+/// Every HTTP method, for `any(handler)` and a method-less `on(...)` filter,
+/// which route on all verbs.
+const ALL_METHODS: [HttpMethod; 8] = [
+    HttpMethod::Get,
+    HttpMethod::Post,
+    HttpMethod::Put,
+    HttpMethod::Patch,
+    HttpMethod::Delete,
+    HttpMethod::Head,
+    HttpMethod::Options,
+    HttpMethod::Trace,
+];
+
 fn collect_method_router(node: Node, src: &[u8], out: &mut Vec<(HttpMethod, String)>) {
     if node.kind() != "call_expression" {
         return;
@@ -128,22 +141,73 @@ fn collect_method_router(node: Node, src: &[u8], out: &mut Vec<(HttpMethod, Stri
         return;
     };
     let args = node.child_by_field_name("arguments");
-    if func.kind() == "field_expression" {
+    let verb = if func.kind() == "field_expression" {
         if let Some(recv) = func.child_by_field_name("value") {
             collect_method_router(recv, src, out);
         }
-        let verb = func
-            .child_by_field_name("field")
+        func.child_by_field_name("field")
             .map(|n| text(n, src))
-            .unwrap_or_default();
-        if let Some(m) = HttpMethod::parse(&verb) {
-            out.push((m, handler_name(args, src)));
-        }
+            .unwrap_or_default()
     } else {
-        let verb = func_name(func, src);
-        if let Some(m) = HttpMethod::parse(last_segment(&verb)) {
-            out.push((m, handler_name(args, src)));
+        last_segment(&func_name(func, src)).to_string()
+    };
+    match verb.as_str() {
+        // `on(MethodFilter::POST, handler)` / chained `.on(filter, handler)`:
+        // the filter's verb(s) come first, the handler second. A filter with no
+        // recognizable verb (or `MethodFilter::all()`) routes on every method.
+        "on" | "on_service" => {
+            let methods = method_filter_verbs(args, src);
+            let methods = if methods.is_empty() {
+                ALL_METHODS.to_vec()
+            } else {
+                methods
+            };
+            let handler = arg_handler(named_arg(args, 1), src);
+            for m in methods {
+                out.push((m, handler.clone()));
+            }
         }
+        // `any(handler)` matches every method.
+        "any" | "any_service" => {
+            let handler = arg_handler(named_arg(args, 0), src);
+            for m in ALL_METHODS {
+                out.push((m, handler.clone()));
+            }
+        }
+        v => {
+            if let Some(m) = HttpMethod::parse(v) {
+                out.push((m, handler_name(args, src)));
+            }
+        }
+    }
+}
+
+/// HTTP verbs named anywhere in an `on(...)` first argument (the `MethodFilter`
+/// expression), e.g. `MethodFilter::POST` or `MethodFilter::GET.or(POST)`.
+fn method_filter_verbs(args: Option<Node>, src: &[u8]) -> Vec<HttpMethod> {
+    let Some(filter) = named_arg(args, 0) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    walk(filter, &mut |n| {
+        if n.kind() == "identifier"
+            && let Some(m) = HttpMethod::parse(&text(n, src))
+            && !out.contains(&m)
+        {
+            out.push(m);
+        }
+    });
+    out
+}
+
+/// The handler symbol named by a `MethodRouter` argument node (a bare or scoped
+/// identifier), else empty for an inline closure.
+fn arg_handler(node: Option<Node>, src: &[u8]) -> String {
+    match node {
+        Some(n) if matches!(n.kind(), "identifier" | "scoped_identifier") => {
+            last_segment(&text(n, src)).to_string()
+        }
+        _ => String::new(),
     }
 }
 
