@@ -139,8 +139,20 @@ A Cargo workspace:
 | `meridian-mcp`    | Model Context Protocol server (stdio) exposing the query tools |
 | `meridian-cli`    | the `meridian` binary |
 
-Storage is SQLite-first behind a store layer so a LadybugDB (Cypher) backend can
-be added later. Multi-repo support is planned.
+Storage is SQLite-first behind the `GraphStore` trait, so backends are
+interchangeable. An opt-in **LadybugDB** (Cypher) backend implements the same
+trait:
+
+```sh
+# Build with the LadybugDB backend (pulls the `lbug` crate).
+cargo build --features meridian-store/ladybug
+```
+
+The `ladybug` feature is **off by default** so the standard build stays light.
+The `lbug` crate downloads a prebuilt `liblbug`, or compiles LadybugDB from
+source via **cmake + a C/C++ toolchain** (clang/gcc) as a fallback — install
+those if the prebuilt archive is unavailable (e.g. `apt-get install cmake clang
+build-essential`).
 
 ## Development
 

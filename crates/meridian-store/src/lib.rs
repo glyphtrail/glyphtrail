@@ -2,10 +2,14 @@
 
 pub mod changeset;
 pub mod graph_store;
+#[cfg(feature = "ladybug")]
+pub mod ladybug;
 pub mod sqlite;
 
 pub use changeset::{ChangeSpec, ChangedFile, SeedSet, changed_files, seed_nodes};
 pub use graph_store::GraphStore;
+#[cfg(feature = "ladybug")]
+pub use ladybug::LadybugStore;
 pub use sqlite::{SqliteStore, Stats};
 
 #[cfg(test)]
