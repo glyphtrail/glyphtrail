@@ -9,3 +9,6 @@
 
 ; Comments
 (comment) @comment
+
+; Inheritance — `extends B with T`.
+(extends_clause (type_identifier) @extends)

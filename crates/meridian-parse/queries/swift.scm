@@ -8,3 +8,6 @@
 
 ; Comments
 (comment) @comment
+
+; Inheritance / conformance — `class A: B, P`.
+(inheritance_specifier (user_type (type_identifier) @extends))

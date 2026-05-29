@@ -10,3 +10,6 @@
 
 ; Comments
 (comment) @comment
+
+; Inheritance — `class A < B`.
+(superclass (constant) @extends)
