@@ -73,6 +73,13 @@ meridian wiki --dry-run                # write the prompts only (no network/keys
 meridian status
 ```
 
+### Excluding sensitive files
+
+`analyze` honors `.gitignore`/`.git/info/exclude`, skips dotfiles, and reads
+exclusion lists from `.meridianignore`, `.aiignore`, `.aiexclude`, and
+`.claudeignore`. List any file with secrets/key material there to keep it out of
+the index entirely — and therefore out of every agent-facing surface (wiki, MCP).
+
 ### Impact reports in CI
 
 Seed the impact analysis from a pull request's diff and post a Markdown summary,

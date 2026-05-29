@@ -34,6 +34,12 @@ fn discover(root: &Path, dyn_langs: &[DynamicLanguage]) -> Result<Vec<Discovered
         .git_ignore(true)
         .git_exclude(true)
         .add_custom_ignore_filename(IGNORE_FILE);
+    // Honor agent-exclusion files so sensitive data (secrets, key material) can
+    // be kept out of the index entirely — and therefore out of any agent-facing
+    // output (wiki, MCP, …). Listed alongside `.gitignore` and dotfile hiding.
+    for ignore_file in [".aiignore", ".aiexclude", ".claudeignore"] {
+        walker.add_custom_ignore_filename(ignore_file);
+    }
 
     let mut out = Vec::new();
     for entry in walker.build() {
