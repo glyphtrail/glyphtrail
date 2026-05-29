@@ -2,3 +2,6 @@
 graph.html
 .codegraph/
 .meridian/
+# Default output dirs/files of the wiki and story commands.
+/wiki/
+/STORY.md
