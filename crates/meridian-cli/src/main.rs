@@ -93,6 +93,8 @@ enum Command {
         #[arg(long, default_value = ".")]
         repo: PathBuf,
     },
+    /// Generate a documentation wiki from the graph via an LLM.
+    Wiki(commands::wiki::WikiArgs),
     /// Run a Model Context Protocol server over stdio (for agents/editors).
     Mcp {
         #[arg(long, default_value = ".")]
@@ -174,6 +176,7 @@ fn main() -> anyhow::Result<()> {
         Command::Serve { repo, port } => commands::serve::run(&repo, port),
         Command::Impact(args) => commands::impact::run(args),
         Command::Cypher { query, repo } => commands::cypher::run(&repo, &query),
+        Command::Wiki(args) => commands::wiki::run(args),
         Command::Mcp { repo } => meridian_mcp::serve_stdio(repo),
         Command::Repo { cmd } => commands::repo::run(cmd),
         Command::Status { repo, all } => {

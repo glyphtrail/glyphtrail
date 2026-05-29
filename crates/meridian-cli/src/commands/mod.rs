@@ -8,3 +8,4 @@ pub mod schema;
 pub mod serve;
 pub mod status;
 pub mod viz;
+pub mod wiki;
