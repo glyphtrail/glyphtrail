@@ -8,6 +8,7 @@ pub mod gin;
 pub mod spring;
 mod ts;
 pub mod utoipa;
+pub mod warp;
 
 use meridian_core::{HttpMethod, Language, Span};
 
@@ -18,6 +19,7 @@ pub use flask::{extract_flask, extract_flask_mounts, extract_flask_router_mounts
 pub use gin::{extract_gin, extract_gin_mounts};
 pub use spring::{extract_spring, extract_spring_mounts};
 pub use utoipa::{extract_utoipa, extract_utoipa_mounts};
+pub use warp::{extract_warp, extract_warp_mounts};
 
 /// A server endpoint extracted from router code.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +86,22 @@ impl RestServerExtractor for AxumExtractor {
     }
     fn mounts(&self, source: &str) -> Vec<RawMount> {
         extract_axum_mounts(source)
+    }
+}
+
+struct WarpExtractor;
+impl RestServerExtractor for WarpExtractor {
+    fn name(&self) -> &'static str {
+        "warp"
+    }
+    fn language(&self) -> Language {
+        Language::Rust
+    }
+    fn endpoints(&self, source: &str) -> Vec<RawEndpoint> {
+        extract_warp(source)
+    }
+    fn mounts(&self, source: &str) -> Vec<RawMount> {
+        extract_warp_mounts(source)
     }
 }
 
@@ -196,6 +214,7 @@ pub fn registry() -> Vec<Box<dyn RestServerExtractor>> {
     vec![
         Box::new(AxumExtractor),
         Box::new(UtoipaExtractor),
+        Box::new(WarpExtractor),
         Box::new(SpringExtractor),
         Box::new(GinExtractor),
         Box::new(FlaskExtractor),
@@ -221,7 +240,7 @@ mod tests {
 
     #[test]
     fn registry_filters_by_language() {
-        check!(extractors_for(&Language::Rust).len() == 2);
+        check!(extractors_for(&Language::Rust).len() == 3);
         check!(
             extractors_for(&Language::Python)
                 .iter()
