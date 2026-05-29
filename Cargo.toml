@@ -60,3 +60,15 @@ tree-sitter-ruby = "0.23"
 
 [profile.release]
 lto = "thin"
+
+# Always build the LadybugDB native dependency (`lbug`) optimized, regardless of
+# meridian's own profile. Its C++ core is unusably slow unoptimized, and a debug
+# build of meridian shouldn't pay to compile a debug `lbug`. The `opt-level`
+# also makes the `cmake` build script select CMAKE_BUILD_TYPE=Release.
+[profile.dev.package.lbug]
+opt-level = 3
+debug = false
+
+[profile.test.package.lbug]
+opt-level = 3
+debug = false
