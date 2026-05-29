@@ -12,6 +12,8 @@
 ; Calls
 (call_expression function: (identifier) @call)
 (call_expression function: (member_expression property: (property_identifier) @call))
+; Constructor instantiation `new Foo()` references the class (#5).
+(new_expression constructor: (identifier) @call)
 
 ; Imports
 (import_statement source: (string) @import)

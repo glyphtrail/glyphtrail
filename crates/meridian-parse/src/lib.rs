@@ -159,6 +159,36 @@ mod tests {
         }
     }
 
+    // #5: `new Foo()` constructor instantiation is a reference to the class, so
+    // it is captured as a call in JS/TS/TSX and Java (Python `Foo()` already is).
+    #[test]
+    fn captures_constructor_instantiations() {
+        let cases = [
+            (
+                Language::JavaScript,
+                "function f(){ const a = new Foo(); }\n",
+            ),
+            (
+                Language::TypeScript,
+                "function f(){ const a = new Foo(); }\n",
+            ),
+            (Language::Tsx, "function f(){ return new Foo(); }\n"),
+            (
+                Language::Java,
+                "class C { void m(){ Foo a = new Foo(); } }\n",
+            ),
+        ];
+        for (lang, src) in cases {
+            let parsed = parse_source(&lang, src).unwrap();
+            check!(
+                parsed.calls.iter().any(|c| c.name == "Foo"),
+                "{}: expected constructor call `Foo`, got {:?}",
+                lang.name(),
+                parsed.calls.iter().map(|c| &c.name).collect::<Vec<_>>()
+            );
+        }
+    }
+
     #[test]
     fn extracts_rust_function_and_call() {
         let src = r#"
