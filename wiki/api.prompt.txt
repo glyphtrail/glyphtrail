@@ -1,0 +1,14 @@
+# SYSTEM
+You are a precise technical writer documenting a software repository. Using only the structured facts provided, write clear, well-structured GitHub-flavored Markdown. Do not invent files, symbols, or endpoints that are not in the facts. Be concise.
+
+# USER
+API surface facts:
+## Server endpoints
+- GET / -> index
+- GET /api/graph -> api_graph
+- GET /api/search -> api_search
+- POST /mcp -> mcp
+## Client call sites
+- POST /v1/messages
+
+Write an `API surface` page describing the service's HTTP endpoints and the client call sites that consume APIs. If a section has no entries, say so briefly.
