@@ -80,6 +80,21 @@ tasks:
     cmds:
       - cargo run -p meridian-cli {{.PROFILE_FLAG}} -- status {{.CLI_ARGS}}
 
+  # Reports API contract drift between code endpoints and the blessed schema.
+  # Requires a prior `task analyze` and a configured `[[api.schemas]]`.
+  # Pass extra flags after `--`, e.g. `task drift -- --format json`.
+  drift:
+    desc: Report API drift (code endpoints vs blessed schema)
+    cmds:
+      - cargo run -p meridian-cli {{.PROFILE_FLAG}} -- drift {{.CLI_ARGS}}
+
+  # Drift check that exits non-zero (code 2) when the API surface has drifted.
+  # Intended for CI pipelines guarding the code↔contract boundary.
+  drift:gate:
+    desc: Fail if API contract drift is found (CI gate)
+    cmds:
+      - cargo run -p meridian-cli {{.PROFILE_FLAG}} -- drift --gate {{.CLI_ARGS}}
+
   # Emits a shell completion script to stdout.
   # Override shell: `task completions SHELL_KIND=zsh`
   completions:
