@@ -11,14 +11,16 @@
 //! has no handler), and the receiver is not `axios`.
 //!
 //! Router mounting (`app.use("/api", router)`) emits a `MOUNTS` edge between
-//! `Router` nodes via [`extract_express_router_mounts`]; endpoint prefix
-//! accumulation across mounts remains a follow-up.
+//! `Router` nodes via [`extract_express_router_mounts`], and routes declared on
+//! a mounted router are prefixed with its mount path (#166).
 
 use tree_sitter::{Node, Parser, Tree};
 
 use meridian_core::{HttpMethod, Language};
 
-use super::ts::{span_of, text};
+use std::collections::HashMap;
+
+use super::ts::{join, span_of, text};
 use super::{RawEndpoint, RawMount, RawRouterMount};
 use crate::registry;
 
@@ -31,15 +33,32 @@ pub fn extract_express(source: &str, lang: &Language) -> Vec<RawEndpoint> {
         return Vec::new();
     };
     let src = source.as_bytes();
+    // Mounted router variable -> its mount prefix, so a route declared on a
+    // router that `app.use("/api", router)` mounts is prefixed `/api` (#166).
+    let prefixes = mount_prefixes(tree.root_node(), src);
     let mut out = Vec::new();
     super::ts::walk(tree.root_node(), &mut |n| {
         if n.kind() == "call_expression"
-            && let Some(ep) = route(n, src)
+            && let Some(ep) = route(n, src, &prefixes)
         {
             out.push(ep);
         }
     });
     out
+}
+
+/// Map each mounted router variable to the prefix it is mounted under, from
+/// `app.use("/api", router)` calls. One level deep (no transitive chains).
+fn mount_prefixes(root: Node, src: &[u8]) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    super::ts::walk(root, &mut |n| {
+        if n.kind() == "call_expression"
+            && let Some(m) = router_mount(n, src)
+        {
+            map.insert(m.mounted, m.prefix);
+        }
+    });
+    map
 }
 
 /// Express composes via router variables, not function builders, so no builder
@@ -113,14 +132,16 @@ fn parse(source: &str, lang: &Language) -> Option<Tree> {
 }
 
 /// An `app.VERB("/path", …handlers, handler)` call as a `RawEndpoint`, else
-/// `None`.
-fn route(call: Node, src: &[u8]) -> Option<RawEndpoint> {
+/// `None`. The route's path is prefixed with the receiver router's mount prefix
+/// (`prefixes`) when it is a router that `app.use(...)` mounts under a path.
+fn route(call: Node, src: &[u8], prefixes: &HashMap<String, String>) -> Option<RawEndpoint> {
     let func = call.child_by_field_name("function")?;
     if func.kind() != "member_expression" {
         return None;
     }
     // Exclude axios so its `.get`/`.post` client calls aren't read as routes.
-    if text(func.child_by_field_name("object")?, src) == "axios" {
+    let receiver = text(func.child_by_field_name("object")?, src);
+    if receiver == "axios" {
         return None;
     }
     let verb = text(func.child_by_field_name("property")?, src);
@@ -142,9 +163,13 @@ fn route(call: Node, src: &[u8]) -> Option<RawEndpoint> {
     if !is_handler(last) {
         return None;
     }
+    let full = match prefixes.get(&receiver) {
+        Some(prefix) => join(prefix, &path),
+        None => path,
+    };
     Some(RawEndpoint {
         method,
-        path,
+        path: full,
         handler: handler_name(last, src),
         span: span_of(call),
     })
@@ -236,6 +261,32 @@ app.use("/api", apiRouter);
     fn use_is_not_a_route() {
         let eps = extract_express(APP, &Language::JavaScript);
         check!(eps.len() == 4);
+    }
+
+    #[test]
+    fn routes_on_a_mounted_router_get_the_mount_prefix() {
+        let src = r#"
+const app = express();
+const apiRouter = express.Router();
+apiRouter.get("/users/:id", getUser);
+apiRouter.post("/users", createUser);
+app.get("/health", health);
+app.use("/api", apiRouter);
+"#;
+        let eps = extract_express(src, &Language::JavaScript);
+        // Routes on apiRouter are prefixed with the /api mount path (#166). The
+        // prefix join also normalizes the param (`:id` -> `{id}`); the matcher
+        // collapses both spellings to one signature regardless.
+        check!(
+            ep(&eps, HttpMethod::Get, "/api/users/{id}").map(|e| e.handler.as_str())
+                == Some("getUser")
+        );
+        check!(
+            ep(&eps, HttpMethod::Post, "/api/users").map(|e| e.handler.as_str())
+                == Some("createUser")
+        );
+        // A route on `app` itself is unprefixed.
+        check!(ep(&eps, HttpMethod::Get, "/health").map(|e| e.handler.as_str()) == Some("health"));
     }
 
     #[test]
