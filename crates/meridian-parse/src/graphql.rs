@@ -175,4 +175,153 @@ impl MutationRoot {
                 .is_empty()
         );
     }
+
+    #[test]
+    fn first_operation_handles_named_anonymous_and_alias() {
+        check!(
+            first_operation("query GetUser { getUser(id: 1) { name } }")
+                == Some(("Query", "getUser".into()))
+        );
+        check!(
+            first_operation("mutation { createUser(name: \"a\") { id } }")
+                == Some(("Mutation", "createUser".into()))
+        );
+        check!(first_operation("{ users { id } }") == Some(("Query", "users".into())));
+        check!(
+            first_operation("query Foo($id: ID!) { u: getUser(id: $id) { name } }")
+                == Some(("Query", "getUser".into()))
+        );
+        check!(first_operation("subscription { ticks }") == Some(("Subscription", "ticks".into())));
+    }
+
+    #[test]
+    fn extracts_gql_tagged_and_called_client_ops() {
+        let src = "const Q = gql`query GetUser { getUser(id: 1) { name } }`;\n\
+                   const M = graphql(`mutation { createUser(name: \"a\") { id } }`);";
+        let ops = extract_graphql_client_ops(src, &Language::JavaScript);
+        check!(
+            ops.iter()
+                .any(|o| o.op_type == "Query" && o.field == "getUser")
+        );
+        check!(
+            ops.iter()
+                .any(|o| o.op_type == "Mutation" && o.field == "createUser")
+        );
+    }
+
+    #[test]
+    fn non_js_yields_no_client_ops() {
+        check!(extract_graphql_client_ops("gql`query { x }`", &Language::Rust).is_empty());
+    }
+}
+
+/// A client-side GraphQL operation call site (`gql`/`graphql` tagged document).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawGraphqlClientOp {
+    pub op_type: &'static str,
+    pub field: String,
+    pub span: Span,
+}
+
+/// Extract client GraphQL operations from JS/TS source: `gql`/`graphql`-tagged
+/// (or -called) documents, reduced to the operation's first root field.
+pub fn extract_graphql_client_ops(source: &str, lang: &Language) -> Vec<RawGraphqlClientOp> {
+    if !matches!(
+        lang,
+        Language::JavaScript | Language::TypeScript | Language::Tsx
+    ) {
+        return Vec::new();
+    }
+    let Some(tree) = parse_lang(source, lang) else {
+        return Vec::new();
+    };
+    let src = source.as_bytes();
+    let mut out = Vec::new();
+    walk(tree.root_node(), &mut |n| {
+        if n.kind() != "call_expression" {
+            return;
+        }
+        let callee = n
+            .child_by_field_name("function")
+            .or_else(|| n.named_child(0))
+            .map(|c| text(c, src));
+        if !matches!(callee.as_deref(), Some("gql") | Some("graphql")) {
+            return;
+        }
+        if let Some(frag) = template_text(n, src)
+            && let Some((op_type, field)) = first_operation(&frag)
+        {
+            out.push(RawGraphqlClientOp {
+                op_type,
+                field,
+                span: span_of(n),
+            });
+        }
+    });
+    out
+}
+
+/// Concatenated `string_fragment`s of the first `template_string` under `node`.
+fn template_text(node: Node, src: &[u8]) -> Option<String> {
+    let mut found: Option<String> = None;
+    walk(node, &mut |n| {
+        if found.is_none() && n.kind() == "template_string" {
+            let mut s = String::new();
+            let mut cursor = n.walk();
+            for c in n.named_children(&mut cursor) {
+                if c.kind() == "string_fragment" {
+                    s.push_str(&text(c, src));
+                }
+            }
+            found = Some(s);
+        }
+    });
+    found
+}
+
+/// Reduce a GraphQL operation document to `(OpType, first root field)`.
+/// Handles named/anonymous operations, variable definitions, and field aliases.
+fn first_operation(doc: &str) -> Option<(&'static str, String)> {
+    let cleaned: String = doc
+        .lines()
+        .map(|l| l.split('#').next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let s = cleaned.trim_start();
+    let (op, rest) = if let Some(r) = s.strip_prefix("mutation") {
+        ("Mutation", r)
+    } else if let Some(r) = s.strip_prefix("subscription") {
+        ("Subscription", r)
+    } else if let Some(r) = s.strip_prefix("query") {
+        ("Query", r)
+    } else {
+        ("Query", s) // anonymous `{ … }`
+    };
+    let brace = rest.find('{')?;
+    first_field(&rest[brace + 1..]).map(|field| (op, field))
+}
+
+/// Leading identifier of `s`, with the remainder after it.
+fn take_ident(s: &str) -> Option<(String, &str)> {
+    let s = s.trim_start();
+    let end = s
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .unwrap_or(s.len());
+    (end > 0).then(|| (s[..end].to_string(), &s[end..]))
+}
+
+/// The first field name inside a selection set, resolving `alias: field`.
+fn first_field(sel: &str) -> Option<String> {
+    let (first, rest) = take_ident(sel)?;
+    // `alias: field` — the real field follows the colon.
+    if let Some(after) = rest.trim_start().strip_prefix(':') {
+        return take_ident(after).map(|(f, _)| f);
+    }
+    Some(first)
+}
+
+fn parse_lang(source: &str, lang: &Language) -> Option<Tree> {
+    let mut parser = Parser::new();
+    parser.set_language(&registry::grammar(lang)?).ok()?;
+    parser.parse(source, None)
 }
