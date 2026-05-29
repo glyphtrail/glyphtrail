@@ -25,6 +25,9 @@ pub enum Language {
     Scala,
     OCaml,
     Haskell,
+    Lua,
+    Swift,
+    Elixir,
     /// A language identified by name but not built in (dynamically loaded).
     Other(String),
 }
@@ -49,6 +52,9 @@ impl Language {
             Language::Scala => "scala",
             Language::OCaml => "ocaml",
             Language::Haskell => "haskell",
+            Language::Lua => "lua",
+            Language::Swift => "swift",
+            Language::Elixir => "elixir",
             Language::Other(name) => name,
         }
     }
@@ -74,6 +80,9 @@ impl Language {
             "scala" | "sc" => Language::Scala,
             "ml" | "mli" => Language::OCaml,
             "hs" => Language::Haskell,
+            "lua" => Language::Lua,
+            "swift" => Language::Swift,
+            "ex" | "exs" => Language::Elixir,
             _ => return None,
         })
     }
@@ -97,11 +106,14 @@ impl Language {
             "scala" => Language::Scala,
             "ocaml" => Language::OCaml,
             "haskell" => Language::Haskell,
+            "lua" => Language::Lua,
+            "swift" => Language::Swift,
+            "elixir" => Language::Elixir,
             _ => return None,
         })
     }
 
-    pub const ALL: [Language; 17] = [
+    pub const ALL: [Language; 20] = [
         Language::Rust,
         Language::Python,
         Language::JavaScript,
@@ -119,5 +131,8 @@ impl Language {
         Language::Scala,
         Language::OCaml,
         Language::Haskell,
+        Language::Lua,
+        Language::Swift,
+        Language::Elixir,
     ];
 }

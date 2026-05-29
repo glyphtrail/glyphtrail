@@ -23,6 +23,9 @@ pub fn grammar(lang: &Language) -> Option<TsLanguage> {
         Language::Scala => tree_sitter_scala::LANGUAGE.into(),
         Language::OCaml => tree_sitter_ocaml::LANGUAGE_OCAML.into(),
         Language::Haskell => tree_sitter_haskell::LANGUAGE.into(),
+        Language::Lua => tree_sitter_lua::LANGUAGE.into(),
+        Language::Swift => tree_sitter_swift::LANGUAGE.into(),
+        Language::Elixir => tree_sitter_elixir::LANGUAGE.into(),
         Language::Other(_) => return None,
     })
 }
@@ -53,6 +56,9 @@ pub fn query_source(lang: &Language) -> Option<&'static str> {
         Language::Scala => include_str!("../queries/scala.scm"),
         Language::OCaml => include_str!("../queries/ocaml.scm"),
         Language::Haskell => include_str!("../queries/haskell.scm"),
+        Language::Lua => include_str!("../queries/lua.scm"),
+        Language::Swift => include_str!("../queries/swift.scm"),
+        Language::Elixir => include_str!("../queries/elixir.scm"),
         Language::Other(_) => return None,
     })
 }

@@ -84,6 +84,9 @@ mod tests {
             (Language::Scala, "def f(): Unit = {}\n"),
             (Language::OCaml, "let f x = x\n"),
             (Language::Haskell, "f x = x\n"),
+            (Language::Lua, "local function f() end\n"),
+            (Language::Swift, "func f() {}\n"),
+            (Language::Elixir, "def f(x), do: x\n"),
         ];
         for (lang, src) in cases {
             let parsed = parse_source(&lang, src)
@@ -131,6 +134,13 @@ mod tests {
             (Language::Scala, "// note\ndef f(): Unit = { g() }\n", "g"),
             (Language::OCaml, "(* note *)\nlet f x = g x\n", "g"),
             (Language::Haskell, "-- note\nf x = g x\n", "g"),
+            (
+                Language::Lua,
+                "-- note\nlocal function f(x) return g(x) end\n",
+                "g",
+            ),
+            (Language::Swift, "// note\nfunc f() { g() }\n", "g"),
+            (Language::Elixir, "# note\ndef f(x), do: g(x)\n", "g"),
         ];
         for (lang, src, call) in cases {
             let parsed = parse_source(&lang, src)
