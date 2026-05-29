@@ -20,6 +20,9 @@ pub enum Language {
     CSharp,
     Ruby,
     Kotlin,
+    Bash,
+    Php,
+    Scala,
     /// A language identified by name but not built in (dynamically loaded).
     Other(String),
 }
@@ -39,6 +42,9 @@ impl Language {
             Language::CSharp => "csharp",
             Language::Ruby => "ruby",
             Language::Kotlin => "kotlin",
+            Language::Bash => "bash",
+            Language::Php => "php",
+            Language::Scala => "scala",
             Language::Other(name) => name,
         }
     }
@@ -59,6 +65,9 @@ impl Language {
             "cs" => Language::CSharp,
             "rb" => Language::Ruby,
             "kt" | "kts" => Language::Kotlin,
+            "sh" | "bash" => Language::Bash,
+            "php" => Language::Php,
+            "scala" | "sc" => Language::Scala,
             _ => return None,
         })
     }
@@ -77,11 +86,14 @@ impl Language {
             "csharp" => Language::CSharp,
             "ruby" => Language::Ruby,
             "kotlin" => Language::Kotlin,
+            "bash" => Language::Bash,
+            "php" => Language::Php,
+            "scala" => Language::Scala,
             _ => return None,
         })
     }
 
-    pub const ALL: [Language; 12] = [
+    pub const ALL: [Language; 15] = [
         Language::Rust,
         Language::Python,
         Language::JavaScript,
@@ -94,5 +106,8 @@ impl Language {
         Language::CSharp,
         Language::Ruby,
         Language::Kotlin,
+        Language::Bash,
+        Language::Php,
+        Language::Scala,
     ];
 }

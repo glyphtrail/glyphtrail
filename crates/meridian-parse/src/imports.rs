@@ -36,6 +36,9 @@ pub fn resolve_import(importer_rel: &str, raw: &str, lang: &Language) -> Vec<Str
         | Language::CSharp
         | Language::Ruby
         | Language::Kotlin
+        | Language::Bash
+        | Language::Php
+        | Language::Scala
         | Language::Other(_) => Vec::new(),
     }
 }
