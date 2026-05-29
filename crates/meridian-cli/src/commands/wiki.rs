@@ -6,14 +6,14 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, anyhow, bail};
-use clap::{Args, ValueEnum};
+use anyhow::{Context, Result, bail};
+use clap::Args;
 use meridian_core::NodeKind;
 use meridian_core::config::RepoPaths;
 use meridian_store::GraphStore;
-use serde_json::{Value, json};
 
 use super::backend::{self, BackendKind};
+use super::llm::{Llm, Provider};
 
 #[derive(Args)]
 pub struct WikiArgs {
@@ -38,17 +38,6 @@ pub struct WikiArgs {
     /// Write the composed prompts instead of calling the LLM (no network/keys).
     #[arg(long)]
     pub dry_run: bool,
-}
-
-#[derive(Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
-pub enum Provider {
-    /// Anthropic Claude (`ANTHROPIC_API_KEY`).
-    #[default]
-    Claude,
-    /// OpenAI (`OPENAI_API_KEY`).
-    Openai,
-    /// OpenRouter, OpenAI-compatible (`OPENROUTER_API_KEY`).
-    Openrouter,
 }
 
 pub fn run(args: WikiArgs) -> Result<()> {
@@ -169,83 +158,6 @@ fn operations_facts(
         lines.push(format!("- {method} {}{handler}", key.path));
     }
     Ok(lines.join("\n"))
-}
-
-struct Llm {
-    provider: Provider,
-    model: String,
-    key: String,
-    base_url: Option<String>,
-}
-
-impl Llm {
-    fn new(provider: Provider, model: Option<String>, base_url: Option<String>) -> Result<Self> {
-        let (env, default_model) = match provider {
-            Provider::Claude => ("ANTHROPIC_API_KEY", "claude-sonnet-4-6"),
-            Provider::Openai => ("OPENAI_API_KEY", "gpt-4o"),
-            Provider::Openrouter => ("OPENROUTER_API_KEY", "anthropic/claude-3.5-sonnet"),
-        };
-        let key = std::env::var(env)
-            .map_err(|_| anyhow!("set {env} (or use --dry-run) to generate the wiki"))?;
-        Ok(Self {
-            provider,
-            model: model.unwrap_or_else(|| default_model.to_string()),
-            key,
-            base_url,
-        })
-    }
-
-    fn complete(&self, system: &str, user: &str) -> Result<String> {
-        match self.provider {
-            Provider::Claude => self.anthropic(system, user),
-            Provider::Openai | Provider::Openrouter => self.openai_compatible(system, user),
-        }
-    }
-
-    fn anthropic(&self, system: &str, user: &str) -> Result<String> {
-        let body = json!({
-            "model": self.model,
-            "max_tokens": 4096,
-            "system": system,
-            "messages": [{ "role": "user", "content": user }],
-        });
-        let resp: Value = ureq::post("https://api.anthropic.com/v1/messages")
-            .set("x-api-key", &self.key)
-            .set("anthropic-version", "2023-06-01")
-            .set("content-type", "application/json")
-            .send_json(body)?
-            .into_json()?;
-        resp["content"][0]["text"]
-            .as_str()
-            .map(str::to_string)
-            .ok_or_else(|| anyhow!("unexpected Anthropic response: {resp}"))
-    }
-
-    fn openai_compatible(&self, system: &str, user: &str) -> Result<String> {
-        let url = self.base_url.clone().unwrap_or_else(|| {
-            match self.provider {
-                Provider::Openai => "https://api.openai.com/v1/chat/completions",
-                _ => "https://openrouter.ai/api/v1/chat/completions",
-            }
-            .to_string()
-        });
-        let body = json!({
-            "model": self.model,
-            "messages": [
-                { "role": "system", "content": system },
-                { "role": "user", "content": user },
-            ],
-        });
-        let resp: Value = ureq::post(&url)
-            .set("Authorization", &format!("Bearer {}", self.key))
-            .set("content-type", "application/json")
-            .send_json(body)?
-            .into_json()?;
-        resp["choices"][0]["message"]["content"]
-            .as_str()
-            .map(str::to_string)
-            .ok_or_else(|| anyhow!("unexpected response: {resp}"))
-    }
 }
 
 #[cfg(test)]

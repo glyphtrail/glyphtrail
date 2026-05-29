@@ -99,6 +99,8 @@ enum Command {
     },
     /// Generate a documentation wiki from the graph via an LLM.
     Wiki(commands::wiki::WikiArgs),
+    /// Narrate the repository's history from its git log via an LLM.
+    Story(commands::story::StoryArgs),
     /// Run a Model Context Protocol server over stdio (for agents/editors).
     Mcp {
         #[arg(long, default_value = ".")]
@@ -185,6 +187,7 @@ fn main() -> anyhow::Result<()> {
         Command::Impact(args) => commands::impact::run(args),
         Command::Cypher { query, repo } => commands::cypher::run(&repo, &query),
         Command::Wiki(args) => commands::wiki::run(args),
+        Command::Story(args) => commands::story::run(args),
         Command::Mcp { repo } => meridian_mcp::serve_stdio(repo),
         Command::Repo { cmd } => commands::repo::run(cmd),
         Command::Status { repo, all } => {
