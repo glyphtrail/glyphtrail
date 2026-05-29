@@ -10,8 +10,8 @@ use meridian_core::{
 };
 use meridian_parse::{
     DynamicGrammar, PendingEdge, build_client_graph, build_file_graph, build_graphql_client_graph,
-    build_graphql_graph, build_grpc_graph, build_rest_graph, load_dynamic, parse_source,
-    resolve_import,
+    build_graphql_graph, build_grpc_client_graph, build_grpc_graph, build_rest_graph, load_dynamic,
+    parse_source, resolve_import,
 };
 use std::collections::HashSet;
 
@@ -237,6 +237,10 @@ pub fn run(path: &Path, update: bool, backend: BackendKind) -> Result<()> {
                 let qc = build_graphql_client_graph(&f.rel_path, &source, &f.language);
                 graph.extend(qc.graph);
                 operations.extend(qc.operations);
+                // gRPC client stub calls (tonic) → INVOKES.
+                let gc = build_grpc_client_graph(&f.rel_path, &source, &f.language);
+                graph.extend(gc.graph);
+                operations.extend(gc.operations);
                 graph.extend(fg.graph);
                 pending.extend(fg.pending);
                 imports.extend(

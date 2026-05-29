@@ -235,6 +235,39 @@ pub struct ClientGraph {
     pub operations: Vec<(NodeId, OperationKey)>,
 }
 
+/// Build the gRPC client-call fragment for a file: each tonic stub call
+/// (`client.method(req)`) becomes a `ClientCall` keyed `Service/method`, linked
+/// to the server endpoint / proto op by the matcher (INVOKES). Rust-only.
+pub fn build_grpc_client_graph(rel_path: &str, source: &str, lang: &Language) -> ClientGraph {
+    let mut cg = ClientGraph::default();
+    if *lang != Language::Rust {
+        return cg;
+    }
+    for call in crate::grpc::extract_grpc_client_calls(source) {
+        let path = format!("{}/{}", call.service, call.method);
+        let id = NodeId::derive(&[
+            rel_path,
+            "client_call",
+            "grpc",
+            &path,
+            &call.span.start_byte.to_string(),
+        ]);
+        cg.graph.add_node(Node {
+            id: id.clone(),
+            kind: NodeKind::ClientCall,
+            name: format!("grpc {path}"),
+            qualified_name: path.clone(),
+            file: rel_path.to_string(),
+            language: Some(lang.name().to_string()),
+            span: Some(call.span),
+            doc: None,
+        });
+        cg.operations
+            .push((id, OperationKey::opaque(Protocol::Grpc, path)));
+    }
+    cg
+}
+
 /// Build the GraphQL client-op fragment for a JS/TS file: each `gql`/`graphql`
 /// document becomes a `ClientCall` keyed `OpType.field`, linked to a resolver
 /// endpoint / schema op by the matcher (INVOKES) via the GraphQL signature.
