@@ -32,23 +32,88 @@ pub fn extract_flask(source: &str) -> Vec<RawEndpoint> {
     let src = source.as_bytes();
     let prefixes = router_prefixes(tree.root_node(), src);
     let mut out = Vec::new();
-    super::ts::walk(tree.root_node(), &mut |n| {
-        if n.kind() == "decorated_definition" {
-            collect(n, src, &prefixes, &mut out);
-        }
+    super::ts::walk(tree.root_node(), &mut |n| match n.kind() {
+        "decorated_definition" => collect(n, src, &prefixes, &mut out),
+        "call" => collect_add_url_rule(n, src, &prefixes, &mut out),
+        _ => {}
     });
     out
 }
 
-/// Map each FastAPI router variable to its accumulated path prefix: the
-/// `APIRouter(prefix=…)` declared prefix, prepended by any
-/// `include_router(router, prefix=…)` mount prefix.
+/// `app.add_url_rule("/x", view_func=fn, methods=[...])` — the imperative
+/// route registration. The receiver's accumulated prefix applies (e.g. when
+/// called on a blueprint variable); methods default to GET.
+fn collect_add_url_rule(
+    n: Node,
+    src: &[u8],
+    prefixes: &HashMap<String, String>,
+    out: &mut Vec<RawEndpoint>,
+) {
+    if attr_name(n, src).as_deref() != Some("add_url_rule") {
+        return;
+    }
+    let args = n.child_by_field_name("arguments");
+    let Some(path) = first_string_arg(args, src) else {
+        return;
+    };
+    let handler = ident_kwarg(args, "view_func", src).unwrap_or_default();
+    let prefix = n
+        .child_by_field_name("function")
+        .and_then(|f| f.child_by_field_name("object"))
+        .map(|o| text(o, src))
+        .and_then(|recv| prefixes.get(&recv).cloned())
+        .unwrap_or_default();
+    let full = join(&prefix, &path);
+    let methods = methods_kwarg(args, src);
+    let methods = if methods.is_empty() {
+        vec![HttpMethod::Get]
+    } else {
+        methods
+    };
+    for method in methods {
+        out.push(RawEndpoint {
+            method,
+            path: full.clone(),
+            handler: handler.clone(),
+            span: span_of(n),
+        });
+    }
+}
+
+/// The identifier value of a `name=ident` keyword argument (e.g. `view_func=fn`).
+fn ident_kwarg(args: Option<Node>, name: &str, src: &[u8]) -> Option<String> {
+    let args = args?;
+    let mut cursor = args.walk();
+    args.named_children(&mut cursor).find_map(|arg| {
+        (arg.kind() == "keyword_argument"
+            && arg
+                .child_by_field_name("name")
+                .map(|n| text(n, src))
+                .as_deref()
+                == Some(name))
+        .then(|| {
+            arg.child_by_field_name("value")
+                .filter(|v| v.kind() == "identifier")
+                .map(|v| text(v, src))
+        })
+        .flatten()
+    })
+}
+
+/// The attribute names that mount a router/blueprint variable under a host,
+/// with the keyword carrying the mount prefix: FastAPI `include_router(…,
+/// prefix=)` and Flask `register_blueprint(…, url_prefix=)`.
+const MOUNT_CALLS: [&str; 2] = ["include_router", "register_blueprint"];
+
+/// Map each router/blueprint variable to its accumulated path prefix: the
+/// `APIRouter(prefix=…)` / `Blueprint(url_prefix=…)` declared prefix, prepended
+/// by any `include_router` / `register_blueprint` mount prefix.
 fn router_prefixes(root: Node, src: &[u8]) -> HashMap<String, String> {
     let mut own: HashMap<String, String> = HashMap::new();
     let mut mounted: HashMap<String, String> = HashMap::new();
     super::ts::walk(root, &mut |n| match n.kind() {
-        "assignment" => collect_apirouter(n, src, &mut own),
-        "call" => collect_include_router(n, src, &mut mounted),
+        "assignment" => collect_router_decl(n, src, &mut own),
+        "call" => collect_mount(n, src, &mut mounted),
         _ => {}
     });
 
@@ -65,40 +130,59 @@ fn router_prefixes(root: Node, src: &[u8]) -> HashMap<String, String> {
         .collect()
 }
 
-/// Record a `router = APIRouter(prefix="/x")` declaration.
-fn collect_apirouter(n: Node, src: &[u8], own: &mut HashMap<String, String>) {
-    if let Some(var) = n.child_by_field_name("left").map(|l| text(l, src))
-        && let Some(rhs) = n
-            .child_by_field_name("right")
-            .filter(|r| r.kind() == "call")
-        && is_call_to(rhs, "APIRouter", src)
-    {
-        let p =
-            string_kwarg(rhs.child_by_field_name("arguments"), "prefix", src).unwrap_or_default();
-        own.insert(var, p);
-    }
+/// Record a `router = APIRouter(prefix="/x")` or `bp = Blueprint(..,
+/// url_prefix="/x")` declaration and its own prefix.
+fn collect_router_decl(n: Node, src: &[u8], own: &mut HashMap<String, String>) {
+    let Some(var) = n.child_by_field_name("left").map(|l| text(l, src)) else {
+        return;
+    };
+    let Some(rhs) = n
+        .child_by_field_name("right")
+        .filter(|r| r.kind() == "call")
+    else {
+        return;
+    };
+    let kwarg = if is_call_to(rhs, "APIRouter", src) {
+        "prefix"
+    } else if is_call_to(rhs, "Blueprint", src) {
+        "url_prefix"
+    } else {
+        return;
+    };
+    let p = string_kwarg(rhs.child_by_field_name("arguments"), kwarg, src).unwrap_or_default();
+    own.insert(var, p);
 }
 
-/// Record an `app.include_router(router, prefix="/y")` mount.
-fn collect_include_router(n: Node, src: &[u8], mounted: &mut HashMap<String, String>) {
-    if attr_name(n, src).as_deref() == Some("include_router")
+/// Record an `app.include_router(r, prefix="/y")` / `app.register_blueprint(bp,
+/// url_prefix="/y")` mount and the prefix it imposes on the mounted variable.
+fn collect_mount(n: Node, src: &[u8], mounted: &mut HashMap<String, String>) {
+    if MOUNT_CALLS.contains(&attr_name(n, src).as_deref().unwrap_or(""))
         && let Some(child) = first_positional_ident(n.child_by_field_name("arguments"), src)
     {
-        let p = string_kwarg(n.child_by_field_name("arguments"), "prefix", src).unwrap_or_default();
+        let args = n.child_by_field_name("arguments");
+        let p = mount_prefix(args, src);
         mounted.insert(child, p);
     }
 }
 
-/// Flask blueprints / builder mounting are a follow-up; no builder mounts are
-/// emitted. Router-variable mounts (`include_router`) are handled separately by
-/// [`extract_flask_router_mounts`].
+/// The mount prefix from an `include_router`/`register_blueprint` call: FastAPI
+/// uses `prefix=`, Flask uses `url_prefix=`.
+fn mount_prefix(args: Option<Node>, src: &[u8]) -> String {
+    string_kwarg(args, "prefix", src)
+        .or_else(|| string_kwarg(args, "url_prefix", src))
+        .unwrap_or_default()
+}
+
+/// Flask builder mounting is not used; routers/blueprints compose via variables,
+/// emitted by [`extract_flask_router_mounts`].
 pub fn extract_flask_mounts(_source: &str) -> Vec<RawMount> {
     Vec::new()
 }
 
-/// Router-variable mounts: `app.include_router(router, prefix="/y")` mounts the
-/// `router` variable under `app` at `/y` (#128). The receiver is the host
-/// router, the first positional identifier is the mounted router.
+/// Router-variable mounts: `app.include_router(r, prefix="/y")` (FastAPI) and
+/// `app.register_blueprint(bp, url_prefix="/y")` (Flask) mount the variable
+/// under the receiver (#128/#89). The receiver is the host, the first positional
+/// identifier is the mounted router/blueprint.
 pub fn extract_flask_router_mounts(source: &str) -> Vec<RawRouterMount> {
     let Some(tree) = parse(source) else {
         return Vec::new();
@@ -107,19 +191,17 @@ pub fn extract_flask_router_mounts(source: &str) -> Vec<RawRouterMount> {
     let mut out = Vec::new();
     super::ts::walk(tree.root_node(), &mut |n| {
         if n.kind() == "call"
-            && attr_name(n, src).as_deref() == Some("include_router")
+            && MOUNT_CALLS.contains(&attr_name(n, src).as_deref().unwrap_or(""))
             && let Some(host) = n
                 .child_by_field_name("function")
                 .and_then(|f| f.child_by_field_name("object"))
                 .map(|o| text(o, src))
             && let Some(mounted) = first_positional_ident(n.child_by_field_name("arguments"), src)
         {
-            let prefix =
-                string_kwarg(n.child_by_field_name("arguments"), "prefix", src).unwrap_or_default();
             out.push(RawRouterMount {
                 host,
                 mounted,
-                prefix,
+                prefix: mount_prefix(n.child_by_field_name("arguments"), src),
                 span: span_of(n),
             });
         }
@@ -392,6 +474,47 @@ def create(): ...
         check!(
             ep(&eps, HttpMethod::Post, "/v1/items").map(|e| e.handler.as_str()) == Some("create")
         );
+    }
+
+    #[test]
+    fn flask_blueprint_prefix_register_and_mount() {
+        let src = r#"
+bp = Blueprint("users", __name__, url_prefix="/users")
+
+@bp.route("/<int:id>", methods=["GET", "DELETE"])
+def get_user(id): ...
+
+app.register_blueprint(bp, url_prefix="/api")
+"#;
+        let eps = extract_flask(src);
+        // /api (register_blueprint) + /users (Blueprint) + /{id} (route, with the
+        // `<int:id>` Flask converter normalized to `{id}`).
+        check!(
+            ep(&eps, HttpMethod::Get, "/api/users/{id}").map(|e| e.handler.as_str())
+                == Some("get_user")
+        );
+        check!(ep(&eps, HttpMethod::Delete, "/api/users/{id}").is_some());
+        // register_blueprint emits a router-variable MOUNTS pair.
+        let mounts = extract_flask_router_mounts(src);
+        check!(
+            mounts
+                .iter()
+                .any(|m| m.host == "app" && m.mounted == "bp" && m.prefix == "/api")
+        );
+    }
+
+    #[test]
+    fn flask_add_url_rule_imperative_route() {
+        let src = r#"
+def home(): ...
+app.add_url_rule("/home", view_func=home, methods=["GET", "POST"])
+app.add_url_rule("/ping", view_func=ping)
+"#;
+        let eps = extract_flask(src);
+        check!(ep(&eps, HttpMethod::Get, "/home").map(|e| e.handler.as_str()) == Some("home"));
+        check!(ep(&eps, HttpMethod::Post, "/home").is_some());
+        // Methods default to GET when omitted.
+        check!(ep(&eps, HttpMethod::Get, "/ping").map(|e| e.handler.as_str()) == Some("ping"));
     }
 
     #[test]
