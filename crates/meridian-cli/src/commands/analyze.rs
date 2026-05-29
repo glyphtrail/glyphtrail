@@ -20,6 +20,7 @@ use crate::commands::schema;
 use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
 use indicatif::{ProgressBar, ProgressStyle};
+use rayon::prelude::*;
 
 /// A spinner for an open-ended phase. Auto-hidden when stderr is not a terminal
 /// (pipes, CI, tests), so it never pollutes captured output.
@@ -79,6 +80,128 @@ struct DiscoveredFile {
     abs_path: std::path::PathBuf,
     language: Language,
     hash: String,
+}
+
+/// One file's parsed graph fragment plus the side lists merged into the global
+/// accumulators after the parallel parse (#169).
+struct FileOutput {
+    graph: CodeGraph,
+    operations: Vec<(NodeId, OperationKey)>,
+    pending_handlers: Vec<(String, NodeId)>,
+    pending: Vec<PendingEdge>,
+    imports: Vec<(String, String, String)>,
+}
+
+/// Parse one discovered file and build its graph fragment + side lists. Pure and
+/// self-contained (no DB, no shared mutable state), so it runs in parallel
+/// (#169). `dyn_grammars` is pre-resolved so dynamic languages need no mutation
+/// here. Returns `None` only when the file can't be read; a parse failure or a
+/// missing dynamic grammar still yields the file node (matching the prior
+/// sequential behavior).
+fn parse_file(
+    f: &DiscoveredFile,
+    repo_id: &NodeId,
+    dyn_grammars: &HashMap<String, Option<DynamicGrammar>>,
+) -> Option<FileOutput> {
+    let source = std::fs::read_to_string(&f.abs_path).ok()?;
+    let file_id = NodeId::derive(&["file", &f.rel_path]);
+    let mut out = FileOutput {
+        graph: CodeGraph::new(),
+        operations: Vec::new(),
+        pending_handlers: Vec::new(),
+        pending: Vec::new(),
+        imports: Vec::new(),
+    };
+    out.graph.add_node(Node {
+        id: file_id.clone(),
+        kind: NodeKind::File,
+        name: f.rel_path.clone(),
+        qualified_name: f.rel_path.clone(),
+        file: f.rel_path.clone(),
+        language: Some(f.language.name().to_string()),
+        span: None,
+        doc: None,
+    });
+    out.graph.add_edge(
+        repo_id.clone(),
+        file_id.clone(),
+        EdgeKind::Contains,
+        Confidence::Extracted,
+    );
+
+    // Built-in languages parse via the compiled-in registry; a dynamic
+    // `Language::Other` is parsed with its pre-resolved grammar + query.
+    let parsed = match &f.language {
+        Language::Other(name) => match dyn_grammars.get(name).and_then(|o| o.as_ref()) {
+            Some(dg) => meridian_parse::parse_with(&dg.grammar, &dg.query, &source),
+            None => return Some(out),
+        },
+        builtin => parse_source(builtin, &source),
+    };
+    let parsed = match parsed {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("parse failed for {}: {e}", f.rel_path);
+            return Some(out);
+        }
+    };
+
+    let fg = build_file_graph(&f.rel_path, &f.language, &file_id, &parsed);
+    // REST server-route extraction runs for any language with a registered
+    // extractor (registry decides; no-op otherwise).
+    let rg = build_rest_graph(&f.rel_path, &f.language, &fg.symbols, &source);
+    out.graph.extend(rg.graph);
+    out.operations.extend(rg.operations);
+    out.pending_handlers.extend(rg.pending_handlers);
+    // gRPC server-impl extraction (tonic/Rust).
+    let gg = build_grpc_graph(&f.rel_path, &f.language, &fg.symbols, &source);
+    out.graph.extend(gg.graph);
+    out.operations.extend(gg.operations);
+    out.pending_handlers.extend(gg.pending_handlers);
+    // GraphQL resolver extraction (async-graphql/Rust).
+    let qg = build_graphql_graph(&f.rel_path, &f.language, &fg.symbols, &source);
+    out.graph.extend(qg.graph);
+    out.operations.extend(qg.operations);
+    out.pending_handlers.extend(qg.pending_handlers);
+    // Client-call extraction (fetch/axios/reqwest/...).
+    let cg = build_client_graph(&f.rel_path, &source, &f.language);
+    // GraphQL client operations (gql-tagged docs) → INVOKES.
+    let qc = build_graphql_client_graph(&f.rel_path, &source, &f.language);
+    // gRPC client stub calls (tonic) → INVOKES.
+    let gc = build_grpc_client_graph(&f.rel_path, &source, &f.language);
+    // WebSocket client connections (`new WebSocket(url)`) → INVOKES (#51).
+    let wc = build_ws_client_graph(&f.rel_path, &source, &f.language);
+    // Link each client call site to its enclosing function (#130).
+    let client_call_nodes: Vec<Node> = cg
+        .graph
+        .nodes
+        .iter()
+        .chain(&qc.graph.nodes)
+        .chain(&gc.graph.nodes)
+        .chain(&wc.graph.nodes)
+        .filter(|n| n.kind == NodeKind::ClientCall)
+        .cloned()
+        .collect();
+    let enclosing_edges = meridian_parse::enclosing_call_edges(&fg.graph.nodes, &client_call_nodes);
+    out.graph.extend(cg.graph);
+    out.operations.extend(cg.operations);
+    out.graph.extend(qc.graph);
+    out.operations.extend(qc.operations);
+    out.graph.extend(gc.graph);
+    out.operations.extend(gc.operations);
+    out.graph.extend(wc.graph);
+    out.operations.extend(wc.operations);
+    out.graph.extend(fg.graph);
+    for e in enclosing_edges {
+        out.graph.add_edge(e.src, e.dst, e.kind, e.confidence);
+    }
+    out.pending.extend(fg.pending);
+    out.imports.extend(
+        fg.imports
+            .into_iter()
+            .map(|raw| (f.rel_path.clone(), raw, f.language.name().to_string())),
+    );
+    Some(out)
 }
 
 fn discover(
@@ -252,114 +375,44 @@ pub fn run(path: &Path, update: bool, backend: BackendKind) -> Result<()> {
     // (importer rel-path, raw import, language name) resolved against the file set.
     let mut imports: Vec<(String, String, String)> = Vec::new();
 
+    // Pre-resolve dynamic-language grammars once (sequential; warns once per
+    // missing grammar) so the parallel parse can read them immutably.
     for f in &changed {
-        parse_progress.set_message(f.rel_path.clone());
-        parse_progress.inc(1);
-        if update {
-            store.delete_file_data(&f.rel_path)?;
-        }
-        let source = match std::fs::read_to_string(&f.abs_path) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let file_id = NodeId::derive(&["file", &f.rel_path]);
-        graph.add_node(Node {
-            id: file_id.clone(),
-            kind: NodeKind::File,
-            name: f.rel_path.clone(),
-            qualified_name: f.rel_path.clone(),
-            file: f.rel_path.clone(),
-            language: Some(f.language.name().to_string()),
-            span: None,
-            doc: None,
-        });
-        graph.add_edge(
-            repo_id.clone(),
-            file_id.clone(),
-            EdgeKind::Contains,
-            Confidence::Extracted,
-        );
-
-        // Built-in languages parse via the compiled-in registry; a dynamic
-        // `Language::Other` is parsed with its runtime-loaded grammar + query.
-        let parsed = match &f.language {
-            Language::Other(name) => {
-                match dynamic_grammar(name, &cfg.languages, &mut dyn_grammars, &root) {
-                    Some(dg) => meridian_parse::parse_with(&dg.grammar, &dg.query, &source),
-                    None => continue,
-                }
-            }
-            builtin => parse_source(builtin, &source),
-        };
-        match parsed {
-            Ok(parsed) => {
-                let fg = build_file_graph(&f.rel_path, &f.language, &file_id, &parsed);
-                // REST server-route extraction runs for any language with a
-                // registered extractor (registry decides; no-op otherwise).
-                let rg = build_rest_graph(&f.rel_path, &f.language, &fg.symbols, &source);
-                graph.extend(rg.graph);
-                operations.extend(rg.operations);
-                pending_handlers.extend(rg.pending_handlers);
-                // gRPC server-impl extraction (tonic/Rust): Service/method
-                // endpoints, linked to proto SchemaOps via EXPOSES.
-                let gg = build_grpc_graph(&f.rel_path, &f.language, &fg.symbols, &source);
-                graph.extend(gg.graph);
-                operations.extend(gg.operations);
-                pending_handlers.extend(gg.pending_handlers);
-                // GraphQL resolver extraction (async-graphql/Rust): OpType.field
-                // endpoints, linked to SDL/Hasura SchemaOps via EXPOSES.
-                let qg = build_graphql_graph(&f.rel_path, &f.language, &fg.symbols, &source);
-                graph.extend(qg.graph);
-                operations.extend(qg.operations);
-                pending_handlers.extend(qg.pending_handlers);
-                // Client-call extraction runs for any language with a client
-                // extractor (the extractor decides; no-op otherwise).
-                let cg = build_client_graph(&f.rel_path, &source, &f.language);
-                // GraphQL client operations (gql-tagged docs) → INVOKES.
-                let qc = build_graphql_client_graph(&f.rel_path, &source, &f.language);
-                // gRPC client stub calls (tonic) → INVOKES.
-                let gc = build_grpc_client_graph(&f.rel_path, &source, &f.language);
-                // WebSocket client connections (`new WebSocket(url)`) → INVOKES
-                // against the upgrade route (#51).
-                let wc = build_ws_client_graph(&f.rel_path, &source, &f.language);
-                // Link each client call site to its enclosing function so impact
-                // can propagate from a reached ClientCall up to local callers
-                // across the wire (#130). Computed before the graphs are moved.
-                let client_call_nodes: Vec<Node> = cg
-                    .graph
-                    .nodes
-                    .iter()
-                    .chain(&qc.graph.nodes)
-                    .chain(&gc.graph.nodes)
-                    .chain(&wc.graph.nodes)
-                    .filter(|n| n.kind == NodeKind::ClientCall)
-                    .cloned()
-                    .collect();
-                let enclosing_edges =
-                    meridian_parse::enclosing_call_edges(&fg.graph.nodes, &client_call_nodes);
-                graph.extend(cg.graph);
-                operations.extend(cg.operations);
-                graph.extend(qc.graph);
-                operations.extend(qc.operations);
-                graph.extend(gc.graph);
-                operations.extend(gc.operations);
-                graph.extend(wc.graph);
-                operations.extend(wc.operations);
-                graph.extend(fg.graph);
-                for e in enclosing_edges {
-                    graph.add_edge(e.src, e.dst, e.kind, e.confidence);
-                }
-                pending.extend(fg.pending);
-                imports.extend(
-                    fg.imports
-                        .into_iter()
-                        .map(|raw| (f.rel_path.clone(), raw, f.language.name().to_string())),
-                );
-            }
-            Err(e) => tracing::warn!("parse failed for {}: {e}", f.rel_path),
+        if let Language::Other(name) = &f.language {
+            dynamic_grammar(name, &cfg.languages, &mut dyn_grammars, &root);
         }
     }
+
+    // On --update, drop each changed file's prior data before re-inserting. DB
+    // mutation stays sequential; the parse below is parallel.
+    if update {
+        for f in &changed {
+            store.delete_file_data(&f.rel_path)?;
+        }
+    }
+
+    // Parse + build per-file fragments in parallel — CPU-bound and independent
+    // per file (#169). rayon's `par_iter().filter_map().collect()` preserves
+    // input order, so node insertion below stays deterministic.
+    let outputs: Vec<FileOutput> = changed
+        .par_iter()
+        .filter_map(|f| {
+            parse_progress.set_message(f.rel_path.clone());
+            let out = parse_file(f, &repo_id, &dyn_grammars);
+            parse_progress.inc(1);
+            out
+        })
+        .collect();
     parse_progress.finish_and_clear();
+
+    // Merge the fragments into the global accumulators, in file order.
+    for out in outputs {
+        graph.extend(out.graph);
+        operations.extend(out.operations);
+        pending_handlers.extend(out.pending_handlers);
+        pending.extend(out.pending);
+        imports.extend(out.imports);
+    }
 
     let resolve_progress = phase_spinner("resolving references and cross-boundary links");
 
