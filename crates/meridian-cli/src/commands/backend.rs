@@ -3,6 +3,7 @@
 //! either. The LadybugDB backend is only available when built with the
 //! `ladybug` feature.
 
+use std::fmt;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -18,6 +19,15 @@ pub enum BackendKind {
     /// directory). Built unless `--no-default-features`.
     #[default]
     Ladybug,
+}
+
+impl fmt::Display for BackendKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BackendKind::Sqlite => f.write_str("sqlite"),
+            BackendKind::Ladybug => f.write_str("ladybug"),
+        }
+    }
 }
 
 impl BackendKind {

@@ -114,7 +114,15 @@ pub fn call(db: &Path, name: &str, args: &Value) -> Value {
         Ok(s) => s,
         Err(e) => return text_result(&json!({ "error": e }), true),
     };
-    let repo = db.parent().and_then(Path::parent).unwrap_or(Path::new("."));
+    let repo = match db.parent().and_then(Path::parent) {
+        Some(p) => p,
+        None => {
+            return text_result(
+                &json!({ "error": format!("invalid database path: {}", db.display()) }),
+                true,
+            )
+        }
+    };
     match dispatch_on(&*store, repo, name, args) {
         Ok(value) => text_result(&value, false),
         Err(message) => text_result(&json!({ "error": message }), true),

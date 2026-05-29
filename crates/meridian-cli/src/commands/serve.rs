@@ -9,8 +9,10 @@ pub fn run(repo: &Path, port: u16, backend: BackendKind) -> Result<()> {
     let paths = RepoPaths::new(repo);
     if !backend.exists(&paths) {
         bail!(
-            "no index found at {} — run `meridian analyze` first",
-            backend.location(&paths).display()
+            "no {} index found at {} — run `meridian analyze --backend {}` first",
+            backend,
+            backend.location(&paths).display(),
+            backend,
         );
     }
     let store = open_backend(&paths, backend)?;
