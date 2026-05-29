@@ -35,6 +35,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      # LadybugDB (default feature) links `lbug`, which builds from C++ via
+      # cmake/clang if no prebuilt archive matches the target. Linux runners
+      # need the toolchain; macOS/Windows runners ship cmake.
+      - name: Install LadybugDB build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake clang build-essential
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@v2
         with:
