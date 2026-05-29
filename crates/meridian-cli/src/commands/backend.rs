@@ -12,10 +12,11 @@ use meridian_store::{GraphStore, SqliteStore};
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
 pub enum BackendKind {
-    /// SQLite + FTS5 (default; a single `.meridian/graph.db` file).
-    #[default]
+    /// SQLite + FTS5 (a single `.meridian/graph.db` file).
     Sqlite,
-    /// LadybugDB / Cypher (a `.meridian/ladybug` directory; needs `--features ladybug`).
+    /// LadybugDB / Cypher — the default backend (a `.meridian/ladybug`
+    /// directory). Built unless `--no-default-features`.
+    #[default]
     Ladybug,
 }
 

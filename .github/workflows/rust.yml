@@ -23,6 +23,10 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain }}
           components: rustfmt, clippy
+      # LadybugDB is a default feature now, so the default build links `lbug`
+      # (prebuilt archive, or a cmake/clang source build as fallback).
+      - name: Install LadybugDB build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake clang build-essential
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@v2
       - name: Format check

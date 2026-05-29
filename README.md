@@ -139,20 +139,24 @@ A Cargo workspace:
 | `meridian-mcp`    | Model Context Protocol server (stdio) exposing the query tools |
 | `meridian-cli`    | the `meridian` binary |
 
-Storage is SQLite-first behind the `GraphStore` trait, so backends are
-interchangeable. An opt-in **LadybugDB** (Cypher) backend implements the same
-trait:
+Storage sits behind the `GraphStore` trait, so backends are interchangeable.
+**LadybugDB** (Cypher, native graph traversal) is the **default** backend;
+SQLite + FTS5 is the lightweight alternative.
 
 ```sh
-# Build with the LadybugDB backend (pulls the `lbug` crate).
-cargo build --features meridian-store/ladybug
+meridian analyze .                    # default: LadybugDB (.meridian/ladybug)
+meridian analyze . --backend sqlite   # opt out to SQLite (.meridian/graph.db)
+meridian cypher "MATCH (n:Node) RETURN n.name LIMIT 10"   # raw Cypher (LadybugDB)
 ```
 
-The `ladybug` feature is **off by default** so the standard build stays light.
-The `lbug` crate downloads a prebuilt `liblbug`, or compiles LadybugDB from
-source via **cmake + a C/C++ toolchain** (clang/gcc) as a fallback — install
-those if the prebuilt archive is unavailable (e.g. `apt-get install cmake clang
-build-essential`).
+LadybugDB links the `lbug` crate, which downloads a prebuilt `liblbug` or builds
+from source via **cmake + a C/C++ toolchain** (clang/gcc) — install those if the
+prebuilt archive is unavailable (e.g. `apt-get install cmake clang
+build-essential`). To skip the C++ build entirely, build SQLite-only:
+
+```sh
+cargo build --no-default-features -p meridian-cli   # then use --backend sqlite
+```
 
 ## Development
 
