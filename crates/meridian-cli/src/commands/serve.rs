@@ -14,12 +14,13 @@ pub fn run(repo: &Path, port: u16, backend: BackendKind) -> Result<()> {
         );
     }
     let store = backend::open(&paths, backend)?;
-    // The `/mcp` endpoint dispatches against a SQLite path; it is only wired
-    // when serving the sqlite backend (the MCP layer is sqlite-only for now).
-    let mcp_db = match backend {
-        BackendKind::Sqlite => Some(paths.db_path.clone()),
-        _ => None,
-    };
+    // The `/mcp` endpoint opens the repo's graph store itself, auto-detecting the
+    // backend beside this path, so it works for either backend (#165). Passing
+    // the canonical `graph.db` path lets it locate the `.meridian` dir.
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(meridian_server::serve(store, mcp_db, port))
+    rt.block_on(meridian_server::serve(
+        store,
+        Some(paths.db_path.clone()),
+        port,
+    ))
 }

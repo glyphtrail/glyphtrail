@@ -15,5 +15,10 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 
+[features]
+# Serve queries against a LadybugDB index when one exists (#165). Pulls the
+# lbug C++ build via meridian-store; off by default to keep the crate light.
+ladybug = ["meridian-store/ladybug"]
+
 [dev-dependencies]
 assert2.workspace = true
