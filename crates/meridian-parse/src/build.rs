@@ -179,6 +179,54 @@ pub fn build_grpc_graph(
     rg
 }
 
+/// Build the GraphQL endpoint fragment for a file: one `Endpoint` per
+/// async-graphql resolver method (`OpType.field`), `HANDLES`-linked to the
+/// resolver when it resolves to a unique local symbol. Rust-only for now.
+pub fn build_graphql_graph(
+    rel_path: &str,
+    lang: &Language,
+    symbols: &[SymbolEntry],
+    source: &str,
+) -> RestGraph {
+    let mut rg = RestGraph::default();
+    if *lang != Language::Rust {
+        return rg;
+    }
+    let mut seen: HashSet<NodeId> = HashSet::new();
+    for f in crate::graphql::extract_graphql_resolvers(source) {
+        let path = format!("{}.{}", f.op_type, f.field);
+        let ep_id = NodeId::derive(&[rel_path, "endpoint", "graphql", &path]);
+        if !seen.insert(ep_id.clone()) {
+            continue;
+        }
+        rg.graph.add_node(Node {
+            id: ep_id.clone(),
+            kind: NodeKind::Endpoint,
+            name: format!("graphql {path}"),
+            qualified_name: path.clone(),
+            file: rel_path.to_string(),
+            language: Some(lang.name().to_string()),
+            span: Some(f.span),
+            doc: None,
+        });
+        rg.operations
+            .push((ep_id.clone(), OperationKey::opaque(Protocol::GraphQl, path)));
+
+        let local: Vec<&SymbolEntry> = symbols.iter().filter(|s| s.name == f.handler).collect();
+        if local.len() == 1 {
+            rg.graph.add_edge(
+                local[0].id.clone(),
+                ep_id,
+                EdgeKind::Handles,
+                Confidence::Extracted,
+            );
+        } else {
+            rg.pending_handlers.push((f.handler, ep_id));
+        }
+    }
+    rg
+}
+
 /// Client-side API call sites extracted from a JS/TS file: `ClientCall` nodes
 /// and their operation keys (linked to endpoints later by the matcher).
 #[derive(Debug, Default)]

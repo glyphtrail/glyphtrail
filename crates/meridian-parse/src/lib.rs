@@ -4,6 +4,7 @@ pub mod build;
 pub mod client;
 pub mod dynamic;
 pub mod extract;
+pub mod graphql;
 pub mod grpc;
 pub mod imports;
 pub mod registry;
@@ -11,7 +12,7 @@ pub mod rest;
 
 pub use build::{
     ClientGraph, FileGraph, PendingEdge, RestGraph, SymbolEntry, build_client_graph,
-    build_file_graph, build_grpc_graph, build_rest_graph,
+    build_file_graph, build_graphql_graph, build_grpc_graph, build_rest_graph,
 };
 pub use client::{RawClientCall, extract_client_calls};
 pub use dynamic::{DynamicGrammar, load_dynamic};
