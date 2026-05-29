@@ -8,6 +8,8 @@
 //! Client-stub (`INVOKES`) extraction needs receiver-type tracking and is a
 //! follow-up; this covers the server side.
 
+use std::collections::HashMap;
+
 use tree_sitter::{Node, Parser, Tree};
 
 use meridian_core::{Language, Span};
@@ -156,4 +158,119 @@ impl greeter_server::Greeter for S {
         check!(eps.len() == 1);
         check!(eps[0].service == "Greeter");
     }
+
+    #[test]
+    fn extracts_client_stub_calls() {
+        let src = r#"
+async fn run() {
+    let mut client = GreeterClient::connect("http://x").await.unwrap();
+    let _ = client.say_hello(req).await.unwrap();
+    let _ = client.say_goodbye(req2).await;
+}
+"#;
+        let calls = extract_grpc_client_calls(src);
+        check!(
+            calls
+                .iter()
+                .any(|c| c.service == "Greeter" && c.method == "say_hello")
+        );
+        check!(
+            calls
+                .iter()
+                .any(|c| c.service == "Greeter" && c.method == "say_goodbye")
+        );
+        // `.unwrap()`/`.await` chains on non-client receivers are not RPC calls.
+        check!(!calls.iter().any(|c| c.method == "unwrap"));
+    }
+
+    #[test]
+    fn untracked_receivers_yield_no_calls() {
+        let src = "async fn f() { let v = compute(); v.do_thing(x); }";
+        check!(extract_grpc_client_calls(src).is_empty());
+    }
+}
+
+/// A gRPC client stub call site (`var.method(req)` where `var` was built from a
+/// `<Service>Client`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawGrpcCall {
+    pub service: String,
+    pub method: String,
+    pub span: Span,
+}
+
+/// Extract tonic gRPC client calls from Rust `source`. Tracks `let v =
+/// <Service>Client::connect(...)` bindings (the tonic client naming convention),
+/// then method calls `v.method(req)` on those variables.
+pub fn extract_grpc_client_calls(source: &str) -> Vec<RawGrpcCall> {
+    let Some(tree) = parse(source) else {
+        return Vec::new();
+    };
+    let src = source.as_bytes();
+    let root = tree.root_node();
+
+    // Pass 1: variable -> service, from `<Service>Client::…` initializers.
+    let mut var_service: HashMap<String, String> = HashMap::new();
+    walk(root, &mut |n| {
+        if n.kind() != "let_declaration" {
+            return;
+        }
+        let Some(pat) = n
+            .child_by_field_name("pattern")
+            .filter(|p| p.kind() == "identifier")
+        else {
+            return;
+        };
+        let Some(val) = n.child_by_field_name("value") else {
+            return;
+        };
+        let mut service = None;
+        walk(val, &mut |m| {
+            if service.is_none()
+                && m.kind() == "identifier"
+                && let Some(svc) = text(m, src)
+                    .strip_suffix("Client")
+                    .filter(|s| !s.is_empty())
+            {
+                service = Some(svc.to_string());
+            }
+        });
+        if let Some(svc) = service {
+            var_service.insert(text(pat, src), svc);
+        }
+    });
+    if var_service.is_empty() {
+        return Vec::new();
+    }
+
+    // Pass 2: method calls `<var>.method(...)` on a tracked client variable.
+    let mut out = Vec::new();
+    walk(root, &mut |n| {
+        if n.kind() != "call_expression" {
+            return;
+        }
+        let Some(func) = n
+            .child_by_field_name("function")
+            .filter(|f| f.kind() == "field_expression")
+        else {
+            return;
+        };
+        let Some(recv) = func
+            .child_by_field_name("value")
+            .filter(|o| o.kind() == "identifier")
+            .map(|o| text(o, src))
+        else {
+            return;
+        };
+        if let Some(service) = var_service.get(&recv)
+            && let Some(method) = func.child_by_field_name("field").map(|f| text(f, src))
+        {
+            out.push(RawGrpcCall {
+                service: service.clone(),
+                method,
+                span: span_of(n),
+            });
+        }
+    });
+    out
 }
