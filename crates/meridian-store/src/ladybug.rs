@@ -12,7 +12,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use lbug::{Connection, Database, SystemConfig, Value};
 use meridian_core::{
     Adjacency, ClassifiedItem, Confidence, Direction, Edge, EdgeKind, ImpactPolicy, Node, NodeId,
@@ -27,8 +27,8 @@ const SCHEMA: &[&str] = &[
     "CREATE REL TABLE IF NOT EXISTS Edge(FROM Node TO Node, kind STRING, confidence STRING)",
     "CREATE NODE TABLE IF NOT EXISTS File(path STRING, language STRING, hash STRING, PRIMARY KEY(path))",
     "CREATE NODE TABLE IF NOT EXISTS ApiOp(node_id STRING, protocol STRING, method STRING, path STRING, signature STRING, PRIMARY KEY(node_id))",
-    "CREATE NODE TABLE IF NOT EXISTS Pending(rowid STRING, anchor STRING, name STRING, kind STRING, name_is_src INT64, PRIMARY KEY(rowid))",
-    "CREATE NODE TABLE IF NOT EXISTS Import(rowid STRING, importer STRING, raw STRING, language STRING, PRIMARY KEY(rowid))",
+    "CREATE NODE TABLE IF NOT EXISTS Pending(pk STRING, anchor STRING, name STRING, kind STRING, name_is_src INT64, PRIMARY KEY(pk))",
+    "CREATE NODE TABLE IF NOT EXISTS Import(pk STRING, importer STRING, raw STRING, language STRING, PRIMARY KEY(pk))",
     "CREATE NODE TABLE IF NOT EXISTS Meta(key STRING, value STRING, PRIMARY KEY(key))",
 ];
 
@@ -60,12 +60,24 @@ impl LadybugStore {
     fn run(&self, cypher: &str, params: Vec<(&str, Value)>) -> Result<Vec<Vec<Value>>> {
         let conn = self.conn()?;
         let rows: Vec<Vec<Value>> = if params.is_empty() {
-            conn.query(cypher)?.collect()
+            conn.query(cypher)
+                .with_context(|| cypher.to_string())?
+                .collect()
         } else {
-            let mut stmt = conn.prepare(cypher)?;
-            conn.execute(&mut stmt, params)?.collect()
+            let mut stmt = conn.prepare(cypher).with_context(|| cypher.to_string())?;
+            conn.execute(&mut stmt, params)
+                .with_context(|| cypher.to_string())?
+                .collect()
         };
         Ok(rows)
+    }
+
+    /// Prepare + execute one statement, attaching the query as error context.
+    fn exec(&self, conn: &Connection, cypher: &str, params: Vec<(&str, Value)>) -> Result<()> {
+        let mut st = conn.prepare(cypher).with_context(|| cypher.to_string())?;
+        conn.execute(&mut st, params)
+            .with_context(|| cypher.to_string())?;
+        Ok(())
     }
 
     fn run_nodes(&self, cypher: &str, params: Vec<(&str, Value)>) -> Result<Vec<Node>> {
@@ -79,9 +91,6 @@ impl LadybugStore {
 
 fn s(v: &str) -> Value {
     Value::String(v.to_string())
-}
-fn i(n: i64) -> Value {
-    Value::Int64(n)
 }
 fn get_str(row: &[Value], idx: usize) -> String {
     match row.get(idx) {
@@ -192,6 +201,13 @@ impl Adjacency for LadybugStore {
 }
 
 impl LadybugStore {
+    /// Run a raw Cypher query and return its formatted result (the `cypher`
+    /// subcommand escape hatch, #9).
+    pub fn cypher(&self, query: &str) -> Result<String> {
+        let conn = self.conn()?;
+        Ok(format!("{}", conn.query(query)?))
+    }
+
     fn edge_step(
         &self,
         node: &str,
@@ -213,10 +229,11 @@ impl LadybugStore {
 
 impl GraphStore for LadybugStore {
     fn clear(&mut self) -> Result<()> {
-        let conn = self.conn()?;
-        conn.query("MATCH ()-[e:Edge]->() DELETE e")?;
-        for tbl in ["Node", "File", "ApiOp", "Pending", "Import", "Meta"] {
-            conn.query(&format!("MATCH (n:{tbl}) DELETE n"))?;
+        // DETACH DELETE removes a node and its rels in one step (LadybugDB does
+        // not support deleting undirected rels).
+        self.run("MATCH (n:Node) DETACH DELETE n", vec![])?;
+        for tbl in ["File", "ApiOp", "Pending", "Import", "Meta"] {
+            self.run(&format!("MATCH (n:{tbl}) DELETE n"), vec![])?;
         }
         Ok(())
     }
@@ -234,95 +251,88 @@ impl GraphStore for LadybugStore {
     }
 
     fn delete_file_data(&mut self, path: &str) -> Result<()> {
-        let conn = self.conn()?;
-        let mut st = conn.prepare("MATCH (n:Node {file:$f})-[e:Edge]-() DELETE e")?;
-        conn.execute(&mut st, vec![("f", s(path))])?;
-        let mut st = conn.prepare("MATCH (n:Node {file:$f}) DELETE n")?;
-        conn.execute(&mut st, vec![("f", s(path))])?;
-        let mut st = conn.prepare("MATCH (f:File {path:$f}) DELETE f")?;
-        conn.execute(&mut st, vec![("f", s(path))])?;
-        let mut st = conn.prepare("MATCH (i:Import {importer:$f}) DELETE i")?;
-        conn.execute(&mut st, vec![("f", s(path))])?;
+        self.run(
+            "MATCH (n:Node {file:$f}) DETACH DELETE n",
+            vec![("f", s(path))],
+        )?;
+        self.run("MATCH (f:File {path:$f}) DELETE f", vec![("f", s(path))])?;
+        self.run(
+            "MATCH (i:Import {importer:$f}) DELETE i",
+            vec![("f", s(path))],
+        )?;
         Ok(())
     }
 
     fn delete_nodes_by_kind(&mut self, kind: NodeKind) -> Result<()> {
-        let conn = self.conn()?;
-        let mut st = conn.prepare("MATCH (n:Node {kind:$k})-[e:Edge]-() DELETE e")?;
-        conn.execute(&mut st, vec![("k", s(kind.as_str()))])?;
-        let mut st = conn.prepare("MATCH (n:Node {kind:$k}) DELETE n")?;
-        conn.execute(&mut st, vec![("k", s(kind.as_str()))])?;
+        self.run(
+            "MATCH (n:Node {kind:$k}) DETACH DELETE n",
+            vec![("k", s(kind.as_str()))],
+        )?;
         Ok(())
     }
 
     fn insert_graph(&mut self, nodes: &[Node], edges: &[Edge]) -> Result<()> {
         let conn = self.conn()?;
-        if !nodes.is_empty() {
-            let mut st = conn.prepare(
-                "MERGE (n:Node {id:$id}) SET n.kind=$kind, n.name=$name, n.qualified_name=$qn, \
-                 n.file=$file, n.language=$lang, n.start_byte=$sb, n.end_byte=$eb, \
-                 n.start_line=$sl, n.end_line=$el, n.doc=$doc",
+        // lbug caches a parameter's type by name within a connection, so each
+        // statement uses its own freshly-prepared connection (via `exec`) to keep
+        // INT64 and STRING params from colliding across the analyze flow.
+        for n in nodes {
+            let (sb, eb, sl, el) = n
+                .span
+                .map(|sp| {
+                    (
+                        sp.start_byte as i64,
+                        sp.end_byte as i64,
+                        sp.start_line as i64,
+                        sp.end_line as i64,
+                    )
+                })
+                .unwrap_or((-1, -1, -1, -1));
+            // Integer columns are inlined (not bound) so no INT64 parameter is
+            // ever created; see `lit`.
+            self.exec(
+                &conn,
+                &format!(
+                    "MERGE (n:Node {{id:$id}}) SET n.kind=$kind, n.name=$name, \
+                     n.qualified_name=$qn, n.file=$file, n.language=$lang, \
+                     n.start_byte={sb}, n.end_byte={eb}, n.start_line={sl}, \
+                     n.end_line={el}, n.doc=$doc"
+                ),
+                vec![
+                    ("id", s(&n.id.0)),
+                    ("kind", s(n.kind.as_str())),
+                    ("name", s(&n.name)),
+                    ("qn", s(&n.qualified_name)),
+                    ("file", s(&n.file)),
+                    ("lang", s(n.language.as_deref().unwrap_or(""))),
+                    ("doc", s(n.doc.as_deref().unwrap_or(""))),
+                ],
             )?;
-            for n in nodes {
-                let (sb, eb, sl, el) = n
-                    .span
-                    .map(|sp| {
-                        (
-                            sp.start_byte as i64,
-                            sp.end_byte as i64,
-                            sp.start_line as i64,
-                            sp.end_line as i64,
-                        )
-                    })
-                    .unwrap_or((-1, -1, -1, -1));
-                conn.execute(
-                    &mut st,
-                    vec![
-                        ("id", s(&n.id.0)),
-                        ("kind", s(n.kind.as_str())),
-                        ("name", s(&n.name)),
-                        ("qn", s(&n.qualified_name)),
-                        ("file", s(&n.file)),
-                        ("lang", s(n.language.as_deref().unwrap_or(""))),
-                        ("sb", i(sb)),
-                        ("eb", i(eb)),
-                        ("sl", i(sl)),
-                        ("el", i(el)),
-                        ("doc", s(n.doc.as_deref().unwrap_or(""))),
-                    ],
-                )?;
-            }
         }
-        if !edges.is_empty() {
-            let mut st = conn.prepare(
-                "MATCH (a:Node {id:$s}), (b:Node {id:$d}) \
-                 MERGE (a)-[e:Edge {kind:$k}]->(b) \
-                 ON CREATE SET e.confidence=$c \
-                 ON MATCH SET e.confidence = CASE WHEN $c = 'extracted' THEN 'extracted' ELSE e.confidence END",
+        for e in edges {
+            self.exec(
+                &conn,
+                "MATCH (a:Node {id:$src}), (b:Node {id:$dst}) \
+                 MERGE (a)-[e:Edge {kind:$ekind}]->(b) \
+                 ON CREATE SET e.confidence=$conf \
+                 ON MATCH SET e.confidence = CASE WHEN $conf = 'extracted' THEN 'extracted' ELSE e.confidence END",
+                vec![
+                    ("src", s(&e.src.0)),
+                    ("dst", s(&e.dst.0)),
+                    ("ekind", s(e.kind.as_str())),
+                    ("conf", s(e.confidence.as_str())),
+                ],
             )?;
-            for e in edges {
-                conn.execute(
-                    &mut st,
-                    vec![
-                        ("s", s(&e.src.0)),
-                        ("d", s(&e.dst.0)),
-                        ("k", s(e.kind.as_str())),
-                        ("c", s(e.confidence.as_str())),
-                    ],
-                )?;
-            }
         }
         Ok(())
     }
 
     fn insert_operations(&mut self, ops: &[(NodeId, OperationKey)]) -> Result<()> {
         let conn = self.conn()?;
-        let mut st = conn.prepare(
-            "MERGE (o:ApiOp {node_id:$id}) SET o.protocol=$p, o.method=$m, o.path=$path, o.signature=$sig",
-        )?;
         for (id, key) in ops {
-            conn.execute(
-                &mut st,
+            self.exec(
+                &conn,
+                "MERGE (o:ApiOp {node_id:$id}) SET o.protocol=$p, o.method=$m, o.path=$path, o.signature=$sig",
                 vec![
                     ("id", s(&id.0)),
                     ("p", s(key.protocol.as_str())),
@@ -337,9 +347,6 @@ impl GraphStore for LadybugStore {
 
     fn insert_pending(&mut self, links: &[PendingLink]) -> Result<()> {
         let conn = self.conn()?;
-        let mut st = conn.prepare(
-            "MERGE (p:Pending {rowid:$r}) SET p.anchor=$a, p.name=$n, p.kind=$k, p.name_is_src=$s",
-        )?;
         for l in links {
             let rowid = format!(
                 "{}|{}|{}|{}",
@@ -348,14 +355,18 @@ impl GraphStore for LadybugStore {
                 l.kind.as_str(),
                 l.name_is_src
             );
-            conn.execute(
-                &mut st,
+            self.exec(
+                &conn,
+                &format!(
+                    "MERGE (p:Pending {{pk:$r}}) SET p.anchor=$a, p.name=$n, \
+                     p.kind=$k, p.name_is_src={}",
+                    l.name_is_src as i64
+                ),
                 vec![
                     ("r", s(&rowid)),
                     ("a", s(&l.anchor.0)),
                     ("n", s(&l.name)),
                     ("k", s(l.kind.as_str())),
-                    ("s", i(l.name_is_src as i64)),
                 ],
             )?;
         }
@@ -364,18 +375,16 @@ impl GraphStore for LadybugStore {
 
     fn insert_imports(&mut self, imports: &[(String, String, String)]) -> Result<()> {
         let conn = self.conn()?;
-        let mut st = conn.prepare(
-            "MERGE (i:Import {rowid:$r}) SET i.importer=$imp, i.raw=$raw, i.language=$lang",
-        )?;
         for (importer, raw, language) in imports {
             let rowid = format!("{importer}|{raw}|{language}");
-            conn.execute(
-                &mut st,
+            self.exec(
+                &conn,
+                "MERGE (i:Import {pk:$im_rowid}) SET i.importer=$im_importer, i.raw=$im_raw, i.language=$im_lang",
                 vec![
-                    ("r", s(&rowid)),
-                    ("imp", s(importer)),
-                    ("raw", s(raw)),
-                    ("lang", s(language)),
+                    ("im_rowid", s(&rowid)),
+                    ("im_importer", s(importer)),
+                    ("im_raw", s(raw)),
+                    ("im_lang", s(language)),
                 ],
             )?;
         }
@@ -739,6 +748,16 @@ mod tests {
     }
 
     #[test]
+    fn imports_insert_in_isolation() {
+        let dir = tmp_dir("imports");
+        let mut lb = LadybugStore::open(&dir).unwrap();
+        lb.insert_imports(&[("a.rs".into(), "b".into(), "rust".into())])
+            .unwrap();
+        check!(lb.all_imports().unwrap().len() == 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn parity_with_sqlite_on_a_fixture() {
         let nodes = vec![node("a", "caller"), node("b", "callee")];
         let edges = vec![Edge {
@@ -776,6 +795,27 @@ mod tests {
         check!(lb.get_meta("tool_version").unwrap().as_deref() == Some("9.9"));
         lb.set_file("a.rs", Some("rust"), "h1").unwrap();
         check!(lb.file_hash("a.rs").unwrap().as_deref() == Some("h1"));
+
+        // The analyze write sequence (operations + imports + pending) must work
+        // after node inserts — exercises the mixed-write path that hit lbug's
+        // parameter-type cache.
+        lb.insert_operations(&[(
+            NodeId("a".into()),
+            meridian_core::OperationKey::rest(meridian_core::HttpMethod::Get, "/x"),
+        )])
+        .unwrap();
+        lb.insert_imports(&[("a.rs".into(), "b".into(), "rust".into())])
+            .unwrap();
+        lb.insert_pending(&[meridian_core::PendingLink {
+            anchor: NodeId("a".into()),
+            name: "callee".into(),
+            kind: EdgeKind::Calls,
+            name_is_src: false,
+        }])
+        .unwrap();
+        check!(lb.all_imports().unwrap().len() == 1);
+        check!(lb.all_pending().unwrap().len() == 1);
+        check!(lb.operations_by_kind(NodeKind::Function).unwrap().len() == 1);
 
         std::fs::remove_dir_all(&dir).ok();
     }

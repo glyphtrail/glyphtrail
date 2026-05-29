@@ -34,8 +34,8 @@ fn registry_path() -> Result<PathBuf> {
 
 /// Re-analyze every registered repo (`analyze --all`). Per-repo failures are
 /// reported and don't abort the run.
-pub fn analyze_all(update: bool) -> Result<()> {
-    each_repo("analyze", |root| super::analyze::run(root, update))
+pub fn analyze_all(update: bool, backend: super::backend::BackendKind) -> Result<()> {
+    each_repo("analyze", |root| super::analyze::run(root, update, backend))
 }
 
 /// Show index stats for every registered repo (`status --all`).

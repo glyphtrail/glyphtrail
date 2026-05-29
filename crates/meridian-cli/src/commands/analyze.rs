@@ -13,8 +13,10 @@ use meridian_parse::{
 };
 use std::collections::HashSet;
 
+use crate::commands::backend::{self, BackendKind};
 use crate::commands::schema;
 use ignore::WalkBuilder;
+#[cfg(test)]
 use meridian_store::SqliteStore;
 
 struct DiscoveredFile {
@@ -71,13 +73,13 @@ fn discover(root: &Path, dyn_langs: &[DynamicLanguage]) -> Result<Vec<Discovered
     Ok(out)
 }
 
-pub fn run(path: &Path, update: bool) -> Result<()> {
+pub fn run(path: &Path, update: bool, backend: BackendKind) -> Result<()> {
     let root = path
         .canonicalize()
         .with_context(|| format!("cannot resolve path {}", path.display()))?;
     let paths = RepoPaths::new(&root);
     paths.ensure_index_dir()?;
-    let mut store = SqliteStore::open(&paths.db_path)?;
+    let mut store = backend::open(&paths, backend)?;
 
     let cfg = Config::load(&root)?;
     let files = discover(&root, &cfg.languages)?;
@@ -597,7 +599,7 @@ mod tests {
         std::fs::write(dir.join("def.rs"), "\n").unwrap();
 
         // Full index: foo is undefined, so the call cannot resolve yet.
-        run(&dir, false).unwrap();
+        run(&dir, false, BackendKind::Sqlite).unwrap();
         {
             let store = SqliteStore::open(&RepoPaths::new(&dir).db_path).unwrap();
             check!(store.find_by_name("foo").unwrap().is_empty());
@@ -606,7 +608,7 @@ mod tests {
         // Add the definition; caller.rs is unchanged, so only a global
         // re-resolution of persisted pending edges can create the link.
         std::fs::write(dir.join("def.rs"), "fn foo() {}\n").unwrap();
-        run(&dir, true).unwrap();
+        run(&dir, true, BackendKind::Sqlite).unwrap();
         check!(
             callers_of(&dir, "foo").contains(&"use_it".to_string()),
             "expected use_it -> foo after adding the definition on --update"
@@ -622,12 +624,12 @@ mod tests {
         let dir = temp_repo("reresolve-remove");
         std::fs::write(dir.join("caller.rs"), "fn use_it() { foo(); }\n").unwrap();
         std::fs::write(dir.join("def.rs"), "fn foo() {}\n").unwrap();
-        run(&dir, false).unwrap();
+        run(&dir, false, BackendKind::Sqlite).unwrap();
         check!(callers_of(&dir, "foo").contains(&"use_it".to_string()));
 
         // Remove foo; the inferred use_it -> foo edge must disappear.
         std::fs::write(dir.join("def.rs"), "fn other() {}\n").unwrap();
-        run(&dir, true).unwrap();
+        run(&dir, true, BackendKind::Sqlite).unwrap();
         let store = SqliteStore::open(&RepoPaths::new(&dir).db_path).unwrap();
         check!(
             store.find_by_name("foo").unwrap().is_empty(),
@@ -672,7 +674,7 @@ mod tests {
         std::fs::write(dir.join("web/app.ts"), "import { x } from \"./util\";\n").unwrap();
         std::fs::write(dir.join("web/util.ts"), "export const x = 1;\n").unwrap();
         std::fs::write(dir.join("web/ext.ts"), "import \"react\";\n").unwrap();
-        run(&dir, false).unwrap();
+        run(&dir, false, BackendKind::Sqlite).unwrap();
 
         let targets = import_targets(&dir, "web/app.ts");
         check!(
@@ -696,7 +698,7 @@ mod tests {
         let dir = temp_repo("import-add");
         std::fs::create_dir_all(dir.join("web")).unwrap();
         std::fs::write(dir.join("web/app.ts"), "import { x } from \"./util\";\n").unwrap();
-        run(&dir, false).unwrap();
+        run(&dir, false, BackendKind::Sqlite).unwrap();
         // No util.ts yet: the import is a placeholder module.
         check!(
             import_targets(&dir, "web/app.ts")
@@ -707,7 +709,7 @@ mod tests {
 
         // Add the target; app.ts is unchanged, so only the global rebuild links it.
         std::fs::write(dir.join("web/util.ts"), "export const x = 1;\n").unwrap();
-        run(&dir, true).unwrap();
+        run(&dir, true, BackendKind::Sqlite).unwrap();
         let targets = import_targets(&dir, "web/app.ts");
         check!(
             targets.contains(&("web/util.ts".to_string(), "file".to_string())),
@@ -750,7 +752,7 @@ mod tests {
             "import { helper } from \"./b\";\nexport function use() { helper(); }\n",
         )
         .unwrap();
-        run(&dir, false).unwrap();
+        run(&dir, false, BackendKind::Sqlite).unwrap();
 
         // The call resolves to b.ts (imported), not c.ts.
         check!(
@@ -786,7 +788,7 @@ mod tests {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/sample");
         let dir = temp_repo("fixture");
         copy_dir(&fixture, &dir);
-        run(&dir, false).unwrap();
+        run(&dir, false, BackendKind::Sqlite).unwrap();
 
         let store = SqliteStore::open(&RepoPaths::new(&dir).db_path).unwrap();
         // Four source files (2 Rust, 2 Python).
