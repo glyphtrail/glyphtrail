@@ -10,6 +10,8 @@
 
 ; Calls
 (method_invocation name: (identifier) @call)
+; Constructor instantiation `new Bar()` references the class (#5).
+(object_creation_expression type: (type_identifier) @call)
 
 ; Imports
 (import_declaration (scoped_identifier) @import)
