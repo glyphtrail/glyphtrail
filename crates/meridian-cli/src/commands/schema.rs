@@ -82,12 +82,15 @@ pub fn proto_grpc_operations(text: &str) -> Vec<String> {
     out
 }
 
-/// Parse a GraphQL SDL document into the root operations it declares, as
-/// `Query.field` / `Mutation.field` / `Subscription.field`. Best-effort line
-/// scanner: enters a root operation type (`type Query { … }`, optionally
-/// `extend`ed) and takes each field's leading identifier. Object-type fields
-/// don't open braces (args use `()`), so the type's own `}` ends the block.
+/// Parse a GraphQL schema into the root operations it declares, as
+/// `Query.field` / `Mutation.field` / `Subscription.field`. Accepts either SDL
+/// or an introspection-result JSON document (`__schema`), so a remote schema can
+/// be ingested from whichever form is exported (#168). Introspection JSON is
+/// tried first; anything else falls back to the SDL line scanner below.
 pub fn graphql_operations(text: &str) -> Vec<String> {
+    if let Some(ops) = graphql_introspection_operations(text) {
+        return ops;
+    }
     const ROOTS: [&str; 3] = ["Query", "Mutation", "Subscription"];
     let mut out = Vec::new();
     let mut current: Option<&'static str> = None;
@@ -117,6 +120,48 @@ pub fn graphql_operations(text: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// Parse a GraphQL introspection-result JSON document into root operations
+/// (`Query.field`, …). Accepts the bare `{"__schema": …}` or the wrapped
+/// `{"data": {"__schema": …}}` form. Each root is keyed by its *kind*
+/// (Query/Mutation/Subscription), even when the schema names the root type
+/// differently, so the keys match SDL-derived ops and client operation keys.
+/// Returns `None` when the text is not introspection JSON (caller uses SDL).
+fn graphql_introspection_operations(text: &str) -> Option<Vec<String>> {
+    let doc: Value = serde_json::from_str(text).ok()?;
+    let schema = doc
+        .get("__schema")
+        .or_else(|| doc.get("data").and_then(|d| d.get("__schema")))?;
+    let types = schema.get("types").and_then(Value::as_array)?;
+    let mut out = Vec::new();
+    for (root_key, kind) in [
+        ("queryType", "Query"),
+        ("mutationType", "Mutation"),
+        ("subscriptionType", "Subscription"),
+    ] {
+        let Some(type_name) = schema
+            .get(root_key)
+            .and_then(|t| t.get("name"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let Some(ty) = types
+            .iter()
+            .find(|t| t.get("name").and_then(Value::as_str) == Some(type_name))
+        else {
+            continue;
+        };
+        if let Some(fields) = ty.get("fields").and_then(Value::as_array) {
+            for f in fields {
+                if let Some(name) = f.get("name").and_then(Value::as_str) {
+                    out.push(format!("{kind}.{name}"));
+                }
+            }
+        }
+    }
+    Some(out)
 }
 
 /// Parse Hasura metadata (JSON or YAML) into the operations it exposes:
@@ -499,6 +544,31 @@ type Mutation {
     fn graphql_extend_query_is_recognized() {
         let sdl = "extend type Query {\n  health: Boolean\n}\n";
         check!(graphql_operations(sdl) == vec!["Query.health"]);
+    }
+
+    #[test]
+    fn graphql_introspection_json_yields_root_operations() {
+        // A remote schema exported as introspection JSON (#168), with a custom
+        // query root type name (`RootQuery`) keyed back to the `Query` kind.
+        let json = r#"{
+            "data": { "__schema": {
+                "queryType": { "name": "RootQuery" },
+                "mutationType": { "name": "Mutation" },
+                "subscriptionType": null,
+                "types": [
+                    { "name": "RootQuery", "fields": [ {"name": "me"}, {"name": "user"} ] },
+                    { "name": "Mutation", "fields": [ {"name": "createUser"} ] },
+                    { "name": "User", "fields": [ {"name": "id"} ] }
+                ]
+            } }
+        }"#;
+        let ops = graphql_operations(json);
+        check!(ops.contains(&"Query.me".to_string()));
+        check!(ops.contains(&"Query.user".to_string()));
+        check!(ops.contains(&"Mutation.createUser".to_string()));
+        // Non-root object type fields are not operations.
+        check!(!ops.iter().any(|o| o.ends_with(".id")));
+        check!(ops.len() == 3);
     }
 
     #[test]
