@@ -19,6 +19,20 @@ use crate::commands::backend::{self, BackendKind};
 use crate::commands::schema;
 use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
+use indicatif::{ProgressBar, ProgressStyle};
+
+/// A spinner for an open-ended phase. Auto-hidden when stderr is not a terminal
+/// (pipes, CI, tests), so it never pollutes captured output.
+fn phase_spinner(message: &str) -> ProgressBar {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    pb.set_message(message.to_string());
+    pb.enable_steady_tick(std::time::Duration::from_millis(120));
+    pb
+}
 
 /// Build/output/dependency/VCS directories skipped during discovery regardless
 /// of `.gitignore` (#144). Bare names match at any depth (gitignore semantics).
@@ -204,6 +218,14 @@ pub fn run(path: &Path, update: bool, backend: BackendKind) -> Result<()> {
     }
     tracing::info!("{} files need parsing", changed.len());
 
+    // Per-file parse progress. Hidden automatically when stderr is not a TTY.
+    let parse_progress = ProgressBar::new(changed.len() as u64);
+    parse_progress.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} parsing [{bar:30}] {pos}/{len} {wide_msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
+            .progress_chars("=> "),
+    );
+
     // Accumulate the new fragment.
     let repo_name = root
         .file_name()
@@ -231,6 +253,8 @@ pub fn run(path: &Path, update: bool, backend: BackendKind) -> Result<()> {
     let mut imports: Vec<(String, String, String)> = Vec::new();
 
     for f in &changed {
+        parse_progress.set_message(f.rel_path.clone());
+        parse_progress.inc(1);
         if update {
             store.delete_file_data(&f.rel_path)?;
         }
@@ -312,6 +336,9 @@ pub fn run(path: &Path, update: bool, backend: BackendKind) -> Result<()> {
             Err(e) => tracing::warn!("parse failed for {}: {e}", f.rel_path),
         }
     }
+    parse_progress.finish_and_clear();
+
+    let resolve_progress = phase_spinner("resolving references and cross-boundary links");
 
     // Ingest blessed schema artifacts into SchemaOp nodes (reconciled with code
     // endpoints as EXPOSES edges below). Schema ops are derived entirely from
@@ -500,6 +527,7 @@ pub fn run(path: &Path, update: bool, backend: BackendKind) -> Result<()> {
     }
 
     store.set_meta("tool_version", VERSION)?;
+    resolve_progress.finish_and_clear();
 
     let stats = store.stats()?;
     println!(

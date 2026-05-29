@@ -30,6 +30,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 tokio.workspace = true
 ureq = { version = "2", features = ["json"] }
+indicatif = "0.17"
 
 [features]
 # LadybugDB is the default backend (more capable: Cypher + native graph
