@@ -82,6 +82,8 @@ mod tests {
             (Language::Bash, "f() { :; }\n"),
             (Language::Php, "<?php\nfunction f() {}\n"),
             (Language::Scala, "def f(): Unit = {}\n"),
+            (Language::OCaml, "let f x = x\n"),
+            (Language::Haskell, "f x = x\n"),
         ];
         for (lang, src) in cases {
             let parsed = parse_source(&lang, src)
@@ -127,6 +129,8 @@ mod tests {
                 "g",
             ),
             (Language::Scala, "// note\ndef f(): Unit = { g() }\n", "g"),
+            (Language::OCaml, "(* note *)\nlet f x = g x\n", "g"),
+            (Language::Haskell, "-- note\nf x = g x\n", "g"),
         ];
         for (lang, src, call) in cases {
             let parsed = parse_source(&lang, src)

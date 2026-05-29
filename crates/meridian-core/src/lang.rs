@@ -23,6 +23,8 @@ pub enum Language {
     Bash,
     Php,
     Scala,
+    OCaml,
+    Haskell,
     /// A language identified by name but not built in (dynamically loaded).
     Other(String),
 }
@@ -45,6 +47,8 @@ impl Language {
             Language::Bash => "bash",
             Language::Php => "php",
             Language::Scala => "scala",
+            Language::OCaml => "ocaml",
+            Language::Haskell => "haskell",
             Language::Other(name) => name,
         }
     }
@@ -68,6 +72,8 @@ impl Language {
             "sh" | "bash" => Language::Bash,
             "php" => Language::Php,
             "scala" | "sc" => Language::Scala,
+            "ml" | "mli" => Language::OCaml,
+            "hs" => Language::Haskell,
             _ => return None,
         })
     }
@@ -89,11 +95,13 @@ impl Language {
             "bash" => Language::Bash,
             "php" => Language::Php,
             "scala" => Language::Scala,
+            "ocaml" => Language::OCaml,
+            "haskell" => Language::Haskell,
             _ => return None,
         })
     }
 
-    pub const ALL: [Language; 15] = [
+    pub const ALL: [Language; 17] = [
         Language::Rust,
         Language::Python,
         Language::JavaScript,
@@ -109,5 +117,7 @@ impl Language {
         Language::Bash,
         Language::Php,
         Language::Scala,
+        Language::OCaml,
+        Language::Haskell,
     ];
 }
