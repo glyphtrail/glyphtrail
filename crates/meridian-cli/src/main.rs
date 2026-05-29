@@ -89,6 +89,8 @@ enum Command {
     },
     /// Compute the blast radius of a change (symbol, file, or git change set).
     Impact(commands::impact::ImpactArgs),
+    /// Report API contract drift: code endpoints vs blessed schema operations.
+    Drift(commands::drift::DriftArgs),
     /// Run a raw Cypher query against the LadybugDB backend (needs --features ladybug).
     Cypher {
         /// The Cypher query to run.
@@ -185,6 +187,7 @@ fn main() -> anyhow::Result<()> {
             backend,
         } => commands::serve::run(&repo, port, backend),
         Command::Impact(args) => commands::impact::run(args),
+        Command::Drift(args) => commands::drift::run(args),
         Command::Cypher { query, repo } => commands::cypher::run(&repo, &query),
         Command::Wiki(args) => commands::wiki::run(args),
         Command::Story(args) => commands::story::run(args),
