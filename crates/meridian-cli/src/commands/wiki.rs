@@ -35,10 +35,13 @@ pub struct WikiArgs {
     /// Output directory for the generated pages.
     #[arg(long, default_value = "wiki")]
     pub output: PathBuf,
-    /// Output target: plain Markdown, or a GitHub Pages-ready site (adds a
-    /// Jekyll `_config.yml` so the output dir publishes via Pages).
+    /// Output target: plain Markdown, a GitHub Pages-ready site (adds a Jekyll
+    /// `_config.yml`), or serve the generated pages locally over HTTP.
     #[arg(long, value_enum, default_value_t)]
     pub target: Target,
+    /// Port for `--target serve` (the local wiki browser).
+    #[arg(long, default_value_t = 7780)]
+    pub port: u16,
     /// Write the composed prompts instead of calling the LLM (no network/keys).
     #[arg(long)]
     pub dry_run: bool,
@@ -51,6 +54,8 @@ pub enum Target {
     Static,
     /// Markdown plus a Jekyll `_config.yml` for GitHub Pages.
     Pages,
+    /// Generate, then serve the pages locally over HTTP (rendered to HTML).
+    Serve,
 }
 
 pub fn run(args: WikiArgs) -> Result<()> {
@@ -61,6 +66,13 @@ pub fn run(args: WikiArgs) -> Result<()> {
             args.backend.location(&paths).display()
         );
     }
+    // `--target serve --dry-run` browses a previously-generated wiki offline:
+    // skip the graph/LLM work and just serve the existing output directory.
+    if args.target == Target::Serve && args.dry_run {
+        let rt = tokio::runtime::Runtime::new()?;
+        return rt.block_on(meridian_server::serve_wiki(args.output.clone(), args.port));
+    }
+
     let store = backend::open(&paths, args.backend)?;
     let pages = build_pages(store.as_ref())?;
 
@@ -103,6 +115,12 @@ pub fn run(args: WikiArgs) -> Result<()> {
         std::fs::write(&path, pages_config(&title))
             .with_context(|| format!("cannot write {}", path.display()))?;
         println!("wrote {} (GitHub Pages config)", path.display());
+    }
+
+    // Serve the generated pages locally, rendering Markdown to HTML on request.
+    if args.target == Target::Serve {
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(meridian_server::serve_wiki(args.output.clone(), args.port))?;
     }
     Ok(())
 }
