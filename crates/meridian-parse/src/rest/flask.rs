@@ -9,8 +9,8 @@
 //! The decorated function's name is the handler. FastAPI prefixes accumulate:
 //! a route on a `router = APIRouter(prefix="/x")` is prefixed with `/x`, and
 //! `app.include_router(router, prefix="/y")` further prefixes it with `/y`, so
-//! `@router.get("/{id}")` becomes `GET /y/x/{id}`. (Emitting `MOUNTS` edges for
-//! `include_router` needs a router-variable mount model; tracked as a follow-up.)
+//! `@router.get("/{id}")` becomes `GET /y/x/{id}`. `include_router` also emits a
+//! `MOUNTS` edge between `Router` nodes via [`extract_flask_router_mounts`].
 
 use std::collections::HashMap;
 
@@ -19,7 +19,7 @@ use tree_sitter::{Node, Parser, Tree};
 use meridian_core::{HttpMethod, Language};
 
 use super::ts::{join, span_of, text};
-use super::{RawEndpoint, RawMount};
+use super::{RawEndpoint, RawMount, RawRouterMount};
 use crate::registry;
 
 const VERBS: [&str; 6] = ["get", "post", "put", "delete", "patch", "head"];
@@ -89,9 +89,42 @@ fn collect_include_router(n: Node, src: &[u8], mounted: &mut HashMap<String, Str
     }
 }
 
-/// Flask blueprints / mounting are a follow-up; no mounts are emitted.
+/// Flask blueprints / builder mounting are a follow-up; no builder mounts are
+/// emitted. Router-variable mounts (`include_router`) are handled separately by
+/// [`extract_flask_router_mounts`].
 pub fn extract_flask_mounts(_source: &str) -> Vec<RawMount> {
     Vec::new()
+}
+
+/// Router-variable mounts: `app.include_router(router, prefix="/y")` mounts the
+/// `router` variable under `app` at `/y` (#128). The receiver is the host
+/// router, the first positional identifier is the mounted router.
+pub fn extract_flask_router_mounts(source: &str) -> Vec<RawRouterMount> {
+    let Some(tree) = parse(source) else {
+        return Vec::new();
+    };
+    let src = source.as_bytes();
+    let mut out = Vec::new();
+    super::ts::walk(tree.root_node(), &mut |n| {
+        if n.kind() == "call"
+            && attr_name(n, src).as_deref() == Some("include_router")
+            && let Some(host) = n
+                .child_by_field_name("function")
+                .and_then(|f| f.child_by_field_name("object"))
+                .map(|o| text(o, src))
+            && let Some(mounted) = first_positional_ident(n.child_by_field_name("arguments"), src)
+        {
+            let prefix =
+                string_kwarg(n.child_by_field_name("arguments"), "prefix", src).unwrap_or_default();
+            out.push(RawRouterMount {
+                host,
+                mounted,
+                prefix,
+                span: span_of(n),
+            });
+        }
+    });
+    out
 }
 
 fn parse(source: &str) -> Option<Tree> {
@@ -359,6 +392,21 @@ def create(): ...
         check!(
             ep(&eps, HttpMethod::Post, "/v1/items").map(|e| e.handler.as_str()) == Some("create")
         );
+    }
+
+    #[test]
+    fn include_router_yields_router_mount() {
+        let src = r#"
+router = APIRouter(prefix="/users")
+app.include_router(router, prefix="/api")
+"#;
+        let m = extract_flask_router_mounts(src);
+        check!(m.len() == 1);
+        check!(m[0].host == "app");
+        check!(m[0].mounted == "router");
+        check!(m[0].prefix == "/api");
+        // No include_router in the decorator-only fixture.
+        check!(extract_flask_router_mounts(APP).is_empty());
     }
 
     #[test]

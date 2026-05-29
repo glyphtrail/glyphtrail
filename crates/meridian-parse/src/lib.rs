@@ -275,4 +275,37 @@ fn app() -> Router {
             && e.dst == sym("users_router")
             && e.confidence == Confidence::Extracted));
     }
+
+    // #128: FastAPI `include_router` composes via router *variables*, which
+    // become synthetic `Router` nodes linked host -> mounted with `MOUNTS`.
+    #[test]
+    fn router_variable_mounts_emit_router_nodes_and_edges() {
+        use meridian_core::{Confidence, EdgeKind, NodeKind};
+        let src =
+            "router = APIRouter(prefix=\"/users\")\napp.include_router(router, prefix=\"/api\")\n";
+        let rg = build_rest_graph("app.py", &Language::Python, &[], src);
+        let routers: Vec<_> = rg
+            .graph
+            .nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Router)
+            .collect();
+        check!(routers.len() == 2);
+        let host = rg
+            .graph
+            .nodes
+            .iter()
+            .find(|n| n.name == "app" && n.kind == NodeKind::Router)
+            .expect("app router node");
+        let mounted = rg
+            .graph
+            .nodes
+            .iter()
+            .find(|n| n.name == "router" && n.kind == NodeKind::Router)
+            .expect("mounted router node");
+        check!(rg.graph.edges.iter().any(|e| e.kind == EdgeKind::Mounts
+            && e.src == host.id
+            && e.dst == mounted.id
+            && e.confidence == Confidence::Extracted));
+    }
 }
