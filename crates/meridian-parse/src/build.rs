@@ -126,6 +126,40 @@ pub fn build_rest_graph(
                 .add_edge(p, c, EdgeKind::Mounts, Confidence::Extracted);
         }
     }
+
+    // Router-variable composition (#128): FastAPI `include_router`, Express
+    // `app.use`. Each router variable becomes a synthetic `Router` node (one per
+    // file + variable name), linked host -> mounted with `MOUNTS`. Unlike the
+    // builder mounts above, the ends are variables, not function symbols, so
+    // they resolve to these synthetic nodes rather than local `Function` nodes.
+    let mut router_ids: HashSet<NodeId> = HashSet::new();
+    let mut router_edges: HashSet<(NodeId, NodeId)> = HashSet::new();
+    let mut raw_router_mounts = Vec::new();
+    for ex in &extractors {
+        raw_router_mounts.extend(ex.router_mounts(source));
+    }
+    for rm in raw_router_mounts {
+        let host_id = NodeId::derive(&[rel_path, "router", &rm.host]);
+        let mounted_id = NodeId::derive(&[rel_path, "router", &rm.mounted]);
+        for (id, name) in [(&host_id, &rm.host), (&mounted_id, &rm.mounted)] {
+            if router_ids.insert(id.clone()) {
+                rg.graph.add_node(Node {
+                    id: id.clone(),
+                    kind: NodeKind::Router,
+                    name: name.clone(),
+                    qualified_name: name.clone(),
+                    file: rel_path.to_string(),
+                    language: Some(lang.name().to_string()),
+                    span: Some(rm.span),
+                    doc: None,
+                });
+            }
+        }
+        if router_edges.insert((host_id.clone(), mounted_id.clone())) {
+            rg.graph
+                .add_edge(host_id, mounted_id, EdgeKind::Mounts, Confidence::Extracted);
+        }
+    }
     rg
 }
 

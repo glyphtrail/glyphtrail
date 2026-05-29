@@ -13,8 +13,8 @@ use meridian_core::{HttpMethod, Language, Span};
 
 pub use aspnet::{extract_aspnet, extract_aspnet_mounts};
 pub use axum::{extract_axum, extract_axum_mounts};
-pub use express::{extract_express, extract_express_mounts};
-pub use flask::{extract_flask, extract_flask_mounts};
+pub use express::{extract_express, extract_express_mounts, extract_express_router_mounts};
+pub use flask::{extract_flask, extract_flask_mounts, extract_flask_router_mounts};
 pub use gin::{extract_gin, extract_gin_mounts};
 pub use spring::{extract_spring, extract_spring_mounts};
 pub use utoipa::{extract_utoipa, extract_utoipa_mounts};
@@ -39,6 +39,18 @@ pub struct RawMount {
     pub child: String,
 }
 
+/// A router-*variable* mount: host router `host` mounts router `mounted` under
+/// `prefix` (FastAPI `app.include_router(r, prefix=…)`, Express
+/// `app.use("/x", r)`). Both ends are variables (not function builders), so they
+/// resolve to synthetic `Router` nodes rather than `Function` nodes (#128).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawRouterMount {
+    pub host: String,
+    pub mounted: String,
+    pub prefix: String,
+    pub span: Span,
+}
+
 /// A per-framework REST server-route extractor. Each implementation is a
 /// self-contained module that turns source for one framework into endpoints
 /// and router-composition mounts. Implementations share the prefix-accumulation
@@ -52,6 +64,11 @@ pub trait RestServerExtractor {
     fn endpoints(&self, source: &str) -> Vec<RawEndpoint>;
     /// Router-composition mounts (`parent` nests/merges builder `child`).
     fn mounts(&self, source: &str) -> Vec<RawMount>;
+    /// Router-variable mounts (`host` mounts `mounted` under a prefix). Empty for
+    /// frameworks that compose via function builders rather than variables.
+    fn router_mounts(&self, _source: &str) -> Vec<RawRouterMount> {
+        Vec::new()
+    }
 }
 
 struct AxumExtractor;
@@ -132,6 +149,9 @@ impl RestServerExtractor for FlaskExtractor {
     fn mounts(&self, source: &str) -> Vec<RawMount> {
         extract_flask_mounts(source)
     }
+    fn router_mounts(&self, source: &str) -> Vec<RawRouterMount> {
+        extract_flask_router_mounts(source)
+    }
 }
 
 struct AspNetExtractor;
@@ -164,6 +184,9 @@ impl RestServerExtractor for ExpressExtractor {
     }
     fn mounts(&self, source: &str) -> Vec<RawMount> {
         extract_express_mounts(source, &self.0)
+    }
+    fn router_mounts(&self, source: &str) -> Vec<RawRouterMount> {
+        extract_express_router_mounts(source, &self.0)
     }
 }
 

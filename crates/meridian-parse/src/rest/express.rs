@@ -10,15 +10,16 @@
 //! function-like handler argument (an axios `.get(url)` / `.get(url, {config})`
 //! has no handler), and the receiver is not `axios`.
 //!
-//! Router mounting (`app.use("/api", router)`) and prefix accumulation are a
-//! follow-up; flat routes are extracted.
+//! Router mounting (`app.use("/api", router)`) emits a `MOUNTS` edge between
+//! `Router` nodes via [`extract_express_router_mounts`]; endpoint prefix
+//! accumulation across mounts remains a follow-up.
 
 use tree_sitter::{Node, Parser, Tree};
 
 use meridian_core::{HttpMethod, Language};
 
 use super::ts::{span_of, text};
-use super::{RawEndpoint, RawMount};
+use super::{RawEndpoint, RawMount, RawRouterMount};
 use crate::registry;
 
 const VERBS: [&str; 7] = ["get", "post", "put", "delete", "patch", "head", "options"];
@@ -41,9 +42,60 @@ pub fn extract_express(source: &str, lang: &Language) -> Vec<RawEndpoint> {
     out
 }
 
-/// Router mounting is a follow-up; no mounts are emitted.
+/// Express composes via router variables, not function builders, so no builder
+/// mounts are emitted; see [`extract_express_router_mounts`].
 pub fn extract_express_mounts(_source: &str, _lang: &Language) -> Vec<RawMount> {
     Vec::new()
+}
+
+/// Router-variable mounts: `app.use("/api", apiRouter)` mounts `apiRouter` under
+/// `app` at `/api` (#128). Recognized as a `.use(<string path>, …, <identifier>)`
+/// call: a string path argument and a trailing bare-identifier router. This
+/// shape excludes middleware forms (`app.use(express.json())`, `app.use(cors())`)
+/// whose trailing argument is a call, not an identifier.
+pub fn extract_express_router_mounts(source: &str, lang: &Language) -> Vec<RawRouterMount> {
+    let Some(tree) = parse(source, lang) else {
+        return Vec::new();
+    };
+    let src = source.as_bytes();
+    let mut out = Vec::new();
+    super::ts::walk(tree.root_node(), &mut |n| {
+        if n.kind() == "call_expression"
+            && let Some(m) = router_mount(n, src)
+        {
+            out.push(m);
+        }
+    });
+    out
+}
+
+/// An `app.use("/path", router)` call as a [`RawRouterMount`], else `None`.
+fn router_mount(call: Node, src: &[u8]) -> Option<RawRouterMount> {
+    let func = call.child_by_field_name("function")?;
+    if func.kind() != "member_expression" {
+        return None;
+    }
+    let host = text(func.child_by_field_name("object")?, src);
+    if host == "axios" || text(func.child_by_field_name("property")?, src) != "use" {
+        return None;
+    }
+    let args = call.child_by_field_name("arguments")?;
+    let mut cursor = args.walk();
+    let named: Vec<Node> = args.named_children(&mut cursor).collect();
+    if named.len() < 2 {
+        return None;
+    }
+    let prefix = js_url(named[0], src)?;
+    let mounted_node = *named.last()?;
+    if mounted_node.kind() != "identifier" {
+        return None;
+    }
+    Some(RawRouterMount {
+        host,
+        mounted: text(mounted_node, src),
+        prefix,
+        span: span_of(call),
+    })
 }
 
 fn parse(source: &str, lang: &Language) -> Option<Tree> {
@@ -184,6 +236,22 @@ app.use("/api", apiRouter);
     fn use_is_not_a_route() {
         let eps = extract_express(APP, &Language::JavaScript);
         check!(eps.len() == 4);
+    }
+
+    #[test]
+    fn use_with_path_and_router_is_a_router_mount() {
+        let mounts = extract_express_router_mounts(APP, &Language::JavaScript);
+        check!(mounts.len() == 1);
+        check!(mounts[0].host == "app");
+        check!(mounts[0].mounted == "apiRouter");
+        check!(mounts[0].prefix == "/api");
+    }
+
+    #[test]
+    fn middleware_use_is_not_a_router_mount() {
+        // Trailing call argument (middleware), not a router identifier.
+        let src = "const app = express(); app.use(express.json()); app.use(cors());";
+        check!(extract_express_router_mounts(src, &Language::JavaScript).is_empty());
     }
 
     #[test]

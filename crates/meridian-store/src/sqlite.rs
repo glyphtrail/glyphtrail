@@ -751,6 +751,7 @@ fn parse_kind(s: &str) -> NodeKind {
         "endpoint" => NodeKind::Endpoint,
         "client_call" => NodeKind::ClientCall,
         "schema_op" => NodeKind::SchemaOp,
+        "router" => NodeKind::Router,
         _ => NodeKind::Comment,
     }
 }

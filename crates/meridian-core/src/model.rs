@@ -44,6 +44,10 @@ pub enum NodeKind {
     ClientCall,
     /// An operation declared in an API schema artifact (OpenAPI/proto/GraphQL).
     SchemaOp,
+    /// A router value composed via a router variable (FastAPI `APIRouter`,
+    /// Express `express.Router()`); the `MOUNTS` target of `include_router` /
+    /// `app.use`.
+    Router,
 }
 
 impl NodeKind {
@@ -64,6 +68,7 @@ impl NodeKind {
             NodeKind::Endpoint => "endpoint",
             NodeKind::ClientCall => "client_call",
             NodeKind::SchemaOp => "schema_op",
+            NodeKind::Router => "router",
         }
     }
 }
