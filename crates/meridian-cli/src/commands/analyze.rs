@@ -10,8 +10,8 @@ use meridian_core::{
 };
 use meridian_parse::{
     DynamicGrammar, PendingEdge, build_client_graph, build_file_graph, build_graphql_client_graph,
-    build_graphql_graph, build_grpc_client_graph, build_grpc_graph, build_rest_graph, load_dynamic,
-    parse_source, resolve_import,
+    build_graphql_graph, build_grpc_client_graph, build_grpc_graph, build_rest_graph,
+    build_ws_client_graph, load_dynamic, parse_source, resolve_import,
 };
 use std::collections::HashSet;
 
@@ -319,6 +319,9 @@ pub fn run(path: &Path, update: bool, backend: BackendKind) -> Result<()> {
                 let qc = build_graphql_client_graph(&f.rel_path, &source, &f.language);
                 // gRPC client stub calls (tonic) → INVOKES.
                 let gc = build_grpc_client_graph(&f.rel_path, &source, &f.language);
+                // WebSocket client connections (`new WebSocket(url)`) → INVOKES
+                // against the upgrade route (#51).
+                let wc = build_ws_client_graph(&f.rel_path, &source, &f.language);
                 // Link each client call site to its enclosing function so impact
                 // can propagate from a reached ClientCall up to local callers
                 // across the wire (#130). Computed before the graphs are moved.
@@ -328,6 +331,7 @@ pub fn run(path: &Path, update: bool, backend: BackendKind) -> Result<()> {
                     .iter()
                     .chain(&qc.graph.nodes)
                     .chain(&gc.graph.nodes)
+                    .chain(&wc.graph.nodes)
                     .filter(|n| n.kind == NodeKind::ClientCall)
                     .cloned()
                     .collect();
@@ -339,6 +343,8 @@ pub fn run(path: &Path, update: bool, backend: BackendKind) -> Result<()> {
                 operations.extend(qc.operations);
                 graph.extend(gc.graph);
                 operations.extend(gc.operations);
+                graph.extend(wc.graph);
+                operations.extend(wc.operations);
                 graph.extend(fg.graph);
                 for e in enclosing_edges {
                     graph.add_edge(e.src, e.dst, e.kind, e.confidence);
@@ -665,6 +671,9 @@ fn ingest_schemas(
                     .into_iter()
                     .map(|path| OperationKey::opaque(Protocol::GraphQl, path))
                     .collect(),
+                // WebSocket has no schema-artifact format; connections are
+                // extracted from code, not declared in a blessed schema.
+                Protocol::WebSocket => Vec::new(),
             },
         };
         if keys.is_empty() {
@@ -764,6 +773,40 @@ mod tests {
         check!(
             names.iter().any(|n| n == "caller"),
             "caller of the call site should be impacted, got {names:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // #51: a `new WebSocket(url)` client links to the server's upgrade route
+    // (a REST GET endpoint at the same path) via INVOKES.
+    #[test]
+    fn websocket_connection_invokes_upgrade_route() {
+        let dir = temp_repo("ws-connect");
+        std::fs::write(
+            dir.join("server.rs"),
+            "async fn ws_handler() {}\nfn app() -> Router { Router::new().route(\"/ws\", get(ws_handler)) }\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("client.ts"), "const s = new WebSocket(\"/ws\");\n").unwrap();
+        run(&dir, false, BackendKind::Sqlite).unwrap();
+
+        let store = SqliteStore::open(&RepoPaths::new(&dir).db_path).unwrap();
+        let endpoint = store
+            .operations_by_kind(NodeKind::Endpoint)
+            .unwrap()
+            .into_iter()
+            .find(|(_, k)| k.path == "/ws")
+            .map(|(id, _)| id)
+            .expect("GET /ws upgrade route");
+        // Incoming INVOKES on the endpoint should include the WS client call.
+        let invokers = store
+            .neighbors(&endpoint.0, Some(EdgeKind::Invokes), false)
+            .unwrap();
+        check!(
+            invokers.iter().any(|(n, _, _)| n.name.starts_with("ws ")),
+            "WebSocket client should INVOKES the /ws route, got {:?}",
+            invokers.iter().map(|(n, _, _)| &n.name).collect::<Vec<_>>()
         );
 
         std::fs::remove_dir_all(&dir).ok();

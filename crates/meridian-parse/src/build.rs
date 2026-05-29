@@ -336,6 +336,36 @@ pub fn build_grpc_client_graph(rel_path: &str, source: &str, lang: &Language) ->
     cg
 }
 
+/// Build the WebSocket client-connection fragment for a JS/TS file: each
+/// `new WebSocket(url)` becomes a `ClientCall` keyed as a WebSocket connection
+/// (a REST `GET` upgrade), so it links to the server's upgrade route via
+/// `INVOKES` through the same matcher (#51).
+pub fn build_ws_client_graph(rel_path: &str, source: &str, lang: &Language) -> ClientGraph {
+    let mut cg = ClientGraph::default();
+    for conn in crate::ws::extract_ws_connections(source, lang) {
+        let key = OperationKey::websocket(&conn.path);
+        let id = NodeId::derive(&[
+            rel_path,
+            "client_call",
+            "ws",
+            &key.path,
+            &conn.span.start_byte.to_string(),
+        ]);
+        cg.graph.add_node(Node {
+            id: id.clone(),
+            kind: NodeKind::ClientCall,
+            name: format!("ws {}", key.path),
+            qualified_name: key.path.clone(),
+            file: rel_path.to_string(),
+            language: Some(lang.name().to_string()),
+            span: Some(conn.span),
+            doc: None,
+        });
+        cg.operations.push((id, key));
+    }
+    cg
+}
+
 /// Build the GraphQL client-op fragment for a JS/TS file: each `gql`/`graphql`
 /// document becomes a `ClientCall` keyed `OpType.field`, linked to a resolver
 /// endpoint / schema op by the matcher (INVOKES) via the GraphQL signature.
