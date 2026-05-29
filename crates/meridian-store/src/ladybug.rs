@@ -257,7 +257,10 @@ impl GraphStore for LadybugStore {
         // DETACH DELETE removes a node and its rels in one step (LadybugDB does
         // not support deleting undirected rels).
         self.run("MATCH (n:Node) DETACH DELETE n", vec![])?;
-        for tbl in ["File", "ApiOp", "Pending", "Import", "Meta"] {
+        // Note: `Meta` is intentionally preserved (matching the SQLite backend)
+        // so the `schema_version` stamp survives a content clear; deleting it
+        // made every reopen look unversioned and wipe the DB via migrate (#159).
+        for tbl in ["File", "ApiOp", "Pending", "Import"] {
             self.run(&format!("MATCH (n:{tbl}) DELETE n"), vec![])?;
         }
         Ok(())
@@ -779,6 +782,28 @@ mod tests {
         lb.insert_imports(&[("a.rs".into(), "b".into(), "rust".into())])
             .unwrap();
         check!(lb.all_imports().unwrap().len() == 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // #159: reopening must not wipe the DB. `clear()` (run by a non-update
+    // analyze) used to delete the `Meta` node holding `schema_version`, so the
+    // next open looked unversioned and `migrate_schema` rebuilt the schema,
+    // dropping all data. `clear()` now preserves `Meta`.
+    #[test]
+    fn reopen_preserves_data_across_clear_and_migrate() {
+        let dir = tmp_dir("reopen");
+        {
+            let mut lb = LadybugStore::open(&dir).unwrap();
+            lb.clear().unwrap(); // mirrors a fresh (non-update) analyze
+            lb.insert_graph(&[node("a", "keeper")], &[]).unwrap();
+        }
+        // Reopen in a second store instance: migrate must see the persisted
+        // schema_version and leave the data intact.
+        let lb = LadybugStore::open(&dir).unwrap();
+        check!(
+            !lb.find_by_name("keeper").unwrap().is_empty(),
+            "node should survive reopen, but the DB was wiped"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
