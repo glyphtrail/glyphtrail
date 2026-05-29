@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use crate::api::OperationKey;
+use crate::api::{OperationKey, Protocol};
 use crate::model::{Confidence, NodeId};
 use crate::rewrite::RewriteEngine;
 
@@ -45,6 +45,15 @@ impl Matcher {
     pub fn build(endpoints: &[Endpoint], rewrite: &RewriteEngine) -> Self {
         let mut index: HashMap<String, Vec<(NodeId, Confidence)>> = HashMap::new();
         for ep in endpoints {
+            // The rewrite engine is REST-path logic (prefix strip, normalization).
+            // gRPC/GraphQL operations match by their canonical signature directly.
+            if ep.key.protocol != Protocol::Rest {
+                index
+                    .entry(ep.key.signature())
+                    .or_default()
+                    .push((ep.id.clone(), Confidence::Extracted));
+                continue;
+            }
             for cand in rewrite.external_candidates(&ep.key.path) {
                 let key = OperationKey {
                     protocol: ep.key.protocol,

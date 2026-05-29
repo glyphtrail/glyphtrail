@@ -126,7 +126,13 @@ impl OperationKey {
     /// A match signature that collapses path parameters and concrete dynamic
     /// values, so equivalent client/server operations produce the same string.
     /// e.g. `GET /users/{id}` and `GET /users/123` both yield `rest|GET|/users/{}`.
+    /// For gRPC the path is reduced to `service/method` (package dropped, case
+    /// and underscores normalized) so a tonic impl's `Greeter/say_hello` matches
+    /// the proto's `helloworld.Greeter/SayHello`.
     pub fn signature(&self) -> String {
+        if self.protocol == Protocol::Grpc {
+            return format!("grpc|{}", grpc_signature(&self.path));
+        }
         let method = self.method.map(|m| m.as_str()).unwrap_or("*");
         format!(
             "{}|{}|{}",
@@ -135,6 +141,21 @@ impl OperationKey {
             path_signature(&self.path)
         )
     }
+}
+
+/// Normalize a gRPC `[package.]Service/Method` path to `service/method` with the
+/// package dropped and case + underscores removed, so code and proto spellings
+/// (`Greeter/say_hello` vs `helloworld.Greeter/SayHello`) collapse to one key.
+fn grpc_signature(path: &str) -> String {
+    let (svc_part, method) = path.rsplit_once('/').unwrap_or(("", path));
+    let service = svc_part.rsplit('.').next().unwrap_or(svc_part);
+    let norm = |s: &str| -> String {
+        s.chars()
+            .filter(|c| *c != '_')
+            .flat_map(char::to_lowercase)
+            .collect()
+    };
+    format!("{}/{}", norm(service), norm(method))
 }
 
 impl fmt::Display for OperationKey {
@@ -400,5 +421,17 @@ mod tests {
         check!(k.to_string() == "DELETE /users/{id}");
         let g = OperationKey::opaque(Protocol::Grpc, "users.UserService/GetUser");
         check!(g.to_string() == "grpc users.UserService/GetUser");
+    }
+
+    #[test]
+    fn grpc_signature_ignores_package_case_and_underscores() {
+        // A tonic impl (`Greeter/say_hello`) and the proto contract
+        // (`helloworld.Greeter/SayHello`) must collapse to the same signature.
+        let code = OperationKey::opaque(Protocol::Grpc, "Greeter/say_hello");
+        let proto = OperationKey::opaque(Protocol::Grpc, "helloworld.Greeter/SayHello");
+        check!(code.signature() == proto.signature());
+        // Distinct methods stay distinct.
+        let other = OperationKey::opaque(Protocol::Grpc, "helloworld.Greeter/SayGoodbye");
+        check!(code.signature() != other.signature());
     }
 }
