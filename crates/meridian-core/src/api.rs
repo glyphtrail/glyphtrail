@@ -133,6 +133,19 @@ impl OperationKey {
         }
     }
 
+    /// Build a WebSocket *message* key for an event/channel name (e.g. socket.io
+    /// `emit('chat:message')` / `on('chat:message')`). Keyed in the `event:`
+    /// namespace so it matches by event name, distinct from connection paths
+    /// (#51). A client emit and a server handler of the same event share a
+    /// signature and link via INVOKES.
+    pub fn ws_event(name: &str) -> Self {
+        OperationKey {
+            protocol: Protocol::WebSocket,
+            method: None,
+            path: format!("event:{name}"),
+        }
+    }
+
     /// A protocol-agnostic key whose `path` is taken verbatim (already canonical).
     pub fn opaque(protocol: Protocol, path: impl Into<String>) -> Self {
         OperationKey {
@@ -155,10 +168,15 @@ impl OperationKey {
         if self.protocol == Protocol::GraphQl {
             return format!("graphql|{}", graphql_signature(&self.path));
         }
-        // A WebSocket connection handshake is a REST `GET` upgrade, so it shares
-        // the REST `GET` signature of its upgrade route — a client `new
-        // WebSocket("/ws")` links to the server's `GET /ws` route (#51).
         if self.protocol == Protocol::WebSocket {
+            // A message key (`event:<name>`) matches by event name across the
+            // wire (case/underscore folded, like other non-REST protocols).
+            if let Some(event) = self.path.strip_prefix("event:") {
+                return format!("ws|event|{}", fold(event));
+            }
+            // A connection handshake is a REST `GET` upgrade, so it shares the
+            // REST `GET` signature of its upgrade route — a client `new
+            // WebSocket("/ws")` links to the server's `GET /ws` route (#51).
             return format!("rest|GET|{}", path_signature(&self.path));
         }
         let method = self.method.map(|m| m.as_str()).unwrap_or("*");
@@ -416,6 +434,21 @@ mod tests {
                 == OperationKey::rest(HttpMethod::Get, "/rooms/{id}").signature()
         );
         check!(connect.signature() != OperationKey::rest(HttpMethod::Post, "/ws").signature());
+    }
+
+    #[test]
+    fn websocket_event_matches_by_name_not_connection_path() {
+        // A client emit and a server handler of the same event link by name,
+        // case/underscore folded (#51 message boundary).
+        let emit = OperationKey::ws_event("chat:message");
+        let on = OperationKey::ws_event("chat:message");
+        check!(emit.signature() == on.signature());
+        check!(emit.signature() == "ws|event|chat:message");
+        check!(OperationKey::ws_event("ChatMessage").signature() == "ws|event|chatmessage");
+        // An event key never collides with a connection key of the same text.
+        check!(
+            OperationKey::ws_event("ws").signature() != OperationKey::websocket("/ws").signature()
+        );
     }
 
     #[test]
