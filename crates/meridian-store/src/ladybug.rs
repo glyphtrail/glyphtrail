@@ -110,6 +110,11 @@ fn get_opt_i64(row: &[Value], idx: usize) -> Option<i64> {
         _ => None,
     }
 }
+/// Read an INT64 column that represents a byte offset or line number: returns
+/// 0 if the value is missing, null, or negative (including the `-1` sentinel).
+fn get_byte_offset(row: &[Value], idx: usize) -> usize {
+    get_opt_i64(row, idx).unwrap_or(-1).max(0) as usize
+}
 fn get_opt_str(row: &[Value], idx: usize) -> Option<String> {
     match row.get(idx) {
         Some(Value::String(s)) => Some(s.clone()),
@@ -126,10 +131,10 @@ fn row_to_node(row: &[Value]) -> Node {
     // the two cases colliding when get_i64 would return -1 for both.
     let sl = get_opt_i64(row, 8);
     let span = sl.filter(|&v| v >= 0).map(|sl| Span {
-        start_byte: get_opt_i64(row, 6).unwrap_or(-1).max(0) as usize,
-        end_byte: get_opt_i64(row, 7).unwrap_or(-1).max(0) as usize,
+        start_byte: get_byte_offset(row, 6),
+        end_byte: get_byte_offset(row, 7),
         start_line: sl as usize,
-        end_line: get_opt_i64(row, 9).unwrap_or(-1).max(0) as usize,
+        end_line: get_byte_offset(row, 9),
     });
     Node {
         id: NodeId(get_str(row, 0)),
