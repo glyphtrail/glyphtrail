@@ -95,3 +95,64 @@ pub async fn serve(
     axum::serve(listener, app).await?;
     Ok(())
 }
+
+/// Serve a generated wiki directory over HTTP, rendering each Markdown page to
+/// HTML on the fly (#52). `/` serves `index.md`; `/<slug>` serves `<slug>.md`.
+/// Page slugs are restricted to a single safe filename segment (no path
+/// traversal). Other assets are not served — the wiki output is flat Markdown.
+pub async fn serve_wiki(dir: PathBuf, port: u16) -> Result<()> {
+    let app = Router::new()
+        .route("/", get(wiki_page))
+        .route("/{slug}", get(wiki_page))
+        .with_state(dir);
+    let addr = format!("127.0.0.1:{port}");
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    println!("meridian wiki serving at http://{addr}");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn wiki_page(
+    State(dir): State<PathBuf>,
+    slug: Option<axum::extract::Path<String>>,
+) -> Response {
+    let raw = slug.map(|s| s.0).unwrap_or_default();
+    let slug = if raw.is_empty() {
+        "index"
+    } else {
+        raw.trim_end_matches(".md")
+    };
+    // Reject anything that isn't a plain single-segment page name.
+    if slug.is_empty() || slug.contains('/') || slug.contains("..") {
+        return (StatusCode::BAD_REQUEST, "invalid page").into_response();
+    }
+    match std::fs::read_to_string(dir.join(format!("{slug}.md"))) {
+        Ok(md) => Html(render_markdown(slug, &md)).into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, format!("no wiki page '{slug}'")).into_response(),
+    }
+}
+
+/// Render a Markdown page to a minimal standalone HTML document.
+fn render_markdown(title: &str, markdown: &str) -> String {
+    let mut body = String::new();
+    pulldown_cmark::html::push_html(&mut body, pulldown_cmark::Parser::new(markdown));
+    format!(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
+         <title>{title}</title></head><body>{body}</body></html>"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_markdown;
+    use assert2::check;
+
+    #[test]
+    fn renders_markdown_to_html_document() {
+        let html = render_markdown("Page", "# Title\n\nA **bold** word.\n");
+        check!(html.contains("<title>Page</title>"));
+        check!(html.contains("<h1>Title</h1>"));
+        check!(html.contains("<strong>bold</strong>"));
+        check!(html.starts_with("<!DOCTYPE html>"));
+    }
+}
