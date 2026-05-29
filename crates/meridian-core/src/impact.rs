@@ -217,7 +217,7 @@ struct Reach {
 /// access. Seeds themselves are excluded from the result. Each impacted node is
 /// kept with its shortest path; ties on distance prefer the stronger
 /// min-confidence. Deterministic and cycle-safe.
-pub fn compute_impact<A: Adjacency>(
+pub fn compute_impact<A: Adjacency + ?Sized>(
     seeds: &[NodeId],
     policy: &ImpactPolicy,
     adj: &A,

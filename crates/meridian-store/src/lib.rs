@@ -1,9 +1,11 @@
 #![forbid(unsafe_code)]
 
 pub mod changeset;
+pub mod graph_store;
 pub mod sqlite;
 
 pub use changeset::{ChangeSpec, ChangedFile, SeedSet, changed_files, seed_nodes};
+pub use graph_store::GraphStore;
 pub use sqlite::{SqliteStore, Stats};
 
 #[cfg(test)]

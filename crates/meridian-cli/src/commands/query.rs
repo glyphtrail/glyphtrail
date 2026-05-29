@@ -8,7 +8,7 @@ use meridian_core::{
     EdgeKind, HttpMethod, Node, NodeKind, OperationKey, Protocol, Registry, RegistryEntry,
     default_registry_path,
 };
-use meridian_store::SqliteStore;
+use meridian_store::{GraphStore, SqliteStore};
 use serde::Serialize;
 
 #[derive(Subcommand)]
@@ -76,7 +76,7 @@ struct NeighborOut {
     confidence: String,
 }
 
-fn resolve_one(store: &SqliteStore, name: &str) -> Result<Node> {
+fn resolve_one(store: &dyn GraphStore, name: &str) -> Result<Node> {
     let matches = store.find_by_name(name)?;
     match matches.into_iter().next() {
         Some(n) => Ok(n),
@@ -223,7 +223,7 @@ fn operation_out(key: &OperationKey, node: Option<&Node>, handler: Option<String
 }
 
 /// The handler symbol serving an endpoint (incoming HANDLES edge), if any.
-fn endpoint_handler(store: &SqliteStore, id: &str) -> Result<Option<String>> {
+fn endpoint_handler(store: &dyn GraphStore, id: &str) -> Result<Option<String>> {
     let handlers = store.neighbors(id, Some(EdgeKind::Handles), false)?;
     Ok(handlers
         .into_iter()
@@ -252,7 +252,7 @@ fn operations_text(ops: &[OperationOut]) {
 /// Build display rows for every operation of `kind`, optionally filtered by
 /// protocol. `with_handler` resolves the HANDLES edge for endpoints.
 fn collect_operations(
-    store: &SqliteStore,
+    store: &dyn GraphStore,
     kind: NodeKind,
     protocol: Option<Protocol>,
     with_handler: bool,
@@ -275,7 +275,7 @@ fn collect_operations(
     Ok(out)
 }
 
-fn open_store(repo: &Path) -> Result<SqliteStore> {
+fn open_store(repo: &Path) -> Result<Box<dyn GraphStore>> {
     let paths = RepoPaths::new(repo);
     if !paths.db_path.exists() {
         bail!(
@@ -283,12 +283,12 @@ fn open_store(repo: &Path) -> Result<SqliteStore> {
             paths.db_path.display()
         );
     }
-    SqliteStore::open(&paths.db_path)
+    Ok(Box::new(SqliteStore::open(&paths.db_path)?))
 }
 
 /// Compute a query answer against one open store. Pure of output so the same
 /// arm serves single-repo text, single-repo JSON, and cross-repo aggregation.
-fn execute(store: &SqliteStore, cmd: &QueryCmd) -> Result<QueryResult> {
+fn execute(store: &dyn GraphStore, cmd: &QueryCmd) -> Result<QueryResult> {
     Ok(match cmd {
         QueryCmd::Def { name } => QueryResult::Nodes(store.find_by_name(name)?),
         QueryCmd::Callers { name } => {
@@ -456,7 +456,7 @@ fn print_value(value: &serde_json::Value, emit: Emit) -> Result<()> {
 
 pub fn run(repo: &Path, cmd: QueryCmd, emit: Emit) -> Result<()> {
     let store = open_store(repo)?;
-    let result = execute(&store, &cmd)?;
+    let result = execute(&*store, &cmd)?;
     match emit {
         Emit::Text => result.print_text(),
         _ => print_value(&result.to_value(), emit)?,
@@ -500,7 +500,7 @@ pub fn run_registry(
     if emit == Emit::Text {
         for e in &selected {
             println!("== {} ({}) ==", e.name, e.root.display());
-            match open_store(&e.root).and_then(|s| execute(&s, &cmd)) {
+            match open_store(&e.root).and_then(|s| execute(s.as_ref(), &cmd)) {
                 Ok(r) => r.print_text(),
                 Err(err) => println!("  error: {err:#}"),
             }
@@ -510,7 +510,7 @@ pub fn run_registry(
 
     let mut arr = Vec::new();
     for e in &selected {
-        let value = match open_store(&e.root).and_then(|s| execute(&s, &cmd)) {
+        let value = match open_store(&e.root).and_then(|s| execute(s.as_ref(), &cmd)) {
             Ok(r) => r.to_value(),
             Err(err) => serde_json::json!({ "error": format!("{err:#}") }),
         };
