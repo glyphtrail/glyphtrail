@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use meridian_core::config::RepoPaths;
+use meridian_store::GraphStore;
 use serde_json::{Value, json};
 
 /// MCP protocol revision this server implements.
@@ -50,6 +51,37 @@ pub fn serve_stdio(repo: PathBuf) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Dispatch a single JSON-RPC message against an already-opened `store`.
+/// Returns `Some(response)` for requests (those carrying an `id`) and `None`
+/// for notifications. `repo` is the repository root, needed for git-based seed
+/// modes in the `impact` tool. Shared by the HTTP `/mcp` endpoint so that the
+/// server can use any backend (SQLite or LadybugDB) rather than re-opening a
+/// SQLite file on every request.
+pub fn handle_request_with_store(
+    store: &dyn GraphStore,
+    repo: &Path,
+    msg: &Value,
+) -> Option<Value> {
+    let method = msg.get("method").and_then(Value::as_str)?;
+    let id = msg.get("id").cloned();
+    match method {
+        "initialize" => Some(success(id?, initialize_result())),
+        "ping" => Some(success(id?, json!({}))),
+        "tools/list" => Some(success(id?, json!({ "tools": tools::definitions() }))),
+        "tools/call" => {
+            let id = id?;
+            let params = msg.get("params").cloned().unwrap_or(Value::Null);
+            let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+            let args = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            Some(success(id, tools::call_with_store(store, repo, name, &args)))
+        }
+        _ => id.map(|id| error(id, -32601, &format!("method not found: {method}"))),
+    }
 }
 
 /// Dispatch a single JSON-RPC message against the graph database at `db`.

@@ -13,7 +13,7 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use meridian_core::NodeId;
 
-use crate::SqliteStore;
+use crate::GraphStore;
 
 /// What change to seed the impact analysis from.
 #[derive(Debug, Clone)]
@@ -149,7 +149,7 @@ fn overlaps(a1: usize, a2: usize, b1: usize, b2: usize) -> bool {
 
 /// Map changed files to seed node ids by intersecting changed line ranges with
 /// indexed node spans. Whole-file changes seed every symbol in the file.
-pub fn seed_nodes(store: &SqliteStore, files: &[ChangedFile]) -> Result<SeedSet> {
+pub fn seed_nodes(store: &dyn GraphStore, files: &[ChangedFile]) -> Result<SeedSet> {
     let mut seeds: Vec<NodeId> = Vec::new();
     let mut removed_files = Vec::new();
     let mut unresolved_files = Vec::new();
@@ -197,6 +197,7 @@ pub fn seed_nodes(store: &SqliteStore, files: &[ChangedFile]) -> Result<SeedSet>
 mod tests {
     use super::*;
     use assert2::check;
+    use crate::SqliteStore;
 
     #[test]
     fn parses_new_side_ranges_and_deletions() {

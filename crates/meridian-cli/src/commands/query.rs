@@ -277,7 +277,7 @@ fn collect_operations(
     Ok(out)
 }
 
-fn open_store(repo: &Path, backend: BackendKind) -> Result<Box<dyn GraphStore>> {
+fn open_store(repo: &Path, backend: BackendKind) -> Result<Box<dyn GraphStore + Send>> {
     let paths = RepoPaths::new(repo);
     if !backend.exists(&paths) {
         bail!(

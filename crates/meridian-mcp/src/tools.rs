@@ -6,7 +6,7 @@ use meridian_core::{
     Confidence, EdgeKind, HttpMethod, ImpactPolicy, ImpactReport, Node, NodeId, NodeKind,
     OperationKey, Protocol, operations_matching,
 };
-use meridian_store::{ChangeSpec, SqliteStore, changed_files, seed_nodes};
+use meridian_store::{ChangeSpec, GraphStore, SqliteStore, changed_files, seed_nodes};
 use serde_json::{Value, json};
 
 /// The advertised tool set (`tools/list`).
@@ -107,18 +107,31 @@ pub fn definitions() -> Vec<Value> {
     ]
 }
 
-/// Execute a tool call, returning a `tools/call` result object. Tool-level
-/// failures are reported as `isError` results rather than protocol errors, per
-/// the MCP convention.
+/// Execute a tool call against the SQLite index at `db`, returning a
+/// `tools/call` result object.
 pub fn call(db: &Path, name: &str, args: &Value) -> Value {
-    match dispatch(db, name, args) {
+    let store = match open(db) {
+        Ok(s) => s,
+        Err(e) => return text_result(&json!({ "error": e }), true),
+    };
+    let repo = db.parent().and_then(Path::parent).unwrap_or(Path::new("."));
+    match dispatch_on(&*store, repo, name, args) {
         Ok(value) => text_result(&value, false),
         Err(message) => text_result(&json!({ "error": message }), true),
     }
 }
 
-fn dispatch(db: &Path, name: &str, args: &Value) -> Result<Value, String> {
-    let store = open(db)?;
+/// Execute a tool call against an already-opened `store`, returning a
+/// `tools/call` result object. `repo` is the repository root, needed for
+/// git-based seed modes in the `impact` tool.
+pub fn call_with_store(store: &dyn GraphStore, repo: &Path, name: &str, args: &Value) -> Value {
+    match dispatch_on(store, repo, name, args) {
+        Ok(value) => text_result(&value, false),
+        Err(message) => text_result(&json!({ "error": message }), true),
+    }
+}
+
+fn dispatch_on(store: &dyn GraphStore, repo: &Path, name: &str, args: &Value) -> Result<Value, String> {
     match name {
         "search" => {
             let limit = opt_usize(args, "limit").unwrap_or(30);
@@ -129,32 +142,32 @@ fn dispatch(db: &Path, name: &str, args: &Value) -> Result<Value, String> {
             let nodes = store.find_by_name(req_str(args, "name")?).map_err(err)?;
             Ok(nodes_json(&nodes))
         }
-        "callers" => neighbors_of(&store, args, EdgeKind::Calls, false),
-        "callees" => neighbors_of(&store, args, EdgeKind::Calls, true),
+        "callers" => neighbors_of(store, args, EdgeKind::Calls, false),
+        "callees" => neighbors_of(store, args, EdgeKind::Calls, true),
         "neighbors" => {
-            let node = resolve_one(&store, req_str(args, "name")?)?;
+            let node = resolve_one(store, req_str(args, "name")?)?;
             let mut items = store.neighbors(&node.id.0, None, true).map_err(err)?;
             items.extend(store.neighbors(&node.id.0, None, false).map_err(err)?);
             Ok(neighbors_json(&items))
         }
-        "endpoints" => operations_list(&store, NodeKind::Endpoint, args, true),
-        "clients" => operations_list(&store, NodeKind::ClientCall, args, false),
+        "endpoints" => operations_list(store, NodeKind::Endpoint, args, true),
+        "clients" => operations_list(store, NodeKind::ClientCall, args, false),
         "serves" => {
-            let matched = matched_endpoints(&store, args)?;
+            let matched = matched_endpoints(store, args)?;
             let mut out = Vec::new();
             for (id, key) in matched {
                 let node = store.get_node(&id.0).map_err(err)?;
                 out.push(operation_json(
                     &key,
                     node.as_ref(),
-                    endpoint_handler(&store, &id)?,
+                    endpoint_handler(store, &id)?,
                 ));
             }
             Ok(Value::Array(out))
         }
         "who_calls" => {
             let mut items = Vec::new();
-            for (id, _) in matched_endpoints(&store, args)? {
+            for (id, _) in matched_endpoints(store, args)? {
                 items.extend(
                     store
                         .neighbors(&id.0, Some(EdgeKind::Invokes), false)
@@ -165,18 +178,18 @@ fn dispatch(db: &Path, name: &str, args: &Value) -> Result<Value, String> {
         }
         "api_impact" => {
             let mut report = Vec::new();
-            for (id, key) in matched_endpoints(&store, args)? {
+            for (id, key) in matched_endpoints(store, args)? {
                 let node = store.get_node(&id.0).map_err(err)?;
                 report.push(json!({
                     "endpoint": operation_json(&key, node.as_ref(), None),
-                    "handlers": neighbor_nodes(&store, &id, EdgeKind::Handles, false)?,
-                    "callers": neighbor_nodes(&store, &id, EdgeKind::Invokes, false)?,
-                    "schema_ops": neighbor_nodes(&store, &id, EdgeKind::Exposes, true)?,
+                    "handlers": neighbor_nodes(store, &id, EdgeKind::Handles, false)?,
+                    "callers": neighbor_nodes(store, &id, EdgeKind::Invokes, false)?,
+                    "schema_ops": neighbor_nodes(store, &id, EdgeKind::Exposes, true)?,
                 }));
             }
             Ok(Value::Array(report))
         }
-        "impact" => impact_tool(db, &store, args),
+        "impact" => impact_tool(repo, store, args),
         "status" => {
             let s = store.stats().map_err(err)?;
             let languages: serde_json::Map<String, Value> = s
@@ -192,18 +205,20 @@ fn dispatch(db: &Path, name: &str, args: &Value) -> Result<Value, String> {
     }
 }
 
-fn open(db: &Path) -> Result<SqliteStore, String> {
+fn open(db: &Path) -> Result<Box<dyn GraphStore>, String> {
     if !db.exists() {
         return Err(format!(
             "no index at {} — run `meridian analyze` first",
             db.display()
         ));
     }
-    SqliteStore::open(db).map_err(err)
+    SqliteStore::open(db)
+        .map(|s| Box::new(s) as Box<dyn GraphStore>)
+        .map_err(err)
 }
 
 fn neighbors_of(
-    store: &SqliteStore,
+    store: &dyn GraphStore,
     args: &Value,
     kind: EdgeKind,
     outgoing: bool,
@@ -216,7 +231,7 @@ fn neighbors_of(
 }
 
 fn operations_list(
-    store: &SqliteStore,
+    store: &dyn GraphStore,
     kind: NodeKind,
     args: &Value,
     with_handler: bool,
@@ -244,13 +259,7 @@ fn operations_list(
 /// Impact-analysis tool: resolve seeds (symbol / file / change set), run the
 /// shared engine via `store.classify_impact`, and return the `ImpactReport`
 /// JSON — the same report the `meridian impact` CLI emits.
-fn impact_tool(db: &Path, store: &SqliteStore, args: &Value) -> Result<Value, String> {
-    // The DB lives at <repo>/.meridian/graph.db; git seed modes need the repo root.
-    let repo = db
-        .parent()
-        .and_then(Path::parent)
-        .unwrap_or_else(|| Path::new("."));
-
+fn impact_tool(repo: &Path, store: &dyn GraphStore, args: &Value) -> Result<Value, String> {
     let (seeds, removed, unresolved) = if let Some(name) = opt_str(args, "name") {
         let ids: Vec<NodeId> = store
             .find_by_name(name)
@@ -306,7 +315,7 @@ fn impact_tool(db: &Path, store: &SqliteStore, args: &Value) -> Result<Value, St
 
 /// Endpoints matching the `path` (+ optional `method`) arguments.
 fn matched_endpoints(
-    store: &SqliteStore,
+    store: &dyn GraphStore,
     args: &Value,
 ) -> Result<Vec<(NodeId, OperationKey)>, String> {
     let path = req_str(args, "path")?;
@@ -322,7 +331,7 @@ fn matched_endpoints(
     Ok(matched)
 }
 
-fn endpoint_handler(store: &SqliteStore, id: &NodeId) -> Result<Option<String>, String> {
+fn endpoint_handler(store: &dyn GraphStore, id: &NodeId) -> Result<Option<String>, String> {
     Ok(store
         .neighbors(&id.0, Some(EdgeKind::Handles), false)
         .map_err(err)?
@@ -332,7 +341,7 @@ fn endpoint_handler(store: &SqliteStore, id: &NodeId) -> Result<Option<String>, 
 }
 
 fn neighbor_nodes(
-    store: &SqliteStore,
+    store: &dyn GraphStore,
     id: &NodeId,
     kind: EdgeKind,
     outgoing: bool,
@@ -376,7 +385,7 @@ fn neighbors_json(items: &[(Node, EdgeKind, Confidence)]) -> Value {
     )
 }
 
-fn resolve_one(store: &SqliteStore, name: &str) -> Result<Node, String> {
+fn resolve_one(store: &dyn GraphStore, name: &str) -> Result<Node, String> {
     store
         .find_by_name(name)
         .map_err(err)?

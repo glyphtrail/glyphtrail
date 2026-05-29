@@ -36,7 +36,7 @@ impl BackendKind {
 }
 
 /// Open (creating if needed) the selected backend for `paths`.
-pub fn open(paths: &RepoPaths, kind: BackendKind) -> Result<Box<dyn GraphStore>> {
+pub fn open(paths: &RepoPaths, kind: BackendKind) -> Result<Box<dyn GraphStore + Send>> {
     match kind {
         BackendKind::Sqlite => Ok(Box::new(SqliteStore::open(&paths.db_path)?)),
         BackendKind::Ladybug => open_ladybug(paths),
@@ -44,13 +44,13 @@ pub fn open(paths: &RepoPaths, kind: BackendKind) -> Result<Box<dyn GraphStore>>
 }
 
 #[cfg(feature = "ladybug")]
-fn open_ladybug(paths: &RepoPaths) -> Result<Box<dyn GraphStore>> {
+fn open_ladybug(paths: &RepoPaths) -> Result<Box<dyn GraphStore + Send>> {
     Ok(Box::new(meridian_store::LadybugStore::open(
         &paths.index_dir.join("ladybug"),
     )?))
 }
 
 #[cfg(not(feature = "ladybug"))]
-fn open_ladybug(_paths: &RepoPaths) -> Result<Box<dyn GraphStore>> {
+fn open_ladybug(_paths: &RepoPaths) -> Result<Box<dyn GraphStore + Send>> {
     anyhow::bail!("the ladybug backend is not built; rebuild with `--features ladybug`")
 }
