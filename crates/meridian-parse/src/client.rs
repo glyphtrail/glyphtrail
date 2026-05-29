@@ -60,8 +60,75 @@ pub fn extract_client_calls(source: &str, lang: &Language) -> Vec<RawClientCall>
         Language::Rust => rust_client_calls(source),
         Language::Go => go_client_calls(source),
         Language::Python => python_client_calls(source),
+        Language::Java | Language::Kotlin => retrofit_client_calls(source, lang),
         _ => Vec::new(),
     }
+}
+
+/// Retrofit HTTP-client call sites (JVM): method-level annotations
+/// `@GET("path")` / `@POST(...)` / … on interface methods become `(method,
+/// path)` client calls. Works for both Java and Kotlin (the annotation shape
+/// differs but both nest the verb identifier and a path string literal).
+fn retrofit_client_calls(source: &str, lang: &Language) -> Vec<RawClientCall> {
+    const VERBS: [&str; 7] = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"];
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&grammar(lang).expect("built-in grammar"))
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+    let src = source.as_bytes();
+    let mut out = Vec::new();
+    walk(tree.root_node(), &mut |n| {
+        if n.kind() != "annotation" {
+            return;
+        }
+        // Annotation name: first identifier descendant (Java `@GET`, Kotlin
+        // `@GET(...)` via constructor_invocation > user_type > identifier).
+        let Some(verb) = first_descendant(n, "identifier").map(|d| text(d, src)) else {
+            return;
+        };
+        let Some(method) = VERBS
+            .contains(&verb.as_str())
+            .then(|| HttpMethod::parse(&verb))
+            .flatten()
+        else {
+            return;
+        };
+        // Path: the annotation's string argument (Java string_fragment, Kotlin
+        // string_content).
+        let path = first_descendant(n, "string_fragment")
+            .or_else(|| first_descendant(n, "string_content"))
+            .map(|d| text(d, src));
+        if let Some(p) = path {
+            let path = if p.starts_with('/') {
+                p
+            } else {
+                format!("/{p}")
+            };
+            out.push(RawClientCall {
+                method,
+                path,
+                span: span_of(n),
+            });
+        }
+    });
+    out
+}
+
+/// First descendant of `node` with the given kind, in pre-order.
+fn first_descendant<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    let mut found = None;
+    walk(node, &mut |n| {
+        if found.is_none() && n.kind() == kind {
+            found = Some(n);
+        }
+    });
+    found
 }
 
 /// fetch / axios calls in JS/TS/TSX source.
@@ -778,6 +845,23 @@ s.put(f"/users/{user_id}/profile")
         // `.get` with a non-URL literal (dict access) is not a request.
         let src = "d.get(\"key\")\nfetchData(url)\n";
         check!(extract_client_calls(src, &Language::Python).is_empty());
+    }
+
+    #[test]
+    fn retrofit_java_annotations_become_client_calls() {
+        let src = "interface Api {\n  @GET(\"users/{id}\")\n  Call<User> getUser(@Path(\"id\") int id);\n  @POST(\"/items\")\n  Call<Item> create();\n}\n";
+        let calls = extract_client_calls(src, &Language::Java);
+        check!(call(&calls, HttpMethod::Get, "/users/{id}").is_some());
+        check!(call(&calls, HttpMethod::Post, "/items").is_some());
+        // `@Path` is a parameter annotation, not an HTTP verb.
+        check!(calls.len() == 2);
+    }
+
+    #[test]
+    fn retrofit_kotlin_annotations_become_client_calls() {
+        let src = "interface Api {\n  @GET(\"users/{id}\")\n  suspend fun getUser(@Path(\"id\") id: Int): User\n}\n";
+        let calls = extract_client_calls(src, &Language::Kotlin);
+        check!(call(&calls, HttpMethod::Get, "/users/{id}").is_some());
     }
 
     #[test]
