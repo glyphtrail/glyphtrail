@@ -5,6 +5,7 @@ pub mod config;
 pub mod error;
 pub mod impact;
 pub mod lang;
+pub mod manifest;
 pub mod matcher;
 pub mod model;
 pub mod registry;
@@ -22,6 +23,7 @@ pub use impact::{
     parse_confidence,
 };
 pub use lang::Language;
+pub use manifest::{CargoDependency, CargoPackage, DepKind, DepSource, parse_cargo_manifest};
 pub use matcher::{ClientCall, Endpoint, Match, Matcher};
 pub use model::{CodeGraph, Confidence, Edge, EdgeKind, Node, NodeId, NodeKind, PendingLink, Span};
 pub use registry::{Registry, RegistryEntry, RepoHealth, default_registry_path};

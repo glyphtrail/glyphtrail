@@ -28,6 +28,11 @@ pub enum CoreError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("invalid Cargo manifest: {source}")]
+    ManifestParse {
+        #[source]
+        source: Box<toml::de::Error>,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;
