@@ -468,6 +468,59 @@ impl ImpactReport {
     }
 }
 
+/// The impacted nodes in one repo, for a federated (cross-repo) report (#222).
+#[derive(Debug, Clone, Serialize)]
+pub struct RepoImpact {
+    pub repo: String,
+    /// True for the repo the change originates in; the rest are downstream.
+    pub origin: bool,
+    pub items: Vec<ClassifiedItem>,
+}
+
+/// Cross-repo blast radius: an aggregate summary plus per-repo impacted nodes,
+/// origin first then downstream. The summary is derived from all items.
+#[derive(Debug, Clone, Serialize)]
+pub struct FederatedReport {
+    pub summary: ImpactSummary,
+    pub repos: Vec<RepoImpact>,
+}
+
+impl FederatedReport {
+    /// Assemble from per-repo impacts: order origin first then downstream
+    /// alphabetically, and derive the aggregate summary across all items.
+    pub fn new(mut repos: Vec<RepoImpact>) -> Self {
+        repos.sort_by(|a, b| b.origin.cmp(&a.origin).then(a.repo.cmp(&b.repo)));
+        let mut summary = ImpactSummary {
+            total: 0,
+            tests: 0,
+            api: 0,
+            entrypoints: 0,
+            internal: 0,
+            cross_boundary: 0,
+            max_distance: 0,
+        };
+        for i in repos.iter().flat_map(|r| &r.items) {
+            summary.total += 1;
+            match i.class {
+                ImpactClass::Test => summary.tests += 1,
+                ImpactClass::Api => summary.api += 1,
+                ImpactClass::Entrypoint => summary.entrypoints += 1,
+                ImpactClass::Internal => summary.internal += 1,
+            }
+            if i.cross_boundary {
+                summary.cross_boundary += 1;
+            }
+            summary.max_distance = summary.max_distance.max(i.distance);
+        }
+        FederatedReport { summary, repos }
+    }
+
+    /// Count of downstream (non-origin) repos with impacted nodes.
+    pub fn downstream_repos(&self) -> usize {
+        self.repos.iter().filter(|r| !r.origin).count()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
