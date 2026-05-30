@@ -114,6 +114,9 @@ struct FileOutput {
     pending_handlers: Vec<(String, NodeId)>,
     pending: Vec<PendingEdge>,
     imports: Vec<(String, String, String)>,
+    /// `(file, local symbol, module, language)` for symbol-level import
+    /// resolution — links an imported router variable to its defining file (#167).
+    import_symbols: Vec<(String, String, String, String)>,
 }
 
 /// Parse one discovered file and build its graph fragment + side lists. Pure and
@@ -134,6 +137,7 @@ fn parse_file(
         pending_handlers: Vec::new(),
         pending: Vec::new(),
         imports: Vec::new(),
+        import_symbols: Vec::new(),
     };
 
     // Sensitive record-only file (#136): record that it exists, never read it.
@@ -251,6 +255,11 @@ fn parse_file(
         fg.imports
             .into_iter()
             .map(|raw| (f.rel_path.clone(), raw, language.name().to_string())),
+    );
+    out.import_symbols.extend(
+        meridian_parse::extract_import_symbols(&source, language)
+            .into_iter()
+            .map(|(sym, module)| (f.rel_path.clone(), sym, module, language.name().to_string())),
     );
     Some(out)
 }
@@ -482,6 +491,8 @@ pub fn run(path: &Path, update: bool, backend: BackendKind) -> Result<()> {
     let mut pending_handlers: Vec<(String, NodeId)> = Vec::new();
     // (importer rel-path, raw import, language name) resolved against the file set.
     let mut imports: Vec<(String, String, String)> = Vec::new();
+    // (file, local symbol, module, language) for symbol→file resolution (#167).
+    let mut import_symbols: Vec<(String, String, String, String)> = Vec::new();
 
     // Pre-resolve dynamic-language grammars once (sequential; warns once per
     // missing grammar) so the parallel parse can read them immutably.
@@ -520,6 +531,7 @@ pub fn run(path: &Path, update: bool, backend: BackendKind) -> Result<()> {
         pending_handlers.extend(out.pending_handlers);
         pending.extend(out.pending);
         imports.extend(out.imports);
+        import_symbols.extend(out.import_symbols);
     }
 
     let resolve_progress = phase_spinner("resolving references and cross-boundary links");
@@ -572,6 +584,20 @@ pub fn run(path: &Path, update: bool, backend: BackendKind) -> Result<()> {
     // disambiguate ambiguous call/inheritance names below (#18, #19).
     let file_rels: Vec<String> = files.iter().map(|f| f.rel_path.clone()).collect();
     let file_set: HashSet<&str> = file_rels.iter().map(|s| s.as_str()).collect();
+
+    // (importing file, local symbol) -> defining file, from symbol-level imports,
+    // so an imported router variable can be linked to its source file (#167).
+    let mut symbol_file: HashMap<(String, String), String> = HashMap::new();
+    for (file, symbol, module, lang_name) in &import_symbols {
+        if let Some(target) = Language::ALL
+            .into_iter()
+            .find(|l| l.name() == lang_name)
+            .and_then(|l| resolve_target(&resolve_import(file, module, &l), &file_rels, &file_set))
+        {
+            symbol_file.insert((file.clone(), symbol.clone()), target);
+        }
+    }
+
     let mut resolved_imports: Vec<(String, String, Option<String>)> = Vec::new();
     let mut import_map: HashMap<String, HashSet<String>> = HashMap::new();
     for (importer, raw, lang_name) in store.all_imports()? {
@@ -701,6 +727,25 @@ pub fn run(path: &Path, update: bool, backend: BackendKind) -> Result<()> {
         confidence: m.confidence,
     }));
     store.insert_graph(&[], &edges)?;
+
+    // Cross-file router-variable MOUNTS (#167): a synthetic `Router` node whose
+    // variable was imported from another file gets a MOUNTS edge to that file, so
+    // `app.use("/api", router)` where `router` is imported links end-to-end.
+    let router_edges: Vec<Edge> = graph
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Router)
+        .filter_map(|n| {
+            let target = symbol_file.get(&(n.file.clone(), n.name.clone()))?;
+            Some(Edge {
+                src: n.id.clone(),
+                dst: NodeId::derive(&["file", target]),
+                kind: EdgeKind::Mounts,
+                confidence: Confidence::Inferred,
+            })
+        })
+        .collect();
+    store.insert_graph(&[], &router_edges)?;
 
     for f in &changed {
         store.set_file(&f.rel_path, f.language.as_ref().map(|l| l.name()), &f.hash)?;
@@ -1007,6 +1052,38 @@ mod tests {
                 .any(|(n, _, _)| n.name.starts_with("ws emit ")),
             "emit should INVOKES the on handler, got {:?}",
             invokers.iter().map(|(n, _, _)| &n.name).collect::<Vec<_>>()
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // #167: a router variable mounted in one file but imported from another links
+    // the synthetic Router node to the defining file with a MOUNTS edge.
+    #[test]
+    fn cross_file_router_mount_links_to_defining_file() {
+        let dir = temp_repo("xfile-router");
+        std::fs::write(
+            dir.join("app.js"),
+            "import apiRouter from './api';\nconst app = express();\napp.use(\"/api\", apiRouter);\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("api.js"),
+            "const apiRouter = express.Router();\napiRouter.get(\"/users\", getUsers);\nexport default apiRouter;\n",
+        )
+        .unwrap();
+        run(&dir, false, BackendKind::Sqlite).unwrap();
+
+        let store = SqliteStore::open(&RepoPaths::new(&dir).db_path).unwrap();
+        // The mounted `apiRouter` Router node (in app.js) MOUNTS the api.js file.
+        let router_id = NodeId::derive(&["app.js", "router", "apiRouter"]);
+        let mounts = store
+            .neighbors(&router_id.0, Some(EdgeKind::Mounts), true)
+            .unwrap();
+        check!(
+            mounts.iter().any(|(n, _, _)| n.name == "api.js"),
+            "expected apiRouter -> api.js MOUNTS, got {:?}",
+            mounts.iter().map(|(n, _, _)| &n.name).collect::<Vec<_>>()
         );
 
         std::fs::remove_dir_all(&dir).ok();
