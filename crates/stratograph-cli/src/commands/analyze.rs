@@ -545,6 +545,77 @@ fn index_packages(
         .collect())
 }
 
+/// A use-site where one of this repo's files references an external crate
+/// (#220): an import whose root path segment matches a dependency declared by
+/// the package that owns the importing file. This is the consumer side of a
+/// cross-repo link; #221 matches `package` to a producer repo and `path` to its
+/// exports, falling back to crate level when no symbol matches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ExternalUse {
+    /// The consumer package (by name) that owns the importing file.
+    from_package: String,
+    from_file: String,
+    /// Real crate name of the referenced dependency, rename-resolved.
+    package: String,
+    /// The import path as written, e.g. `widget::go` or `widget::{a, b}`.
+    path: String,
+}
+
+/// The name a dependency is referenced under in code: its rename alias when
+/// present, otherwise the crate name, with `-` normalised to `_` (Cargo crate
+/// names hyphenate; Rust paths use underscores).
+fn dep_code_name(dep: &stratograph_core::CargoDependency) -> String {
+    dep.alias.as_deref().unwrap_or(&dep.name).replace('-', "_")
+}
+
+/// The first path segment of an import specifier, ignoring a leading `::`.
+fn import_root(path: &str) -> Option<&str> {
+    path.split("::")
+        .map(str::trim)
+        .find(|s| !s.is_empty() && *s != "{")
+}
+
+/// Identify the imports that reference an external crate, the consumer side of
+/// cross-repo links (#220). For each import record `(file, raw, lang)`, find the
+/// package owning `file` (longest-directory match) and match the import's root
+/// segment against that package's declared dependencies. Read-only over `store`.
+fn external_uses(store: &dyn GraphStore, indexed: &[IndexedPackage]) -> Result<Vec<ExternalUse>> {
+    let owner = |file: &str| -> Option<&IndexedPackage> {
+        indexed
+            .iter()
+            .filter(|p| {
+                p.dir.is_empty() || file == p.dir || file.starts_with(&format!("{}/", p.dir))
+            })
+            .max_by_key(|p| p.dir.len())
+    };
+
+    let mut uses = Vec::new();
+    for (file, raw, _lang) in store.all_imports()? {
+        let Some(pkg) = owner(&file) else { continue };
+        let Some(root) = import_root(&raw) else {
+            continue;
+        };
+        if let Some(dep) = pkg
+            .package
+            .dependencies
+            .iter()
+            .find(|d| dep_code_name(d) == root)
+        {
+            uses.push(ExternalUse {
+                from_package: pkg.package.name.clone(),
+                from_file: file.clone(),
+                package: dep.name.clone(),
+                path: raw,
+            });
+        }
+    }
+    uses.sort_by(|a, b| {
+        (&a.from_file, &a.path, &a.package).cmp(&(&b.from_file, &b.path, &b.package))
+    });
+    uses.dedup();
+    Ok(uses)
+}
+
 /// Expand one workspace `members` entry (a path or path glob relative to `root`)
 /// into the directories it matches. Each path component is matched
 /// independently: a literal component must name an existing directory, while a
@@ -1037,7 +1108,12 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
     // package identity (#220). Read-only borrow ends before the meta write.
     let indexed = index_packages(&*store, &discovered)?;
     let packages_json = serde_json::to_string(&indexed).unwrap_or_else(|_| "[]".to_string());
+    // Consumer side of cross-repo links (#220): imports referencing a declared
+    // dependency. Resolved from the same identity, persisted for #221.
+    let uses_json = serde_json::to_string(&external_uses(&*store, &indexed)?)
+        .unwrap_or_else(|_| "[]".to_string());
     store.set_meta("packages", &packages_json)?;
+    store.set_meta("external_uses", &uses_json)?;
     store.set_meta("packages_fingerprint", &packages_fingerprint)?;
     resolve_progress.finish_and_clear();
 
@@ -1376,6 +1452,61 @@ mod tests {
             "expected `go` export, got {:?}",
             widget.exports.iter().map(|e| &e.name).collect::<Vec<_>>()
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn import_root_takes_first_path_segment() {
+        check!(import_root("widget::go") == Some("widget"));
+        check!(import_root("::widget::go") == Some("widget"));
+        check!(import_root("widget") == Some("widget"));
+        check!(import_root("") == None);
+    }
+
+    // #220: imports referencing a declared dependency are tagged as external
+    // use-sites (the consumer side of a cross-repo link); std and unknown roots
+    // are not.
+    #[test]
+    fn analyze_tags_external_crate_uses() {
+        let dir = temp_repo("external-uses");
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        let app = dir.join("crates/app");
+        std::fs::create_dir_all(app.join("src")).unwrap();
+        std::fs::write(
+            app.join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nwidget = \"1\"\nlocaldep = { path = \"../localdep\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("src/lib.rs"),
+            "use widget::go;\nuse localdep::helper;\nuse std::collections::HashMap;\nfn use_them() { let _: HashMap<u8, u8>; }\n",
+        )
+        .unwrap();
+        run(&dir, false).unwrap();
+
+        let store = LadybugStore::open(&RepoPaths::new(&dir).index_dir.join("ladybug")).unwrap();
+        let json = store
+            .get_meta("external_uses")
+            .unwrap()
+            .expect("external_uses meta written");
+        let uses: Vec<ExternalUse> = serde_json::from_str(&json).unwrap();
+        check!(
+            uses.iter()
+                .any(|u| u.package == "widget" && u.path == "widget::go"),
+            "expected widget::go external use, got {uses:?}"
+        );
+        check!(
+            uses.iter()
+                .any(|u| u.package == "localdep" && u.path == "localdep::helper")
+        );
+        // std is not a declared dependency, so it is not an external use.
+        check!(!uses.iter().any(|u| u.package == "std"));
+        check!(uses.iter().all(|u| u.from_package == "app"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
