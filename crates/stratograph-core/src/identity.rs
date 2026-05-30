@@ -57,6 +57,11 @@ pub struct ExternalUse {
     pub package: String,
     /// The import path as written, e.g. `widget::go` or `widget::{a, b}`.
     pub path: String,
+    /// Node ids of the symbols in `from_file` whose body references the imported
+    /// name(s) — the precise use-sites (#236). Empty when none could be
+    /// attributed, in which case consumers fall back to file-level landing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub from_nodes: Vec<String>,
 }
 
 /// A repo's full persisted package identity: the packages it publishes (with
@@ -114,6 +119,7 @@ mod tests {
                 from_file: "crates/app/src/lib.rs".into(),
                 package: "widget".into(),
                 path: "widget::go".into(),
+                from_nodes: vec!["node-caller".into()],
             }],
         };
         let packages_json = serde_json::to_string(&identity.packages).unwrap();

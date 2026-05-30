@@ -32,7 +32,7 @@ pub use impact::{
     edge_rules, is_cross_boundary_path, parse_confidence,
 };
 pub use lang::Language;
-pub use links::{CrossRepoLink, LinkKind, RepoIdentity, resolve_links};
+pub use links::{CrossRepoLink, LinkKind, RepoIdentity, imported_symbols, resolve_links};
 pub use manifest::{
     CargoDependency, CargoPackage, DepKind, DepSource, parse_cargo_manifest, workspace_members,
 };

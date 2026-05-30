@@ -167,18 +167,24 @@ pub fn federated_impact(
     for link in resolve_links(&identities) {
         match &link.to_node {
             // Symbol-level link: add a cross-edge from the producer export to the
-            // consumer's symbols in the importing file.
+            // consumer use-sites. Precise use-sites (#236) land on exactly the
+            // referencing symbols; otherwise fall back to every symbol in the
+            // importing file.
             Some(node_id) => {
-                let Some(consumer) = stores.get(&link.from_repo) else {
-                    continue;
-                };
                 let producer = qualify(&link.to_repo, &NodeId(node_id.clone()));
-                for node in consumer.nodes_in_file(&link.from_file)? {
-                    if is_symbol_node(node.kind) {
-                        cross
-                            .entry(producer.clone())
-                            .or_default()
-                            .push((qualify(&link.from_repo, &node.id), Confidence::Inferred));
+                let edges = cross.entry(producer).or_default();
+                if !link.from_nodes.is_empty() {
+                    for n in &link.from_nodes {
+                        edges.push((
+                            qualify(&link.from_repo, &NodeId(n.clone())),
+                            Confidence::Inferred,
+                        ));
+                    }
+                } else if let Some(consumer) = stores.get(&link.from_repo) {
+                    for node in consumer.nodes_in_file(&link.from_file)? {
+                        if is_symbol_node(node.kind) {
+                            edges.push((qualify(&link.from_repo, &node.id), Confidence::Inferred));
+                        }
                     }
                 }
             }
