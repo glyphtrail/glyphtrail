@@ -103,6 +103,11 @@ enum Command {
         #[command(subcommand)]
         cmd: commands::repo::RepoCmd,
     },
+    /// Manage named groups of repositories (~/.stratograph/groups.json).
+    Group {
+        #[command(subcommand)]
+        cmd: commands::group::GroupCmd,
+    },
     /// Show index statistics.
     Status {
         #[arg(long, default_value = ".")]
@@ -179,6 +184,7 @@ fn main() -> anyhow::Result<()> {
         Command::Story(args) => commands::story::run(args),
         Command::Mcp { repo } => stratograph_mcp::serve_stdio(repo),
         Command::Repo { cmd } => commands::repo::run(cmd),
+        Command::Group { cmd } => commands::group::run(cmd),
         Command::Status {
             repo,
             all,
