@@ -551,7 +551,7 @@ fn doc_for(parsed: &ParsedFile, start_line: usize) -> Option<String> {
     let mut lines = Vec::new();
     let mut want = start_line.checked_sub(1)?;
     while let Some(c) = parsed.comments.iter().find(|c| c.end_line() == want) {
-        lines.push(c.text.clone());
+        lines.push(meridian_core::scrub_secrets(&c.text).into_owned());
         if want <= 1 {
             break;
         }
@@ -731,15 +731,18 @@ pub fn build_file_graph(
             .map(|i| defs[i].id.clone())
             .unwrap_or_else(|| file_id.clone());
         let cid = NodeId::derive(&[rel_path, "comment", &c.span.start_byte.to_string()]);
+        // Redact secret-looking values so a token hardcoded in a comment never
+        // reaches the index/search/wiki/MCP (#136).
+        let text = meridian_core::scrub_secrets(&c.text);
         fg.graph.add_node(Node {
             id: cid.clone(),
             kind: NodeKind::Comment,
-            name: c.text.chars().take(60).collect(),
+            name: text.chars().take(60).collect(),
             qualified_name: String::new(),
             file: rel_path.to_string(),
             language: Some(lang.name().to_string()),
             span: Some(c.span),
-            doc: Some(c.text.clone()),
+            doc: Some(text.into_owned()),
         });
         fg.graph
             .add_edge(cid, scope, EdgeKind::Documents, Confidence::Extracted);

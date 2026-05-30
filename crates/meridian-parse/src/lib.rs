@@ -220,6 +220,31 @@ mod tests {
         }
     }
 
+    // #136: a secret hardcoded in a design-rationale comment is redacted before
+    // it becomes a Comment node, so it never reaches the index / search / wiki.
+    #[test]
+    fn scrubs_secrets_from_comment_nodes() {
+        use meridian_core::{NodeId, NodeKind};
+        let token = "ghp_0123456789abcdefABCDEF0123456789abcd";
+        let src = format!("// NOTE: rotate {token} soon\nfn f() {{}}\n");
+        let parsed = parse_source(&Language::Rust, &src).unwrap();
+        let file_id = NodeId::derive(&["file", "c.rs"]);
+        let fg = build_file_graph("c.rs", &Language::Rust, &file_id, &parsed);
+        let comment = fg
+            .graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Comment)
+            .expect("comment node");
+        check!(comment.doc.as_deref().unwrap().contains("[REDACTED]"));
+        // The raw token appears nowhere in the built graph (name or doc).
+        let leaked =
+            fg.graph.nodes.iter().any(|n| {
+                n.name.contains(token) || n.doc.as_deref().is_some_and(|d| d.contains(token))
+            });
+        check!(!leaked, "secret token leaked into the graph");
+    }
+
     #[test]
     fn extracts_rust_function_and_call() {
         let src = r#"
