@@ -221,7 +221,9 @@ const WORKER_SRC = `
   self.onmessage = (e) => {
     try {
       if (!loaded) {
-        importScripts("https://cdn.jsdelivr.net/npm/d3-force@3/dist/d3-force.min.js");
+        // The full d3 bundle: d3-force's own UMD is not self-contained (it needs
+        // d3-timer/d3-dispatch/d3-quadtree), which fails inside a bare worker.
+        importScripts("https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js");
         loaded = true;
       }
       const { nodes, links } = e.data;
