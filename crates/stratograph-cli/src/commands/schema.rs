@@ -180,14 +180,23 @@ pub fn hasura_operations(text: &str) -> Vec<OperationKey> {
 
     let mut out = Vec::new();
     for table in hasura_tables(&doc) {
+        // Field names follow Hasura's `custom_name` (the type rename, which is the
+        // base for default field names) and per-operation `custom_root_fields`
+        // overrides where present, else the default `{table}` / `insert_{table}` …
+        // conventions, so client GraphQL ops key by the *exposed* names (#90).
+        let base = &table.base;
+        let root = |key: &str, default: String| table.roots.get(key).cloned().unwrap_or(default);
         for (op, field) in [
-            ("Query", table.clone()),
-            ("Query", format!("{table}_by_pk")),
-            ("Query", format!("{table}_aggregate")),
-            ("Mutation", format!("insert_{table}")),
-            ("Mutation", format!("update_{table}")),
-            ("Mutation", format!("delete_{table}")),
-            ("Subscription", table.clone()),
+            ("Query", root("select", base.clone())),
+            ("Query", root("select_by_pk", format!("{base}_by_pk"))),
+            (
+                "Query",
+                root("select_aggregate", format!("{base}_aggregate")),
+            ),
+            ("Mutation", root("insert", format!("insert_{base}"))),
+            ("Mutation", root("update", format!("update_{base}"))),
+            ("Mutation", root("delete", format!("delete_{base}"))),
+            ("Subscription", root("select", base.clone())),
         ] {
             out.push(OperationKey::opaque(
                 Protocol::GraphQl,
@@ -280,8 +289,18 @@ fn webhook_path(handler: &str) -> Option<String> {
     Some(h[idx..].to_string())
 }
 
-/// Tracked table names from Hasura metadata, across the layouts Hasura emits.
-fn hasura_tables(doc: &Value) -> Vec<String> {
+/// A tracked Hasura table with the naming it exposes in GraphQL.
+struct HasuraTable {
+    /// Base name for default field generation: the `custom_name` rename if set,
+    /// else the table name.
+    base: String,
+    /// Explicit `custom_root_fields` overrides (`select`, `insert`, …).
+    roots: std::collections::HashMap<String, String>,
+}
+
+/// Tracked tables from Hasura metadata, across the layouts Hasura emits, with
+/// their `custom_name` / `custom_root_fields` naming (#90).
+fn hasura_tables(doc: &Value) -> Vec<HasuraTable> {
     let mut names = Vec::new();
     let mut collect = |tables: &Value| {
         if let Some(arr) = tables.as_array() {
@@ -293,7 +312,22 @@ fn hasura_tables(doc: &Value) -> Vec<String> {
                     None => None,
                 };
                 if let Some(n) = name {
-                    names.push(n);
+                    let config = t.get("configuration");
+                    let base = config
+                        .and_then(|c| c.get("custom_name"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .unwrap_or(n);
+                    let roots = config
+                        .and_then(|c| c.get("custom_root_fields"))
+                        .and_then(Value::as_object)
+                        .map(|m| {
+                            m.iter()
+                                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    names.push(HasuraTable { base, roots });
                 }
             }
         }
@@ -377,6 +411,39 @@ rest_endpoints:
             ops.iter()
                 .any(|k| k.method == Some(HttpMethod::Post) && k.path == "/api/rest/get_user")
         );
+    }
+
+    #[test]
+    fn hasura_custom_root_fields_and_name() {
+        let yaml = r#"
+version: 3
+sources:
+  - name: default
+    tables:
+      - table:
+          name: users
+          schema: public
+        configuration:
+          custom_name: user
+          custom_root_fields:
+            select: getUsers
+            insert: createUser
+"#;
+        let paths: Vec<String> = hasura_operations(yaml)
+            .iter()
+            .map(|k| k.path.clone())
+            .collect();
+        // Overridden root fields use the custom names…
+        check!(paths.contains(&"Query.getUsers".to_string())); // select override
+        check!(paths.contains(&"Mutation.createUser".to_string())); // insert override
+        check!(paths.contains(&"Subscription.getUsers".to_string())); // subscription = select
+        // …and the rest fall back to `custom_name` (`user`), not the table name.
+        check!(paths.contains(&"Query.user_by_pk".to_string()));
+        check!(paths.contains(&"Mutation.update_user".to_string()));
+        check!(paths.contains(&"Query.user_aggregate".to_string()));
+        // The raw table-name defaults are not emitted once renamed.
+        check!(!paths.contains(&"Query.users".to_string()));
+        check!(!paths.contains(&"Mutation.insert_users".to_string()));
     }
 
     #[test]
