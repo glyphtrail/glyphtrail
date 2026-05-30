@@ -3,6 +3,7 @@
 pub mod api;
 pub mod config;
 pub mod error;
+pub mod identity;
 pub mod impact;
 pub mod lang;
 pub mod manifest;
@@ -17,6 +18,9 @@ pub use api::{
 };
 pub use config::{ApiConfig, Config, DynamicLanguage, SchemaFormat, SchemaSource};
 pub use error::{CoreError, Result};
+pub use identity::{
+    ExternalUse, IndexedPackage, META_EXTERNAL_USES, META_PACKAGES, PackageExport, PackageIdentity,
+};
 pub use impact::{
     Adjacency, ClassifiedItem, Direction, EdgeRule, ImpactClass, ImpactItem, ImpactPolicy,
     ImpactReport, ImpactSummary, classify, compute_impact, edge_rules, is_cross_boundary_path,
