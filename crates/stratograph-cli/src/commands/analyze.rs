@@ -7,8 +7,9 @@ use std::collections::HashSet;
 use stratograph_core::config::{IGNORE_FILE, RepoPaths};
 use stratograph_core::{
     CargoPackage, ClientCall, CodeGraph, Confidence, Config, DynamicLanguage, Edge, EdgeKind,
-    Endpoint, Language, Matcher, Node, NodeId, NodeKind, OperationKey, PendingLink, Protocol,
-    RewriteEngine, SchemaFormat, parse_cargo_manifest, workspace_members,
+    Endpoint, ExternalUse, IndexedPackage, Language, META_EXTERNAL_USES, META_PACKAGES, Matcher,
+    Node, NodeId, NodeKind, OperationKey, PackageExport, PendingLink, Protocol, RewriteEngine,
+    SchemaFormat, parse_cargo_manifest, workspace_members,
 };
 use stratograph_parse::{
     DynamicGrammar, PendingEdge, build_client_graph, build_file_graph, build_graphql_client_graph,
@@ -414,31 +415,6 @@ struct DiscoveredPackage {
     package: CargoPackage,
 }
 
-/// One exported symbol of a package: a definition another crate could name.
-/// Visibility is not resolved here — a consumer can only reference `pub` items,
-/// so matching a consumer's import path against this set stays correct without
-/// it (a private symbol simply never appears in any consumer's path). Module
-/// path / `pub use` re-export disambiguation is a later refinement; the link
-/// step (#221) falls back to crate level when a path can't be matched exactly.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PackageExport {
-    name: String,
-    qualified_name: String,
-    kind: NodeKind,
-    file: String,
-    node_id: String,
-}
-
-/// A package's identity together with its resolved export index — the shape
-/// persisted to index meta under `packages` for the cross-repo link step.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct IndexedPackage {
-    dir: String,
-    #[serde(flatten)]
-    package: CargoPackage,
-    exports: Vec<PackageExport>,
-}
-
 /// Discover the Cargo packages a repo publishes (#220): the root `Cargo.toml`
 /// plus every workspace member (member globs like `crates/*` expanded against
 /// the filesystem), each paired with its repo-relative manifest directory. A
@@ -543,22 +519,6 @@ fn index_packages(
             }
         })
         .collect())
-}
-
-/// A use-site where one of this repo's files references an external crate
-/// (#220): an import whose root path segment matches a dependency declared by
-/// the package that owns the importing file. This is the consumer side of a
-/// cross-repo link; #221 matches `package` to a producer repo and `path` to its
-/// exports, falling back to crate level when no symbol matches.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ExternalUse {
-    /// The consumer package (by name) that owns the importing file.
-    from_package: String,
-    from_file: String,
-    /// Real crate name of the referenced dependency, rename-resolved.
-    package: String,
-    /// The import path as written, e.g. `widget::go` or `widget::{a, b}`.
-    path: String,
 }
 
 /// The name a dependency is referenced under in code: its rename alias when
@@ -1112,8 +1072,8 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
     // dependency. Resolved from the same identity, persisted for #221.
     let uses_json = serde_json::to_string(&external_uses(&*store, &indexed)?)
         .unwrap_or_else(|_| "[]".to_string());
-    store.set_meta("packages", &packages_json)?;
-    store.set_meta("external_uses", &uses_json)?;
+    store.set_meta(META_PACKAGES, &packages_json)?;
+    store.set_meta(META_EXTERNAL_USES, &uses_json)?;
     store.set_meta("packages_fingerprint", &packages_fingerprint)?;
     resolve_progress.finish_and_clear();
 
