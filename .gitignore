@@ -1,7 +1,6 @@
 /target
 graph.html
-.codegraph/
-.meridian/
+.stratograph/
 # Default output dirs/files of the wiki and story commands.
 /wiki/
 /STORY.md

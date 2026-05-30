@@ -1,0 +1,38 @@
+[package]
+name = "stratograph-cli"
+version.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "stratograph"
+path = "src/main.rs"
+
+[dependencies]
+stratograph-core.workspace = true
+stratograph-parse.workspace = true
+stratograph-store.workspace = true
+stratograph-viz.workspace = true
+stratograph-server.workspace = true
+stratograph-mcp.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+ignore.workspace = true
+blake3.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_norway.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio.workspace = true
+ureq = { version = "2", features = ["json"] }
+indicatif = "0.17"
+globset = "0.4"
+rayon = "1"
+
+[dev-dependencies]
+assert2.workspace = true
