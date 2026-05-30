@@ -617,7 +617,20 @@ fn expand_member(root: &Path, pattern: &str) -> Vec<PathBuf> {
     current
 }
 
-pub fn run(path: &Path, update: bool) -> Result<()> {
+/// The result of an analysis run, returned rather than printed so callers (the
+/// CLI, the MCP server) decide how to surface it. `up_to_date` is true when the
+/// #110 fast path found nothing changed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalyzeOutcome {
+    pub up_to_date: bool,
+    pub files: usize,
+    pub nodes: usize,
+    pub edges: usize,
+    /// Indexed file counts per language, descending by count.
+    pub languages: Vec<(String, usize)>,
+}
+
+pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
     let root = path
         .canonicalize()
         .with_context(|| format!("cannot resolve path {}", path.display()))?;
@@ -667,8 +680,14 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
         && store.get_meta("packages_fingerprint")?.as_deref() == Some(packages_fingerprint.as_str())
         && store.get_meta("tool_version")?.as_deref() == Some(VERSION)
     {
-        println!("Index up to date ({} files); nothing changed.", files.len());
-        return Ok(());
+        let stats = store.stats()?;
+        return Ok(AnalyzeOutcome {
+            up_to_date: true,
+            files: stats.files,
+            nodes: stats.nodes,
+            edges: stats.edges,
+            languages: stats.languages,
+        });
     }
 
     // Lazily-loaded dynamic grammars, keyed by language name. `None` records a
@@ -1078,20 +1097,13 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
     resolve_progress.finish_and_clear();
 
     let stats = store.stats()?;
-    println!(
-        "Indexed {} files: {} nodes, {} edges",
-        stats.files, stats.nodes, stats.edges
-    );
-    if !stats.languages.is_empty() {
-        let langs = stats
-            .languages
-            .iter()
-            .map(|(lang, n)| format!("{lang} {n}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        println!("Languages: {langs}");
-    }
-    Ok(())
+    Ok(AnalyzeOutcome {
+        up_to_date: false,
+        files: stats.files,
+        nodes: stats.nodes,
+        edges: stats.edges,
+        languages: stats.languages,
+    })
 }
 
 /// Lazily compile + load the grammar for a dynamic language by name, caching the

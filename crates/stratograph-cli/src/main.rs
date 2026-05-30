@@ -130,11 +130,14 @@ enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Logs go to stderr so stdout carries only command output — critical for the
+    // MCP stdio transport (JSON-RPC) and for piping JSON/YAML query results.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with_target(false)
+        .with_writer(std::io::stderr)
         .init();
 
     let cli = Cli::parse();
@@ -143,7 +146,25 @@ fn main() -> anyhow::Result<()> {
             if all {
                 commands::repo::analyze_all(update)
             } else {
-                commands::analyze::run(&path, update)
+                let outcome = commands::analyze::run(&path, update)?;
+                if outcome.up_to_date {
+                    println!(
+                        "Index up to date ({} files); nothing changed.",
+                        outcome.files
+                    );
+                } else {
+                    println!(
+                        "Indexed {} files: {} nodes, {} edges",
+                        outcome.files, outcome.nodes, outcome.edges
+                    );
+                }
+                if !outcome.languages.is_empty() {
+                    println!(
+                        "Languages: {}",
+                        commands::status::format_languages(&outcome.languages)
+                    );
+                }
+                Ok(())
             }
         }
         Command::Query {

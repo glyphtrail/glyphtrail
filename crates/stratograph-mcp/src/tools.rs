@@ -120,6 +120,18 @@ pub fn definitions() -> Vec<Value> {
             json!({}),
             &[],
         ),
+        tool(
+            "analyze",
+            "(Re)index a repository: walk it, parse sources, resolve links, and \
+             persist the graph. Targets the `repo` (registered name or path) or \
+             the server's launch repo. Run this after code changes, or to index \
+             a repo the server has never seen, so queries reflect the latest \
+             state — no shell required.",
+            json!({
+                "update": { "type": "boolean", "description": "Only reparse files changed since the last index (incremental)." }
+            }),
+            &[],
+        ),
     ]
 }
 
@@ -141,6 +153,11 @@ fn dispatch(db: &Path, name: &str, args: &Value) -> Result<Value, String> {
     // Resolve the per-call repo selector (#240): a registered name or a path
     // overrides the server's launch repo; absent, the launch repo is used.
     let db = target_db(db, args)?;
+    // analyze writes a fresh index for the target repo; it opens its own store,
+    // so it runs before (and instead of) the read-path store open.
+    if name == "analyze" {
+        return analyze_tool(&db, args);
+    }
     // Cross-repo impact opens its own member stores (incl. the current repo), so
     // it must not be given the pre-opened per-repo store (no double-open).
     if name == "impact" && is_federated(args) {
@@ -408,6 +425,20 @@ fn policy_from_args(args: &Value) -> Result<ImpactPolicy, String> {
         policy.min_confidence = stratograph_core::parse_confidence(mc)?;
     }
     Ok(policy)
+}
+
+/// Analyze (index) a repository on demand (#240): resolve the repo root from
+/// the (already repo-resolved) index anchor and run the analysis pipeline, so an
+/// agent can point the server at any repo and build/refresh its index without a
+/// shell. Returns the `AnalyzeOutcome` JSON.
+fn analyze_tool(db: &Path, args: &Value) -> Result<Value, String> {
+    let root = db
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| format!("invalid repo path {}", db.display()))?;
+    let update = args.get("update").and_then(Value::as_bool).unwrap_or(false);
+    let outcome = stratograph_analyze::run(root, update).map_err(err)?;
+    serde_json::to_value(&outcome).map_err(err)
 }
 
 /// Cross-repo impact (#222/#223): seed in the current repo and traverse into
@@ -763,6 +794,36 @@ mod tests {
         let text = res["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
         check!(parsed[0]["name"] == json!("zonk"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // #240: the analyze tool indexes a repo at an arbitrary path on demand,
+    // returning the outcome — no shell, no server restart.
+    #[test]
+    fn analyze_tool_indexes_a_path() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("stratograph-mcp-analyze-{nanos}"));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"t\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+
+        let res = call(
+            Path::new("/nonexistent/graph.db"),
+            "analyze",
+            &json!({ "repo": root.to_str().unwrap() }),
+        );
+        check!(res["isError"] == json!(false));
+        let text = res["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        check!(parsed["files"].as_u64().unwrap() >= 1);
+        check!(parsed["nodes"].as_u64().unwrap() >= 1);
         std::fs::remove_dir_all(&root).ok();
     }
 

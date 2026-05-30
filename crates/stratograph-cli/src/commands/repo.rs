@@ -35,7 +35,18 @@ fn registry_path() -> Result<PathBuf> {
 /// Re-analyze every registered repo (`analyze --all`). Per-repo failures are
 /// reported and don't abort the run.
 pub fn analyze_all(update: bool) -> Result<()> {
-    each_repo("analyze", |root| super::analyze::run(root, update))
+    each_repo("analyze", |root| {
+        let outcome = super::analyze::run(root, update)?;
+        if outcome.up_to_date {
+            println!("  up to date ({} files)", outcome.files);
+        } else {
+            println!(
+                "  {} files, {} nodes, {} edges",
+                outcome.files, outcome.nodes, outcome.edges
+            );
+        }
+        Ok(())
+    })
 }
 
 /// Show index stats for every registered repo (`status --all`).
