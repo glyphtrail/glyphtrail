@@ -30,9 +30,6 @@ enum Command {
         /// Analyze every repository in the global registry instead of `path`.
         #[arg(long)]
         all: bool,
-        /// Storage backend: sqlite (default) or ladybug (needs --features ladybug).
-        #[arg(long, value_enum, default_value_t)]
-        backend: commands::backend::BackendKind,
     },
     /// Query the graph.
     Query {
@@ -47,9 +44,6 @@ enum Command {
         /// Emit YAML instead of text (compact structured output for agents).
         #[arg(long)]
         yaml: bool,
-        /// Storage backend: sqlite (default) or ladybug.
-        #[arg(long, value_enum, default_value_t)]
-        backend: commands::backend::BackendKind,
         /// Query every repository in the global registry, tagging each result.
         #[arg(long)]
         all: bool,
@@ -82,16 +76,12 @@ enum Command {
         repo: PathBuf,
         #[arg(long, default_value_t = 7700)]
         port: u16,
-        /// Storage backend: sqlite or ladybug (default). The web UI works with
-        /// either; the `/mcp` endpoint requires the sqlite backend.
-        #[arg(long, value_enum, default_value_t = commands::backend::BackendKind::default())]
-        backend: commands::backend::BackendKind,
     },
     /// Compute the blast radius of a change (symbol, file, or git change set).
     Impact(commands::impact::ImpactArgs),
     /// Report API contract drift: code endpoints vs blessed schema operations.
     Drift(commands::drift::DriftArgs),
-    /// Run a raw Cypher query against the LadybugDB backend (needs --features ladybug).
+    /// Run a raw Cypher query against the graph.
     Cypher {
         /// The Cypher query to run.
         query: String,
@@ -138,16 +128,11 @@ fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Analyze {
-            path,
-            update,
-            all,
-            backend,
-        } => {
+        Command::Analyze { path, update, all } => {
             if all {
-                commands::repo::analyze_all(update, backend)
+                commands::repo::analyze_all(update)
             } else {
-                commands::analyze::run(&path, update, backend)
+                commands::analyze::run(&path, update)
             }
         }
         Command::Query {
@@ -155,7 +140,6 @@ fn main() -> anyhow::Result<()> {
             repo,
             json,
             yaml,
-            backend,
             all,
             repos,
         } => {
@@ -163,7 +147,7 @@ fn main() -> anyhow::Result<()> {
             if all || repos.is_some() {
                 commands::query::run_registry(query, emit, all, repos)
             } else {
-                commands::query::run(&repo, query, emit, backend)
+                commands::query::run(&repo, query, emit)
             }
         }
         Command::Viz {
@@ -181,11 +165,7 @@ fn main() -> anyhow::Result<()> {
             cross_boundary,
             depth,
         ),
-        Command::Serve {
-            repo,
-            port,
-            backend,
-        } => commands::serve::run(&repo, port, backend),
+        Command::Serve { repo, port } => commands::serve::run(&repo, port),
         Command::Impact(args) => commands::impact::run(args),
         Command::Drift(args) => commands::drift::run(args),
         Command::Cypher { query, repo } => commands::cypher::run(&repo, &query),

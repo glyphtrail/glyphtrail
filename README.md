@@ -11,10 +11,10 @@ structure, trace lineage, and discover recurring ideas across time.
 
 It parses source with [tree-sitter](https://tree-sitter.github.io/), extracts
 symbols, calls, imports, inheritance, design-rationale comments, and
-cross-boundary API links, stores them in a per-repo SQLite graph, and lets you
-query or visualize the result.
+cross-boundary API links, stores them in a per-repo LadybugDB graph, and lets
+you query or visualize the result.
 
-Built native in Rust — fast and dependency-light.
+Built native in Rust.
 
 ## Install
 
@@ -32,7 +32,7 @@ cargo build --release   # binary at target/release/meridian
 ## Usage
 
 ```sh
-# Index the current repository (writes .meridian/graph.db)
+# Index the current repository (writes .meridian/ladybug)
 meridian analyze .
 
 # Re-index only files that changed
@@ -145,30 +145,25 @@ A Cargo workspace:
 |-------|----------------|
 | `meridian-core`   | domain model, language detection, config |
 | `meridian-parse`  | tree-sitter registry, extraction, graph building |
-| `meridian-store`  | SQLite + FTS5 storage and graph queries |
+| `meridian-store`  | LadybugDB (Cypher) storage and graph queries |
 | `meridian-viz`    | Cytoscape graph rendering (HTML/JSON) |
 | `meridian-server` | `axum` server for the interactive explorer |
 | `meridian-mcp`    | Model Context Protocol server (stdio) exposing the query tools |
 | `meridian-cli`    | the `meridian` binary |
 
-Storage sits behind the `GraphStore` trait, so backends are interchangeable.
-**LadybugDB** (Cypher, native graph traversal) is the **default** backend;
-SQLite + FTS5 is the lightweight alternative.
+Storage sits behind the `GraphStore` trait. **LadybugDB** (Cypher, native graph
+traversal) is the storage backend; the `.meridian/ladybug` index is the source
+of truth.
 
 ```sh
-meridian analyze .                    # default: LadybugDB (.meridian/ladybug)
-meridian analyze . --backend sqlite   # opt out to SQLite (.meridian/graph.db)
-meridian cypher "MATCH (n:Node) RETURN n.name LIMIT 10"   # raw Cypher (LadybugDB)
+meridian analyze .                    # writes .meridian/ladybug
+meridian cypher "MATCH (n:Node) RETURN n.name LIMIT 10"   # raw Cypher
 ```
 
 LadybugDB links the `lbug` crate, which downloads a prebuilt `liblbug` or builds
 from source via **cmake + a C/C++ toolchain** (clang/gcc) — install those if the
 prebuilt archive is unavailable (e.g. `apt-get install cmake clang
-build-essential`). To skip the C++ build entirely, build SQLite-only:
-
-```sh
-cargo build --no-default-features -p meridian-cli   # then use --backend sqlite
-```
+build-essential`).
 
 ## Development
 

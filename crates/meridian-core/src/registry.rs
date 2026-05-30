@@ -1,7 +1,7 @@
 //! Global registry of indexed repositories, stored at
 //! `~/.meridian/registry.json`. It tracks repo roots by name so the analyzer
-//! can target or span many repositories; each repo's `.meridian/graph.db`
-//! remains the source of truth.
+//! can target or span many repositories; each repo's `.meridian/` index remains
+//! the source of truth.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -27,7 +27,7 @@ pub enum RepoHealth {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegistryEntry {
     pub name: String,
-    /// Absolute repository root (contains `.meridian/graph.db`).
+    /// Absolute repository root (contains the `.meridian/` index).
     pub root: PathBuf,
     /// Unix seconds when the root was first observed missing; cleared when it
     /// reappears. Drives `prune_missing` so dead entries don't collect dust,
@@ -41,7 +41,11 @@ impl RegistryEntry {
     pub fn health(&self) -> RepoHealth {
         if !self.root.exists() {
             RepoHealth::Missing
-        } else if RepoPaths::new(&self.root).db_path.exists() {
+        } else if RepoPaths::new(&self.root)
+            .index_dir
+            .join("ladybug")
+            .exists()
+        {
             RepoHealth::Indexed
         } else {
             RepoHealth::Unindexed

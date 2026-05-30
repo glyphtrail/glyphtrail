@@ -9,7 +9,9 @@ use clap::{Args, ValueEnum};
 use globset::{Glob, GlobSetBuilder};
 use meridian_core::config::{Config, RepoPaths};
 use meridian_core::{ClassifiedItem, Confidence, ImpactClass, ImpactPolicy, ImpactReport};
-use meridian_store::{ChangeSpec, SeedSet, SqliteStore, changed_files, seed_nodes};
+use meridian_store::{ChangeSpec, GraphStore, SeedSet, changed_files, seed_nodes};
+
+use crate::commands::backend;
 
 /// Exit code used by `--gate` when a change touches the API/contract surface.
 const GATE_EXIT_CODE: i32 = 2;
@@ -77,13 +79,7 @@ pub struct ImpactArgs {
 
 pub fn run(args: ImpactArgs) -> Result<()> {
     let paths = RepoPaths::new(&args.repo);
-    if !paths.db_path.exists() {
-        bail!(
-            "no index found at {} — run `meridian analyze` first",
-            paths.db_path.display()
-        );
-    }
-    let store = SqliteStore::open(&paths.db_path)?;
+    let store = backend::open_existing(&paths)?;
 
     let format = if args.json && args.format == Format::Text {
         Format::Json
@@ -91,7 +87,7 @@ pub fn run(args: ImpactArgs) -> Result<()> {
         args.format
     };
 
-    let seed_set = resolve_seeds(&store, &args)?;
+    let seed_set = resolve_seeds(store.as_ref(), &args)?;
     let report = if seed_set.seeds.is_empty() {
         // Still emit (possibly noting removed/unresolved files) rather than error.
         ImpactReport::new(
@@ -158,7 +154,7 @@ fn retag_configured_tests(items: &mut [ClassifiedItem], globs: &[String]) -> Res
     Ok(())
 }
 
-fn resolve_seeds(store: &SqliteStore, args: &ImpactArgs) -> Result<SeedSet> {
+fn resolve_seeds(store: &dyn GraphStore, args: &ImpactArgs) -> Result<SeedSet> {
     // Change-set seed modes are mutually exclusive with a symbol name; the first
     // set one wins, in a documented precedence.
     if let Some(name) = &args.name {

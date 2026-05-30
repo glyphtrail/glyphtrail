@@ -6,7 +6,7 @@ use meridian_core::{
     Confidence, EdgeKind, HttpMethod, ImpactPolicy, ImpactReport, Node, NodeId, NodeKind,
     OperationKey, Protocol, operations_matching,
 };
-use meridian_store::{ChangeSpec, GraphStore, SqliteStore, changed_files, seed_nodes};
+use meridian_store::{ChangeSpec, GraphStore, LadybugStore, changed_files, seed_nodes};
 use serde_json::{Value, json};
 
 /// The advertised tool set (`tools/list`).
@@ -192,27 +192,22 @@ fn dispatch(db: &Path, name: &str, args: &Value) -> Result<Value, String> {
     }
 }
 
-/// Open the repo's graph store, auto-detecting the backend (#165). `db` is the
-/// SQLite index path (`.meridian/graph.db`); a LadybugDB index, when built and
-/// present, lives beside it at `.meridian/ladybug` and is preferred (it is the
-/// default backend). Returns a trait object so every tool is backend-agnostic.
+/// Open the repo's LadybugDB graph store. `db` is the index anchor path
+/// (`.meridian/graph.db`); the LadybugDB index lives beside it at
+/// `.meridian/ladybug`. Returns a trait object so every tool stays decoupled
+/// from the concrete store type.
 fn open(db: &Path) -> Result<Box<dyn GraphStore>, String> {
-    #[cfg(feature = "ladybug")]
-    if let Some(dir) = db.parent() {
-        let ladybug = dir.join("ladybug");
-        if ladybug.exists() {
-            return Ok(Box::new(
-                meridian_store::LadybugStore::open(&ladybug).map_err(err)?,
-            ));
-        }
-    }
-    if !db.exists() {
+    let dir = db
+        .parent()
+        .ok_or_else(|| format!("invalid index path {}", db.display()))?;
+    let ladybug = dir.join("ladybug");
+    if !ladybug.exists() {
         return Err(format!(
             "no index at {} — run `meridian analyze` first",
-            db.display()
+            ladybug.display()
         ));
     }
-    Ok(Box::new(SqliteStore::open(db).map_err(err)?))
+    Ok(Box::new(LadybugStore::open(&ladybug).map_err(err)?))
 }
 
 fn neighbors_of(
@@ -451,14 +446,16 @@ mod tests {
     use assert2::check;
     use meridian_core::{Confidence, Edge, Span};
 
-    // Build a tiny graph at a temp db path and return that path.
+    // Build a tiny graph in a temp index dir; return the `graph.db` anchor path
+    // (the LadybugDB index sits beside it at `<dir>/ladybug`).
     fn build_db(tag: &str) -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let db = std::env::temp_dir().join(format!("meridian-mcp-{tag}-{nanos}.db"));
-        let mut store = SqliteStore::open(&db).unwrap();
+        let dir = std::env::temp_dir().join(format!("meridian-mcp-{tag}-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut store = LadybugStore::open(&dir.join("ladybug")).unwrap();
         let mk = |id: &str, name: &str, file: &str, kind: NodeKind| Node {
             id: NodeId(id.into()),
             kind,
@@ -488,7 +485,7 @@ mod tests {
                 }],
             )
             .unwrap();
-        db
+        dir.join("graph.db")
     }
 
     #[test]
@@ -497,12 +494,10 @@ mod tests {
         check!(res["isError"] == json!(true));
     }
 
-    // #165: when a LadybugDB index sits beside the graph.db path, the MCP tools
-    // open it (the default backend) rather than erroring on the absent sqlite db.
-    #[cfg(feature = "ladybug")]
+    // #165: the MCP tools open the LadybugDB index that sits beside the
+    // `graph.db` anchor path.
     #[test]
     fn opens_ladybug_index_beside_graph_db() {
-        use meridian_store::LadybugStore;
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -549,7 +544,7 @@ mod tests {
         let parsed: Value = serde_json::from_str(text).unwrap();
         check!(parsed[0]["node"]["name"] == json!("caller"));
         check!(parsed[0]["edge"] == json!("calls"));
-        std::fs::remove_file(&db).ok();
+        std::fs::remove_dir_all(db.parent().unwrap()).ok();
     }
 
     #[test]
@@ -560,7 +555,7 @@ mod tests {
         let parsed: Value = serde_json::from_str(text).unwrap();
         check!(parsed["nodes"] == json!(2));
         check!(parsed["edges"] == json!(1));
-        std::fs::remove_file(&db).ok();
+        std::fs::remove_dir_all(db.parent().unwrap()).ok();
     }
 
     #[test]
@@ -568,6 +563,6 @@ mod tests {
         let db = build_db("unknown");
         let res = call(&db, "nope", &json!({}));
         check!(res["isError"] == json!(true));
-        std::fs::remove_file(&db).ok();
+        std::fs::remove_dir_all(db.parent().unwrap()).ok();
     }
 }

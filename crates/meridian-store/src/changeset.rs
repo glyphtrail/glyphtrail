@@ -14,7 +14,7 @@ use anyhow::{Context, Result, bail};
 use meridian_core::NodeId;
 
 #[cfg(test)]
-use crate::SqliteStore;
+use crate::LadybugStore;
 use crate::graph_store::GraphStore;
 
 /// What change to seed the impact analysis from.
@@ -239,7 +239,7 @@ index 333..000
     #[test]
     fn seeds_map_ranges_to_overlapping_spans() {
         use meridian_core::{Node, NodeId, NodeKind, Span};
-        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mut store = LadybugStore::open_temp().unwrap();
         let mk = |id: &str, sl: usize, el: usize| Node {
             id: NodeId(id.into()),
             kind: NodeKind::Function,

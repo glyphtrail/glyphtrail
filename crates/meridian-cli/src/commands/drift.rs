@@ -9,14 +9,14 @@
 //! **orphan** (declared in the contract but not served). A method/path mismatch
 //! surfaces as both — the two keys simply fail to match.
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use clap::{Args, ValueEnum};
 use meridian_core::config::RepoPaths;
 use meridian_core::{EdgeKind, NodeKind, OperationKey};
 use meridian_store::GraphStore;
 use serde::Serialize;
 
-use crate::commands::backend::{self, BackendKind};
+use crate::commands::backend;
 
 /// Exit code used by `--gate` when the API surface has drifted.
 const GATE_EXIT_CODE: i32 = 2;
@@ -26,9 +26,6 @@ pub struct DriftArgs {
     /// Repository root.
     #[arg(long, default_value = ".")]
     pub repo: std::path::PathBuf,
-    /// Storage backend to read from.
-    #[arg(long, value_enum, default_value_t)]
-    pub backend: BackendKind,
     /// Output format.
     #[arg(long, value_enum, default_value_t)]
     pub format: Format,
@@ -72,13 +69,7 @@ impl Report {
 
 pub fn run(args: DriftArgs) -> Result<()> {
     let paths = RepoPaths::new(&args.repo);
-    if !args.backend.exists(&paths) {
-        bail!(
-            "no index found at {} — run `meridian analyze` first",
-            args.backend.location(&paths).display()
-        );
-    }
-    let store = backend::open(&paths, args.backend)?;
+    let store = backend::open_existing(&paths)?;
     let report = reconcile(store.as_ref())?;
 
     match args.format {
@@ -185,7 +176,7 @@ mod tests {
     use super::*;
     use assert2::check;
     use meridian_core::{Confidence, Edge, HttpMethod, Node, NodeId, Span};
-    use meridian_store::SqliteStore;
+    use meridian_store::LadybugStore;
 
     fn op_node(id: &str, kind: NodeKind) -> Node {
         Node {
@@ -207,7 +198,7 @@ mod tests {
 
     #[test]
     fn reconcile_reports_undocumented_and_orphan() {
-        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mut store = LadybugStore::open_temp().unwrap();
         // Documented endpoint <-> schema op (linked by EXPOSES); an undocumented
         // endpoint; and an orphan schema op.
         let nodes = [
@@ -263,7 +254,7 @@ mod tests {
 
     #[test]
     fn no_schema_means_no_undocumented_noise() {
-        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mut store = LadybugStore::open_temp().unwrap();
         store
             .insert_graph(&[op_node("e1", NodeKind::Endpoint)], &[])
             .unwrap();

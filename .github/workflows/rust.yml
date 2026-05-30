@@ -23,8 +23,9 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain }}
           components: rustfmt, clippy
-      # LadybugDB is a default feature now, so the default build links `lbug`
-      # (prebuilt archive, or a cmake/clang source build as fallback).
+      # LadybugDB is the sole storage backend (a required dependency), so every
+      # build links `lbug` (a prebuilt liblbug, or a cmake/clang source build as
+      # fallback) and needs the C++ toolchain.
       - name: Install LadybugDB build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake clang build-essential
       - name: Cache Cargo artifacts
@@ -37,24 +38,6 @@ jobs:
         run: cargo build --workspace --verbose
       - name: Test
         run: cargo test --workspace --verbose
-
-  ladybug:
-    name: ladybug backend
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-      # The `lbug` crate downloads a prebuilt liblbug, or builds LadybugDB from
-      # source via cmake/clang as a fallback — install the toolchain either way.
-      - name: Install LadybugDB build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake clang build-essential
-      - name: Cache Cargo artifacts
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: ladybug
-      - name: Build + test the ladybug backend
-        run: cargo test -p meridian-store --features ladybug --verbose
 
   dependencies:
     name: Dependency Submission

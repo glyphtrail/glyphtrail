@@ -2,15 +2,11 @@
 
 pub mod changeset;
 pub mod graph_store;
-#[cfg(feature = "ladybug")]
 pub mod ladybug;
-pub mod sqlite;
 
 pub use changeset::{ChangeSpec, ChangedFile, SeedSet, changed_files, seed_nodes};
-pub use graph_store::GraphStore;
-#[cfg(feature = "ladybug")]
+pub use graph_store::{GraphStore, Stats};
 pub use ladybug::LadybugStore;
-pub use sqlite::{SqliteStore, Stats};
 
 #[cfg(test)]
 mod tests {
@@ -37,30 +33,8 @@ mod tests {
     }
 
     #[test]
-    fn stale_schema_version_rebuilds_on_open() {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("meridian-schemaver-{nanos}.db"));
-        {
-            let mut s = SqliteStore::open(&path).unwrap();
-            s.insert_graph(&[node("a", "x", NodeKind::Function)], &[])
-                .unwrap();
-            check!(s.stats().unwrap().nodes == 1);
-            // Simulate an index written by a build with a different schema.
-            s.set_meta("schema_version", "0").unwrap();
-        }
-        // Reopen: the version mismatch wipes + recreates; analyze would rebuild.
-        let s2 = SqliteStore::open(&path).unwrap();
-        check!(s2.stats().unwrap().nodes == 0);
-        check!(s2.get_meta("schema_version").unwrap().as_deref() == Some(sqlite::SCHEMA_VERSION));
-        std::fs::remove_file(&path).ok();
-    }
-
-    #[test]
     fn roundtrip_and_traversal() {
-        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mut store = LadybugStore::open_temp().unwrap();
         let nodes = vec![
             node("a", "caller", NodeKind::Function),
             node("b", "callee", NodeKind::Function),
@@ -93,7 +67,7 @@ mod tests {
 
     #[test]
     fn meta_and_file_hashes_roundtrip() {
-        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mut store = LadybugStore::open_temp().unwrap();
         check!(store.get_meta("tool_version").unwrap() == None);
         store.set_meta("tool_version", "9.9.9").unwrap();
         store.set_meta("tool_version", "1.2.3").unwrap(); // upsert
@@ -110,7 +84,7 @@ mod tests {
     fn api_operations_persist_and_filter_by_kind() {
         use meridian_core::{HttpMethod, OperationKey};
 
-        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mut store = LadybugStore::open_temp().unwrap();
         let mut endpoint = node("e1", "get_user", NodeKind::Endpoint);
         endpoint.file = "routes.rs".into();
         let mut client = node("c1", "fetchUser", NodeKind::ClientCall);
@@ -164,7 +138,7 @@ mod tests {
 
     #[test]
     fn pending_edges_persist_and_clear_with_their_anchor_file() {
-        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mut store = LadybugStore::open_temp().unwrap();
         let caller = node("caller", "use_it", NodeKind::Function); // file a.rs
         store.insert_graph(&[caller], &[]).unwrap();
         let link = PendingLink {
@@ -185,7 +159,7 @@ mod tests {
 
     #[test]
     fn delete_edges_by_confidence_removes_only_that_confidence() {
-        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mut store = LadybugStore::open_temp().unwrap();
         store
             .insert_graph(
                 &[
@@ -209,12 +183,10 @@ mod tests {
             )
             .unwrap();
         check!(store.stats().unwrap().edges == 2);
-        check!(
-            store
-                .delete_edges_by_confidence(Confidence::Inferred)
-                .unwrap()
-                == 1
-        );
+        store
+            .delete_edges_by_confidence(Confidence::Inferred)
+            .unwrap();
+        // Only the inferred edge is removed; the extracted one survives.
         check!(store.stats().unwrap().edges == 1);
     }
 
@@ -222,7 +194,7 @@ mod tests {
     fn delete_nodes_by_kind_removes_nodes_edges_and_ops() {
         use meridian_core::{HttpMethod, OperationKey};
 
-        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mut store = LadybugStore::open_temp().unwrap();
         let endpoint = node("e1", "get_user", NodeKind::Endpoint);
         let schema_op = node("s1", "GET /users", NodeKind::SchemaOp);
         let exposes = Edge {

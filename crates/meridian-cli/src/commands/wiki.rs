@@ -6,13 +6,13 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::{Args, ValueEnum};
 use meridian_core::NodeKind;
 use meridian_core::config::RepoPaths;
 use meridian_store::GraphStore;
 
-use super::backend::{self, BackendKind};
+use super::backend;
 use super::llm::{Llm, Provider};
 
 #[derive(Args)]
@@ -20,9 +20,6 @@ pub struct WikiArgs {
     /// Repository root.
     #[arg(long, default_value = ".")]
     pub repo: PathBuf,
-    /// Storage backend to read from.
-    #[arg(long, value_enum, default_value_t)]
-    pub backend: BackendKind,
     /// LLM provider.
     #[arg(long, value_enum, default_value_t)]
     pub provider: Provider,
@@ -60,12 +57,6 @@ pub enum Target {
 
 pub fn run(args: WikiArgs) -> Result<()> {
     let paths = RepoPaths::new(&args.repo);
-    if !args.backend.exists(&paths) {
-        bail!(
-            "no index found at {} — run `meridian analyze` first",
-            args.backend.location(&paths).display()
-        );
-    }
     // `--target serve --dry-run` browses a previously-generated wiki offline:
     // skip the graph/LLM work and just serve the existing output directory.
     if args.target == Target::Serve && args.dry_run {
@@ -73,7 +64,7 @@ pub fn run(args: WikiArgs) -> Result<()> {
         return rt.block_on(meridian_server::serve_wiki(args.output.clone(), args.port));
     }
 
-    let store = backend::open(&paths, args.backend)?;
+    let store = backend::open_existing(&paths)?;
     let pages = build_pages(store.as_ref())?;
 
     std::fs::create_dir_all(&args.output)
@@ -218,12 +209,12 @@ fn operations_facts(
 mod tests {
     use super::*;
     use assert2::check;
-    use meridian_store::SqliteStore;
+    use meridian_store::LadybugStore;
 
     #[test]
     fn pages_compose_from_graph_facts() {
         use meridian_core::{Edge, Node, NodeId, Span};
-        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mut store = LadybugStore::open_temp().unwrap();
         let n = Node {
             id: NodeId("f".into()),
             kind: NodeKind::Function,
