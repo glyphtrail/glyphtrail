@@ -51,17 +51,18 @@ struct NeighborParams {
     id: String,
 }
 
-/// Parse a comma-separated query value into a set, or `None` when absent/empty
-/// (meaning "no filter").
+/// Parse a comma-separated query value into a set of kinds. An **absent** param
+/// (`None`) means "no filter, keep all"; a **present** one (even empty, e.g.
+/// `kinds=`) is an explicit selection — so unchecking every box yields an empty
+/// set that matches nothing, rather than silently falling back to everything.
 fn csv_set(value: &Option<String>) -> Option<HashSet<String>> {
-    let set: HashSet<String> = value
-        .as_deref()?
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .collect();
-    (!set.is_empty()).then_some(set)
+    value.as_ref().map(|v| {
+        v.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect()
+    })
 }
 
 async fn index() -> Html<&'static str> {

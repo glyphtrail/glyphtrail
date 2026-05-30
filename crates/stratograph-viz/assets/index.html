@@ -150,8 +150,27 @@ function setStatus(cy, note) {
     cy.nodes().length + " nodes, " + cy.edges().length + " edges" + (note ? " · " + note : "");
 }
 
-function runLayout(cy) {
-  cy.layout({ name: "cose", animate: false, nodeRepulsion: 8000, idealEdgeLength: 60 }).run();
+// While a fetch + relayout is in flight the toolbar is disabled, so rapid
+// toggling can't queue up several blocking rebuilds (#194 follow-up).
+let busy = false;
+function setBusy(on) {
+  busy = on;
+  document.querySelectorAll("#toolbar input, #toolbar select")
+    .forEach((el) => { el.disabled = on; });
+  document.getElementById("toolbar").style.opacity = on ? "0.55" : "1";
+}
+
+// Animated cose runs the physics over animation frames instead of one blocking
+// pass, so the graph visibly settles into place and the UI stays responsive
+// (the old `animate:false` froze the tab for seconds on a few hundred nodes).
+// `done` fires once the layout stops.
+function runLayout(cy, done) {
+  const layout = cy.layout({
+    name: "cose", animate: true, refresh: 12, numIter: 1000,
+    nodeRepulsion: 8000, idealEdgeLength: 60, randomize: false, fit: true,
+  });
+  if (done) layout.one("layoutstop", done);
+  layout.run();
 }
 
 const CY_STYLE = [
@@ -189,15 +208,31 @@ let getNodeKinds, getEdgeKinds;
 
 // Fetch a fresh graph from the server for the current toggle selection.
 async function reload() {
+  if (busy) return;
   const kinds = getNodeKinds().join(",");
   const edges = getEdgeKinds().join(",");
-  const url = `/api/graph?kinds=${encodeURIComponent(kinds)}&edges=${encodeURIComponent(edges)}&limit=${NODE_LIMIT}`;
+  // No node kinds selected -> an empty graph; skip the fetch entirely (an empty
+  // `kinds=` must not be read by the server as "no filter, send everything").
+  if (!kinds) {
+    cy.elements().remove();
+    setStatus(cy, "no node kinds selected");
+    return;
+  }
+  setBusy(true);
   setStatus(cy, "loading…");
-  const data = await (await fetch(url)).json();
+  const url = `/api/graph?kinds=${encodeURIComponent(kinds)}&edges=${encodeURIComponent(edges)}&limit=${NODE_LIMIT}`;
+  let data;
+  try {
+    data = await (await fetch(url)).json();
+  } catch (_) {
+    setBusy(false);
+    setStatus(cy, "load failed");
+    return;
+  }
   cy.elements().remove();
   cy.add(data);
-  runLayout(cy);
-  setStatus(cy, kinds === "" ? "no node kinds selected" : null);
+  setStatus(cy, "building…");
+  runLayout(cy, () => { setBusy(false); setStatus(cy, null); });
 }
 
 // Static mode: all data is present; toggles show/hide by kind client-side.
@@ -212,10 +247,25 @@ function applyStaticFilter() {
 
 // Click-to-expand: pull a node's neighbours from the server and merge them in.
 async function expand(id) {
-  const data = await (await fetch("/api/neighbors?id=" + encodeURIComponent(id))).json();
+  if (busy) return;
+  setBusy(true);
+  setStatus(cy, "expanding…");
+  let data;
+  try {
+    data = await (await fetch("/api/neighbors?id=" + encodeURIComponent(id))).json();
+  } catch (_) {
+    setBusy(false);
+    setStatus(cy, "expand failed");
+    return;
+  }
   const fresh = data.filter((el) => !cy.getElementById(el.data.id).length);
-  if (fresh.length) { cy.add(fresh); runLayout(cy); }
-  setStatus(cy, "expanded +" + fresh.length);
+  if (fresh.length) {
+    cy.add(fresh);
+    runLayout(cy, () => { setBusy(false); setStatus(cy, "expanded +" + fresh.length); });
+  } else {
+    setBusy(false);
+    setStatus(cy, "no new neighbours");
+  }
 }
 
 // A static export is already a curated subgraph (e.g. an impact view), so show
@@ -227,8 +277,8 @@ getEdgeKinds = buildToggles("edgeGroups", EDGE_GROUPS, STATIC ? new Set() : EDGE
 // Initial render.
 if (STATIC) {
   cy.add(window.STRATOGRAPH_DATA);
-  runLayout(cy);
   applyStaticFilter();
+  runLayout(cy);
 } else {
   reload();
 }
