@@ -34,13 +34,5 @@ indicatif = "0.17"
 globset = "0.4"
 rayon = "1"
 
-[features]
-# LadybugDB is the default backend (more capable: Cypher + native graph
-# traversal). Opt out of the C++/cmake build with `--no-default-features`
-# (then use `--backend sqlite`).
-default = ["ladybug"]
-# LadybugDB backend + `cypher` subcommand (pulls the lbug C++ build).
-ladybug = ["meridian-store/ladybug", "meridian-mcp/ladybug"]
-
 [dev-dependencies]
 assert2.workspace = true

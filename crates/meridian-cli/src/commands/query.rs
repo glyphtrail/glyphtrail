@@ -11,7 +11,7 @@ use meridian_core::{
 use meridian_store::GraphStore;
 use serde::Serialize;
 
-use crate::commands::backend::{self, BackendKind};
+use crate::commands::backend;
 
 #[derive(Subcommand)]
 pub enum QueryCmd {
@@ -277,15 +277,8 @@ fn collect_operations(
     Ok(out)
 }
 
-fn open_store(repo: &Path, backend: BackendKind) -> Result<Box<dyn GraphStore + Send>> {
-    let paths = RepoPaths::new(repo);
-    if !backend.exists(&paths) {
-        bail!(
-            "no index found at {} — run `meridian analyze` first",
-            backend.location(&paths).display()
-        );
-    }
-    backend::open(&paths, backend)
+fn open_store(repo: &Path) -> Result<Box<dyn GraphStore + Send>> {
+    backend::open_existing(&RepoPaths::new(repo))
 }
 
 /// Compute a query answer against one open store. Pure of output so the same
@@ -456,8 +449,8 @@ fn print_value(value: &serde_json::Value, emit: Emit) -> Result<()> {
     Ok(())
 }
 
-pub fn run(repo: &Path, cmd: QueryCmd, emit: Emit, backend: BackendKind) -> Result<()> {
-    let store = open_store(repo, backend)?;
+pub fn run(repo: &Path, cmd: QueryCmd, emit: Emit) -> Result<()> {
+    let store = open_store(repo)?;
     let result = execute(&*store, &cmd)?;
     match emit {
         Emit::Text => result.print_text(),
@@ -502,7 +495,7 @@ pub fn run_registry(
     if emit == Emit::Text {
         for e in &selected {
             println!("== {} ({}) ==", e.name, e.root.display());
-            match open_store(&e.root, BackendKind::Sqlite).and_then(|s| execute(s.as_ref(), &cmd)) {
+            match open_store(&e.root).and_then(|s| execute(s.as_ref(), &cmd)) {
                 Ok(r) => r.print_text(),
                 Err(err) => println!("  error: {err:#}"),
             }
@@ -512,9 +505,7 @@ pub fn run_registry(
 
     let mut arr = Vec::new();
     for e in &selected {
-        let value = match open_store(&e.root, BackendKind::Sqlite)
-            .and_then(|s| execute(s.as_ref(), &cmd))
-        {
+        let value = match open_store(&e.root).and_then(|s| execute(s.as_ref(), &cmd)) {
             Ok(r) => r.to_value(),
             Err(err) => serde_json::json!({ "error": format!("{err:#}") }),
         };

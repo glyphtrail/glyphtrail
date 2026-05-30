@@ -15,7 +15,7 @@ use meridian_parse::{
 };
 use std::collections::HashSet;
 
-use crate::commands::backend::{self, BackendKind};
+use crate::commands::backend;
 use crate::commands::schema;
 use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
@@ -104,7 +104,7 @@ const DEFAULT_SENSITIVE_FILES: &[&str] = &[
     "*.tfvars",
 ];
 #[cfg(test)]
-use meridian_store::SqliteStore;
+use meridian_store::{GraphStore, LadybugStore};
 
 struct DiscoveredFile {
     rel_path: String,
@@ -399,13 +399,13 @@ fn discover(
     Ok(out)
 }
 
-pub fn run(path: &Path, update: bool, backend: BackendKind) -> Result<()> {
+pub fn run(path: &Path, update: bool) -> Result<()> {
     let root = path
         .canonicalize()
         .with_context(|| format!("cannot resolve path {}", path.display()))?;
     let paths = RepoPaths::new(&root);
     paths.ensure_index_dir()?;
-    let mut store = backend::open(&paths, backend)?;
+    let mut store = backend::open(&paths)?;
 
     let cfg = Config::load(&root)?;
     let files = discover(
@@ -1002,9 +1002,9 @@ mod tests {
             "function consume() { return fetch(\"/users\"); }\nfunction caller() { return consume(); }\n",
         )
         .unwrap();
-        run(&dir, false, BackendKind::Sqlite).unwrap();
+        run(&dir, false).unwrap();
 
-        let store = SqliteStore::open(&RepoPaths::new(&dir).db_path).unwrap();
+        let store = LadybugStore::open(&RepoPaths::new(&dir).index_dir.join("ladybug")).unwrap();
         let handler = store
             .find_by_name("list")
             .unwrap()
@@ -1039,9 +1039,9 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.join("client.ts"), "const s = new WebSocket(\"/ws\");\n").unwrap();
-        run(&dir, false, BackendKind::Sqlite).unwrap();
+        run(&dir, false).unwrap();
 
-        let store = SqliteStore::open(&RepoPaths::new(&dir).db_path).unwrap();
+        let store = LadybugStore::open(&RepoPaths::new(&dir).index_dir.join("ladybug")).unwrap();
         let endpoint = store
             .operations_by_kind(NodeKind::Endpoint)
             .unwrap()
@@ -1077,9 +1077,9 @@ mod tests {
             "socket.emit(\"chat:message\", payload);\n",
         )
         .unwrap();
-        run(&dir, false, BackendKind::Sqlite).unwrap();
+        run(&dir, false).unwrap();
 
-        let store = SqliteStore::open(&RepoPaths::new(&dir).db_path).unwrap();
+        let store = LadybugStore::open(&RepoPaths::new(&dir).index_dir.join("ladybug")).unwrap();
         let endpoint = store
             .operations_by_kind(NodeKind::Endpoint)
             .unwrap()
@@ -1116,9 +1116,9 @@ mod tests {
             "const apiRouter = express.Router();\napiRouter.get(\"/users\", getUsers);\nexport default apiRouter;\n",
         )
         .unwrap();
-        run(&dir, false, BackendKind::Sqlite).unwrap();
+        run(&dir, false).unwrap();
 
-        let store = SqliteStore::open(&RepoPaths::new(&dir).db_path).unwrap();
+        let store = LadybugStore::open(&RepoPaths::new(&dir).index_dir.join("ladybug")).unwrap();
         // The mounted `apiRouter` Router node (in app.js) MOUNTS the api.js file.
         let router_id = NodeId::derive(&["app.js", "router", "apiRouter"]);
         let mounts = store
@@ -1198,9 +1198,9 @@ mod tests {
             "[security]\nrecord_sensitive_files = true\n",
         )
         .unwrap();
-        run(&dir, false, BackendKind::Sqlite).unwrap();
+        run(&dir, false).unwrap();
 
-        let store = SqliteStore::open(&RepoPaths::new(&dir).db_path).unwrap();
+        let store = LadybugStore::open(&RepoPaths::new(&dir).index_dir.join("ladybug")).unwrap();
         let env = store
             .find_by_name(".env")
             .unwrap()
@@ -1216,7 +1216,7 @@ mod tests {
     }
 
     fn callers_of(dir: &Path, name: &str) -> Vec<String> {
-        let store = SqliteStore::open(&RepoPaths::new(dir).db_path).unwrap();
+        let store = LadybugStore::open(&RepoPaths::new(dir).index_dir.join("ladybug")).unwrap();
         let target = store
             .find_by_name(name)
             .unwrap()
@@ -1240,16 +1240,17 @@ mod tests {
         std::fs::write(dir.join("def.rs"), "\n").unwrap();
 
         // Full index: foo is undefined, so the call cannot resolve yet.
-        run(&dir, false, BackendKind::Sqlite).unwrap();
+        run(&dir, false).unwrap();
         {
-            let store = SqliteStore::open(&RepoPaths::new(&dir).db_path).unwrap();
+            let store =
+                LadybugStore::open(&RepoPaths::new(&dir).index_dir.join("ladybug")).unwrap();
             check!(store.find_by_name("foo").unwrap().is_empty());
         }
 
         // Add the definition; caller.rs is unchanged, so only a global
         // re-resolution of persisted pending edges can create the link.
         std::fs::write(dir.join("def.rs"), "fn foo() {}\n").unwrap();
-        run(&dir, true, BackendKind::Sqlite).unwrap();
+        run(&dir, true).unwrap();
         check!(
             callers_of(&dir, "foo").contains(&"use_it".to_string()),
             "expected use_it -> foo after adding the definition on --update"
@@ -1265,13 +1266,13 @@ mod tests {
         let dir = temp_repo("reresolve-remove");
         std::fs::write(dir.join("caller.rs"), "fn use_it() { foo(); }\n").unwrap();
         std::fs::write(dir.join("def.rs"), "fn foo() {}\n").unwrap();
-        run(&dir, false, BackendKind::Sqlite).unwrap();
+        run(&dir, false).unwrap();
         check!(callers_of(&dir, "foo").contains(&"use_it".to_string()));
 
         // Remove foo; the inferred use_it -> foo edge must disappear.
         std::fs::write(dir.join("def.rs"), "fn other() {}\n").unwrap();
-        run(&dir, true, BackendKind::Sqlite).unwrap();
-        let store = SqliteStore::open(&RepoPaths::new(&dir).db_path).unwrap();
+        run(&dir, true).unwrap();
+        let store = LadybugStore::open(&RepoPaths::new(&dir).index_dir.join("ladybug")).unwrap();
         check!(
             store.find_by_name("foo").unwrap().is_empty(),
             "foo should be gone after the edit"
@@ -1296,7 +1297,7 @@ mod tests {
 
     // Outgoing IMPORTS neighbours of a file, as (qualified_name, kind).
     fn import_targets(dir: &Path, importer_rel: &str) -> Vec<(String, String)> {
-        let store = SqliteStore::open(&RepoPaths::new(dir).db_path).unwrap();
+        let store = LadybugStore::open(&RepoPaths::new(dir).index_dir.join("ladybug")).unwrap();
         let id = NodeId::derive(&["file", importer_rel]);
         store
             .neighbors(&id.0, Some(EdgeKind::Imports), true)
@@ -1315,7 +1316,7 @@ mod tests {
         std::fs::write(dir.join("web/app.ts"), "import { x } from \"./util\";\n").unwrap();
         std::fs::write(dir.join("web/util.ts"), "export const x = 1;\n").unwrap();
         std::fs::write(dir.join("web/ext.ts"), "import \"react\";\n").unwrap();
-        run(&dir, false, BackendKind::Sqlite).unwrap();
+        run(&dir, false).unwrap();
 
         let targets = import_targets(&dir, "web/app.ts");
         check!(
@@ -1339,7 +1340,7 @@ mod tests {
         let dir = temp_repo("import-add");
         std::fs::create_dir_all(dir.join("web")).unwrap();
         std::fs::write(dir.join("web/app.ts"), "import { x } from \"./util\";\n").unwrap();
-        run(&dir, false, BackendKind::Sqlite).unwrap();
+        run(&dir, false).unwrap();
         // No util.ts yet: the import is a placeholder module.
         check!(
             import_targets(&dir, "web/app.ts")
@@ -1350,7 +1351,7 @@ mod tests {
 
         // Add the target; app.ts is unchanged, so only the global rebuild links it.
         std::fs::write(dir.join("web/util.ts"), "export const x = 1;\n").unwrap();
-        run(&dir, true, BackendKind::Sqlite).unwrap();
+        run(&dir, true).unwrap();
         let targets = import_targets(&dir, "web/app.ts");
         check!(
             targets.contains(&("web/util.ts".to_string(), "file".to_string())),
@@ -1366,7 +1367,7 @@ mod tests {
 
     // Incoming Calls neighbour names of the `helper` definition in `file`.
     fn callers_of_def_in(dir: &Path, name: &str, file: &str) -> Vec<String> {
-        let store = SqliteStore::open(&RepoPaths::new(dir).db_path).unwrap();
+        let store = LadybugStore::open(&RepoPaths::new(dir).index_dir.join("ladybug")).unwrap();
         let def = store
             .find_by_name(name)
             .unwrap()
@@ -1393,7 +1394,7 @@ mod tests {
             "import { helper } from \"./b\";\nexport function use() { helper(); }\n",
         )
         .unwrap();
-        run(&dir, false, BackendKind::Sqlite).unwrap();
+        run(&dir, false).unwrap();
 
         // The call resolves to b.ts (imported), not c.ts.
         check!(
@@ -1429,9 +1430,9 @@ mod tests {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/sample");
         let dir = temp_repo("fixture");
         copy_dir(&fixture, &dir);
-        run(&dir, false, BackendKind::Sqlite).unwrap();
+        run(&dir, false).unwrap();
 
-        let store = SqliteStore::open(&RepoPaths::new(&dir).db_path).unwrap();
+        let store = LadybugStore::open(&RepoPaths::new(&dir).index_dir.join("ladybug")).unwrap();
         // Four source files (2 Rust, 2 Python).
         check!(store.stats().unwrap().files == 4);
 

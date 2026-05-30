@@ -37,7 +37,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 blake3 = "1.8"
 ignore = "0.4"
-rusqlite = { version = "0.40", features = ["bundled"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 axum = "0.8"

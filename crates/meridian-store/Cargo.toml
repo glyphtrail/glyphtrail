@@ -9,16 +9,10 @@ repository.workspace = true
 
 [dependencies]
 meridian-core.workspace = true
-rusqlite.workspace = true
 anyhow.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-lbug = { version = "0.17.0", optional = true }
+# LadybugDB (Cypher) is the sole storage backend (#8). Pulls a prebuilt liblbug
+# (or builds it via cmake), so a C++ toolchain is required to build this crate.
+lbug = "0.17.0"
 
 [dev-dependencies]
 assert2.workspace = true
-
-[features]
-# Opt-in LadybugDB (Cypher) backend (#8). Pulls the `lbug` crate (downloads a
-# prebuilt liblbug, or builds it via cmake), so the default build stays light.
-ladybug = ["dep:lbug"]

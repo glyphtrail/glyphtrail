@@ -35,6 +35,11 @@ const SCHEMA: &[&str] = &[
 /// Property list a `Node` row returns, in order, so `row_to_node` can decode it.
 const NODE_COLS: &str = "n.id, n.kind, n.name, n.qualified_name, n.file, n.language, n.start_byte, n.end_byte, n.start_line, n.end_line, n.doc";
 
+/// Bumped when the node/rel schema shape changes. A stored `schema_version`
+/// other than this triggers a drop + recreate on open (#135); `analyze` then
+/// rebuilds the index from source.
+pub const SCHEMA_VERSION: &str = "1";
+
 pub struct LadybugStore {
     db: Database,
 }
@@ -55,10 +60,23 @@ impl LadybugStore {
         Ok(store)
     }
 
+    /// Open a fresh store in a unique temporary directory. LadybugDB has no
+    /// in-memory mode, so tests (here and in dependent crates) get an isolated
+    /// on-disk database instead; the caller removes the directory when done.
+    pub fn open_temp() -> Result<Self> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir =
+            std::env::temp_dir().join(format!("meridian-lbug-{}-{nanos}", std::process::id()));
+        Self::open(&dir)
+    }
+
     /// Drop + recreate the LadybugDB schema when the stored `schema_version`
     /// differs from the current one. The index is rebuilt on the next `analyze`.
     fn migrate_schema(&mut self) -> Result<()> {
-        if self.get_meta("schema_version")?.as_deref() == Some(crate::sqlite::SCHEMA_VERSION) {
+        if self.get_meta("schema_version")?.as_deref() == Some(SCHEMA_VERSION) {
             return Ok(());
         }
         {
@@ -72,7 +90,7 @@ impl LadybugStore {
                 conn.query(ddl)?;
             }
         }
-        self.set_meta("schema_version", crate::sqlite::SCHEMA_VERSION)?;
+        self.set_meta("schema_version", SCHEMA_VERSION)?;
         Ok(())
     }
 
@@ -320,6 +338,12 @@ impl GraphStore for LadybugStore {
     }
 
     fn delete_file_data(&mut self, path: &str) -> Result<()> {
+        // Drop pending links anchored to a node in this file *before* the nodes
+        // (and their ids) are deleted, else the Pending rows orphan and linger.
+        self.run(
+            "MATCH (n:Node {file:$f}), (p:Pending) WHERE p.anchor = n.id DELETE p",
+            vec![("f", s(path))],
+        )?;
         self.run(
             "MATCH (n:Node {file:$f}) DETACH DELETE n",
             vec![("f", s(path))],
@@ -806,7 +830,6 @@ impl GraphStore for LadybugStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SqliteStore;
     use assert2::check;
 
     fn node(id: &str, name: &str) -> Node {
@@ -868,7 +891,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_with_sqlite_on_a_fixture() {
+    fn fixture_roundtrip_and_traversal() {
         let nodes = vec![node("a", "caller"), node("b", "callee")];
         let edges = vec![Edge {
             src: NodeId("a".into()),
@@ -877,17 +900,14 @@ mod tests {
             confidence: Confidence::Extracted,
         }];
 
-        let mut sq = SqliteStore::open_in_memory().unwrap();
-        sq.insert_graph(&nodes, &edges).unwrap();
-
-        let dir = tmp_dir("parity");
+        let dir = tmp_dir("fixture");
         let mut lb = LadybugStore::open(&dir).unwrap();
         lb.insert_graph(&nodes, &edges).unwrap();
 
-        // Same node/edge counts as the SQLite backend (#8 parity acceptance).
-        let (ss, ls) = (sq.stats().unwrap(), lb.stats().unwrap());
-        check!(ls.nodes == ss.nodes);
-        check!(ls.edges == ss.edges);
+        // Inserted node/edge counts round-trip.
+        let ls = lb.stats().unwrap();
+        check!(ls.nodes == 2);
+        check!(ls.edges == 1);
 
         // Core query set works against LadybugDB.
         check!(lb.find_by_name("caller").unwrap().len() == 1);

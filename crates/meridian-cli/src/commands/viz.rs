@@ -3,8 +3,10 @@ use std::path::Path;
 use anyhow::{Result, bail};
 use meridian_core::config::RepoPaths;
 use meridian_core::{ImpactPolicy, ImpactReport, Node, NodeId, OperationKey};
-use meridian_store::SqliteStore;
+use meridian_store::GraphStore;
 use meridian_viz::ImpactView;
+
+use crate::commands::backend;
 
 pub fn run(
     repo: &Path,
@@ -15,16 +17,10 @@ pub fn run(
     depth: usize,
 ) -> Result<()> {
     let paths = RepoPaths::new(repo);
-    if !paths.db_path.exists() {
-        bail!(
-            "no index found at {} — run `meridian analyze` first",
-            paths.db_path.display()
-        );
-    }
-    let store = SqliteStore::open(&paths.db_path)?;
+    let store = backend::open_existing(&paths)?;
 
     if let Some(seed) = impact {
-        return run_impact(&store, output, seed, cross_boundary, depth);
+        return run_impact(store.as_ref(), output, seed, cross_boundary, depth);
     }
 
     let (nodes, edges) = store.export_graph(limit)?;
@@ -43,7 +39,7 @@ pub fn run(
 /// Render the impacted subgraph for `seed`: seeds + impacted nodes and the edges
 /// among them, highlighted by class / distance / confidence.
 fn run_impact(
-    store: &SqliteStore,
+    store: &dyn GraphStore,
     output: &Path,
     seed: &str,
     cross_boundary: bool,
@@ -89,7 +85,7 @@ fn run_impact(
 
 /// API operation keys for the subgraph's nodes, so endpoints/clients keep their
 /// protocol/method/path annotations in the impact view.
-fn ops_for(store: &SqliteStore, nodes: &[Node]) -> Result<Vec<(NodeId, OperationKey)>> {
+fn ops_for(store: &dyn GraphStore, nodes: &[Node]) -> Result<Vec<(NodeId, OperationKey)>> {
     let ids: std::collections::HashSet<&str> = nodes.iter().map(|n| n.id.0.as_str()).collect();
     Ok(store
         .all_operations()?
