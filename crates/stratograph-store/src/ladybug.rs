@@ -154,6 +154,15 @@ fn s(v: &str) -> Value {
     Value::String(v.to_string())
 }
 
+/// A non-empty list of strings as a Cypher `Value::List`, for `IN $param`
+/// filters. The caller guarantees `items` is non-empty (an empty kind selection
+/// is handled as a `false` predicate, not an empty list).
+fn str_list(items: &[String]) -> Value {
+    let vals: Vec<Value> = items.iter().map(|v| Value::String(v.clone())).collect();
+    let child: LogicalType = (&vals[0]).into();
+    Value::List(child, vals)
+}
+
 fn get_str(row: &[Value], idx: usize) -> String {
     match row.get(idx) {
         Some(Value::String(s)) => s.clone(),
@@ -806,14 +815,64 @@ impl GraphStore for LadybugStore {
     }
 
     fn export_graph(&self, limit: usize) -> Result<(Vec<Node>, Vec<Edge>)> {
+        self.export_filtered(None, None, limit)
+    }
+
+    fn export_filtered(
+        &self,
+        node_kinds: Option<&[String]>,
+        edge_kinds: Option<&[String]>,
+        limit: usize,
+    ) -> Result<(Vec<Node>, Vec<Edge>)> {
+        // Nodes: push the kind filter and the cap into the query.
+        let mut nparams: Vec<(&str, Value)> = Vec::new();
+        let nwhere = match node_kinds {
+            None => String::new(),
+            Some([]) => "WHERE false".into(),
+            Some(ks) => {
+                nparams.push(("nk", str_list(ks)));
+                "WHERE n.kind IN $nk".into()
+            }
+        };
         let nodes = self.run_nodes(
-            &format!("MATCH (n:Node) RETURN {NODE_COLS} LIMIT {limit}"),
-            vec![],
+            &format!("MATCH (n:Node) {nwhere} RETURN {NODE_COLS} LIMIT {limit}"),
+            nparams,
         )?;
+
+        // Edges: filter by edge kind and by both endpoints' kinds, so a trimmed
+        // view never fetches the (often dominant) call/containment edges it would
+        // immediately discard.
+        let mut conds: Vec<&str> = Vec::new();
+        let mut eparams: Vec<(&str, Value)> = Vec::new();
+        match edge_kinds {
+            None => {}
+            Some([]) => conds.push("false"),
+            Some(ks) => {
+                eparams.push(("ek", str_list(ks)));
+                conds.push("e.kind IN $ek");
+            }
+        }
+        match node_kinds {
+            None => {}
+            Some([]) => conds.push("false"),
+            Some(ks) => {
+                eparams.push(("ak", str_list(ks)));
+                eparams.push(("bk", str_list(ks)));
+                conds.push("a.kind IN $ak");
+                conds.push("b.kind IN $bk");
+            }
+        }
+        let ewhere = if conds.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conds.join(" AND "))
+        };
         let edges = self
             .run(
-                "MATCH (a:Node)-[e:Edge]->(b:Node) RETURN a.id, b.id, e.kind, e.confidence",
-                vec![],
+                &format!(
+                    "MATCH (a:Node)-[e:Edge]->(b:Node) {ewhere} RETURN a.id, b.id, e.kind, e.confidence"
+                ),
+                eparams,
             )?
             .iter()
             .map(|r| Edge {
@@ -887,6 +946,55 @@ mod tests {
             !lb.find_by_name("keeper").unwrap().is_empty(),
             "node should survive reopen, but the DB was wiped"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn export_filtered_pushes_kind_filters() {
+        let dir = tmp_dir("export-filtered");
+        let mut lb = LadybugStore::open(&dir).unwrap();
+        let f = node("f", "fn"); // function
+        let mut m = node("m", "mod");
+        m.kind = NodeKind::Module;
+        let mut c = node("c", "cmt");
+        c.kind = NodeKind::Comment;
+        let edges = vec![
+            Edge {
+                src: NodeId("f".into()),
+                dst: NodeId("m".into()),
+                kind: EdgeKind::Imports,
+                confidence: Confidence::Extracted,
+            },
+            Edge {
+                src: NodeId("f".into()),
+                dst: NodeId("c".into()),
+                kind: EdgeKind::Documents,
+                confidence: Confidence::Extracted,
+            },
+        ];
+        lb.insert_graph(&[f, m, c], &edges).unwrap();
+
+        // function + module nodes, imports edges only.
+        let (nodes, eds) = lb
+            .export_filtered(
+                Some(&["function".into(), "module".into()]),
+                Some(&["imports".into()]),
+                100,
+            )
+            .unwrap();
+        let mut kinds: Vec<&str> = nodes.iter().map(|n| n.kind.as_str()).collect();
+        kinds.sort();
+        check!(kinds == vec!["function", "module"]); // comment dropped
+        check!(eds.len() == 1 && eds[0].kind == EdgeKind::Imports); // documents + comment endpoint dropped
+
+        // None keeps everything.
+        let (all_n, all_e) = lb.export_filtered(None, None, 100).unwrap();
+        check!(all_n.len() == 3 && all_e.len() == 2);
+
+        // An explicit empty selection keeps nothing.
+        let (none_n, none_e) = lb.export_filtered(Some(&[]), None, 100).unwrap();
+        check!(none_n.is_empty() && none_e.is_empty());
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
