@@ -122,6 +122,21 @@ mod tests {
         check!(parsed.calls.iter().any(|c| c.name == "println"));
     }
 
+    // #5: a definition inside a macro body (e.g. a proc-macro `quote!`) is not
+    // mistaken for a call by the raw-token heuristic; real calls in the body
+    // still are.
+    #[test]
+    fn macro_body_definition_is_not_a_call() {
+        let src = "fn m() { quote! { fn generated() { real_call(); } }; }";
+        let parsed = parse_source(&Language::Rust, src).unwrap();
+        let names: Vec<&str> = parsed.calls.iter().map(|c| c.name.as_str()).collect();
+        check!(
+            !names.contains(&"generated"),
+            "the defined name should not be a call, got {names:?}"
+        );
+        check!(names.contains(&"real_call"));
+    }
+
     // #21: the newly added languages extract a call and a comment, exercising
     // each new grammar + query beyond the bare definition check above.
     #[test]
