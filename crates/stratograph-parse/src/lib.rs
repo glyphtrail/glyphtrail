@@ -89,6 +89,7 @@ mod tests {
             (Language::Lua, "local function f() end\n"),
             (Language::Swift, "func f() {}\n"),
             (Language::Elixir, "def f(x), do: x\n"),
+            (Language::Zig, "fn f() void {}\n"),
         ];
         for (lang, src) in cases {
             let parsed = parse_source(&lang, src)
@@ -158,6 +159,7 @@ mod tests {
             ),
             (Language::Swift, "// note\nfunc f() { g() }\n", "g"),
             (Language::Elixir, "# note\ndef f(x), do: g(x)\n", "g"),
+            (Language::Zig, "// note\nfn f() void { g(); }\n", "g"),
         ];
         for (lang, src, call) in cases {
             let parsed = parse_source(&lang, src)

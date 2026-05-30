@@ -30,6 +30,7 @@ tree-sitter-haskell.workspace = true
 tree-sitter-lua.workspace = true
 tree-sitter-elixir.workspace = true
 tree-sitter-swift.workspace = true
+tree-sitter-zig.workspace = true
 anyhow.workspace = true
 tree-sitter-kotlin-ng = "1.1.0"
 

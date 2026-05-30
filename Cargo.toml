@@ -65,6 +65,7 @@ tree-sitter-haskell = "0.23"
 tree-sitter-lua = "0.5"
 tree-sitter-elixir = "0.3"
 tree-sitter-swift = "0.7"
+tree-sitter-zig = "1.1.2"
 
 [profile.release]
 lto = "thin"
