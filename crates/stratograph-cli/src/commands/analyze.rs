@@ -1642,4 +1642,43 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    // #5: an in-file qualified call resolves precisely (and at extracted
+    // confidence) to the local method on the named type, not a same-named method
+    // on another class in the same file.
+    #[test]
+    fn qualified_call_resolves_to_local_scope() {
+        let dir = temp_repo("local-qualifier");
+        std::fs::write(
+            dir.join("m.py"),
+            "class User:\n    def save(self):\n        return 1\n\
+             class Admin:\n    def save(self):\n        return 2\n\
+             def go():\n    return User.save(None)\n",
+        )
+        .unwrap();
+        run(&dir, false).unwrap();
+
+        let store = LadybugStore::open(&RepoPaths::new(&dir).index_dir.join("ladybug")).unwrap();
+        let go = store
+            .find_by_name("go")
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("`go` fn")
+            .id;
+        let callees = store.neighbors(&go.0, Some(EdgeKind::Calls), true).unwrap();
+        check!(
+            callees.len() == 1,
+            "got {:?}",
+            callees
+                .iter()
+                .map(|(n, _, c)| (&n.qualified_name, c))
+                .collect::<Vec<_>>()
+        );
+        check!(callees[0].0.qualified_name == "User::save");
+        // Resolved in-file, so it is extracted (not inferred via the global pass).
+        check!(callees[0].2 == Confidence::Extracted);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

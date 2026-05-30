@@ -550,6 +550,20 @@ fn enclosing_def(defs: &[DefInfo], byte: usize) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
+/// The immediate enclosing scope of a `Scope::…::name` qualified name — the
+/// single segment directly before the final name (`""` for a top-level symbol).
+/// Used to match a qualified call's receiver against a definition (#5).
+fn enclosing_scope(qualified: &str) -> &str {
+    let Some(i) = qualified.rfind("::") else {
+        return "";
+    };
+    let parent = &qualified[..i];
+    match parent.rfind("::") {
+        Some(j) => &parent[j + 2..],
+        None => parent,
+    }
+}
+
 /// Doc comment text: contiguous comments immediately preceding `start_line`.
 fn doc_for(parsed: &ParsedFile, start_line: usize) -> Option<String> {
     let mut lines = Vec::new();
@@ -685,6 +699,24 @@ pub fn build_file_graph(
         let caller = enclosing_def(&defs, r.byte)
             .map(|i| defs[i].id.clone())
             .unwrap_or_else(|| file_id.clone());
+        // A qualified call (`Foo.bar()`) prefers a local def whose enclosing
+        // scope matches the receiver, so it resolves precisely to `Foo::bar`
+        // rather than being shadowed by an unrelated same-named local def (#5).
+        if let Some(q) = &r.scope {
+            let scoped: Vec<&DefInfo> = defs
+                .iter()
+                .filter(|d| d.name == r.name && enclosing_scope(&d.qualified) == q.as_str())
+                .collect();
+            if scoped.len() == 1 {
+                fg.graph.add_edge(
+                    caller,
+                    scoped[0].id.clone(),
+                    EdgeKind::Calls,
+                    Confidence::Extracted,
+                );
+                continue;
+            }
+        }
         let local: Vec<&DefInfo> = defs.iter().filter(|d| d.name == r.name).collect();
         if local.len() == 1 {
             fg.graph.add_edge(
