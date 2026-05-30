@@ -110,6 +110,12 @@ enum Command {
         /// Show stats for every repository in the global registry.
         #[arg(long)]
         all: bool,
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
+        /// Emit YAML instead of text (compact structured output for agents).
+        #[arg(long)]
+        yaml: bool,
     },
     /// Generate a shell completion script for the given shell.
     Completions {
@@ -173,11 +179,16 @@ fn main() -> anyhow::Result<()> {
         Command::Story(args) => commands::story::run(args),
         Command::Mcp { repo } => stratograph_mcp::serve_stdio(repo),
         Command::Repo { cmd } => commands::repo::run(cmd),
-        Command::Status { repo, all } => {
+        Command::Status {
+            repo,
+            all,
+            json,
+            yaml,
+        } => {
             if all {
                 commands::repo::status_all()
             } else {
-                commands::status::run(&repo)
+                commands::status::run(&repo, commands::query::Emit::from_flags(json, yaml))
             }
         }
         Command::Completions { shell } => {

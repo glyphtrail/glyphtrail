@@ -40,7 +40,9 @@ pub fn analyze_all(update: bool) -> Result<()> {
 
 /// Show index stats for every registered repo (`status --all`).
 pub fn status_all() -> Result<()> {
-    each_repo("status", super::status::run)
+    each_repo("status", |root| {
+        super::status::run(root, super::query::Emit::Text)
+    })
 }
 
 /// Run `op` over every registered repo, printing a per-repo header and a final
