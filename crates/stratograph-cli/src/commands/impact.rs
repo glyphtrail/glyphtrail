@@ -4,20 +4,17 @@
 //! propagation (#71) and classification (#72) into one report, rendered as text
 //! or a stable JSON `ImpactReport`.
 
-use std::collections::{BTreeMap, HashMap};
-
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, ValueEnum};
 use globset::{Glob, GlobSetBuilder};
-use serde::Serialize;
 use stratograph_core::config::{Config, RepoPaths};
 use stratograph_core::{
-    Adjacency, ClassifiedItem, Confidence, FederatedAdjacency, Groups, ImpactClass, ImpactPolicy,
-    ImpactReport, ImpactSummary, META_EXTERNAL_USES, META_PACKAGES, NodeId, PackageIdentity,
-    Registry, RepoHealth, RepoIdentity, classify, compute_impact, default_groups_path,
-    default_registry_path, is_cross_boundary_path, qualify, resolve_links, unqualify,
+    ClassifiedItem, Confidence, FederatedReport, ImpactClass, ImpactPolicy, ImpactReport,
 };
-use stratograph_store::{ChangeSpec, GraphStore, SeedSet, changed_files, seed_nodes};
+use stratograph_store::{
+    ChangeSpec, FederationScope, GraphStore, SeedSet, SeedSpec, changed_files, federated_impact,
+    seed_nodes,
+};
 
 use crate::commands::backend;
 
@@ -153,34 +150,6 @@ pub fn run(args: ImpactArgs) -> Result<()> {
     Ok(())
 }
 
-/// The impacted nodes in one repo, for the federated report.
-#[derive(Serialize)]
-struct RepoImpact {
-    repo: String,
-    /// True for the repo the change originates in; the rest are downstream.
-    origin: bool,
-    items: Vec<ClassifiedItem>,
-}
-
-/// Cross-repo blast radius: an aggregate summary plus per-repo impacted nodes.
-#[derive(Serialize)]
-struct FederatedReport {
-    summary: ImpactSummary,
-    repos: Vec<RepoImpact>,
-}
-
-fn registry_path() -> Result<std::path::PathBuf> {
-    default_registry_path()
-        .ok_or_else(|| anyhow!("cannot locate home directory (set HOME or USERPROFILE)"))
-}
-
-/// Whether a node is a definition worth landing cross-repo impact on (so the
-/// cross hop reaches real symbols that then propagate, not files or comments).
-fn is_symbol_node(kind: stratograph_core::NodeKind) -> bool {
-    use stratograph_core::NodeKind::*;
-    !matches!(kind, Repo | Directory | File | Comment)
-}
-
 /// Build the traversal policy from the shared impact arguments.
 fn build_policy(args: &ImpactArgs) -> Result<ImpactPolicy> {
     let mut policy = if args.cross_boundary {
@@ -198,209 +167,69 @@ fn build_policy(args: &ImpactArgs) -> Result<ImpactPolicy> {
     Ok(policy)
 }
 
+/// Build the seed spec from the impact arguments, with the same precedence as
+/// the single-repo path: a symbol name, else a git change set.
+fn seed_spec(args: &ImpactArgs) -> Result<SeedSpec> {
+    if let Some(name) = &args.name {
+        return Ok(SeedSpec::Name(name.clone()));
+    }
+    let spec = if let Some(f) = &args.file {
+        ChangeSpec::Files(vec![f.clone()])
+    } else if let Some(fs) = &args.files {
+        ChangeSpec::Files(fs.clone())
+    } else if let Some(rev) = &args.since {
+        ChangeSpec::Since(rev.clone())
+    } else if args.staged {
+        ChangeSpec::Staged
+    } else if args.diff {
+        ChangeSpec::WorkingTree
+    } else {
+        bail!("provide a symbol name or one of --file/--files/--since/--staged/--diff");
+    };
+    Ok(SeedSpec::Change(spec))
+}
+
 /// Federated blast radius (#222): seed in the current repo and traverse into
-/// downstream repos across the cross-repo link table, reporting which repos
-/// break and where. Scope is the whole registry, or a named group.
+/// downstream repos across the cross-repo link table. Scope is the whole
+/// registry, or a named group via `--group`. The heavy lifting lives in
+/// [`federated_impact`]; here we just shape the inputs, apply the origin repo's
+/// configured test globs, and render.
 fn run_federated(args: &ImpactArgs, format: Format) -> Result<()> {
-    let registry = Registry::load(&registry_path()?)?;
-    let here = args
-        .repo
-        .canonicalize()
-        .with_context(|| format!("cannot resolve path {}", args.repo.display()))?;
-    let current = registry
-        .repos
-        .iter()
-        .find(|e| e.root.canonicalize().map(|r| r == here).unwrap_or(false))
-        .map(|e| e.name.clone())
-        .ok_or_else(|| {
-            anyhow!(
-                "repo {} is not registered — `stratograph repo add` it to use --downstream",
-                here.display()
-            )
-        })?;
-
-    // Repos in scope: a named group, or the whole registry. The current repo is
-    // always included so its seeds are traversable.
-    let mut scope: Vec<String> = match &args.group {
-        Some(g) => {
-            let groups = Groups::load(
-                &default_groups_path().ok_or_else(|| anyhow!("cannot locate home directory"))?,
-            )?;
-            groups
-                .get(g)
-                .ok_or_else(|| anyhow!("no group named '{g}'"))?
-                .repos
-                .clone()
-        }
-        None => registry.repos.iter().map(|e| e.name.clone()).collect(),
+    let scope = match &args.group {
+        Some(g) => FederationScope::Group(g.clone()),
+        None => FederationScope::Registry,
     };
-    if !scope.contains(&current) {
-        scope.push(current.clone());
-    }
+    let mut report = federated_impact(&args.repo, &scope, seed_spec(args)?, &build_policy(args)?)?;
 
-    // Open every indexed member's store, keyed by registry name.
-    let mut stores: HashMap<String, Box<dyn GraphStore + Send>> = HashMap::new();
-    for name in &scope {
-        let Some(entry) = registry.get(name) else {
-            continue;
-        };
-        if entry.health() != RepoHealth::Indexed {
-            continue;
-        }
-        stores.insert(
-            name.clone(),
-            backend::open_existing(&RepoPaths::new(&entry.root))?,
-        );
-    }
-    if !stores.contains_key(&current) {
-        bail!("current repo '{current}' has no index — run `stratograph analyze` first");
-    }
-
-    // Resolve cross-repo links and build the qualified cross-edge table: each
-    // symbol-level link's producer export -> the consumer's symbols in the
-    // importing file, so impact lands on real symbols that propagate onward.
-    let identities = stores
-        .iter()
-        .map(|(name, s)| {
-            Ok(RepoIdentity {
-                repo: name.clone(),
-                identity: PackageIdentity::from_meta(
-                    s.get_meta(META_PACKAGES)?.as_deref(),
-                    s.get_meta(META_EXTERNAL_USES)?.as_deref(),
-                ),
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut cross: HashMap<NodeId, Vec<(NodeId, Confidence)>> = HashMap::new();
-    for link in resolve_links(&identities) {
-        let (Some(node_id), Some(consumer)) = (&link.to_node, stores.get(&link.from_repo)) else {
-            continue; // crate-level links carry no producer node to seed from
-        };
-        let producer = qualify(&link.to_repo, &NodeId(node_id.clone()));
-        for node in consumer.nodes_in_file(&link.from_file)? {
-            if is_symbol_node(node.kind) {
-                cross
-                    .entry(producer.clone())
-                    .or_default()
-                    .push((qualify(&link.from_repo, &node.id), Confidence::Inferred));
-            }
-        }
-    }
-
-    // Borrow each store as an Adjacency for the federated traversal; the owned
-    // stores stay available for node lookups during reporting.
-    let repos_adj: HashMap<String, &dyn Adjacency> = stores
-        .iter()
-        .map(|(name, s)| (name.clone(), &**s as &dyn Adjacency))
-        .collect();
-    let fed = FederatedAdjacency::new(repos_adj, cross);
-
-    // Seeds resolved in the current repo, qualified with its name.
-    let current_store = stores.get(&current).expect("checked present");
-    let seed_set = resolve_seeds(current_store.as_ref(), args)?;
-    let seeds: Vec<NodeId> = seed_set
-        .seeds
-        .iter()
-        .map(|s| qualify(&current, s))
-        .collect();
-
-    let policy = build_policy(args)?;
+    // Apply the origin repo's configured test globs (#131), then rebuild so the
+    // summary counts the re-tagged tests.
     let cfg = Config::load(&args.repo)?;
-
-    // Classify impacted nodes, grouped by their owning repo.
-    let mut by_repo: BTreeMap<String, Vec<ClassifiedItem>> = BTreeMap::new();
-    if !seeds.is_empty() {
-        for it in compute_impact(&seeds, &policy, &fed) {
-            let (repo, local) = unqualify(&it.node);
-            let Some(store) = stores.get(repo) else {
-                continue;
-            };
-            if let Some(node) = store.get_node(local)? {
-                by_repo
-                    .entry(repo.to_string())
-                    .or_default()
-                    .push(ClassifiedItem {
-                        id: node.id.0,
-                        name: node.name,
-                        qualified_name: node.qualified_name.clone(),
-                        kind: node.kind,
-                        file: node.file.clone(),
-                        line: node.span.map(|sp| sp.start_line),
-                        class: classify(node.kind, &node.file, &node.qualified_name),
-                        distance: it.distance,
-                        min_confidence: it.min_confidence,
-                        cross_boundary: is_cross_boundary_path(&it.path),
-                        path: it.path.iter().map(|k| k.as_str().to_string()).collect(),
-                    });
-            }
+    if !cfg.impact.test_globs.is_empty() {
+        for r in &mut report.repos {
+            retag_configured_tests(&mut r.items, &cfg.impact.test_globs)?;
         }
+        report = FederatedReport::new(std::mem::take(&mut report.repos));
     }
-
-    // Order repos: origin first, then downstream alphabetically. Apply the
-    // origin repo's configured test globs across all (best-effort).
-    let mut repos: Vec<RepoImpact> = by_repo
-        .into_iter()
-        .map(|(repo, mut items)| {
-            retag_configured_tests(&mut items, &cfg.impact.test_globs).ok();
-            RepoImpact {
-                origin: repo == current,
-                repo,
-                items,
-            }
-        })
-        .collect();
-    repos.sort_by(|a, b| b.origin.cmp(&a.origin).then(a.repo.cmp(&b.repo)));
-
-    let summary = summarize(repos.iter().flat_map(|r| r.items.iter()));
-    let report = FederatedReport { summary, repos };
-    emit_federated(&report, &current, format)
+    emit_federated(&report, format)
 }
 
-/// Aggregate an [`ImpactSummary`] over all federated items.
-fn summarize<'a>(items: impl Iterator<Item = &'a ClassifiedItem>) -> ImpactSummary {
-    let mut s = ImpactSummary {
-        total: 0,
-        tests: 0,
-        api: 0,
-        entrypoints: 0,
-        internal: 0,
-        cross_boundary: 0,
-        max_distance: 0,
-    };
-    for i in items {
-        s.total += 1;
-        match i.class {
-            ImpactClass::Test => s.tests += 1,
-            ImpactClass::Api => s.api += 1,
-            ImpactClass::Entrypoint => s.entrypoints += 1,
-            ImpactClass::Internal => s.internal += 1,
-        }
-        if i.cross_boundary {
-            s.cross_boundary += 1;
-        }
-        s.max_distance = s.max_distance.max(i.distance);
-    }
-    s
-}
-
-fn emit_federated(report: &FederatedReport, current: &str, format: Format) -> Result<()> {
+fn emit_federated(report: &FederatedReport, format: Format) -> Result<()> {
     match format {
         Format::Json => println!("{}", serde_json::to_string_pretty(report)?),
         Format::Yaml => print!("{}", serde_norway::to_string(report)?),
         Format::Md => print!("{}", federated_markdown(report)),
-        Format::Text => print_federated_text(report, current),
+        Format::Text => print_federated_text(report),
     }
     Ok(())
 }
 
-fn print_federated_text(report: &FederatedReport, current: &str) {
-    let downstream_repos = report.repos.iter().filter(|r| !r.origin).count();
+fn print_federated_text(report: &FederatedReport) {
     let s = &report.summary;
     println!(
         "blast radius: {} symbols across {} repo(s) ({} downstream); {} tests, {} API, {} cross-boundary",
         s.total,
         report.repos.len(),
-        downstream_repos,
+        report.downstream_repos(),
         s.tests,
         s.api,
         s.cross_boundary
@@ -414,10 +243,6 @@ fn print_federated_text(report: &FederatedReport, current: &str) {
         for i in &r.items {
             print_item(i);
         }
-    }
-    if report.repos.iter().all(|r| r.repo != current) {
-        // Defensive: the origin should always appear; note if it didn't.
-        println!("\n(note: no impact found in the origin repo '{current}')");
     }
 }
 

@@ -8,7 +8,10 @@ use stratograph_core::{
     OperationKey, Protocol, Registry, RepoHealth, default_groups_path, default_registry_path,
     operations_matching,
 };
-use stratograph_store::{ChangeSpec, GraphStore, LadybugStore, changed_files, seed_nodes};
+use stratograph_store::{
+    ChangeSpec, FederationScope, GraphStore, LadybugStore, SeedSpec, changed_files,
+    federated_impact, seed_nodes,
+};
 
 /// The advertised tool set (`tools/list`).
 pub fn definitions() -> Vec<Value> {
@@ -95,7 +98,9 @@ pub fn definitions() -> Vec<Value> {
                 "edges": { "type": "array", "items": { "type": "string" }, "description": "Edge sets: calls, imports, impl, api." },
                 "depth": { "type": "integer", "description": "Max hops from a seed (default 5)." },
                 "min_confidence": { "type": "string", "enum": ["extracted", "inferred"] },
-                "cross_boundary": { "type": "boolean", "description": "Include HANDLES/INVOKES/EXPOSES/MOUNTS consumers." }
+                "cross_boundary": { "type": "boolean", "description": "Include HANDLES/INVOKES/EXPOSES/MOUNTS consumers." },
+                "downstream": { "type": "boolean", "description": "Extend the blast radius into OTHER indexed repos that depend on this one (federate over the registry). Reports which repos break and where." },
+                "group": { "type": "string", "description": "Like downstream, but scope the federation to a named group." }
             }),
             &[],
         ),
@@ -131,6 +136,11 @@ fn dispatch(db: &Path, name: &str, args: &Value) -> Result<Value, String> {
     // Registry-level tools span repos and need no per-repo store.
     if name == "list_repos" {
         return list_repos();
+    }
+    // Cross-repo impact opens its own member stores (incl. the current repo), so
+    // it must not be given the pre-opened per-repo store (no double-open).
+    if name == "impact" && is_federated(args) {
+        return federated_impact_tool(db, args);
     }
     let store = open(db)?;
     match name {
@@ -341,6 +351,22 @@ fn impact_tool(db: &Path, store: &dyn GraphStore, args: &Value) -> Result<Value,
         (set.seeds, set.removed_files, set.unresolved_files)
     };
 
+    let policy = policy_from_args(args)?;
+    let items = store.classify_impact(&seeds, &policy).map_err(err)?;
+    let report = ImpactReport::new(items, removed, unresolved);
+    serde_json::to_value(&report).map_err(err)
+}
+
+/// Whether the `impact` arguments request a cross-repo (federated) blast radius.
+fn is_federated(args: &Value) -> bool {
+    args.get("downstream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || opt_str(args, "group").is_some()
+}
+
+/// Build the traversal policy from the shared impact arguments.
+fn policy_from_args(args: &Value) -> Result<ImpactPolicy, String> {
     let depth = opt_usize(args, "depth").unwrap_or(5);
     let cross_boundary = args
         .get("cross_boundary")
@@ -358,10 +384,47 @@ fn impact_tool(db: &Path, store: &dyn GraphStore, args: &Value) -> Result<Value,
     if let Some(mc) = opt_str(args, "min_confidence") {
         policy.min_confidence = stratograph_core::parse_confidence(mc)?;
     }
+    Ok(policy)
+}
 
-    let items = store.classify_impact(&seeds, &policy).map_err(err)?;
-    let report = ImpactReport::new(items, removed, unresolved);
+/// Cross-repo impact (#222/#223): seed in the current repo and traverse into
+/// downstream repos across the package boundary, returning the per-repo
+/// `FederatedReport`. Opens its own member stores via the registry.
+fn federated_impact_tool(db: &Path, args: &Value) -> Result<Value, String> {
+    let repo = db
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or_else(|| Path::new("."));
+    let scope = match opt_str(args, "group") {
+        Some(g) => FederationScope::Group(g.to_string()),
+        None => FederationScope::Registry,
+    };
+    let seeds = seed_spec_from_args(args)?;
+    let policy = policy_from_args(args)?;
+    let report = federated_impact(repo, &scope, seeds, &policy).map_err(err)?;
     serde_json::to_value(&report).map_err(err)
+}
+
+/// Build the seed spec from the impact arguments (a symbol name, else a git
+/// change set), matching the single-repo tool's precedence.
+fn seed_spec_from_args(args: &Value) -> Result<SeedSpec, String> {
+    if let Some(name) = opt_str(args, "name") {
+        return Ok(SeedSpec::Name(name.to_string()));
+    }
+    let spec = if let Some(f) = opt_str(args, "file") {
+        ChangeSpec::Files(vec![f.to_string()])
+    } else if let Some(fs) = str_array(args, "files") {
+        ChangeSpec::Files(fs)
+    } else if let Some(rev) = opt_str(args, "since") {
+        ChangeSpec::Since(rev.to_string())
+    } else if args.get("staged").and_then(Value::as_bool).unwrap_or(false) {
+        ChangeSpec::Staged
+    } else if args.get("diff").and_then(Value::as_bool).unwrap_or(false) {
+        ChangeSpec::WorkingTree
+    } else {
+        return Err("provide 'name' or one of file/files/since/staged/diff".into());
+    };
+    Ok(SeedSpec::Change(spec))
 }
 
 /// Endpoints matching the `path` (+ optional `method`) arguments.
