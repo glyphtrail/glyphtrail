@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -13,6 +14,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use stratograph_core::{Edge, NodeId};
 use stratograph_store::GraphStore;
 
 #[derive(Clone)]
@@ -34,14 +36,84 @@ fn default_limit() -> usize {
     50
 }
 
+/// Filters for `/api/graph` (#194): `kinds`/`edges` are comma-separated node and
+/// edge kinds to include (absent = all); `limit` caps the node count so large
+/// graphs are trimmed server-side before they reach the browser.
+#[derive(Deserialize)]
+struct GraphParams {
+    kinds: Option<String>,
+    edges: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct NeighborParams {
+    id: String,
+}
+
+/// Parse a comma-separated query value into a set, or `None` when absent/empty
+/// (meaning "no filter").
+fn csv_set(value: &Option<String>) -> Option<HashSet<String>> {
+    let set: HashSet<String> = value
+        .as_deref()?
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+    (!set.is_empty()).then_some(set)
+}
+
 async fn index() -> Html<&'static str> {
     Html(stratograph_viz::TEMPLATE)
 }
 
-async fn api_graph(State(state): State<AppState>) -> Json<Value> {
+async fn api_graph(State(state): State<AppState>, Query(p): Query<GraphParams>) -> Json<Value> {
     let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
-    let (nodes, edges) = store.export_graph(5000).unwrap_or_default();
+    let (nodes, edges) = store.export_graph(20000).unwrap_or_default();
     let ops = store.all_operations().unwrap_or_default();
+    let sel = stratograph_viz::Selection {
+        kinds: csv_set(&p.kinds),
+        edge_kinds: csv_set(&p.edges),
+        limit: p.limit.unwrap_or(2000),
+    };
+    let (nodes, edges) = stratograph_viz::select_graph(&nodes, &edges, &sel);
+    Json(stratograph_viz::to_elements(&nodes, &edges, &ops, None))
+}
+
+/// Neighbors of one node, for click-to-expand lazy loading (#194): returns the
+/// node plus its direct graph neighbours and the edges connecting them, in the
+/// same Cytoscape element format the frontend merges into the current graph.
+async fn api_neighbors(
+    State(state): State<AppState>,
+    Query(p): Query<NeighborParams>,
+) -> Json<Value> {
+    let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
+    let ops = store.all_operations().unwrap_or_default();
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    if let Ok(Some(center)) = store.get_node(&p.id) {
+        nodes.push(center);
+    }
+    let center = NodeId(p.id.clone());
+    for (n, kind, confidence) in store.neighbors(&p.id, None, true).unwrap_or_default() {
+        edges.push(Edge {
+            src: center.clone(),
+            dst: n.id.clone(),
+            kind,
+            confidence,
+        });
+        nodes.push(n);
+    }
+    for (n, kind, confidence) in store.neighbors(&p.id, None, false).unwrap_or_default() {
+        edges.push(Edge {
+            src: n.id.clone(),
+            dst: center.clone(),
+            kind,
+            confidence,
+        });
+        nodes.push(n);
+    }
     Json(stratograph_viz::to_elements(&nodes, &edges, &ops, None))
 }
 
@@ -74,6 +146,7 @@ pub async fn serve(store: Box<dyn GraphStore + Send>, mcp_db: PathBuf, port: u16
     let app = Router::new()
         .route("/", get(index))
         .route("/api/graph", get(api_graph))
+        .route("/api/neighbors", get(api_neighbors))
         .route("/api/search", get(api_search))
         .route("/mcp", post(mcp))
         .with_state(state);
