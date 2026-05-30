@@ -539,7 +539,11 @@ fn import_root(path: &str) -> Option<&str> {
 /// cross-repo links (#220). For each import record `(file, raw, lang)`, find the
 /// package owning `file` (longest-directory match) and match the import's root
 /// segment against that package's declared dependencies. Read-only over `store`.
-fn external_uses(store: &dyn GraphStore, indexed: &[IndexedPackage]) -> Result<Vec<ExternalUse>> {
+fn external_uses(
+    store: &dyn GraphStore,
+    indexed: &[IndexedPackage],
+    root: &Path,
+) -> Result<Vec<ExternalUse>> {
     let owner = |file: &str| -> Option<&IndexedPackage> {
         indexed
             .iter()
@@ -549,23 +553,27 @@ fn external_uses(store: &dyn GraphStore, indexed: &[IndexedPackage]) -> Result<V
             .max_by_key(|p| p.dir.len())
     };
 
+    // Cache file source bytes so a file imported by several deps is read once.
+    let mut sources: HashMap<String, Option<Vec<u8>>> = HashMap::new();
     let mut uses = Vec::new();
     for (file, raw, _lang) in store.all_imports()? {
         let Some(pkg) = owner(&file) else { continue };
-        let Some(root) = import_root(&raw) else {
+        let Some(root_seg) = import_root(&raw) else {
             continue;
         };
         if let Some(dep) = pkg
             .package
             .dependencies
             .iter()
-            .find(|d| dep_code_name(d) == root)
+            .find(|d| dep_code_name(d) == root_seg)
         {
+            let from_nodes = use_site_nodes(store, root, &file, &raw, &mut sources)?;
             uses.push(ExternalUse {
                 from_package: pkg.package.name.clone(),
                 from_file: file.clone(),
                 package: dep.name.clone(),
                 path: raw,
+                from_nodes,
             });
         }
     }
@@ -574,6 +582,89 @@ fn external_uses(store: &dyn GraphStore, indexed: &[IndexedPackage]) -> Result<V
     });
     uses.dedup();
     Ok(uses)
+}
+
+/// Symbols in `file` whose source span references one of the import's imported
+/// names — the precise consumer use-sites (#236). Empty when the import names no
+/// specific symbol (a glob or bare-crate `use`) or the source can't be read, in
+/// which case the caller falls back to file-level landing. Definitions are
+/// matched by whole-identifier occurrence within their byte span; `Module`-like
+/// spans are excluded so a module doesn't claim all its children.
+fn use_site_nodes(
+    store: &dyn GraphStore,
+    root: &Path,
+    file: &str,
+    path: &str,
+    sources: &mut HashMap<String, Option<Vec<u8>>>,
+) -> Result<Vec<String>> {
+    let names = stratograph_core::imported_symbols(path);
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let bytes = sources
+        .entry(file.to_string())
+        .or_insert_with(|| std::fs::read(root.join(file)).ok());
+    let Some(bytes) = bytes.as_ref() else {
+        return Ok(Vec::new());
+    };
+
+    let mut out = Vec::new();
+    for node in store.nodes_in_file(file)? {
+        if !is_use_site_kind(node.kind) {
+            continue;
+        }
+        if let Some(span) = node.span
+            && let Some(slice) = bytes.get(span.start_byte..span.end_byte)
+        {
+            let text = String::from_utf8_lossy(slice);
+            if names.iter().any(|n| contains_ident(&text, n)) {
+                out.push(node.id.0);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Definition kinds that can reference an import in their span: callable bodies
+/// and type definitions (a field can name an imported type). `Module` is
+/// excluded — its span subsumes all its children, which would re-introduce the
+/// file-level coarseness this avoids.
+fn is_use_site_kind(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Function
+            | NodeKind::Method
+            | NodeKind::Class
+            | NodeKind::Struct
+            | NodeKind::Interface
+            | NodeKind::Enum
+            | NodeKind::Trait
+    )
+}
+
+/// Whether `needle` occurs in `haystack` as a whole identifier (not as a
+/// substring of a larger one), so `go` doesn't match inside `goldfish`.
+fn contains_ident(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let bytes = haystack.as_bytes();
+    let mut search_from = 0;
+    while let Some(rel) = haystack[search_from..].find(needle) {
+        let start = search_from + rel;
+        let end = start + needle.len();
+        let boundary_before = start == 0 || !is_ident_byte(bytes[start - 1]);
+        let boundary_after = end >= bytes.len() || !is_ident_byte(bytes[end]);
+        if boundary_before && boundary_after {
+            return true;
+        }
+        search_from = start + 1;
+    }
+    false
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b == b'_' || b.is_ascii_alphanumeric()
 }
 
 /// Expand one workspace `members` entry (a path or path glob relative to `root`)
@@ -1089,7 +1180,7 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
     let packages_json = serde_json::to_string(&indexed).unwrap_or_else(|_| "[]".to_string());
     // Consumer side of cross-repo links (#220): imports referencing a declared
     // dependency. Resolved from the same identity, persisted for #221.
-    let uses_json = serde_json::to_string(&external_uses(&*store, &indexed)?)
+    let uses_json = serde_json::to_string(&external_uses(&*store, &indexed, &root)?)
         .unwrap_or_else(|_| "[]".to_string());
     store.set_meta(META_PACKAGES, &packages_json)?;
     store.set_meta(META_EXTERNAL_USES, &uses_json)?;
@@ -1482,6 +1573,50 @@ mod tests {
         // std is not a declared dependency, so it is not an external use.
         check!(!uses.iter().any(|u| u.package == "std"));
         check!(uses.iter().all(|u| u.from_package == "app"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // #236: an external use records the precise consumer symbols that reference
+    // the imported name, not every symbol in the file.
+    #[test]
+    fn external_use_records_referencing_symbols() {
+        let dir = temp_repo("precise-use-sites");
+        let app = dir.join("crates/app");
+        std::fs::create_dir_all(app.join("src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nwidget = \"1\"\n",
+        )
+        .unwrap();
+        // `caller` references the imported `go`; `unrelated` does not.
+        std::fs::write(
+            app.join("src/lib.rs"),
+            "use widget::go;\nfn caller() { go(); }\nfn unrelated() { let goldfish = 1; }\n",
+        )
+        .unwrap();
+        run(&dir, false).unwrap();
+
+        let store = LadybugStore::open(&RepoPaths::new(&dir).index_dir.join("ladybug")).unwrap();
+        let uses: Vec<ExternalUse> =
+            serde_json::from_str(&store.get_meta("external_uses").unwrap().unwrap()).unwrap();
+        let go_use = uses
+            .iter()
+            .find(|u| u.package == "widget" && u.path == "widget::go")
+            .expect("widget::go external use");
+        let names: Vec<String> = go_use
+            .from_nodes
+            .iter()
+            .filter_map(|id| store.get_node(id).unwrap().map(|n| n.name))
+            .collect();
+        check!(names.contains(&"caller".to_string()), "got {names:?}");
+        // `unrelated` only contains the substring "go" inside "goldfish".
+        check!(!names.contains(&"unrelated".to_string()), "got {names:?}");
 
         std::fs::remove_dir_all(&dir).ok();
     }

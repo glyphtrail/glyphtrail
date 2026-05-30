@@ -45,6 +45,9 @@ pub struct CrossRepoLink {
     /// The consumer import path that produced this link.
     pub path: String,
     pub kind: LinkKind,
+    /// Consumer symbol node ids that reference the import — the precise
+    /// use-sites (#236). Empty falls back to file-level landing.
+    pub from_nodes: Vec<String>,
 }
 
 /// A repo's name paired with its persisted package identity, the input to
@@ -93,6 +96,7 @@ pub fn resolve_links(repos: &[RepoIdentity]) -> Vec<CrossRepoLink> {
                     to_node,
                     path: u.path.clone(),
                     kind,
+                    from_nodes: u.from_nodes.clone(),
                 };
 
                 let mut matched = false;
@@ -137,7 +141,7 @@ pub fn resolve_links(repos: &[RepoIdentity]) -> Vec<CrossRepoLink> {
 /// segment. `widget::go` → `[go]`; `widget::sub::Thing` → `[Thing]`;
 /// `widget::{a, b as c}` → `[a, b]`; a bare `widget`, a glob `widget::*`, or a
 /// `self` import → `[]` (crate-level).
-fn imported_symbols(path: &str) -> Vec<String> {
+pub fn imported_symbols(path: &str) -> Vec<String> {
     let path = path.trim().trim_start_matches("::");
     if let Some(open) = path.find('{') {
         let close = path.rfind('}').unwrap_or(path.len());
@@ -191,6 +195,7 @@ mod tests {
             from_file: format!("{from_package}/src/lib.rs"),
             package: dep.to_string(),
             path: path.to_string(),
+            from_nodes: Vec::new(),
         }
     }
 
