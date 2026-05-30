@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 stratograph-core.workspace = true
 stratograph-store.workspace = true
+stratograph-analyze.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
