@@ -4,6 +4,7 @@ members = [
     "crates/stratograph-core",
     "crates/stratograph-parse",
     "crates/stratograph-store",
+    "crates/stratograph-analyze",
     "crates/stratograph-viz",
     "crates/stratograph-server",
     "crates/stratograph-mcp",
@@ -22,6 +23,7 @@ repository = "https://github.com/sunsided/stratograph"
 stratograph-core = { path = "crates/stratograph-core" }
 stratograph-parse = { path = "crates/stratograph-parse" }
 stratograph-store = { path = "crates/stratograph-store" }
+stratograph-analyze = { path = "crates/stratograph-analyze" }
 stratograph-viz = { path = "crates/stratograph-viz" }
 stratograph-server = { path = "crates/stratograph-server" }
 stratograph-mcp = { path = "crates/stratograph-mcp" }
