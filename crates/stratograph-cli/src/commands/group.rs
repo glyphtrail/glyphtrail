@@ -7,8 +7,14 @@
 
 use anyhow::{Result, anyhow, bail};
 use clap::Subcommand;
-use std::path::PathBuf;
-use stratograph_core::{Groups, Registry, RepoHealth, default_groups_path, default_registry_path};
+use std::path::{Path, PathBuf};
+use stratograph_core::config::RepoPaths;
+use stratograph_core::{
+    Groups, META_EXTERNAL_USES, META_PACKAGES, PackageIdentity, Registry, RepoHealth, RepoIdentity,
+    default_groups_path, default_registry_path, resolve_links,
+};
+
+use crate::commands::backend;
 
 #[derive(Subcommand)]
 pub enum GroupCmd {
@@ -33,6 +39,13 @@ pub enum GroupCmd {
     /// Resolve a group's members against the registry and show their health.
     Status {
         /// Group name (defaults to every group).
+        name: Option<String>,
+    },
+    /// Resolve cross-repo links across a group (or the whole registry): each
+    /// consumer use-site tied to a producer crate's export. Computed on demand
+    /// from the members' current indexes — there is no separate table to sync.
+    Links {
+        /// Group name to scope to (defaults to the whole registry).
         name: Option<String>,
     },
 }
@@ -86,6 +99,7 @@ pub fn run(cmd: GroupCmd) -> Result<()> {
             }
         },
         GroupCmd::Status { name } => status(&path, name.as_deref())?,
+        GroupCmd::Links { name } => links(&path, name.as_deref())?,
     }
     Ok(())
 }
@@ -123,6 +137,63 @@ fn status(path: &std::path::Path, only: Option<&str>) -> Result<()> {
             };
             println!("  {repo:<20} {note}");
         }
+    }
+    Ok(())
+}
+
+/// Resolve and print cross-repo links for a group (or the whole registry when
+/// no name is given). Each indexed member's persisted identity is loaded and
+/// fed to the pure resolver; unregistered or unindexed members are noted and
+/// skipped rather than failing the run.
+fn links(groups_path: &Path, name: Option<&str>) -> Result<()> {
+    let registry = Registry::load(&registry_path()?)?;
+    let scope: Vec<String> = match name {
+        Some(n) => {
+            let groups = Groups::load(groups_path)?;
+            groups
+                .get(n)
+                .ok_or_else(|| anyhow!("no group named '{n}'"))?
+                .repos
+                .clone()
+        }
+        None => registry.repos.iter().map(|e| e.name.clone()).collect(),
+    };
+
+    let mut repos = Vec::new();
+    for repo_name in &scope {
+        let Some(entry) = registry.get(repo_name) else {
+            eprintln!("note: '{repo_name}' is not registered; skipping");
+            continue;
+        };
+        if entry.health() != RepoHealth::Indexed {
+            eprintln!("note: '{repo_name}' is not indexed; skipping");
+            continue;
+        }
+        let store = backend::open_existing(&RepoPaths::new(&entry.root))?;
+        let identity = PackageIdentity::from_meta(
+            store.get_meta(META_PACKAGES)?.as_deref(),
+            store.get_meta(META_EXTERNAL_USES)?.as_deref(),
+        );
+        repos.push(RepoIdentity {
+            repo: entry.name.clone(),
+            identity,
+        });
+    }
+
+    let links = resolve_links(&repos);
+    if links.is_empty() {
+        println!("(no cross-repo links resolved)");
+        return Ok(());
+    }
+    for l in &links {
+        let target = match &l.to_symbol {
+            Some(sym) => format!("{}::{sym}", l.to_package),
+            None => format!("{} (crate)", l.to_package),
+        };
+        println!(
+            "{} {} -> {} {}",
+            l.from_repo, l.from_file, l.to_repo, target
+        );
     }
     Ok(())
 }

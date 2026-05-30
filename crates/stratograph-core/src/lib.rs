@@ -7,6 +7,7 @@ pub mod groups;
 pub mod identity;
 pub mod impact;
 pub mod lang;
+pub mod links;
 pub mod manifest;
 pub mod matcher;
 pub mod model;
@@ -29,6 +30,7 @@ pub use impact::{
     parse_confidence,
 };
 pub use lang::Language;
+pub use links::{CrossRepoLink, LinkKind, RepoIdentity, resolve_links};
 pub use manifest::{
     CargoDependency, CargoPackage, DepKind, DepSource, parse_cargo_manifest, workspace_members,
 };
