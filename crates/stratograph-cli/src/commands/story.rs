@@ -7,8 +7,9 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Args;
+use stratograph_core::{Registry, RegistryEntry, default_registry_path};
 
 use super::llm::{Llm, Provider};
 
@@ -32,6 +33,13 @@ pub struct StoryArgs {
     /// Output file for the generated story.
     #[arg(long, default_value = "STORY.md")]
     pub output: PathBuf,
+    /// Narrate every repository in the global registry as one portfolio story.
+    #[arg(long)]
+    pub all: bool,
+    /// Narrate the named registered repositories (comma-separated) as one
+    /// portfolio story. Overrides `--repo`.
+    #[arg(long, value_delimiter = ',')]
+    pub repos: Option<Vec<String>>,
     /// Write the composed prompt instead of calling the LLM (no network/keys).
     #[arg(long)]
     pub dry_run: bool,
@@ -53,6 +61,9 @@ and milestones inferred from commit themes and dates, notable contributors, and 
 now. Group related commits into themes rather than listing them verbatim.";
 
 pub fn run(args: StoryArgs) -> Result<()> {
+    if args.all || args.repos.is_some() {
+        return run_portfolio(args);
+    }
     let repo = args
         .repo
         .canonicalize()
@@ -87,6 +98,81 @@ pub fn run(args: StoryArgs) -> Result<()> {
         .with_context(|| format!("cannot write {}", args.output.display()))?;
     println!("wrote {}", args.output.display());
     Ok(())
+}
+
+/// Narrate several registered repositories as one portfolio story (#114): the
+/// `--all` / `--repos` selection the issue calls for, woven into a single
+/// cross-repo history rather than per-repo files.
+fn run_portfolio(args: StoryArgs) -> Result<()> {
+    let path = default_registry_path()
+        .ok_or_else(|| anyhow!("cannot locate home directory (set HOME or USERPROFILE)"))?;
+    let registry = Registry::load(&path)?;
+    let selected = select_repos(&registry, args.all, &args.repos)?;
+    if selected.is_empty() {
+        bail!("no repositories registered; use `stratograph repo add`");
+    }
+    // Gather each repo's history; a missing/empty repo is reported and skipped
+    // rather than aborting the whole portfolio.
+    let mut histories: Vec<(String, Vec<Commit>)> = Vec::new();
+    for e in &selected {
+        match git_history(&e.root, args.max_commits) {
+            Ok(commits) if !commits.is_empty() => histories.push((e.name.clone(), commits)),
+            Ok(_) => eprintln!("  {}: no commits, skipped", e.name),
+            Err(err) => eprintln!("  {}: {err:#}", e.name),
+        }
+    }
+    if histories.is_empty() {
+        bail!("no commit history found across the selected repositories");
+    }
+    let user = portfolio_prompt(&histories);
+
+    if args.dry_run {
+        std::fs::write(
+            &args.output,
+            format!("# SYSTEM\n{SYSTEM}\n\n# USER\n{user}\n"),
+        )
+        .with_context(|| format!("cannot write {}", args.output.display()))?;
+        println!(
+            "wrote {} ({} repositories; dry run, no LLM called)",
+            args.output.display(),
+            histories.len()
+        );
+        return Ok(());
+    }
+
+    let llm = Llm::new(args.provider, args.model, args.base_url)?;
+    let md = llm
+        .complete(SYSTEM, &user)
+        .context("generating portfolio story")?;
+    std::fs::write(&args.output, md)
+        .with_context(|| format!("cannot write {}", args.output.display()))?;
+    println!(
+        "wrote {} ({} repositories)",
+        args.output.display(),
+        histories.len()
+    );
+    Ok(())
+}
+
+/// Select registry entries: every repo for `all`, else the named ones (erroring
+/// on an unknown name).
+fn select_repos<'a>(
+    registry: &'a Registry,
+    all: bool,
+    names: &Option<Vec<String>>,
+) -> Result<Vec<&'a RegistryEntry>> {
+    match (all, names) {
+        (true, _) => Ok(registry.repos.iter().collect()),
+        (false, Some(ns)) => ns
+            .iter()
+            .map(|name| {
+                registry
+                    .get(name)
+                    .ok_or_else(|| anyhow!("no repository named '{name}' in the registry"))
+            })
+            .collect(),
+        (false, None) => Ok(registry.repos.iter().collect()),
+    }
 }
 
 /// The most recent `limit` non-merge commits, newest first. Fields are split on
@@ -131,7 +217,9 @@ fn parse_log(text: &str) -> Vec<Commit> {
 
 /// Compose the user prompt: a facts header (span, contributors) plus the commit
 /// subjects, newest first.
-fn story_prompt(repo_name: &str, commits: &[Commit]) -> String {
+/// A single repository's history facts block: window span, top contributors and
+/// the commit log. Shared by the single-repo and portfolio prompts.
+fn repo_block(repo_name: &str, commits: &[Commit]) -> String {
     // `git log` is newest-first, so the last entry is the oldest in this window.
     let newest = &commits[0].date;
     let oldest = &commits[commits.len() - 1].date;
@@ -160,9 +248,32 @@ fn story_prompt(repo_name: &str, commits: &[Commit]) -> String {
     format!(
         "Repository: {repo_name}\nCommits in window: {} (newest {newest}, oldest {oldest})\n\
          Top contributors: {contributors}\n\n\
-         Commit log (newest first):\n{log}\n\n\
-         Write a `History` page narrating how {repo_name} evolved over this window.",
+         Commit log (newest first):\n{log}",
         commits.len()
+    )
+}
+
+fn story_prompt(repo_name: &str, commits: &[Commit]) -> String {
+    format!(
+        "{}\n\nWrite a `History` page narrating how {repo_name} evolved over this window.",
+        repo_block(repo_name, commits)
+    )
+}
+
+/// Prompt weaving several repositories' histories into one portfolio narrative.
+fn portfolio_prompt(repos: &[(String, Vec<Commit>)]) -> String {
+    let blocks = repos
+        .iter()
+        .map(|(name, commits)| repo_block(name, commits))
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n");
+    format!(
+        "{} repositories from the same portfolio:\n\n{blocks}\n\n\
+         Write a unified `History` narrating how these repositories evolved \
+         together — shared phases and milestones, how effort shifted between them \
+         over time, and notable contributors across the portfolio. Use a section \
+         per repository where it helps, but weave one coherent story.",
+        repos.len()
     )
 }
 
@@ -205,5 +316,20 @@ mod tests {
         // Ada has the most commits, so leads the contributor list.
         check!(p.contains("Top contributors: Ada (2), Grace (1)"));
         check!(p.contains("- 2026-03-01 abc1234 <Ada> Add parser"));
+    }
+
+    #[test]
+    fn portfolio_prompt_weaves_each_repo() {
+        let alpha = vec![c("2026-03-01", "Ada", "Add parser")];
+        let beta = vec![
+            c("2026-02-01", "Grace", "Init beta"),
+            c("2026-01-01", "Grace", "Scaffold beta"),
+        ];
+        let p = portfolio_prompt(&[("alpha".into(), alpha), ("beta".into(), beta)]);
+        check!(p.starts_with("2 repositories from the same portfolio:"));
+        check!(p.contains("Repository: alpha"));
+        check!(p.contains("Repository: beta"));
+        check!(p.contains("\n---\n")); // blocks separated
+        check!(p.contains("weave one coherent story"));
     }
 }
