@@ -22,15 +22,24 @@ use ignore::overrides::OverrideBuilder;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 
-/// A spinner for an open-ended phase. Auto-hidden when stderr is not a terminal
-/// (pipes, CI, tests), so it never pollutes captured output.
-fn phase_spinner(message: &str) -> ProgressBar {
-    let pb = ProgressBar::new_spinner();
+/// Number of labeled stages in the reference-resolution phase, used as the
+/// length of [`resolve_bar`]. Keep in sync with the `stage(...)` calls in `run`.
+const RESOLVE_STAGES: u64 = 10;
+
+/// A determinate bar for the reference-resolution phase: a `{bar} {pos}/{len}`
+/// over the fixed stage count with `{msg}` naming the stage in flight, so the
+/// user sees both how far along the phase is and what it is doing. Auto-hidden
+/// when stderr is not a terminal (pipes, CI, tests), like the parse bar, so it
+/// never pollutes captured output.
+fn resolve_bar() -> ProgressBar {
+    let pb = ProgressBar::new(RESOLVE_STAGES);
     pb.set_style(
-        ProgressStyle::with_template("{spinner:.cyan} {msg}")
-            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+        ProgressStyle::with_template(
+            "{spinner:.cyan} resolving [{bar:24.cyan/blue}] {pos}/{len} {msg}",
+        )
+        .unwrap_or_else(|_| ProgressStyle::default_bar())
+        .progress_chars("=> "),
     );
-    pb.set_message(message.to_string());
     pb.enable_steady_tick(std::time::Duration::from_millis(120));
     pb
 }
@@ -534,14 +543,19 @@ pub fn run(path: &Path, update: bool, backend: BackendKind) -> Result<()> {
         import_symbols.extend(out.import_symbols);
     }
 
-    let resolve_progress = phase_spinner("resolving references and cross-boundary links");
+    let resolve_progress = resolve_bar();
+    // Advance the determinate bar one stage at a time: set the label to the work
+    // about to run, do it, then `inc(1)` so `{pos}` counts completed stages.
+    let stage = |label: &str| resolve_progress.set_message(label.to_string());
 
     // Ingest blessed schema artifacts into SchemaOp nodes (reconciled with code
     // endpoints as EXPOSES edges below). Schema ops are derived entirely from
     // config, so rebuild them from scratch each run: this drops entries whose
     // artifact or config line was removed or whose spec changed.
+    stage("ingesting schema operations");
     store.delete_nodes_by_kind(NodeKind::SchemaOp)?;
     ingest_schemas(&root, &cfg, &mut graph, &mut operations);
+    resolve_progress.inc(1);
 
     // Persist nodes and high-confidence (extracted) edges first.
     let extracted: Vec<Edge> = graph
@@ -550,9 +564,14 @@ pub fn run(path: &Path, update: bool, backend: BackendKind) -> Result<()> {
         .filter(|e| e.confidence == Confidence::Extracted)
         .cloned()
         .collect();
+    stage("persisting nodes and edges");
     store.insert_graph(&graph.nodes, &extracted)?;
+    resolve_progress.inc(1);
+
+    stage("recording API operations and imports");
     store.insert_operations(&operations)?;
     store.insert_imports(&imports)?;
+    resolve_progress.inc(1);
 
     // Persist this run's unresolved cross-file edges (calls / inheritance /
     // handlers). They are re-resolved globally below, so edits anywhere keep
@@ -577,11 +596,14 @@ pub fn run(path: &Path, update: bool, backend: BackendKind) -> Result<()> {
                 name_is_src: true,
             }),
     );
+    stage("recording pending cross-file links");
     store.insert_pending(&pending_links)?;
+    resolve_progress.inc(1);
 
     // Resolve imports against the discovered file set (exact path, then unique
     // suffix). Done before edge insertion so the importer -> target map can also
     // disambiguate ambiguous call/inheritance names below (#18, #19).
+    stage("resolving imports to files");
     let file_rels: Vec<String> = files.iter().map(|f| f.rel_path.clone()).collect();
     let file_set: HashSet<&str> = file_rels.iter().map(|s| s.as_str()).collect();
 
@@ -615,10 +637,12 @@ pub fn run(path: &Path, update: bool, backend: BackendKind) -> Result<()> {
         }
         resolved_imports.push((importer, raw, target));
     }
+    resolve_progress.inc(1);
 
     // Re-resolve all persisted pending edges against the current global index.
     // A uniquely-named target resolves directly; an ambiguous name resolves
     // only if exactly one candidate sits in a file the anchor's file imports (#19).
+    stage("inferring cross-file edges");
     store.delete_edges_by_confidence(Confidence::Inferred)?;
     let mut index: HashMap<String, Vec<NodeId>> = HashMap::new();
     for (name, id) in store.definition_index()? {
@@ -648,11 +672,13 @@ pub fn run(path: &Path, update: bool, backend: BackendKind) -> Result<()> {
         })
         .collect();
     store.insert_graph(&[], &inferred)?;
+    resolve_progress.inc(1);
 
     // Rebuild IMPORTS edges from the resolved import set: real file targets
     // become file -> file (Inferred); the rest fall back to a module placeholder
     // (Extracted). Rebuilt globally each run so imports in unchanged files pick
     // up files added or removed elsewhere (#18).
+    stage("rebuilding import edges");
     store.delete_edges_by_kind(EdgeKind::Imports)?;
     let mut import_nodes: Vec<Node> = Vec::new();
     let mut import_edges: Vec<Edge> = Vec::new();
@@ -687,11 +713,13 @@ pub fn run(path: &Path, update: bool, backend: BackendKind) -> Result<()> {
         }
     }
     store.insert_graph(&import_nodes, &import_edges)?;
+    resolve_progress.inc(1);
 
     // Cross-boundary linking: resolve client calls and schema operations
     // against the endpoints, through the same rewrite-aware matcher. Runs over
     // the full store (endpoints, calls and schema ops commonly live in
     // different, possibly unchanged, files/artifacts).
+    stage("linking client calls to endpoints");
     let rewrite = RewriteEngine::from_config(&cfg.api);
     let endpoints: Vec<Endpoint> = store
         .operations_by_kind(NodeKind::Endpoint)?
@@ -727,10 +755,12 @@ pub fn run(path: &Path, update: bool, backend: BackendKind) -> Result<()> {
         confidence: m.confidence,
     }));
     store.insert_graph(&[], &edges)?;
+    resolve_progress.inc(1);
 
     // Cross-file router-variable MOUNTS (#167): a synthetic `Router` node whose
     // variable was imported from another file gets a MOUNTS edge to that file, so
     // `app.use("/api", router)` where `router` is imported links end-to-end.
+    stage("mounting cross-file routers");
     let router_edges: Vec<Edge> = graph
         .nodes
         .iter()
@@ -746,14 +776,28 @@ pub fn run(path: &Path, update: bool, backend: BackendKind) -> Result<()> {
         })
         .collect();
     store.insert_graph(&[], &router_edges)?;
+    resolve_progress.inc(1);
 
-    for f in &changed {
-        store.set_file(&f.rel_path, f.language.as_ref().map(|l| l.name()), &f.hash)?;
-    }
+    // Stamp the per-file hashes for the changed set in one batch so the next
+    // `--update` run can skip them. One bulk write beats one fresh connection +
+    // commit per file (the per-file loop was the phase's second-slowest stage).
+    stage(&format!("recording {} file records", changed.len()));
+    let file_records: Vec<(String, Option<String>, String)> = changed
+        .iter()
+        .map(|f| {
+            (
+                f.rel_path.clone(),
+                f.language.as_ref().map(|l| l.name().to_string()),
+                f.hash.clone(),
+            )
+        })
+        .collect();
+    store.set_files(&file_records)?;
     let pruned = store.prune_dangling_edges()?;
     if pruned > 0 {
         tracing::info!("pruned {pruned} dangling edges");
     }
+    resolve_progress.inc(1);
 
     store.set_meta("tool_version", VERSION)?;
     resolve_progress.finish_and_clear();
