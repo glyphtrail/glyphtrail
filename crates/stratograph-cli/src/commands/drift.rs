@@ -39,6 +39,8 @@ pub enum Format {
     #[default]
     Text,
     Json,
+    /// YAML — compact structured output for LLMs/agents.
+    Yaml,
 }
 
 /// One endpoint or schema operation in the drift report.
@@ -74,6 +76,7 @@ pub fn run(args: DriftArgs) -> Result<()> {
 
     match args.format {
         Format::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+        Format::Yaml => print!("{}", serde_norway::to_string(&report)?),
         Format::Text => print_text(&report),
     }
 

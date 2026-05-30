@@ -440,7 +440,9 @@ impl Emit {
     }
 }
 
-fn print_value(value: &serde_json::Value, emit: Emit) -> Result<()> {
+/// Render a JSON value as pretty JSON or YAML; `Text` is a no-op (callers render
+/// their own text form). Shared by every structured-output command (#109).
+pub fn print_value(value: &serde_json::Value, emit: Emit) -> Result<()> {
     match emit {
         Emit::Json => println!("{}", serde_json::to_string_pretty(value)?),
         Emit::Yaml => print!("{}", serde_norway::to_string(value)?),
