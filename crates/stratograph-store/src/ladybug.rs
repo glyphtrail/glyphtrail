@@ -636,6 +636,14 @@ impl GraphStore for LadybugStore {
             .collect())
     }
 
+    fn node_qualified_names(&self) -> Result<Vec<(String, String)>> {
+        Ok(self
+            .run("MATCH (n:Node) RETURN n.id, n.qualified_name", vec![])?
+            .iter()
+            .map(|r| (get_str(r, 0), get_str(r, 1)))
+            .collect())
+    }
+
     fn definition_index(&self) -> Result<Vec<(String, NodeId)>> {
         Ok(self
             .run("MATCH (n:Node) RETURN n.name, n.id", vec![])?

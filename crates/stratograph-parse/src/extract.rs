@@ -14,6 +14,12 @@ pub struct RawDef {
 pub struct RawRef {
     pub name: String,
     pub byte: usize,
+    /// Immediate receiver/scope qualifier of the call, when the call is
+    /// qualified (`Foo::bar`, `Foo.bar`, `obj.method`, `pkg.Func`) — the single
+    /// segment directly before the name. `None` for a bare `name(...)` call or a
+    /// `self`/`this`/`cls`/`super` receiver. Used to disambiguate same-named
+    /// targets by enclosing scope (#5).
+    pub scope: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +74,35 @@ fn clean_import(raw: &str) -> String {
         .to_string()
 }
 
+/// The immediate receiver/scope of a captured `@call` name node, read from its
+/// parent in the AST: `Foo::bar`→`Foo`, `Foo.bar`/`obj.method`→`Foo`/`obj`,
+/// `pkg.Func`→`pkg`. Returns the single segment directly before the name (the
+/// last segment of a dotted/scoped receiver), and `None` for a bare call or a
+/// `self`/`this`/`cls`/`super` receiver. Field names cover the qualified-call
+/// node kinds across the supported grammars (#5).
+fn call_qualifier(node: tree_sitter::Node, src: &[u8]) -> Option<String> {
+    let parent = node.parent()?;
+    let recv = match parent.kind() {
+        // Python attribute, JS/TS member, Java method invocation: `object`.
+        "attribute" | "member_expression" | "method_invocation" => {
+            parent.child_by_field_name("object")
+        }
+        "scoped_identifier" => parent.child_by_field_name("path"), // Rust `Foo::bar`
+        "field_expression" => parent.child_by_field_name("value"), // Rust `obj.field()`
+        "selector_expression" => parent.child_by_field_name("operand"), // Go `pkg.Func`
+        "member_access_expression" => parent.child_by_field_name("expression"), // C#
+        "call" => parent.child_by_field_name("receiver"),          // Ruby `recv.meth`
+        _ => None,
+    }?;
+    let text = recv.utf8_text(src).ok()?;
+    // Reduce a dotted/scoped receiver to its last segment (the immediate scope).
+    let seg = text.rsplit(['.', ':']).next().unwrap_or(text).trim();
+    if seg.is_empty() || matches!(seg, "self" | "this" | "cls" | "super") {
+        return None;
+    }
+    Some(seg.to_string())
+}
+
 /// Parse `source` and extract raw definitions, calls, imports, bases and comments.
 pub fn parse_source(lang: &Language, source: &str) -> anyhow::Result<ParsedFile> {
     let (Some(grammar), Some(query)) = (grammar(lang), query_source(lang)) else {
@@ -120,6 +155,7 @@ pub fn parse_with(
                 "call" => out.calls.push(RawRef {
                     name: text,
                     byte: node.start_byte(),
+                    scope: call_qualifier(node, src),
                 }),
                 "import" => out.imports.push(clean_import(&text)),
                 "extends" => out.bases.push(RawBase {

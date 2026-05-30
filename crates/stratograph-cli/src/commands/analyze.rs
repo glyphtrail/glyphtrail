@@ -575,6 +575,22 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
     store.insert_imports(&imports)?;
     resolve_progress.inc(1);
 
+    // Receiver/scope qualifier per pending call (#5), kept in memory for this
+    // run's resolution below. Keyed like the persisted pending link
+    // `(anchor, name, kind)`; the Pending node has no scope column, so on
+    // `--update` unchanged-file pending simply fall back to the other tiers.
+    let scope_map: HashMap<(String, String, String), String> = pending
+        .iter()
+        .filter_map(|p| {
+            p.scope.clone().map(|sc| {
+                (
+                    (p.src.0.clone(), p.name.clone(), p.kind.as_str().to_string()),
+                    sc,
+                )
+            })
+        })
+        .collect();
+
     // Persist this run's unresolved cross-file edges (calls / inheritance /
     // handlers). They are re-resolved globally below, so edits anywhere keep
     // inferred edges in unchanged files correct (#20).
@@ -642,9 +658,10 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
     resolve_progress.inc(1);
 
     // Re-resolve all persisted pending edges against the current global index.
-    // A uniquely-named target resolves directly; an ambiguous name resolves if
-    // exactly one candidate sits in a file the anchor's file imports (#19), or,
-    // failing that, in the anchor's own directory (same-package locality, #5).
+    // A uniquely-named target resolves directly; an ambiguous name resolves by,
+    // in order: a matching receiver/scope qualifier (#5), exactly one candidate
+    // in a file the anchor imports (#19), or exactly one in the anchor's own
+    // directory (same-package locality, #5).
     stage("inferring cross-file edges");
     store.delete_edges_by_confidence(Confidence::Inferred)?;
     let mut index: HashMap<String, Vec<NodeId>> = HashMap::new();
@@ -652,6 +669,8 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
         index.entry(name).or_default().push(id);
     }
     let node_file: HashMap<String, String> = store.node_files()?.into_iter().collect();
+    let node_qualified: HashMap<String, String> =
+        store.node_qualified_names()?.into_iter().collect();
     let inferred: Vec<Edge> = store
         .all_pending()?
         .into_iter()
@@ -659,7 +678,14 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
             let candidates = index.get(&l.name)?;
             let other = match candidates.as_slice() {
                 [one] => one.clone(),
-                _ => disambiguate_import(&l.anchor, candidates, &node_file, &import_map)
+                _ => scope_map
+                    .get(&(
+                        l.anchor.0.clone(),
+                        l.name.clone(),
+                        l.kind.as_str().to_string(),
+                    ))
+                    .and_then(|q| disambiguate_qualifier(candidates, q, &l.name, &node_qualified))
+                    .or_else(|| disambiguate_import(&l.anchor, candidates, &node_file, &import_map))
                     .or_else(|| disambiguate_dir(&l.anchor, candidates, &node_file))?,
             };
             let (src, dst) = if l.name_is_src {
@@ -912,6 +938,34 @@ fn disambiguate_dir(
         {
             if hit.is_some() {
                 return None; // two candidates in the same directory — still ambiguous
+            }
+            hit = Some(c);
+        }
+    }
+    hit.cloned()
+}
+
+/// Resolve an ambiguous name to the unique candidate whose immediate enclosing
+/// scope equals the call's receiver `qualifier` (#5): a call `Foo::bar()` /
+/// `Foo.bar()` prefers the `bar` defined in `Foo` over same-named `bar`s
+/// elsewhere. Qualified names are `Scope::…::name`, so a match means the
+/// candidate ends in `qualifier::name` (the segment before `name` is the
+/// qualifier). Conservative: returns a target only on a unique match.
+fn disambiguate_qualifier(
+    candidates: &[NodeId],
+    qualifier: &str,
+    name: &str,
+    node_qualified: &HashMap<String, String>,
+) -> Option<NodeId> {
+    let tail = format!("{qualifier}::{name}");
+    let nested = format!("::{tail}");
+    let mut hit: Option<&NodeId> = None;
+    for c in candidates {
+        if let Some(q) = node_qualified.get(&c.0)
+            && (*q == tail || q.ends_with(&nested))
+        {
+            if hit.is_some() {
+                return None; // two candidates share the qualifier — still ambiguous
             }
             hit = Some(c);
         }
@@ -1537,6 +1591,54 @@ mod tests {
         );
         // Resolved to the helper in the caller's directory, not the other one.
         check!(callees[0].0.file == "pkg/b.py");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // #5: a qualified call (`User.save()`) resolves to the method on the named
+    // type, not a same-named method on another type — even when both live in the
+    // caller's own directory (so the same-directory tier can't decide).
+    #[test]
+    fn qualified_call_resolves_by_receiver_scope() {
+        let dir = temp_repo("qualifier-resolve");
+        std::fs::create_dir_all(dir.join("m")).unwrap();
+        std::fs::write(
+            dir.join("m/user.py"),
+            "class User:\n    def save(self):\n        return 1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("m/admin.py"),
+            "class Admin:\n    def save(self):\n        return 2\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("m/caller.py"),
+            "def go():\n    return User.save(None)\n",
+        )
+        .unwrap();
+        run(&dir, false).unwrap();
+
+        let store = LadybugStore::open(&RepoPaths::new(&dir).index_dir.join("ladybug")).unwrap();
+        let go = store
+            .find_by_name("go")
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("`go` fn")
+            .id;
+        let callees = store.neighbors(&go.0, Some(EdgeKind::Calls), true).unwrap();
+        check!(
+            callees.len() == 1,
+            "expected one resolved call, got {:?}",
+            callees
+                .iter()
+                .map(|(n, _, _)| (&n.qualified_name, &n.file))
+                .collect::<Vec<_>>()
+        );
+        // Resolved to User's `save`, not Admin's.
+        check!(callees[0].0.qualified_name == "User::save");
+        check!(callees[0].0.file == "m/user.py");
 
         std::fs::remove_dir_all(&dir).ok();
     }

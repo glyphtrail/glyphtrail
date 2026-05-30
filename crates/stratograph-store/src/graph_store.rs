@@ -57,6 +57,9 @@ pub trait GraphStore: Adjacency {
     fn all_pending(&self) -> Result<Vec<PendingLink>>;
     fn all_imports(&self) -> Result<Vec<(String, String, String)>>;
     fn node_files(&self) -> Result<Vec<(String, String)>>;
+    /// `(node id, qualified name)` for every node, so cross-file resolution can
+    /// match a call's receiver against a candidate's enclosing scope (#5).
+    fn node_qualified_names(&self) -> Result<Vec<(String, String)>>;
     fn definition_index(&self) -> Result<Vec<(String, NodeId)>>;
     fn get_node(&self, id: &str) -> Result<Option<Node>>;
     fn nodes_in_file(&self, file: &str) -> Result<Vec<Node>>;
