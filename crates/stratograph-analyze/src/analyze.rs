@@ -507,11 +507,35 @@ fn index_packages(
         }
     }
 
+    // `pub use X as Y` re-export pass (#239): a renamed re-export makes `Y` a
+    // public name for the item defined as `X`. Non-renamed re-exports and globs
+    // already resolve, since matching is by name. Add an alias export entry so a
+    // consumer importing `Y` matches symbol-level instead of falling back to
+    // crate level. A private `use … as …` adds a harmless alias no consumer can
+    // import, so visibility need not be checked (matching is name-based).
+    for (file, raw, _lang) in store.all_imports()? {
+        let Some(idx) = owner(&file) else {
+            continue;
+        };
+        for (underlying, alias) in use_aliases(&raw) {
+            let clones: Vec<PackageExport> = exports[idx]
+                .iter()
+                .filter(|e| e.name == underlying)
+                .map(|e| PackageExport {
+                    name: alias.clone(),
+                    ..e.clone()
+                })
+                .collect();
+            exports[idx].extend(clones);
+        }
+    }
+
     Ok(discovered
         .iter()
         .zip(exports)
         .map(|(d, mut exports)| {
-            exports.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+            exports.sort_by(|a, b| (&a.node_id, &a.name).cmp(&(&b.node_id, &b.name)));
+            exports.dedup_by(|a, b| a.node_id == b.node_id && a.name == b.name);
             IndexedPackage {
                 dir: d.dir.clone(),
                 package: d.package.clone(),
@@ -519,6 +543,27 @@ fn index_packages(
             }
         })
         .collect())
+}
+
+/// Renamed re-exports in a use specifier: `(underlying, alias)` for each
+/// `X as Y` (underlying is the path tail before `as`). Handles a simple
+/// `foo::Bar as Baz` and brace groups `foo::{Bar as Baz, Qux}`; non-renamed
+/// entries yield nothing.
+fn use_aliases(raw: &str) -> Vec<(String, String)> {
+    let items: Vec<&str> = match (raw.find('{'), raw.rfind('}')) {
+        (Some(open), Some(close)) if close > open => raw[open + 1..close].split(',').collect(),
+        _ => vec![raw],
+    };
+    items
+        .into_iter()
+        .filter_map(|item| {
+            let (lhs, alias) = item.split_once(" as ")?;
+            let underlying = lhs.trim().rsplit("::").next()?.trim();
+            let alias = alias.trim();
+            (!underlying.is_empty() && !alias.is_empty())
+                .then(|| (underlying.to_string(), alias.to_string()))
+        })
+        .collect()
 }
 
 /// The name a dependency is referenced under in code: its rename alias when
@@ -1617,6 +1662,60 @@ mod tests {
         check!(names.contains(&"caller".to_string()), "got {names:?}");
         // `unrelated` only contains the substring "go" inside "goldfish".
         check!(!names.contains(&"unrelated".to_string()), "got {names:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn use_aliases_extracts_renames() {
+        check!(use_aliases("foo::Bar as Baz") == vec![("Bar".to_string(), "Baz".to_string())]);
+        check!(use_aliases("foo::{A as B, C}") == vec![("A".to_string(), "B".to_string())]);
+        check!(use_aliases("foo::Bar").is_empty());
+    }
+
+    // #239: a `pub use X as Y` renamed re-export adds an alias export entry named
+    // `Y` pointing at the item defined as `X`, so a consumer importing `Y`
+    // matches symbol-level.
+    #[test]
+    fn pub_use_rename_adds_alias_export() {
+        let dir = temp_repo("pub-use-rename");
+        let lib = dir.join("crates/lib");
+        std::fs::create_dir_all(lib.join("src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            lib.join("Cargo.toml"),
+            "[package]\nname = \"lib\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            lib.join("src/lib.rs"),
+            "pub struct Thing {}\npub use Thing as Widget;\n",
+        )
+        .unwrap();
+        run(&dir, false).unwrap();
+
+        let store = LadybugStore::open(&RepoPaths::new(&dir).index_dir.join("ladybug")).unwrap();
+        let packages: Vec<IndexedPackage> =
+            serde_json::from_str(&store.get_meta("packages").unwrap().unwrap()).unwrap();
+        let lib_pkg = packages
+            .iter()
+            .find(|p| p.package.name == "lib")
+            .expect("lib package");
+        let thing = lib_pkg
+            .exports
+            .iter()
+            .find(|e| e.name == "Thing")
+            .expect("Thing export");
+        let widget = lib_pkg
+            .exports
+            .iter()
+            .find(|e| e.name == "Widget")
+            .expect("Widget alias export");
+        check!(widget.node_id == thing.node_id);
 
         std::fs::remove_dir_all(&dir).ok();
     }
