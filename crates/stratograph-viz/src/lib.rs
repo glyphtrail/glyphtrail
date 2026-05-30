@@ -209,6 +209,21 @@ mod tests {
     }
 
     #[test]
+    fn empty_kind_set_keeps_nothing() {
+        // An explicit empty selection (every toolbar box off) must keep no nodes,
+        // unlike `None` which keeps all.
+        let nodes = [node("a", NodeKind::Function)];
+        let edges = [edge("a", "a", EdgeKind::Calls)];
+        let sel = Selection {
+            kinds: Some(HashSet::new()),
+            ..Default::default()
+        };
+        let (n, e) = select_graph(&nodes, &edges, &sel);
+        check!(n.is_empty());
+        check!(e.is_empty());
+    }
+
+    #[test]
     fn kind_filter_drops_nodes_and_their_edges() {
         let nodes = [node("a", NodeKind::Function), node("b", NodeKind::Comment)];
         let edges = [edge("a", "b", EdgeKind::Documents)];
