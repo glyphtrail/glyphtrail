@@ -3,6 +3,7 @@
 pub mod api;
 pub mod config;
 pub mod error;
+pub mod federated;
 pub mod groups;
 pub mod identity;
 pub mod impact;
@@ -20,6 +21,7 @@ pub use api::{
 };
 pub use config::{ApiConfig, Config, DynamicLanguage, SchemaFormat, SchemaSource};
 pub use error::{CoreError, Result};
+pub use federated::{FederatedAdjacency, qualify, unqualify};
 pub use groups::{Group, Groups, default_groups_path};
 pub use identity::{
     ExternalUse, IndexedPackage, META_EXTERNAL_USES, META_PACKAGES, PackageExport, PackageIdentity,
