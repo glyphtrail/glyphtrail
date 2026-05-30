@@ -202,17 +202,93 @@ function setBusy(on) {
   document.getElementById("toolbar").style.opacity = on ? "0.55" : "1";
 }
 
-// Animated cose runs the physics over animation frames instead of one blocking
-// pass, so the graph visibly settles into place and the UI stays responsive
-// (the old `animate:false` froze the tab for seconds on a few hundred nodes).
-// `done` fires once the layout stops.
-function runLayout(cy, done) {
+// Apply worker-computed positions to the live graph in one batch (one repaint).
+function applyPositions(cy, positions) {
+  cy.batch(() => {
+    for (const p of positions) {
+      const n = cy.getElementById(p.id);
+      if (n.length) n.position({ x: p.x, y: p.y });
+    }
+  });
+}
+
+// The force layout runs in a Web Worker: the position maths (the expensive part)
+// happen off the main thread, so even large graphs stay fully interactive while
+// they settle, and intermediate ticks stream back so the graph visibly builds.
+// d3-force is loaded inside the worker from the same CDN as cytoscape.
+const WORKER_SRC = `
+  let loaded = false;
+  self.onmessage = (e) => {
+    try {
+      if (!loaded) {
+        importScripts("https://cdn.jsdelivr.net/npm/d3-force@3/dist/d3-force.min.js");
+        loaded = true;
+      }
+      const { nodes, links } = e.data;
+      const sim = self.d3.forceSimulation(nodes)
+        .force("charge", self.d3.forceManyBody().strength(-140))
+        .force("link", self.d3.forceLink(links).id((d) => d.id).distance(60))
+        .force("center", self.d3.forceCenter(0, 0))
+        .stop();
+      const iters = Math.max(120, Math.min(360, 360 - Math.floor(nodes.length / 25)));
+      const pos = () => nodes.map((n) => ({ id: n.id, x: n.x, y: n.y }));
+      for (let i = 0; i < iters; i++) {
+        sim.tick();
+        if (i % 16 === 0) self.postMessage({ type: "tick", positions: pos() });
+      }
+      self.postMessage({ type: "done", positions: pos() });
+    } catch (err) {
+      self.postMessage({ type: "error" });
+    }
+  };
+`;
+
+let layoutWorker = null;
+let workerOk = typeof Worker !== "undefined";
+let onWorkerMsg = null;
+let pendingAbort = null;
+function getWorker() {
+  if (layoutWorker || !workerOk) return layoutWorker;
+  try {
+    const url = URL.createObjectURL(new Blob([WORKER_SRC], { type: "application/javascript" }));
+    layoutWorker = new Worker(url);
+    layoutWorker.onmessage = (e) => { if (onWorkerMsg) onWorkerMsg(e.data); };
+    layoutWorker.onerror = () => { workerOk = false; if (pendingAbort) pendingAbort(); };
+  } catch (_) { workerOk = false; }
+  return layoutWorker;
+}
+
+// Fallback: animated cose runs over animation frames in-page (non-blocking but
+// main-thread). Used when Workers or the d3-force CDN script are unavailable.
+function coseLayout(cy, done) {
   const layout = cy.layout({
     name: "cose", animate: true, refresh: 12, numIter: 1000,
     nodeRepulsion: 8000, idealEdgeLength: 60, randomize: false, fit: true,
   });
   if (done) layout.one("layoutstop", done);
   layout.run();
+}
+
+function runLayout(cy, done) {
+  const w = getWorker();
+  const nodes = cy.nodes().map((n) => ({ id: n.id() }));
+  if (!w || !nodes.length) { coseLayout(cy, done); return; }
+  const links = cy.edges().map((e) => ({ source: e.source().id(), target: e.target().id() }));
+  let fitted = false, finished = false;
+  const finish = (cb) => {
+    if (finished) return;
+    finished = true; onWorkerMsg = null; pendingAbort = null; cb();
+  };
+  // Any worker failure (init, CDN fetch, or a layout exception) falls back to
+  // cose, so `done` always runs and the toolbar never stays disabled.
+  pendingAbort = () => finish(() => coseLayout(cy, done));
+  onWorkerMsg = (msg) => {
+    if (msg.type === "error") { finish(() => coseLayout(cy, done)); return; }
+    applyPositions(cy, msg.positions);
+    if (!fitted) { cy.fit(undefined, 40); fitted = true; }
+    if (msg.type === "done") finish(() => { cy.fit(undefined, 40); if (done) done(); });
+  };
+  w.postMessage({ nodes, links });
 }
 
 const CY_STYLE = [
