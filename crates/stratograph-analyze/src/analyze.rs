@@ -17,8 +17,8 @@ use stratograph_parse::{
     build_ws_client_graph, build_ws_server_graph, load_dynamic, parse_source, resolve_import,
 };
 
-use crate::commands::backend;
-use crate::commands::schema;
+use crate::backend;
+use crate::schema;
 use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -1083,10 +1083,13 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
         stats.files, stats.nodes, stats.edges
     );
     if !stats.languages.is_empty() {
-        println!(
-            "Languages: {}",
-            super::status::format_languages(&stats.languages)
-        );
+        let langs = stats
+            .languages
+            .iter()
+            .map(|(lang, n)| format!("{lang} {n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("Languages: {langs}");
     }
     Ok(())
 }
