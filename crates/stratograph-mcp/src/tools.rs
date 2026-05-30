@@ -4,8 +4,9 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 use stratograph_core::{
-    Confidence, EdgeKind, HttpMethod, ImpactPolicy, ImpactReport, Node, NodeId, NodeKind,
-    OperationKey, Protocol, operations_matching,
+    Confidence, EdgeKind, Groups, HttpMethod, ImpactPolicy, ImpactReport, Node, NodeId, NodeKind,
+    OperationKey, Protocol, Registry, RepoHealth, default_groups_path, default_registry_path,
+    operations_matching,
 };
 use stratograph_store::{ChangeSpec, GraphStore, LadybugStore, changed_files, seed_nodes};
 
@@ -104,6 +105,15 @@ pub fn definitions() -> Vec<Value> {
             json!({}),
             &[],
         ),
+        tool(
+            "list_repos",
+            "List repositories indexed in the global registry, each with its \
+             on-disk health (indexed/unindexed/missing) and the groups it \
+             belongs to. Use this to discover what is indexed before a \
+             cross-repo query — no shell required.",
+            json!({}),
+            &[],
+        ),
     ]
 }
 
@@ -118,6 +128,10 @@ pub fn call(db: &Path, name: &str, args: &Value) -> Value {
 }
 
 fn dispatch(db: &Path, name: &str, args: &Value) -> Result<Value, String> {
+    // Registry-level tools span repos and need no per-repo store.
+    if name == "list_repos" {
+        return list_repos();
+    }
     let store = open(db)?;
     match name {
         "search" => {
@@ -190,6 +204,44 @@ fn dispatch(db: &Path, name: &str, args: &Value) -> Result<Value, String> {
         }
         other => Err(format!("unknown tool: {other}")),
     }
+}
+
+/// Enumerate the global registry: every indexed repo with its on-disk health
+/// and group membership. Reads the registry and groups files directly (no
+/// per-repo store), so an agent can discover what is indexed without a shell.
+fn list_repos() -> Result<Value, String> {
+    let registry = match default_registry_path() {
+        Some(p) => Registry::load(&p).map_err(err)?,
+        None => Registry::default(),
+    };
+    let groups = match default_groups_path() {
+        Some(p) => Groups::load(&p).map_err(err)?,
+        None => Groups::default(),
+    };
+    let repos: Vec<Value> = registry
+        .repos
+        .iter()
+        .map(|e| {
+            let health = match e.health() {
+                RepoHealth::Indexed => "indexed",
+                RepoHealth::Unindexed => "unindexed",
+                RepoHealth::Missing => "missing",
+            };
+            let member_of: Vec<&str> = groups
+                .groups
+                .iter()
+                .filter(|g| g.repos.iter().any(|r| r == &e.name))
+                .map(|g| g.name.as_str())
+                .collect();
+            json!({
+                "name": e.name,
+                "root": e.root,
+                "health": health,
+                "groups": member_of,
+            })
+        })
+        .collect();
+    Ok(Value::Array(repos))
 }
 
 /// Open the repo's LadybugDB graph store. `db` is the index anchor path
@@ -561,6 +613,17 @@ mod tests {
         check!(parsed["nodes"] == json!(2));
         check!(parsed["edges"] == json!(1));
         std::fs::remove_dir_all(db.parent().unwrap()).ok();
+    }
+
+    // #223: a registry-level tool needs no per-repo index. It reads the global
+    // registry (empty in CI) and returns an array, even with a bogus db path.
+    #[test]
+    fn list_repos_needs_no_store_and_returns_an_array() {
+        let res = call(Path::new("/nonexistent/graph.db"), "list_repos", &json!({}));
+        check!(res["isError"] == json!(false));
+        let text = res["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        check!(parsed.is_array());
     }
 
     #[test]
