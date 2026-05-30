@@ -23,6 +23,10 @@ pub struct PendingEdge {
     pub src: NodeId,
     pub name: String,
     pub kind: EdgeKind,
+    /// Receiver/scope qualifier of a qualified call (`Foo::bar`, `obj.method`),
+    /// used to disambiguate same-named targets by enclosing scope (#5). `None`
+    /// for bare calls and inheritance bases.
+    pub scope: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -694,6 +698,7 @@ pub fn build_file_graph(
                 src: caller,
                 name: r.name.clone(),
                 kind: EdgeKind::Calls,
+                scope: r.scope.clone(),
             });
         }
     }
@@ -713,6 +718,7 @@ pub fn build_file_graph(
                 src,
                 name: b.name.clone(),
                 kind: b.kind,
+                scope: None,
             });
         }
     }
