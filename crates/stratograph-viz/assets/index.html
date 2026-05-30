@@ -51,6 +51,15 @@
   #results .r:last-child { border-bottom: none; }
   #results .r:hover { background: #21262d; }
   #results .r small { opacity: 0.6; }
+  #legend {
+    position: fixed; left: 12px; bottom: 12px; z-index: 9; max-width: 220px;
+    background: rgba(22, 27, 34, 0.92); color: #c9d1d9; border: 1px solid #333;
+    border-radius: 6px; padding: 6px 9px; font-size: 11px;
+  }
+  #legend h4 { margin: 0; font-size: 11px; opacity: 0.7; cursor: pointer; user-select: none; }
+  #legend .items { display: flex; flex-wrap: wrap; gap: 3px 10px; margin-top: 6px; }
+  #legend .it { display: flex; align-items: center; gap: 5px; white-space: nowrap; }
+  #legend .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
 </style>
 </head>
 <body>
@@ -69,6 +78,7 @@
 </div>
 <div id="results"></div>
 <div id="cy"></div>
+<div id="legend"></div>
 <div id="summary"></div>
 <div id="info"></div>
 <script>
@@ -164,6 +174,24 @@ function setStatus(cy, note) {
     cy.nodes().length + " nodes, " + cy.edges().length + " edges" + (note ? " · " + note : "");
 }
 
+// Color key for the node kinds currently in the graph (collapsible).
+let legendOpen = true;
+function updateLegend() {
+  const kinds = [...new Set(cy.nodes().map((n) => n.data("kind")))].sort();
+  const legend = document.getElementById("legend");
+  if (!kinds.length) { legend.style.display = "none"; return; }
+  legend.style.display = "block";
+  const items = kinds.map((k) =>
+    "<span class='it'><span class='dot' style='background:" + (KIND_COLOR[k] || "#888") +
+    "'></span>" + esc(k) + "</span>").join("");
+  legend.innerHTML = "<h4 id='legendToggle'>legend " + (legendOpen ? "▾" : "▸") + "</h4>" +
+    "<div class='items' style='display:" + (legendOpen ? "flex" : "none") + "'>" + items + "</div>";
+  document.getElementById("legendToggle").addEventListener("click", () => {
+    legendOpen = !legendOpen;
+    updateLegend();
+  });
+}
+
 // While a fetch + relayout is in flight the toolbar is disabled, so rapid
 // toggling can't queue up several blocking rebuilds (#194 follow-up).
 let busy = false;
@@ -192,7 +220,9 @@ const CY_STYLE = [
     "background-color": (e) => KIND_COLOR[e.data("kind")] || "#888",
     "label": "data(label)", "color": "#ddd", "font-size": 9,
     "text-valign": "bottom", "text-wrap": "ellipsis", "text-max-width": 90,
-    "width": 14, "height": 14 } },
+    // Size by connectivity so hubs (heavily-referenced symbols) stand out.
+    "width": (e) => 12 + Math.min(20, e.degree(false) * 1.4),
+    "height": (e) => 12 + Math.min(20, e.degree(false) * 1.4) } },
   { selector: "edge", style: {
     "width": (e) => CROSS_BOUNDARY.has(e.data("kind")) ? 2 : 1,
     "line-color": edgeColor,
@@ -229,6 +259,7 @@ async function reload() {
   // `kinds=` must not be read by the server as "no filter, send everything").
   if (!kinds) {
     cy.elements().remove();
+    updateLegend();
     setStatus(cy, "no node kinds selected");
     return;
   }
@@ -245,6 +276,7 @@ async function reload() {
   }
   cy.elements().remove();
   cy.add(data);
+  updateLegend();
   setStatus(cy, "building…");
   runLayout(cy, () => { setBusy(false); setStatus(cy, null); });
 }
@@ -275,6 +307,7 @@ async function expand(id) {
   const fresh = data.filter((el) => !cy.getElementById(el.data.id).length);
   if (fresh.length) {
     cy.add(fresh);
+    updateLegend();
     runLayout(cy, () => { setBusy(false); setStatus(cy, "expanded +" + fresh.length); });
   } else {
     setBusy(false);
@@ -310,6 +343,7 @@ getEdgeKinds = edgeT.kinds;
 if (STATIC) {
   cy.add(window.STRATOGRAPH_DATA);
   applyStaticFilter();
+  updateLegend();
   runLayout(cy);
 } else {
   reload();
