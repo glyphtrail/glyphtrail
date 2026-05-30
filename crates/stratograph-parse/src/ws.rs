@@ -4,17 +4,20 @@
 //!   an HTTP `GET` upgrade at `url`; the connection path links to the server's
 //!   upgrade route (a REST `GET` endpoint) since a WebSocket connection
 //!   [`OperationKey`](stratograph_core::OperationKey) shares a REST `GET` signature.
-//! - **Message** — matched by event/method name across the wire: socket.io
-//!   `socket.on("event", h)` (handler) and `socket.emit("event", …)` (client),
-//!   plus SignalR `connection.on("Method", h)` (handler) and
-//!   `connection.invoke("Method", …)` / `.send(...)` (client). To avoid matching
-//!   unrelated `.on`/`.emit` emitters, only socket-like ([`SOCKETIO_RECEIVERS`])
-//!   and SignalR ([`SIGNALR_RECEIVERS`]) receiver identifiers are considered,
-//!   with verbs gated per family and reserved lifecycle events skipped.
+//! - **Message** — matched by event/channel/method name across the wire:
+//!   socket.io `socket.on("event", h)` (handler) and `socket.emit("event", …)`
+//!   (client); SignalR `connection.on("Method", h)` (handler) and
+//!   `connection.invoke("Method", …)` / `.send(...)` (client); and Centrifugo
+//!   pub/sub `centrifuge.subscribe("channel", h)` / `newSubscription("channel")`
+//!   (subscriber) and `centrifuge.publish("channel", …)` (publisher). To avoid
+//!   matching unrelated `.on`/`.emit` emitters, only socket-like
+//!   ([`SOCKETIO_RECEIVERS`]), SignalR ([`SIGNALR_RECEIVERS`]) and Centrifugo
+//!   ([`CENTRIFUGO_RECEIVERS`]) receiver identifiers are considered, with verbs
+//!   gated per family and reserved lifecycle events skipped.
 //!
-//! Only string/template-literal URLs and string-literal event names are
-//! extracted; dynamic values are out of scope. Centrifugo channels and native
-//! `send`/`onmessage` framing remain follow-ups.
+//! Only string/template-literal URLs and string-literal event/channel names are
+//! extracted; dynamic values are out of scope. Native `send`/`onmessage` framing
+//! (no event name to key on) and Phoenix Channels remain follow-ups.
 
 use stratograph_core::{Language, Span};
 use tree_sitter::{Node, Parser};
@@ -59,6 +62,11 @@ const SOCKETIO_RECEIVERS: [&str; 5] = ["socket", "io", "sock", "nsp", "namespace
 /// `send` to call a hub method, `on` to register a client handler) (#51).
 const SIGNALR_RECEIVERS: [&str; 4] = ["connection", "hubConnection", "conn", "hub"];
 
+/// Receiver identifiers treated as Centrifugo clients/subscriptions (#51). The
+/// pub/sub key is the **channel** name: `subscribe`/`newSubscription` register a
+/// subscriber (listener), `publish` sends to the channel.
+const CENTRIFUGO_RECEIVERS: [&str; 4] = ["centrifuge", "centrifugo", "sub", "subscription"];
+
 /// socket.io reserved/lifecycle events that are not user message channels.
 const RESERVED_EVENTS: [&str; 6] = [
     "connect",
@@ -69,8 +77,10 @@ const RESERVED_EVENTS: [&str; 6] = [
     "reconnect",
 ];
 
-/// Extract socket.io (`on`/`emit`) and SignalR (`on`/`invoke`/`send`) event
-/// sites from JS/TS/TSX `source`. Empty on parse failure or other languages.
+/// Extract message-boundary sites from JS/TS/TSX `source`: socket.io
+/// (`on`/`emit`), SignalR (`on`/`invoke`/`send`), and Centrifugo
+/// (`subscribe`/`newSubscription`/`publish`, keyed by channel). Empty on parse
+/// failure or other languages.
 pub fn extract_ws_events(source: &str, lang: &Language) -> Vec<RawWsEvent> {
     if !matches!(
         lang,
@@ -121,6 +131,13 @@ fn ws_event(call: Node, src: &[u8]) -> Option<RawWsEvent> {
         match property.as_str() {
             "on" => WsEventKind::On,
             "invoke" | "send" => WsEventKind::Emit,
+            _ => return None,
+        }
+    } else if CENTRIFUGO_RECEIVERS.contains(&receiver.as_str()) {
+        // Keyed by channel: a subscriber listens, a publisher sends to it.
+        match property.as_str() {
+            "subscribe" | "newSubscription" => WsEventKind::On,
+            "publish" => WsEventKind::Emit,
             _ => return None,
         }
     } else {
@@ -333,5 +350,36 @@ widget.invoke("x", 1);               // non-signalr receiver: skipped
         check!(emits.contains(&"SendMessage")); // invoke
         check!(emits.contains(&"Notify")); // send
         check!(!evs.iter().any(|e| e.event == "x")); // non-signalr receiver excluded
+    }
+
+    #[test]
+    fn extracts_centrifugo_subscribe_and_publish() {
+        let src = r#"
+const sub = centrifuge.newSubscription("news");
+centrifuge.subscribe("chat", onChat);
+centrifuge.publish("chat", payload);
+sub.publish(data);                   // no channel arg: skipped
+other.subscribe("x", h);             // non-centrifugo receiver: skipped
+"#;
+        let evs = extract_ws_events(src, &Language::JavaScript);
+        // Subscribers (listeners) become `On`, keyed by channel.
+        let subs: Vec<&str> = evs
+            .iter()
+            .filter(|e| e.kind == WsEventKind::On)
+            .map(|e| e.event.as_str())
+            .collect();
+        check!(subs.contains(&"news")); // newSubscription
+        check!(subs.contains(&"chat")); // subscribe
+        check!(
+            evs.iter()
+                .any(|e| e.event == "chat" && e.handler == "onChat")
+        );
+        // Publisher becomes `Emit` on the same channel.
+        check!(
+            evs.iter()
+                .any(|e| e.kind == WsEventKind::Emit && e.event == "chat")
+        );
+        // A non-centrifugo receiver is excluded.
+        check!(!evs.iter().any(|e| e.event == "x"));
     }
 }
