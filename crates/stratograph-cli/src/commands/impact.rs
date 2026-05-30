@@ -208,7 +208,10 @@ fn run_federated(args: &ImpactArgs, format: Format) -> Result<()> {
         for r in &mut report.repos {
             retag_configured_tests(&mut r.items, &cfg.impact.test_globs)?;
         }
-        report = FederatedReport::new(std::mem::take(&mut report.repos));
+        report = FederatedReport::new(
+            std::mem::take(&mut report.repos),
+            std::mem::take(&mut report.crate_level),
+        );
     }
     emit_federated(&report, format)
 }
@@ -244,6 +247,12 @@ fn print_federated_text(report: &FederatedReport) {
             print_item(i);
         }
     }
+    if !report.crate_level.is_empty() {
+        println!("\npotentially affected (crate-level, unresolved symbol):");
+        for h in &report.crate_level {
+            println!("  {} {} (via {})", h.repo, h.file, h.via);
+        }
+    }
 }
 
 fn federated_markdown(report: &FederatedReport) -> String {
@@ -273,6 +282,12 @@ fn federated_markdown(report: &FederatedReport) -> String {
                 "- `{}` ({}) — d{}\n",
                 i.qualified_name, loc, i.distance
             ));
+        }
+    }
+    if !report.crate_level.is_empty() {
+        md.push_str("\n### Potentially affected (crate-level, unresolved symbol)\n\n");
+        for h in &report.crate_level {
+            md.push_str(&format!("- {} `{}` (via {})\n", h.repo, h.file, h.via));
         }
     }
     md

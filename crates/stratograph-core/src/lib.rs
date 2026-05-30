@@ -27,9 +27,9 @@ pub use identity::{
     ExternalUse, IndexedPackage, META_EXTERNAL_USES, META_PACKAGES, PackageExport, PackageIdentity,
 };
 pub use impact::{
-    Adjacency, ClassifiedItem, Direction, EdgeRule, FederatedReport, ImpactClass, ImpactItem,
-    ImpactPolicy, ImpactReport, ImpactSummary, RepoImpact, classify, compute_impact, edge_rules,
-    is_cross_boundary_path, parse_confidence,
+    Adjacency, ClassifiedItem, CrateLevelHit, Direction, EdgeRule, FederatedReport, ImpactClass,
+    ImpactItem, ImpactPolicy, ImpactReport, ImpactSummary, RepoImpact, classify, compute_impact,
+    edge_rules, is_cross_boundary_path, parse_confidence,
 };
 pub use lang::Language;
 pub use links::{CrossRepoLink, LinkKind, RepoIdentity, resolve_links};

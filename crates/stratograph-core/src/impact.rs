@@ -477,19 +477,43 @@ pub struct RepoImpact {
     pub items: Vec<ClassifiedItem>,
 }
 
-/// Cross-repo blast radius: an aggregate summary plus per-repo impacted nodes,
-/// origin first then downstream. The summary is derived from all items.
+/// A consumer crate-level-linked to an impacted producer package, where the
+/// exact symbol couldn't be resolved (a `pub use` re-export, macro-generated
+/// item, or parser gap). Coarser than a per-symbol item: it flags "this repo
+/// depends on the changed crate, check it" rather than naming impacted nodes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CrateLevelHit {
+    /// Consumer repo that may be affected.
+    pub repo: String,
+    /// Consumer package declaring the dependency.
+    pub package: String,
+    /// Consumer file importing the producer crate.
+    pub file: String,
+    /// Impacted producer package the consumer depends on.
+    pub via: String,
+}
+
+/// Cross-repo blast radius: an aggregate summary, per-repo impacted nodes
+/// (origin first then downstream), and coarse crate-level "potentially
+/// affected" consumers. The summary is derived from all per-node items.
 #[derive(Debug, Clone, Serialize)]
 pub struct FederatedReport {
     pub summary: ImpactSummary,
     pub repos: Vec<RepoImpact>,
+    /// Consumers linked only at crate level to an impacted producer package
+    /// (see [`CrateLevelHit`]); not counted in `summary`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub crate_level: Vec<CrateLevelHit>,
 }
 
 impl FederatedReport {
-    /// Assemble from per-repo impacts: order origin first then downstream
-    /// alphabetically, and derive the aggregate summary across all items.
-    pub fn new(mut repos: Vec<RepoImpact>) -> Self {
+    /// Assemble from per-repo impacts plus crate-level hits: order repos origin
+    /// first then downstream alphabetically, sort/dedup the crate-level hits,
+    /// and derive the aggregate summary across all per-node items.
+    pub fn new(mut repos: Vec<RepoImpact>, mut crate_level: Vec<CrateLevelHit>) -> Self {
         repos.sort_by(|a, b| b.origin.cmp(&a.origin).then(a.repo.cmp(&b.repo)));
+        crate_level.sort_by(|a, b| (&a.repo, &a.file, &a.via).cmp(&(&b.repo, &b.file, &b.via)));
+        crate_level.dedup();
         let mut summary = ImpactSummary {
             total: 0,
             tests: 0,
@@ -512,7 +536,11 @@ impl FederatedReport {
             }
             summary.max_distance = summary.max_distance.max(i.distance);
         }
-        FederatedReport { summary, repos }
+        FederatedReport {
+            summary,
+            repos,
+            crate_level,
+        }
     }
 
     /// Count of downstream (non-origin) repos with impacted nodes.
