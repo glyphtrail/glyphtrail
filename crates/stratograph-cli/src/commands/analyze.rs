@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use stratograph_core::config::{IGNORE_FILE, RepoPaths};
 use stratograph_core::{
@@ -103,8 +104,9 @@ const DEFAULT_SENSITIVE_FILES: &[&str] = &[
     "id_ed25519",
     "*.tfvars",
 ];
+use stratograph_store::GraphStore;
 #[cfg(test)]
-use stratograph_store::{GraphStore, LadybugStore};
+use stratograph_store::LadybugStore;
 
 struct DiscoveredFile {
     rel_path: String,
@@ -400,14 +402,52 @@ fn discover(
     Ok(out)
 }
 
+/// A Cargo package found on disk, paired with the repo-relative directory of
+/// its manifest. The directory lets a workspace's many crates be told apart by
+/// file location, so each symbol can be attributed to the crate that owns it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DiscoveredPackage {
+    /// Manifest directory, repo-root-relative and forward-slashed; "" is the
+    /// repo root.
+    dir: String,
+    #[serde(flatten)]
+    package: CargoPackage,
+}
+
+/// One exported symbol of a package: a definition another crate could name.
+/// Visibility is not resolved here — a consumer can only reference `pub` items,
+/// so matching a consumer's import path against this set stays correct without
+/// it (a private symbol simply never appears in any consumer's path). Module
+/// path / `pub use` re-export disambiguation is a later refinement; the link
+/// step (#221) falls back to crate level when a path can't be matched exactly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PackageExport {
+    name: String,
+    qualified_name: String,
+    kind: NodeKind,
+    file: String,
+    node_id: String,
+}
+
+/// A package's identity together with its resolved export index — the shape
+/// persisted to index meta under `packages` for the cross-repo link step.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IndexedPackage {
+    dir: String,
+    #[serde(flatten)]
+    package: CargoPackage,
+    exports: Vec<PackageExport>,
+}
+
 /// Discover the Cargo packages a repo publishes (#220): the root `Cargo.toml`
 /// plus every workspace member (member globs like `crates/*` expanded against
-/// the filesystem). A virtual workspace root contributes no package of its own,
-/// only its members. Packages are de-duplicated by name and sorted, so the
-/// result is stable across runs. Cargo.toml is not a parsed source language, so
-/// this is a separate, best-effort pass: an unreadable or malformed manifest is
-/// skipped rather than failing the analysis.
-fn discover_packages(root: &Path) -> Vec<CargoPackage> {
+/// the filesystem), each paired with its repo-relative manifest directory. A
+/// virtual workspace root contributes no package of its own, only its members.
+/// Packages are de-duplicated by name and sorted, so the result is stable
+/// across runs. Cargo.toml is not a parsed source language, so this is a
+/// separate, best-effort pass: an unreadable or malformed manifest is skipped
+/// rather than failing the analysis.
+fn discover_packages(root: &Path) -> Vec<DiscoveredPackage> {
     let root_manifest = root.join("Cargo.toml");
     let mut manifests: Vec<PathBuf> = vec![root_manifest.clone()];
     if let Ok(text) = std::fs::read_to_string(&root_manifest) {
@@ -421,14 +461,88 @@ fn discover_packages(root: &Path) -> Vec<CargoPackage> {
     let mut packages = Vec::new();
     for manifest in manifests {
         if let Ok(text) = std::fs::read_to_string(&manifest)
-            && let Ok(Some(pkg)) = parse_cargo_manifest(&text)
+            && let Ok(Some(package)) = parse_cargo_manifest(&text)
         {
-            packages.push(pkg);
+            let dir = manifest
+                .parent()
+                .and_then(|p| p.strip_prefix(root).ok())
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
+            packages.push(DiscoveredPackage { dir, package });
         }
     }
-    packages.sort_by(|a, b| a.name.cmp(&b.name));
-    packages.dedup_by(|a, b| a.name == b.name);
+    packages.sort_by(|a, b| a.package.name.cmp(&b.package.name));
+    packages.dedup_by(|a, b| a.package.name == b.package.name);
     packages
+}
+
+/// Whether a node kind is a definition another crate could import — the kinds
+/// worth recording as exports. Structural and API-surface kinds are excluded.
+fn is_exportable_kind(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Function
+            | NodeKind::Method
+            | NodeKind::Class
+            | NodeKind::Struct
+            | NodeKind::Interface
+            | NodeKind::Enum
+            | NodeKind::Trait
+            | NodeKind::Module
+    )
+}
+
+/// Resolve each discovered package's export index from the freshly-built graph:
+/// every exportable symbol whose file lives under the package's directory,
+/// attributed to the most specific (longest-directory) package so a workspace's
+/// crates don't claim each other's symbols. Read-only over `store`.
+fn index_packages(
+    store: &dyn GraphStore,
+    discovered: &[DiscoveredPackage],
+) -> Result<Vec<IndexedPackage>> {
+    // Owning package for a file: the one whose dir is the longest matching
+    // prefix. "" (a root package) matches anything but loses to any deeper dir.
+    let owner = |file: &str| -> Option<usize> {
+        discovered
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| {
+                p.dir.is_empty() || file == p.dir || file.starts_with(&format!("{}/", p.dir))
+            })
+            .max_by_key(|(_, p)| p.dir.len())
+            .map(|(i, _)| i)
+    };
+
+    let mut exports: Vec<Vec<PackageExport>> = vec![Vec::new(); discovered.len()];
+    for file in store.all_files()? {
+        let Some(idx) = owner(&file) else {
+            continue;
+        };
+        for node in store.nodes_in_file(&file)? {
+            if is_exportable_kind(node.kind) {
+                exports[idx].push(PackageExport {
+                    name: node.name,
+                    qualified_name: node.qualified_name,
+                    kind: node.kind,
+                    file: node.file,
+                    node_id: node.id.0,
+                });
+            }
+        }
+    }
+
+    Ok(discovered
+        .iter()
+        .zip(exports)
+        .map(|(d, mut exports)| {
+            exports.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+            IndexedPackage {
+                dir: d.dir.clone(),
+                package: d.package.clone(),
+                exports,
+            }
+        })
+        .collect())
 }
 
 /// Expand one workspace `members` entry (a path or path glob relative to `root`)
@@ -492,11 +606,18 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
     // Cargo package identity (#220): the crate(s) this repo publishes and the
     // dependencies it declares, persisted so the cross-repo link step (#221) can
     // match a consumer's dependency to the producer repo whose package name
-    // equals it. A fingerprint over the parsed identity folds into the fast path
-    // below, so editing a `Cargo.toml` alone (no source change) still refreshes.
-    let packages = discover_packages(&root);
-    let packages_json = serde_json::to_string(&packages).unwrap_or_else(|_| "[]".to_string());
-    let packages_fingerprint = blake3::hash(packages_json.as_bytes()).to_hex().to_string();
+    // equals it. A fingerprint over the discovered identity (name/version/deps +
+    // directory) folds into the fast path below, so editing a `Cargo.toml` alone
+    // (no source change) still refreshes. The per-package export index is
+    // resolved from the built graph and persisted later in the write path.
+    let discovered = discover_packages(&root);
+    let packages_fingerprint = blake3::hash(
+        serde_json::to_string(&discovered)
+            .unwrap_or_default()
+            .as_bytes(),
+    )
+    .to_hex()
+    .to_string();
 
     // Fast path (#110): when every discovered file matches the stored
     // (path, hash) set, the package identity is unchanged, and the index was
@@ -912,6 +1033,10 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
     resolve_progress.inc(1);
 
     store.set_meta("tool_version", VERSION)?;
+    // Resolve the export index from the now-complete graph and persist the full
+    // package identity (#220). Read-only borrow ends before the meta write.
+    let indexed = index_packages(&*store, &discovered)?;
+    let packages_json = serde_json::to_string(&indexed).unwrap_or_else(|_| "[]".to_string());
     store.set_meta("packages", &packages_json)?;
     store.set_meta("packages_fingerprint", &packages_fingerprint)?;
     resolve_progress.finish_and_clear();
@@ -1230,18 +1355,27 @@ mod tests {
             .get_meta("packages")
             .unwrap()
             .expect("packages meta written");
-        let packages: Vec<CargoPackage> = serde_json::from_str(&json).unwrap();
+        let packages: Vec<IndexedPackage> = serde_json::from_str(&json).unwrap();
         let widget = packages
             .iter()
-            .find(|p| p.name == "widget")
+            .find(|p| p.package.name == "widget")
             .expect("widget package recorded");
-        check!(widget.version == Some("0.3.0".to_string()));
+        check!(widget.package.version == Some("0.3.0".to_string()));
+        check!(widget.dir == "crates/widget");
         let helper = widget
+            .package
             .dependencies
             .iter()
             .find(|d| d.name == "helper")
             .expect("helper dependency recorded");
         check!(helper.source == stratograph_core::DepSource::Path("../helper".into()));
+        // #220c: the member crate's pub fn is recorded as an export attributed
+        // to the owning package (longest-dir match), not the virtual root.
+        check!(
+            widget.exports.iter().any(|e| e.name == "go"),
+            "expected `go` export, got {:?}",
+            widget.exports.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
