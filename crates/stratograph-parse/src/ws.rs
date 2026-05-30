@@ -6,7 +6,9 @@
 //!   [`OperationKey`](stratograph_core::OperationKey) shares a REST `GET` signature.
 //! - **Message** — matched by event/channel/method name across the wire:
 //!   socket.io `socket.on("event", h)` (handler) and `socket.emit("event", …)`
-//!   (client); SignalR `connection.on("Method", h)` (handler) and
+//!   (client), namespace-aware — a variable bound to `io.of("/ns")` / `io("/ns")`
+//!   is recognised and its events are keyed by namespace; SignalR
+//!   `connection.on("Method", h)` (handler) and
 //!   `connection.invoke("Method", …)` / `.send(...)` (client); and Centrifugo
 //!   pub/sub `centrifuge.subscribe("channel", h)` / `newSubscription("channel")`
 //!   (subscriber) and `centrifuge.publish("channel", …)` (publisher); Phoenix
@@ -20,8 +22,9 @@
 //!
 //! Only string/template-literal URLs and string-literal event/channel names are
 //! extracted; dynamic values are out of scope. Native `send`/`onmessage` framing
-//! (no event name to key on) and socket.io `io.of` namespace-aware keying remain
-//! follow-ups.
+//! (no event name to key on) remains a follow-up.
+
+use std::collections::HashMap;
 
 use stratograph_core::{Language, Span};
 use tree_sitter::{Node, Parser};
@@ -114,15 +117,66 @@ fn extract_js_ws_events(source: &str, lang: &Language) -> Vec<RawWsEvent> {
         return Vec::new();
     };
     let src = source.as_bytes();
+    // Map socket.io namespace-bound variables (`const ns = io.of("/admin")`,
+    // `const sock = io("/admin")`) to their namespace, so their events are both
+    // captured and kept distinct from other namespaces (#51).
+    let namespaces = namespace_bindings(tree.root_node(), src);
     let mut out = Vec::new();
     walk(tree.root_node(), &mut |n| {
         if n.kind() == "call_expression"
-            && let Some(ev) = ws_event(n, src)
+            && let Some(ev) = ws_event(n, src, &namespaces)
         {
             out.push(ev);
         }
     });
     out
+}
+
+/// Variable → socket.io namespace from same-file `io.of("/ns")` / `io("/ns")` /
+/// `io.connect("/ns")` assignments.
+fn namespace_bindings(root: Node, src: &[u8]) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    walk(root, &mut |n| {
+        if n.kind() != "variable_declarator" {
+            return;
+        }
+        if let Some(name) = n
+            .child_by_field_name("name")
+            .filter(|x| x.kind() == "identifier")
+            && let Some(value) = n.child_by_field_name("value")
+            && let Some(ns) = io_namespace(value, src)
+        {
+            map.insert(text(name, src), ns);
+        }
+    });
+    map
+}
+
+/// Namespace string of an `io.of("/ns")` / `io("/ns")` / `io.connect("/ns")`
+/// call expression, else `None`.
+fn io_namespace(call: Node, src: &[u8]) -> Option<String> {
+    if call.kind() != "call_expression" {
+        return None;
+    }
+    let func = call.child_by_field_name("function")?;
+    let is_io = match func.kind() {
+        "identifier" => text(func, src) == "io",
+        "member_expression" => {
+            text(func.child_by_field_name("object")?, src) == "io"
+                && matches!(
+                    text(func.child_by_field_name("property")?, src).as_str(),
+                    "of" | "connect"
+                )
+        }
+        _ => false,
+    };
+    if !is_io {
+        return None;
+    }
+    let args = call.child_by_field_name("arguments")?;
+    let mut cursor = args.walk();
+    let first = args.named_children(&mut cursor).next()?;
+    string_literal(first, src).filter(|ns| !ns.is_empty())
 }
 
 /// Server-side Phoenix channel message sites in Elixir (#51): `handle_in("ev",
@@ -223,16 +277,19 @@ fn elixir_string(node: Node, src: &[u8]) -> Option<String> {
 
 /// A `socket.on("ev", handler)` / `socket.emit("ev", …)` call as a [`RawWsEvent`],
 /// else `None`. Gated on a socket-like receiver and a string-literal event name.
-fn ws_event(call: Node, src: &[u8]) -> Option<RawWsEvent> {
+/// `namespaces` maps socket.io namespace-bound variables to their namespace.
+fn ws_event(call: Node, src: &[u8], namespaces: &HashMap<String, String>) -> Option<RawWsEvent> {
     let func = call.child_by_field_name("function")?;
     if func.kind() != "member_expression" {
         return None;
     }
     let receiver = text(func.child_by_field_name("object")?, src);
     let property = text(func.child_by_field_name("property")?, src);
+    // A variable bound to `io.of(...)` / `io(...)` is a socket.io namespace.
+    let namespace = namespaces.get(&receiver);
     // Allowed verbs depend on the receiver family: socket.io uses on/emit;
     // SignalR uses on plus invoke/send (call a hub method).
-    let kind = if SOCKETIO_RECEIVERS.contains(&receiver.as_str()) {
+    let kind = if SOCKETIO_RECEIVERS.contains(&receiver.as_str()) || namespace.is_some() {
         match property.as_str() {
             "on" => WsEventKind::On,
             "emit" => WsEventKind::Emit,
@@ -264,10 +321,16 @@ fn ws_event(call: Node, src: &[u8]) -> Option<RawWsEvent> {
     let args = call.child_by_field_name("arguments")?;
     let mut cursor = args.walk();
     let named: Vec<Node> = args.named_children(&mut cursor).collect();
-    let event = string_literal(*named.first()?, src)?;
-    if RESERVED_EVENTS.contains(&event.as_str()) {
+    let raw_event = string_literal(*named.first()?, src)?;
+    if RESERVED_EVENTS.contains(&raw_event.as_str()) {
         return None;
     }
+    // Qualify the event with its namespace so the same event name in different
+    // namespaces stays distinct; the default namespace keeps the bare name.
+    let event = match namespace {
+        Some(ns) => format!("{ns}#{raw_event}"),
+        None => raw_event,
+    };
     let handler = match kind {
         WsEventKind::On => named
             .get(1)
@@ -440,6 +503,40 @@ socket.emit("typing", { user });
         check!(
             !evs.iter()
                 .any(|e| e.event == "connection" || e.event == "click")
+        );
+    }
+
+    #[test]
+    fn socketio_namespaces_keyed_distinctly() {
+        let src = r#"
+const adminNs = io.of("/admin");
+adminNs.on("msg", onAdminMsg);          // namespaced handler
+const sock = io("/admin");
+sock.emit("msg", payload);              // namespaced client emit
+socket.emit("msg", other);              // default namespace: bare key
+const userNs = io.of("/user");
+userNs.on("msg", onUserMsg);            // same name, different namespace
+"#;
+        let evs = extract_ws_events(src, &Language::JavaScript);
+        // The /admin handler and client emit share the namespaced key (they link),
+        // and the handler symbol is captured even though the receiver is a var.
+        check!(evs.iter().any(|e| e.kind == WsEventKind::On
+            && e.event == "/admin#msg"
+            && e.handler == "onAdminMsg"));
+        check!(
+            evs.iter()
+                .any(|e| e.kind == WsEventKind::Emit && e.event == "/admin#msg")
+        );
+        // The default-namespace emit stays a separate, bare key.
+        check!(
+            evs.iter()
+                .any(|e| e.kind == WsEventKind::Emit && e.event == "msg")
+        );
+        // The /user `msg` handler does not collide with /admin.
+        check!(evs.iter().any(|e| e.event == "/user#msg"));
+        check!(
+            !evs.iter()
+                .any(|e| e.event == "/user#msg" && e.handler == "onAdminMsg")
         );
     }
 
