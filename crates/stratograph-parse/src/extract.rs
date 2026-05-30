@@ -74,6 +74,31 @@ fn clean_import(raw: &str) -> String {
         .to_string()
 }
 
+/// Whether a captured `@call` identifier is actually a definition's name,
+/// recognised by an immediately-preceding definition keyword (`fn generated`,
+/// `struct Foo`, …). This only happens inside macro token trees, where the
+/// raw-token call heuristic can't tell a definition from a call (#5); a real
+/// call never has a bare `fn`/`struct`/… token directly before its name.
+fn is_definition_name(node: tree_sitter::Node, src: &[u8]) -> bool {
+    node.prev_sibling()
+        .and_then(|s| s.utf8_text(src).ok())
+        .is_some_and(|kw| {
+            matches!(
+                kw,
+                "fn" | "struct"
+                    | "enum"
+                    | "trait"
+                    | "impl"
+                    | "mod"
+                    | "type"
+                    | "union"
+                    | "class"
+                    | "interface"
+                    | "def"
+            )
+        })
+}
+
 /// The immediate receiver/scope of a captured `@call` name node, read from its
 /// parent in the AST: `Foo::bar`→`Foo`, `Foo.bar`/`obj.method`→`Foo`/`obj`,
 /// `pkg.Func`→`pkg`. Returns the single segment directly before the name (the
@@ -152,6 +177,11 @@ pub fn parse_with(
             let text = node.utf8_text(src).unwrap_or("").to_string();
             match cap_name {
                 "name" => name_text = Some(text),
+                // Skip a "call" that is really a *definition* inside a macro body
+                // (e.g. `fn generated()` in `quote! { fn generated() {} }`): the
+                // raw-token heuristic (rust.scm) would otherwise read the defined
+                // name as a call (#5).
+                "call" if is_definition_name(node, src) => {}
                 "call" => out.calls.push(RawRef {
                     name: text,
                     byte: node.start_byte(),
