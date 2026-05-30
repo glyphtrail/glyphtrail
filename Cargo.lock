@@ -1617,6 +1617,7 @@ name = "stratograph-viz"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "assert2",
  "serde",
  "serde_json",
  "stratograph-core",

@@ -13,3 +13,6 @@ stratograph-store.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
+
+[dev-dependencies]
+assert2.workspace = true
