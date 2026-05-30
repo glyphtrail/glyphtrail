@@ -100,7 +100,9 @@ use meridian_store::SqliteStore;
 struct DiscoveredFile {
     rel_path: String,
     abs_path: std::path::PathBuf,
-    language: Language,
+    /// `None` marks a sensitive record-only file (#136): its existence is
+    /// recorded as a `File` node but its contents are never read or parsed.
+    language: Option<Language>,
     hash: String,
 }
 
@@ -125,7 +127,6 @@ fn parse_file(
     repo_id: &NodeId,
     dyn_grammars: &HashMap<String, Option<DynamicGrammar>>,
 ) -> Option<FileOutput> {
-    let source = std::fs::read_to_string(&f.abs_path).ok()?;
     let file_id = NodeId::derive(&["file", &f.rel_path]);
     let mut out = FileOutput {
         graph: CodeGraph::new(),
@@ -134,13 +135,36 @@ fn parse_file(
         pending: Vec::new(),
         imports: Vec::new(),
     };
+
+    // Sensitive record-only file (#136): record that it exists, never read it.
+    let Some(language) = &f.language else {
+        out.graph.add_node(Node {
+            id: file_id.clone(),
+            kind: NodeKind::File,
+            name: f.rel_path.clone(),
+            qualified_name: f.rel_path.clone(),
+            file: f.rel_path.clone(),
+            language: None,
+            span: None,
+            doc: Some("sensitive: contents excluded from the index".into()),
+        });
+        out.graph.add_edge(
+            repo_id.clone(),
+            file_id,
+            EdgeKind::Contains,
+            Confidence::Extracted,
+        );
+        return Some(out);
+    };
+
+    let source = std::fs::read_to_string(&f.abs_path).ok()?;
     out.graph.add_node(Node {
         id: file_id.clone(),
         kind: NodeKind::File,
         name: f.rel_path.clone(),
         qualified_name: f.rel_path.clone(),
         file: f.rel_path.clone(),
-        language: Some(f.language.name().to_string()),
+        language: Some(language.name().to_string()),
         span: None,
         doc: None,
     });
@@ -153,7 +177,7 @@ fn parse_file(
 
     // Built-in languages parse via the compiled-in registry; a dynamic
     // `Language::Other` is parsed with its pre-resolved grammar + query.
-    let parsed = match &f.language {
+    let parsed = match language {
         Language::Other(name) => match dyn_grammars.get(name).and_then(|o| o.as_ref()) {
             Some(dg) => meridian_parse::parse_with(&dg.grammar, &dg.query, &source),
             None => return Some(out),
@@ -168,36 +192,36 @@ fn parse_file(
         }
     };
 
-    let fg = build_file_graph(&f.rel_path, &f.language, &file_id, &parsed);
+    let fg = build_file_graph(&f.rel_path, language, &file_id, &parsed);
     // REST server-route extraction runs for any language with a registered
     // extractor (registry decides; no-op otherwise).
-    let rg = build_rest_graph(&f.rel_path, &f.language, &fg.symbols, &source);
+    let rg = build_rest_graph(&f.rel_path, language, &fg.symbols, &source);
     out.graph.extend(rg.graph);
     out.operations.extend(rg.operations);
     out.pending_handlers.extend(rg.pending_handlers);
     // gRPC server-impl extraction (tonic/Rust).
-    let gg = build_grpc_graph(&f.rel_path, &f.language, &fg.symbols, &source);
+    let gg = build_grpc_graph(&f.rel_path, language, &fg.symbols, &source);
     out.graph.extend(gg.graph);
     out.operations.extend(gg.operations);
     out.pending_handlers.extend(gg.pending_handlers);
     // GraphQL resolver extraction (async-graphql/Rust).
-    let qg = build_graphql_graph(&f.rel_path, &f.language, &fg.symbols, &source);
+    let qg = build_graphql_graph(&f.rel_path, language, &fg.symbols, &source);
     out.graph.extend(qg.graph);
     out.operations.extend(qg.operations);
     out.pending_handlers.extend(qg.pending_handlers);
     // WebSocket server events (socket.io `on`) → Endpoint + HANDLES (#51).
-    let wg = build_ws_server_graph(&f.rel_path, &f.language, &fg.symbols, &source);
+    let wg = build_ws_server_graph(&f.rel_path, language, &fg.symbols, &source);
     out.graph.extend(wg.graph);
     out.operations.extend(wg.operations);
     out.pending_handlers.extend(wg.pending_handlers);
     // Client-call extraction (fetch/axios/reqwest/...).
-    let cg = build_client_graph(&f.rel_path, &source, &f.language);
+    let cg = build_client_graph(&f.rel_path, &source, language);
     // GraphQL client operations (gql-tagged docs) → INVOKES.
-    let qc = build_graphql_client_graph(&f.rel_path, &source, &f.language);
+    let qc = build_graphql_client_graph(&f.rel_path, &source, language);
     // gRPC client stub calls (tonic) → INVOKES.
-    let gc = build_grpc_client_graph(&f.rel_path, &source, &f.language);
+    let gc = build_grpc_client_graph(&f.rel_path, &source, language);
     // WebSocket client connections (`new WebSocket(url)`) → INVOKES (#51).
-    let wc = build_ws_client_graph(&f.rel_path, &source, &f.language);
+    let wc = build_ws_client_graph(&f.rel_path, &source, language);
     // Link each client call site to its enclosing function (#130).
     let client_call_nodes: Vec<Node> = cg
         .graph
@@ -226,7 +250,7 @@ fn parse_file(
     out.imports.extend(
         fg.imports
             .into_iter()
-            .map(|raw| (f.rel_path.clone(), raw, f.language.name().to_string())),
+            .map(|raw| (f.rel_path.clone(), raw, language.name().to_string())),
     );
     Some(out)
 }
@@ -235,10 +259,26 @@ fn discover(
     root: &Path,
     dyn_langs: &[DynamicLanguage],
     extra_ignore_dirs: &[String],
+    record_sensitive: bool,
 ) -> Result<Vec<DiscoveredFile>> {
+    // Matcher for credential/key file names, used either to exclude them from the
+    // walk (default) or to record their existence content-free (#136).
+    let mut sensitive = globset::GlobSetBuilder::new();
+    for g in DEFAULT_SENSITIVE_FILES {
+        sensitive.add(
+            globset::Glob::new(g).with_context(|| format!("invalid sensitive-file glob {g:?}"))?,
+        );
+    }
+    let sensitive = sensitive
+        .build()
+        .context("building sensitive-file matcher")?;
+
     let mut walker = WalkBuilder::new(root);
     walker
-        .hidden(true)
+        // Dotfiles are hidden by default; in record-sensitive mode they are
+        // walked so hidden secrets (`.env`) can be recorded. Non-sensitive
+        // dotfiles still fall through language detection and are skipped (#136).
+        .hidden(!record_sensitive)
         .git_ignore(true)
         .git_exclude(true)
         .add_custom_ignore_filename(IGNORE_FILE);
@@ -264,14 +304,16 @@ fn discover(
             .add(&glob)
             .with_context(|| format!("invalid ignore_dirs entry {dir:?}"))?;
     }
-    // Never walk credential/key material (#136). These are not source languages,
-    // so they aren't parsed today, but excluding them at the walk step keeps
-    // their contents out of the index entirely — robust even if a config/secret
-    // language is added later, and auditable as an explicit secret-exclusion set.
-    for glob in DEFAULT_SENSITIVE_FILES {
-        overrides
-            .add(&format!("!{glob}"))
-            .with_context(|| format!("invalid sensitive-file glob {glob:?}"))?;
+    // Credential/key material (#136): excluded from the walk entirely by default
+    // so their contents never reach the index. When `record_sensitive` is on we
+    // instead let them through and record a content-free node below, so the graph
+    // shows the file exists without exposing values.
+    if !record_sensitive {
+        for glob in DEFAULT_SENSITIVE_FILES {
+            overrides
+                .add(&format!("!{glob}"))
+                .with_context(|| format!("invalid sensitive-file glob {glob:?}"))?;
+        }
     }
     walker.overrides(overrides.build().context("building ignore overrides")?);
 
@@ -285,6 +327,32 @@ fn discover(
             continue;
         }
         let path = entry.path();
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        // A sensitive file reaches here only when `record_sensitive` is on
+        // (otherwise it was excluded from the walk). Record its existence with a
+        // path-derived hash and never read its bytes (#136).
+        if record_sensitive
+            && path
+                .file_name()
+                .map(|n| sensitive.is_match(n))
+                .unwrap_or(false)
+        {
+            out.push(DiscoveredFile {
+                hash: blake3::hash(format!("sensitive:{rel}").as_bytes())
+                    .to_hex()
+                    .to_string(),
+                rel_path: rel,
+                abs_path: path.to_path_buf(),
+                language: None,
+            });
+            continue;
+        }
+
         // Built-in language by extension, else a configured dynamic language.
         let language = match Language::from_path(path) {
             Some(l) => l,
@@ -303,11 +371,10 @@ fn discover(
             continue;
         };
         let hash = blake3::hash(&bytes).to_hex().to_string();
-        let rel = path.strip_prefix(root).unwrap_or(path);
         out.push(DiscoveredFile {
-            rel_path: rel.to_string_lossy().replace('\\', "/"),
+            rel_path: rel,
             abs_path: path.to_path_buf(),
-            language,
+            language: Some(language),
             hash,
         });
     }
@@ -323,7 +390,12 @@ pub fn run(path: &Path, update: bool, backend: BackendKind) -> Result<()> {
     let mut store = backend::open(&paths, backend)?;
 
     let cfg = Config::load(&root)?;
-    let files = discover(&root, &cfg.languages, &cfg.ignore_dirs)?;
+    let files = discover(
+        &root,
+        &cfg.languages,
+        &cfg.ignore_dirs,
+        cfg.security.record_sensitive_files,
+    )?;
     tracing::info!("discovered {} source files", files.len());
 
     // Fast path (#110): when every discovered file matches the stored
@@ -414,7 +486,7 @@ pub fn run(path: &Path, update: bool, backend: BackendKind) -> Result<()> {
     // Pre-resolve dynamic-language grammars once (sequential; warns once per
     // missing grammar) so the parallel parse can read them immutably.
     for f in &changed {
-        if let Language::Other(name) = &f.language {
+        if let Some(Language::Other(name)) = &f.language {
             dynamic_grammar(name, &cfg.languages, &mut dyn_grammars, &root);
         }
     }
@@ -631,7 +703,7 @@ pub fn run(path: &Path, update: bool, backend: BackendKind) -> Result<()> {
     store.insert_graph(&[], &edges)?;
 
     for f in &changed {
-        store.set_file(&f.rel_path, Some(f.language.name()), &f.hash)?;
+        store.set_file(&f.rel_path, f.language.as_ref().map(|l| l.name()), &f.hash)?;
     }
     let pruned = store.prune_dangling_edges()?;
     if pruned > 0 {
@@ -818,7 +890,7 @@ mod tests {
             std::fs::create_dir_all(dir.join(d)).unwrap();
             std::fs::write(dir.join(d).join("x.rs"), "fn g() {}\n").unwrap();
         }
-        let found = discover(&dir, &[], &["generated".to_string()]).unwrap();
+        let found = discover(&dir, &[], &["generated".to_string()], false).unwrap();
         let rels: Vec<&str> = found.iter().map(|f| f.rel_path.as_str()).collect();
         check!(rels == ["main.rs"], "expected only main.rs, got {rels:?}");
 
@@ -949,12 +1021,75 @@ mod tests {
         for s in [".env", "id_rsa", "server.pem", "prod.tfvars", "app.key"] {
             std::fs::write(dir.join(s), "SECRET=value\n").unwrap();
         }
-        let found = discover(&dir, &[], &[]).unwrap();
+        let found = discover(&dir, &[], &[], false).unwrap();
         let rels: Vec<&str> = found.iter().map(|f| f.rel_path.as_str()).collect();
         check!(
             rels == ["main.rs"],
             "sensitive files must be excluded, got {rels:?}"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // #136 record mode: with record_sensitive on, sensitive files are discovered
+    // as content-less records (language = None) — their bytes are never read.
+    #[test]
+    fn record_sensitive_discovers_existence_without_reading() {
+        let dir = temp_repo("sensitive-record");
+        std::fs::write(dir.join("main.rs"), "fn f() {}\n").unwrap();
+        std::fs::write(dir.join(".env"), "SECRET=value\n").unwrap();
+        std::fs::write(dir.join("id_rsa"), "PRIVATE KEY\n").unwrap();
+
+        let found = discover(&dir, &[], &[], true).unwrap();
+        let env = found
+            .iter()
+            .find(|f| f.rel_path == ".env")
+            .expect(".env recorded");
+        // Recorded but flagged content-less, and the hash is path-derived (not a
+        // hash of the file's secret bytes).
+        check!(env.language.is_none());
+        check!(env.hash == blake3::hash(b"sensitive:.env").to_hex().to_string());
+        check!(
+            found
+                .iter()
+                .any(|f| f.rel_path == "id_rsa" && f.language.is_none())
+        );
+        // Real source is still parsed normally.
+        check!(
+            found
+                .iter()
+                .any(|f| f.rel_path == "main.rs" && f.language.is_some())
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // #136 record mode end-to-end: a sensitive file becomes a File node carrying
+    // an exclusion marker, and its secret value is nowhere in the index.
+    #[test]
+    fn record_sensitive_emits_marked_file_node_without_contents() {
+        let dir = temp_repo("sensitive-e2e");
+        std::fs::write(dir.join("main.rs"), "fn f() {}\n").unwrap();
+        std::fs::write(dir.join(".env"), "API_TOKEN=supersecret\n").unwrap();
+        std::fs::create_dir_all(dir.join(".meridian")).unwrap();
+        std::fs::write(
+            dir.join(".meridian/config.toml"),
+            "[security]\nrecord_sensitive_files = true\n",
+        )
+        .unwrap();
+        run(&dir, false, BackendKind::Sqlite).unwrap();
+
+        let store = SqliteStore::open(&RepoPaths::new(&dir).db_path).unwrap();
+        let env = store
+            .find_by_name(".env")
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect(".env File node");
+        check!(env.kind == NodeKind::File);
+        check!(env.doc.as_deref() == Some("sensitive: contents excluded from the index"));
+        // The secret value never entered the index (no node mentions it).
+        check!(store.search("supersecret", 50).unwrap().is_empty());
 
         std::fs::remove_dir_all(&dir).ok();
     }

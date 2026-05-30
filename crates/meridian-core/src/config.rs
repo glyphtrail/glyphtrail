@@ -58,6 +58,24 @@ pub struct Config {
     pub ignore_dirs: Vec<String>,
     /// Impact-analysis tuning.
     pub impact: ImpactConfig,
+    /// Security / sensitive-data handling.
+    pub security: SecurityConfig,
+}
+
+/// Security configuration.
+///
+/// ```toml
+/// [security]
+/// record_sensitive_files = true
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SecurityConfig {
+    /// Credential/key files are always excluded from parsing. With this set, a
+    /// content-less record (a `File` node, no bytes read) is still added so the
+    /// graph shows the file *exists* without exposing its values. Default off:
+    /// secrets leave no trace at all.
+    pub record_sensitive_files: bool,
 }
 
 /// Impact-analysis configuration.
@@ -294,6 +312,19 @@ mod tests {
         check!(lang.extensions == ["rb", "rake"]);
         check!(lang.grammar == std::path::Path::new("grammars/tree-sitter-ruby/src"));
         check!(lang.query == std::path::Path::new("queries/ruby.scm"));
+    }
+
+    #[test]
+    fn parses_security_record_sensitive_files() {
+        let cfg = Config::from_toml_str("[security]\nrecord_sensitive_files = true\n").unwrap();
+        check!(cfg.security.record_sensitive_files);
+        // Off by default.
+        check!(
+            !Config::from_toml_str("")
+                .unwrap()
+                .security
+                .record_sensitive_files
+        );
     }
 
     #[test]
