@@ -1,8 +1,9 @@
 //! MCP tool definitions and handlers over the Stratograph graph store.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
+use stratograph_core::config::RepoPaths;
 use stratograph_core::{
     Confidence, EdgeKind, Groups, HttpMethod, ImpactPolicy, ImpactReport, Node, NodeId, NodeKind,
     OperationKey, Protocol, Registry, RepoHealth, default_groups_path, default_registry_path,
@@ -137,12 +138,15 @@ fn dispatch(db: &Path, name: &str, args: &Value) -> Result<Value, String> {
     if name == "list_repos" {
         return list_repos();
     }
+    // Resolve the per-call repo selector (#240): a registered name or a path
+    // overrides the server's launch repo; absent, the launch repo is used.
+    let db = target_db(db, args)?;
     // Cross-repo impact opens its own member stores (incl. the current repo), so
     // it must not be given the pre-opened per-repo store (no double-open).
     if name == "impact" && is_federated(args) {
-        return federated_impact_tool(db, args);
+        return federated_impact_tool(&db, args);
     }
-    let store = open(db)?;
+    let store = open(&db)?;
     match name {
         "search" => {
             let limit = opt_usize(args, "limit").unwrap_or(30);
@@ -200,7 +204,7 @@ fn dispatch(db: &Path, name: &str, args: &Value) -> Result<Value, String> {
             }
             Ok(Value::Array(report))
         }
-        "impact" => impact_tool(db, &*store, args),
+        "impact" => impact_tool(&db, &*store, args),
         "status" => {
             let s = store.stats().map_err(err)?;
             let languages: serde_json::Map<String, Value> = s
@@ -252,6 +256,25 @@ fn list_repos() -> Result<Value, String> {
         })
         .collect();
     Ok(Value::Array(repos))
+}
+
+/// Resolve the index anchor path a call targets (#240). With no `repo`
+/// argument, the server's launch `default_db` is used. A `repo` value is first
+/// matched against the global registry by name; if no registered repo matches,
+/// it is treated as a filesystem path to a repository root. Either way the
+/// returned path is the `.stratograph/graph.db` anchor beside which the index
+/// lives.
+fn target_db(default_db: &Path, args: &Value) -> Result<PathBuf, String> {
+    let Some(selector) = opt_str(args, "repo") else {
+        return Ok(default_db.to_path_buf());
+    };
+    if let Some(path) = default_registry_path()
+        && let Ok(registry) = Registry::load(&path)
+        && let Some(entry) = registry.get(selector)
+    {
+        return Ok(RepoPaths::new(&entry.root).db_path);
+    }
+    Ok(RepoPaths::new(Path::new(selector)).db_path)
 }
 
 /// Open the repo's LadybugDB graph store. `db` is the index anchor path
@@ -508,7 +531,19 @@ fn resolve_one(store: &dyn GraphStore, name: &str) -> Result<Node, String> {
         .ok_or_else(|| format!("no symbol named '{name}' in the index"))
 }
 
-fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
+fn tool(name: &str, description: &str, mut properties: Value, required: &[&str]) -> Value {
+    // Every tool accepts an optional `repo` selector so a single MCP server can
+    // be pointed at any repository per call, not just the one it launched in
+    // (#240). list_repos ignores it harmlessly.
+    if let Some(obj) = properties.as_object_mut() {
+        obj.insert(
+            "repo".to_string(),
+            json!({
+                "type": "string",
+                "description": "Target a repository by registered name or filesystem path. Defaults to the server's launch repo."
+            }),
+        );
+    }
     json!({
         "name": name,
         "description": description,
@@ -687,6 +722,48 @@ mod tests {
         let text = res["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
         check!(parsed.is_array());
+    }
+
+    // #240: a `repo` argument redirects a call to another repository by path,
+    // overriding the server's launch repo (which here points nowhere).
+    #[test]
+    fn repo_argument_targets_a_different_repo_by_path() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("stratograph-mcp-target-{nanos}"));
+        let index_dir = root.join(".stratograph");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        {
+            let mut store = LadybugStore::open(&index_dir.join("ladybug")).unwrap();
+            store
+                .insert_graph(
+                    &[Node {
+                        id: NodeId("z".into()),
+                        kind: NodeKind::Function,
+                        name: "zonk".into(),
+                        qualified_name: "zonk".into(),
+                        file: "z.rs".into(),
+                        language: Some("rust".into()),
+                        span: None,
+                        doc: None,
+                    }],
+                    &[],
+                )
+                .unwrap();
+        }
+        // The launch db points nowhere; the `repo` arg redirects to `root`.
+        let res = call(
+            Path::new("/nonexistent/graph.db"),
+            "definition",
+            &json!({ "name": "zonk", "repo": root.to_str().unwrap() }),
+        );
+        check!(res["isError"] == json!(false));
+        let text = res["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        check!(parsed[0]["name"] == json!("zonk"));
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
