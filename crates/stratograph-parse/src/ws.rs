@@ -9,15 +9,19 @@
 //!   (client); SignalR `connection.on("Method", h)` (handler) and
 //!   `connection.invoke("Method", …)` / `.send(...)` (client); and Centrifugo
 //!   pub/sub `centrifuge.subscribe("channel", h)` / `newSubscription("channel")`
-//!   (subscriber) and `centrifuge.publish("channel", …)` (publisher). To avoid
-//!   matching unrelated `.on`/`.emit` emitters, only socket-like
-//!   ([`SOCKETIO_RECEIVERS`]), SignalR ([`SIGNALR_RECEIVERS`]) and Centrifugo
-//!   ([`CENTRIFUGO_RECEIVERS`]) receiver identifiers are considered, with verbs
+//!   (subscriber) and `centrifuge.publish("channel", …)` (publisher); Phoenix
+//!   Channels JS client `channel.push("event", …)` (send) / `channel.on(…)`
+//!   (receive) and the Elixir server `handle_in("event", …)` handler with its
+//!   `broadcast`/`push` sends. To avoid matching unrelated `.on`/`.emit`
+//!   emitters, only socket-like ([`SOCKETIO_RECEIVERS`]), SignalR
+//!   ([`SIGNALR_RECEIVERS`]), Centrifugo ([`CENTRIFUGO_RECEIVERS`]) and Phoenix
+//!   ([`PHOENIX_RECEIVERS`]) receiver identifiers are considered, with verbs
 //!   gated per family and reserved lifecycle events skipped.
 //!
 //! Only string/template-literal URLs and string-literal event/channel names are
 //! extracted; dynamic values are out of scope. Native `send`/`onmessage` framing
-//! (no event name to key on) and Phoenix Channels remain follow-ups.
+//! (no event name to key on) and socket.io `io.of` namespace-aware keying remain
+//! follow-ups.
 
 use stratograph_core::{Language, Span};
 use tree_sitter::{Node, Parser};
@@ -67,6 +71,11 @@ const SIGNALR_RECEIVERS: [&str; 4] = ["connection", "hubConnection", "conn", "hu
 /// subscriber (listener), `publish` sends to the channel.
 const CENTRIFUGO_RECEIVERS: [&str; 4] = ["centrifuge", "centrifugo", "sub", "subscription"];
 
+/// Receiver identifiers treated as a Phoenix Channels client handle (#51): the
+/// JS `channel.push("event", …)` sends to the server `handle_in` handler, and
+/// `channel.on("event", h)` receives a server `push`/`broadcast`.
+const PHOENIX_RECEIVERS: [&str; 2] = ["channel", "chan"];
+
 /// socket.io reserved/lifecycle events that are not user message channels.
 const RESERVED_EVENTS: [&str; 6] = [
     "connect",
@@ -77,17 +86,23 @@ const RESERVED_EVENTS: [&str; 6] = [
     "reconnect",
 ];
 
-/// Extract message-boundary sites from JS/TS/TSX `source`: socket.io
-/// (`on`/`emit`), SignalR (`on`/`invoke`/`send`), and Centrifugo
-/// (`subscribe`/`newSubscription`/`publish`, keyed by channel). Empty on parse
-/// failure or other languages.
+/// Extract message-boundary sites from `source`: JS/TS/TSX socket.io
+/// (`on`/`emit`), SignalR (`on`/`invoke`/`send`), Centrifugo
+/// (`subscribe`/`newSubscription`/`publish`) and Phoenix (`channel.push`/`.on`);
+/// and Elixir Phoenix channels (`handle_in` handlers, `broadcast`/`push`).
+/// Empty on parse failure or unsupported languages.
 pub fn extract_ws_events(source: &str, lang: &Language) -> Vec<RawWsEvent> {
-    if !matches!(
-        lang,
-        Language::JavaScript | Language::TypeScript | Language::Tsx
-    ) {
-        return Vec::new();
+    match lang {
+        Language::JavaScript | Language::TypeScript | Language::Tsx => {
+            extract_js_ws_events(source, lang)
+        }
+        Language::Elixir => extract_elixir_ws_events(source),
+        _ => Vec::new(),
     }
+}
+
+/// socket.io / SignalR / Centrifugo / Phoenix client message sites in JS/TS.
+fn extract_js_ws_events(source: &str, lang: &Language) -> Vec<RawWsEvent> {
     let mut parser = Parser::new();
     if parser
         .set_language(&grammar(lang).expect("built-in grammar"))
@@ -108,6 +123,102 @@ pub fn extract_ws_events(source: &str, lang: &Language) -> Vec<RawWsEvent> {
         }
     });
     out
+}
+
+/// Server-side Phoenix channel message sites in Elixir (#51): `handle_in("ev",
+/// …)` clauses (the handler) and `broadcast`/`push` calls (server → client).
+fn extract_elixir_ws_events(source: &str) -> Vec<RawWsEvent> {
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&grammar(&Language::Elixir).expect("built-in grammar"))
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+    let src = source.as_bytes();
+    let mut out = Vec::new();
+    walk(tree.root_node(), &mut |n| {
+        if n.kind() != "call" {
+            return;
+        }
+        let Some(target) = elixir_call_target(n, src) else {
+            return;
+        };
+        match target.as_str() {
+            // `def handle_in("ev", payload, socket) do … end`: the def's first
+            // argument is a call to `handle_in` whose first argument is the event.
+            "def" | "defp" => {
+                if let Some(inner) = elixir_first_arg_call(n)
+                    && elixir_call_target(inner, src).as_deref() == Some("handle_in")
+                    && let Some(event) = elixir_first_string_arg(inner, src)
+                    && !RESERVED_EVENTS.contains(&event.as_str())
+                {
+                    out.push(RawWsEvent {
+                        kind: WsEventKind::On,
+                        event,
+                        handler: "handle_in".into(),
+                        span: span_of(inner),
+                    });
+                }
+            }
+            // Server → client sends, keyed by event name.
+            "broadcast" | "broadcast!" | "broadcast_from" | "broadcast_from!" | "push" => {
+                if let Some(event) = elixir_first_string_arg(n, src)
+                    && !RESERVED_EVENTS.contains(&event.as_str())
+                {
+                    out.push(RawWsEvent {
+                        kind: WsEventKind::Emit,
+                        event,
+                        handler: String::new(),
+                        span: span_of(n),
+                    });
+                }
+            }
+            _ => {}
+        }
+    });
+    out
+}
+
+/// Target identifier of an Elixir `call` node (`foo(...)` → `foo`).
+fn elixir_call_target(call: Node, src: &[u8]) -> Option<String> {
+    let first = call.named_child(0)?;
+    (first.kind() == "identifier").then(|| text(first, src))
+}
+
+/// The `arguments` node of an Elixir call, if present.
+fn elixir_args(call: Node) -> Option<Node> {
+    let mut c = call.walk();
+    call.named_children(&mut c)
+        .find(|ch| ch.kind() == "arguments")
+}
+
+/// The first argument of an Elixir call that is itself a `call` (the nested
+/// `handle_in(...)` inside `def handle_in(...)`).
+fn elixir_first_arg_call(call: Node) -> Option<Node> {
+    let args = elixir_args(call)?;
+    let mut c = args.walk();
+    args.named_children(&mut c).find(|ch| ch.kind() == "call")
+}
+
+/// First string-literal argument of an Elixir call, ignoring interpolation.
+fn elixir_first_string_arg(call: Node, src: &[u8]) -> Option<String> {
+    let args = elixir_args(call)?;
+    let mut c = args.walk();
+    args.named_children(&mut c)
+        .find_map(|ch| elixir_string(ch, src))
+}
+
+/// Inner text of a simple (non-interpolated) Elixir string literal.
+fn elixir_string(node: Node, src: &[u8]) -> Option<String> {
+    if node.kind() != "string" {
+        return None;
+    }
+    let trimmed = text(node, src).trim_matches('"').to_string();
+    (!trimmed.is_empty() && !trimmed.contains("#{")).then_some(trimmed)
 }
 
 /// A `socket.on("ev", handler)` / `socket.emit("ev", …)` call as a [`RawWsEvent`],
@@ -138,6 +249,13 @@ fn ws_event(call: Node, src: &[u8]) -> Option<RawWsEvent> {
         match property.as_str() {
             "subscribe" | "newSubscription" => WsEventKind::On,
             "publish" => WsEventKind::Emit,
+            _ => return None,
+        }
+    } else if PHOENIX_RECEIVERS.contains(&receiver.as_str()) {
+        // Phoenix JS client: `push` sends to the server, `on` receives.
+        match property.as_str() {
+            "on" => WsEventKind::On,
+            "push" => WsEventKind::Emit,
             _ => return None,
         }
     } else {
@@ -381,5 +499,48 @@ other.subscribe("x", h);             // non-centrifugo receiver: skipped
         );
         // A non-centrifugo receiver is excluded.
         check!(!evs.iter().any(|e| e.event == "x"));
+    }
+
+    #[test]
+    fn extracts_phoenix_js_channel_push_and_on() {
+        let src = r#"
+channel.push("new_msg", { body: "hi" });
+channel.on("new_msg", onNewMsg);
+other.push("x", 1);                  // non-phoenix receiver: skipped
+"#;
+        let evs = extract_ws_events(src, &Language::JavaScript);
+        check!(
+            evs.iter()
+                .any(|e| e.kind == WsEventKind::Emit && e.event == "new_msg")
+        ); // push
+        check!(
+            evs.iter().any(|e| e.kind == WsEventKind::On
+                && e.event == "new_msg"
+                && e.handler == "onNewMsg")
+        ); // on
+        check!(!evs.iter().any(|e| e.event == "x"));
+    }
+
+    #[test]
+    fn extracts_phoenix_elixir_handle_in_and_sends() {
+        let src = r#"defmodule App.RoomChannel do
+  def handle_in("new_msg", payload, socket) do
+    broadcast(socket, "room_update", payload)
+    push(socket, "ack", %{})
+    {:noreply, socket}
+  end
+end"#;
+        let evs = extract_ws_events(src, &Language::Elixir);
+        // The handler keyed by event, plus its broadcast/push sends.
+        check!(evs.iter().any(|e| e.kind == WsEventKind::On
+            && e.event == "new_msg"
+            && e.handler == "handle_in"));
+        let emits: Vec<&str> = evs
+            .iter()
+            .filter(|e| e.kind == WsEventKind::Emit)
+            .map(|e| e.event.as_str())
+            .collect();
+        check!(emits.contains(&"room_update")); // broadcast
+        check!(emits.contains(&"ack")); // push
     }
 }
