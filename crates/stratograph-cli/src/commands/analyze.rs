@@ -642,8 +642,9 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
     resolve_progress.inc(1);
 
     // Re-resolve all persisted pending edges against the current global index.
-    // A uniquely-named target resolves directly; an ambiguous name resolves
-    // only if exactly one candidate sits in a file the anchor's file imports (#19).
+    // A uniquely-named target resolves directly; an ambiguous name resolves if
+    // exactly one candidate sits in a file the anchor's file imports (#19), or,
+    // failing that, in the anchor's own directory (same-package locality, #5).
     stage("inferring cross-file edges");
     store.delete_edges_by_confidence(Confidence::Inferred)?;
     let mut index: HashMap<String, Vec<NodeId>> = HashMap::new();
@@ -658,7 +659,8 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
             let candidates = index.get(&l.name)?;
             let other = match candidates.as_slice() {
                 [one] => one.clone(),
-                _ => disambiguate_import(&l.anchor, candidates, &node_file, &import_map)?,
+                _ => disambiguate_import(&l.anchor, candidates, &node_file, &import_map)
+                    .or_else(|| disambiguate_dir(&l.anchor, candidates, &node_file))?,
             };
             let (src, dst) = if l.name_is_src {
                 (other, l.anchor)
@@ -889,6 +891,40 @@ fn disambiguate_import(
         }
     }
     hit.cloned()
+}
+
+/// Resolve an ambiguous name to the unique candidate defined in the anchor's own
+/// directory (same-package locality, #5), used when import-based disambiguation
+/// found nothing — common for languages where same-package symbols are visible
+/// without an explicit import (Java/Go/C#, Python relative packages). Returns a
+/// target only when exactly one candidate lives in that directory, so it never
+/// invents an edge between two equally-plausible same-named siblings.
+fn disambiguate_dir(
+    anchor: &NodeId,
+    candidates: &[NodeId],
+    node_file: &HashMap<String, String>,
+) -> Option<NodeId> {
+    let anchor_dir = dir_of(node_file.get(&anchor.0)?);
+    let mut hit: Option<&NodeId> = None;
+    for c in candidates {
+        if let Some(f) = node_file.get(&c.0)
+            && dir_of(f) == anchor_dir
+        {
+            if hit.is_some() {
+                return None; // two candidates in the same directory — still ambiguous
+            }
+            hit = Some(c);
+        }
+    }
+    hit.cloned()
+}
+
+/// The directory portion of a repo-relative path (`""` for a top-level file).
+fn dir_of(path: &str) -> &str {
+    match path.rfind('/') {
+        Some(i) => &path[..i],
+        None => "",
+    }
 }
 
 /// Read the configured REST schema artifacts and add a `SchemaOp` node (with
@@ -1461,6 +1497,46 @@ mod tests {
             nodes.iter().any(|n| n.kind == NodeKind::Comment),
             "the NOTE comment should be a Comment node"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // #5: an ambiguous call (two same-named defs in different directories, no
+    // import between them) resolves to the candidate in the caller's own
+    // directory rather than being dropped.
+    #[test]
+    fn ambiguous_call_resolves_within_caller_directory() {
+        let dir = temp_repo("samedir-resolve");
+        std::fs::create_dir_all(dir.join("pkg")).unwrap();
+        std::fs::create_dir_all(dir.join("other")).unwrap();
+        // Caller and its same-directory target, with no import linking them.
+        std::fs::write(dir.join("pkg/a.py"), "def use():\n    return helper()\n").unwrap();
+        std::fs::write(dir.join("pkg/b.py"), "def helper():\n    return 1\n").unwrap();
+        // A second, unrelated `helper` elsewhere makes the bare name ambiguous.
+        std::fs::write(dir.join("other/c.py"), "def helper():\n    return 2\n").unwrap();
+        run(&dir, false).unwrap();
+
+        let store = LadybugStore::open(&RepoPaths::new(&dir).index_dir.join("ladybug")).unwrap();
+        let use_id = store
+            .find_by_name("use")
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("`use` fn")
+            .id;
+        let callees = store
+            .neighbors(&use_id.0, Some(EdgeKind::Calls), true)
+            .unwrap();
+        check!(
+            callees.len() == 1,
+            "expected one resolved call, got {:?}",
+            callees
+                .iter()
+                .map(|(n, _, _)| (&n.name, &n.file))
+                .collect::<Vec<_>>()
+        );
+        // Resolved to the helper in the caller's directory, not the other one.
+        check!(callees[0].0.file == "pkg/b.py");
 
         std::fs::remove_dir_all(&dir).ok();
     }
