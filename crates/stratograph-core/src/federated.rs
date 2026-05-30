@@ -45,18 +45,22 @@ pub fn unqualify(id: &NodeId) -> (&str, &str) {
 /// is routed to the owning repo's adjacency and its neighbours re-qualified;
 /// when a producer export node is reached over `Imports`/`Incoming`, its
 /// downstream consumer nodes in other repos are added.
-pub struct FederatedAdjacency {
-    repos: HashMap<String, Box<dyn Adjacency>>,
+///
+/// The per-repo adjacencies are *borrowed* (`&dyn Adjacency`), so the caller can
+/// keep the underlying stores to look up node details for reporting while the
+/// traversal runs.
+pub struct FederatedAdjacency<'a> {
+    repos: HashMap<String, &'a dyn Adjacency>,
     /// Qualified producer node -> qualified consumer nodes that depend on it
     /// across the package boundary, each with the cross-edge confidence.
     cross: HashMap<NodeId, Vec<(NodeId, Confidence)>>,
 }
 
-impl FederatedAdjacency {
+impl<'a> FederatedAdjacency<'a> {
     /// Build from per-repo adjacencies and a prebuilt cross-edge table. Both the
     /// `cross` keys and its target node ids must already be qualified.
     pub fn new(
-        repos: HashMap<String, Box<dyn Adjacency>>,
+        repos: HashMap<String, &'a dyn Adjacency>,
         cross: HashMap<NodeId, Vec<(NodeId, Confidence)>>,
     ) -> Self {
         Self { repos, cross }
@@ -68,7 +72,7 @@ impl FederatedAdjacency {
     }
 }
 
-impl Adjacency for FederatedAdjacency {
+impl Adjacency for FederatedAdjacency<'_> {
     fn step(&self, node: &NodeId, kind: EdgeKind, dir: Direction) -> Vec<(NodeId, Confidence)> {
         let (repo, local) = unqualify(node);
         let mut out = Vec::new();
@@ -139,9 +143,9 @@ mod tests {
         let mut c = Mock::default();
         c.edge("cc", "cuse", EdgeKind::Calls);
 
-        let mut repos: HashMap<String, Box<dyn Adjacency>> = HashMap::new();
-        repos.insert("p".into(), Box::new(p));
-        repos.insert("c".into(), Box::new(c));
+        let mut repos: HashMap<String, &dyn Adjacency> = HashMap::new();
+        repos.insert("p".into(), &p as &dyn Adjacency);
+        repos.insert("c".into(), &c as &dyn Adjacency);
 
         let mut cross = HashMap::new();
         cross.insert(
