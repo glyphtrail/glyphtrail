@@ -1,13 +1,13 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use stratograph_core::config::{IGNORE_FILE, RepoPaths};
 use stratograph_core::{
-    ClientCall, CodeGraph, Confidence, Config, DynamicLanguage, Edge, EdgeKind, Endpoint, Language,
-    Matcher, Node, NodeId, NodeKind, OperationKey, PendingLink, Protocol, RewriteEngine,
-    SchemaFormat,
+    CargoPackage, ClientCall, CodeGraph, Confidence, Config, DynamicLanguage, Edge, EdgeKind,
+    Endpoint, Language, Matcher, Node, NodeId, NodeKind, OperationKey, PendingLink, Protocol,
+    RewriteEngine, SchemaFormat, parse_cargo_manifest, workspace_members,
 };
 use stratograph_parse::{
     DynamicGrammar, PendingEdge, build_client_graph, build_file_graph, build_graphql_client_graph,
@@ -400,6 +400,78 @@ fn discover(
     Ok(out)
 }
 
+/// Discover the Cargo packages a repo publishes (#220): the root `Cargo.toml`
+/// plus every workspace member (member globs like `crates/*` expanded against
+/// the filesystem). A virtual workspace root contributes no package of its own,
+/// only its members. Packages are de-duplicated by name and sorted, so the
+/// result is stable across runs. Cargo.toml is not a parsed source language, so
+/// this is a separate, best-effort pass: an unreadable or malformed manifest is
+/// skipped rather than failing the analysis.
+fn discover_packages(root: &Path) -> Vec<CargoPackage> {
+    let root_manifest = root.join("Cargo.toml");
+    let mut manifests: Vec<PathBuf> = vec![root_manifest.clone()];
+    if let Ok(text) = std::fs::read_to_string(&root_manifest) {
+        for member in workspace_members(&text) {
+            for dir in expand_member(root, &member) {
+                manifests.push(dir.join("Cargo.toml"));
+            }
+        }
+    }
+
+    let mut packages = Vec::new();
+    for manifest in manifests {
+        if let Ok(text) = std::fs::read_to_string(&manifest)
+            && let Ok(Some(pkg)) = parse_cargo_manifest(&text)
+        {
+            packages.push(pkg);
+        }
+    }
+    packages.sort_by(|a, b| a.name.cmp(&b.name));
+    packages.dedup_by(|a, b| a.name == b.name);
+    packages
+}
+
+/// Expand one workspace `members` entry (a path or path glob relative to `root`)
+/// into the directories it matches. Each path component is matched
+/// independently: a literal component must name an existing directory, while a
+/// component containing a glob metacharacter (`*`, `?`, `[`) is matched against
+/// the directory entries at that level. Covers the common `crates/*` and exact
+/// path forms.
+fn expand_member(root: &Path, pattern: &str) -> Vec<PathBuf> {
+    let mut current = vec![root.to_path_buf()];
+    for comp in pattern.split('/').filter(|c| !c.is_empty()) {
+        let mut next = Vec::new();
+        let matcher = comp
+            .contains(['*', '?', '['])
+            .then(|| globset::Glob::new(comp).ok().map(|g| g.compile_matcher()))
+            .flatten();
+        for base in &current {
+            match &matcher {
+                Some(m) => {
+                    let Ok(entries) = std::fs::read_dir(base) else {
+                        continue;
+                    };
+                    for entry in entries.flatten() {
+                        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                            && m.is_match(entry.file_name().to_string_lossy().as_ref())
+                        {
+                            next.push(entry.path());
+                        }
+                    }
+                }
+                None => {
+                    let joined = base.join(comp);
+                    if joined.is_dir() {
+                        next.push(joined);
+                    }
+                }
+            }
+        }
+        current = next;
+    }
+    current
+}
+
 pub fn run(path: &Path, update: bool) -> Result<()> {
     let root = path
         .canonicalize()
@@ -417,11 +489,20 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
     )?;
     tracing::info!("discovered {} source files", files.len());
 
+    // Cargo package identity (#220): the crate(s) this repo publishes and the
+    // dependencies it declares, persisted so the cross-repo link step (#221) can
+    // match a consumer's dependency to the producer repo whose package name
+    // equals it. A fingerprint over the parsed identity folds into the fast path
+    // below, so editing a `Cargo.toml` alone (no source change) still refreshes.
+    let packages = discover_packages(&root);
+    let packages_json = serde_json::to_string(&packages).unwrap_or_else(|_| "[]".to_string());
+    let packages_fingerprint = blake3::hash(packages_json.as_bytes()).to_hex().to_string();
+
     // Fast path (#110): when every discovered file matches the stored
-    // (path, hash) set and the index was produced by this tool version, nothing
-    // has changed — skip parsing, re-resolution and writes entirely. A version
-    // mismatch forces a rebuild so extractor changes between releases take
-    // effect even on an unchanged tree.
+    // (path, hash) set, the package identity is unchanged, and the index was
+    // produced by this tool version, nothing has changed — skip parsing,
+    // re-resolution and writes entirely. A version mismatch forces a rebuild so
+    // extractor changes between releases take effect even on an unchanged tree.
     const VERSION: &str = env!("CARGO_PKG_VERSION");
     let current_set: std::collections::BTreeSet<(String, String)> = files
         .iter()
@@ -431,6 +512,7 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
         store.files_with_hashes()?.into_iter().collect();
     if !files.is_empty()
         && current_set == stored_set
+        && store.get_meta("packages_fingerprint")?.as_deref() == Some(packages_fingerprint.as_str())
         && store.get_meta("tool_version")?.as_deref() == Some(VERSION)
     {
         println!("Index up to date ({} files); nothing changed.", files.len());
@@ -830,6 +912,8 @@ pub fn run(path: &Path, update: bool) -> Result<()> {
     resolve_progress.inc(1);
 
     store.set_meta("tool_version", VERSION)?;
+    store.set_meta("packages", &packages_json)?;
+    store.set_meta("packages_fingerprint", &packages_fingerprint)?;
     resolve_progress.finish_and_clear();
 
     let stats = store.stats()?;
@@ -1116,6 +1200,48 @@ mod tests {
             names.iter().any(|n| n == "caller"),
             "caller of the call site should be impacted, got {names:?}"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // #220: analyze records Cargo package identity (workspace members, deps and
+    // their sources) into the index meta, so the cross-repo link step can match
+    // consumers to producers.
+    #[test]
+    fn analyze_persists_cargo_package_identity() {
+        let dir = temp_repo("pkg-identity");
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        let member = dir.join("crates/widget");
+        std::fs::create_dir_all(member.join("src")).unwrap();
+        std::fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname = \"widget\"\nversion = \"0.3.0\"\n\n[dependencies]\nserde = \"1\"\nhelper = { path = \"../helper\" }\n",
+        )
+        .unwrap();
+        std::fs::write(member.join("src/lib.rs"), "pub fn go() {}\n").unwrap();
+        run(&dir, false).unwrap();
+
+        let store = LadybugStore::open(&RepoPaths::new(&dir).index_dir.join("ladybug")).unwrap();
+        let json = store
+            .get_meta("packages")
+            .unwrap()
+            .expect("packages meta written");
+        let packages: Vec<CargoPackage> = serde_json::from_str(&json).unwrap();
+        let widget = packages
+            .iter()
+            .find(|p| p.name == "widget")
+            .expect("widget package recorded");
+        check!(widget.version == Some("0.3.0".to_string()));
+        let helper = widget
+            .dependencies
+            .iter()
+            .find(|d| d.name == "helper")
+            .expect("helper dependency recorded");
+        check!(helper.source == stratograph_core::DepSource::Path("../helper".into()));
 
         std::fs::remove_dir_all(&dir).ok();
     }
