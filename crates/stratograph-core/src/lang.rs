@@ -28,6 +28,7 @@ pub enum Language {
     Lua,
     Swift,
     Elixir,
+    Zig,
     /// A language identified by name but not built in (dynamically loaded).
     Other(String),
 }
@@ -55,6 +56,7 @@ impl Language {
             Language::Lua => "lua",
             Language::Swift => "swift",
             Language::Elixir => "elixir",
+            Language::Zig => "zig",
             Language::Other(name) => name,
         }
     }
@@ -83,6 +85,7 @@ impl Language {
             "lua" => Language::Lua,
             "swift" => Language::Swift,
             "ex" | "exs" => Language::Elixir,
+            "zig" => Language::Zig,
             _ => return None,
         })
     }
@@ -109,11 +112,12 @@ impl Language {
             "lua" => Language::Lua,
             "swift" => Language::Swift,
             "elixir" => Language::Elixir,
+            "zig" => Language::Zig,
             _ => return None,
         })
     }
 
-    pub const ALL: [Language; 20] = [
+    pub const ALL: [Language; 21] = [
         Language::Rust,
         Language::Python,
         Language::JavaScript,
@@ -134,5 +138,6 @@ impl Language {
         Language::Lua,
         Language::Swift,
         Language::Elixir,
+        Language::Zig,
     ];
 }
