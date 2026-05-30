@@ -1,13 +1,13 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/meridian-core",
-    "crates/meridian-parse",
-    "crates/meridian-store",
-    "crates/meridian-viz",
-    "crates/meridian-server",
-    "crates/meridian-mcp",
-    "crates/meridian-cli",
+    "crates/stratograph-core",
+    "crates/stratograph-parse",
+    "crates/stratograph-store",
+    "crates/stratograph-viz",
+    "crates/stratograph-server",
+    "crates/stratograph-mcp",
+    "crates/stratograph-cli",
 ]
 
 [workspace.package]
@@ -16,15 +16,15 @@ edition = "2024"
 authors = ["Markus Mayer <widemeadows@gmail.com>"]
 license = "EUPL-1.2"
 rust-version = "1.95"
-repository = "https://github.com/sunsided/meridian"
+repository = "https://github.com/sunsided/stratograph"
 
 [workspace.dependencies]
-meridian-core = { path = "crates/meridian-core" }
-meridian-parse = { path = "crates/meridian-parse" }
-meridian-store = { path = "crates/meridian-store" }
-meridian-viz = { path = "crates/meridian-viz" }
-meridian-server = { path = "crates/meridian-server" }
-meridian-mcp = { path = "crates/meridian-mcp" }
+stratograph-core = { path = "crates/stratograph-core" }
+stratograph-parse = { path = "crates/stratograph-parse" }
+stratograph-store = { path = "crates/stratograph-store" }
+stratograph-viz = { path = "crates/stratograph-viz" }
+stratograph-server = { path = "crates/stratograph-server" }
+stratograph-mcp = { path = "crates/stratograph-mcp" }
 
 anyhow = "1"
 thiserror = "2"
@@ -70,8 +70,8 @@ tree-sitter-swift = "0.7"
 lto = "thin"
 
 # Always build the LadybugDB native dependency (`lbug`) optimized, regardless of
-# meridian's own profile. Its C++ core is unusably slow unoptimized, and a debug
-# build of meridian shouldn't pay to compile a debug `lbug`. The `opt-level`
+# stratograph's own profile. Its C++ core is unusably slow unoptimized, and a debug
+# build of stratograph shouldn't pay to compile a debug `lbug`. The `opt-level`
 # also makes the `cmake` build script select CMAKE_BUILD_TYPE=Release.
 [profile.dev.package.lbug]
 opt-level = 3

@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>stratograph</title>
+<script src="https://cdn.jsdelivr.net/npm/cytoscape@3.30.2/dist/cytoscape.min.js"></script>
+<style>
+  html, body { margin: 0; height: 100%; font-family: ui-monospace, monospace; }
+  #toolbar {
+    position: fixed; top: 0; left: 0; right: 0; height: 44px; z-index: 10;
+    display: flex; align-items: center; gap: 10px; padding: 0 12px;
+    background: #1b1f24; color: #e6e6e6; border-bottom: 1px solid #333;
+  }
+  #toolbar input { background: #0d1117; color: #e6e6e6; border: 1px solid #444;
+    padding: 5px 8px; border-radius: 4px; width: 240px; }
+  #toolbar select { background: #0d1117; color: #e6e6e6; border: 1px solid #444;
+    padding: 5px 8px; border-radius: 4px; }
+  #toolbar label { font-size: 12px; opacity: 0.8; }
+  #cy { position: absolute; top: 44px; bottom: 0; left: 0; right: 0; background: #0d1117; }
+  #info {
+    position: fixed; right: 0; top: 44px; width: 320px; bottom: 0; overflow: auto;
+    background: #161b22; color: #c9d1d9; border-left: 1px solid #333;
+    padding: 12px; font-size: 13px; display: none;
+  }
+  #info h3 { margin: 0 0 6px; font-size: 14px; }
+  #info pre { white-space: pre-wrap; background: #0d1117; padding: 8px; border-radius: 4px; }
+  .tag { font-size: 11px; padding: 1px 6px; border-radius: 8px; background: #30363d; }
+  #summary {
+    position: fixed; left: 0; top: 44px; width: 270px; bottom: 0; overflow: auto;
+    background: #161b22; color: #c9d1d9; border-right: 1px solid #333;
+    padding: 12px; font-size: 12px; display: none;
+  }
+  #summary h3 { margin: 0 0 8px; font-size: 14px; }
+  #summary .row { margin: 2px 0; }
+  #summary .num { color: #f0c674; font-weight: bold; }
+</style>
+</head>
+<body>
+<div id="toolbar">
+  <strong>stratograph</strong>
+  <input id="filter" placeholder="filter by name…" />
+  <select id="protoFilter" title="isolate an API protocol">
+    <option value="">all protocols</option>
+    <option value="rest">REST</option>
+    <option value="grpc">gRPC</option>
+    <option value="graphql">GraphQL</option>
+  </select>
+  <label><input type="checkbox" id="hideContains" /> hide containment</label>
+  <span id="counts"></span>
+</div>
+<div id="cy"></div>
+<div id="summary"></div>
+<div id="info"></div>
+<script>
+const KIND_COLOR = {
+  repo: "#f0c674", directory: "#b294bb", file: "#81a2be",
+  module: "#8abeb7", function: "#b5bd68", method: "#8abeb7",
+  class: "#de935f", struct: "#de935f", interface: "#cc6666",
+  enum: "#cc6666", trait: "#cc6666", comment: "#969896",
+};
+const EDGE_COLOR = {
+  contains: "#3a3f44", calls: "#b5bd68", imports: "#81a2be",
+  extends: "#de935f", implements: "#cc6666", documents: "#969896",
+  defines: "#3a3f44", references: "#666",
+  handles: "#56b6c2", mounts: "#abb2bf", invokes: "#e5c07b", exposes: "#c678dd",
+};
+// Cross-boundary (API) edges render dashed and, where a protocol is known,
+// colored per protocol rather than by edge kind.
+const CROSS_BOUNDARY = new Set(["invokes", "exposes", "handles", "mounts"]);
+const PROTOCOL_COLOR = { rest: "#56b6c2", grpc: "#c678dd", graphql: "#e06c75" };
+
+// The protocol an edge belongs to, taken from whichever endpoint it touches.
+function edgeProtocol(e) {
+  return e.source().data("protocol") || e.target().data("protocol") || null;
+}
+function edgeColor(e) {
+  const k = e.data("kind");
+  if (CROSS_BOUNDARY.has(k)) {
+    const p = edgeProtocol(e);
+    return (p && PROTOCOL_COLOR[p]) || EDGE_COLOR[k] || "#999";
+  }
+  return EDGE_COLOR[k] || "#555";
+}
+
+async function loadData() {
+  if (window.STRATOGRAPH_DATA) return window.STRATOGRAPH_DATA;
+  const res = await fetch("/api/graph");
+  return await res.json();
+}
+
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+loadData().then((data) => {
+  const cy = cytoscape({
+    container: document.getElementById("cy"),
+    elements: data,
+    style: [
+      { selector: "node", style: {
+        "background-color": (e) => KIND_COLOR[e.data("kind")] || "#888",
+        "label": "data(label)", "color": "#ddd", "font-size": 9,
+        "text-valign": "bottom", "text-wrap": "ellipsis", "text-max-width": 90,
+        "width": 14, "height": 14 } },
+      { selector: "edge", style: {
+        "width": (e) => CROSS_BOUNDARY.has(e.data("kind")) ? 2 : 1,
+        "line-color": edgeColor,
+        "target-arrow-color": edgeColor,
+        "target-arrow-shape": "triangle", "arrow-scale": 0.7,
+        "curve-style": "bezier",
+        "line-style": (e) => CROSS_BOUNDARY.has(e.data("kind")) || e.data("confidence") === "inferred" ? "dashed" : "solid" } },
+      { selector: ".faded", style: { "opacity": 0.08 } },
+      // Impact highlighting: seeds are large and gold; nodes reached only across
+      // an inferred edge get a dashed amber border; cross-boundary consumers a
+      // solid amber ring.
+      { selector: "node[?seed]", style: {
+        "background-color": "#f0c674", "border-width": 4, "border-color": "#fff",
+        "width": 22, "height": 22 } },
+      { selector: 'node[impact_conf = "inferred"]', style: {
+        "border-width": 2, "border-color": "#e5c07b", "border-style": "dashed" } },
+      { selector: "node[?impact_cross]", style: {
+        "border-width": 3, "border-color": "#e5c07b", "border-style": "solid" } },
+      { selector: ":selected", style: { "border-width": 3, "border-color": "#fff" } },
+    ],
+    layout: { name: "cose", animate: false, nodeRepulsion: 8000, idealEdgeLength: 60 },
+  });
+
+  document.getElementById("counts").textContent =
+    cy.nodes().length + " nodes, " + cy.edges().length + " edges";
+
+  // Impact mode: render the blast-radius summary panel.
+  const IMPACT = window.STRATOGRAPH_IMPACT || null;
+  if (IMPACT) {
+    const s = IMPACT.summary;
+    const panel = document.getElementById("summary");
+    panel.style.display = "block";
+    panel.innerHTML =
+      "<h3>impact</h3>" +
+      "<p>" + esc(IMPACT.headline) + "</p>" +
+      "<div class='row'><span class='num'>" + s.total + "</span> impacted symbols</div>" +
+      "<div class='row'><span class='num'>" + s.tests + "</span> tests</div>" +
+      "<div class='row'><span class='num'>" + s.api + "</span> API surface</div>" +
+      "<div class='row'><span class='num'>" + s.cross_boundary + "</span> cross-boundary consumers</div>" +
+      "<div class='row'><span class='num'>" + s.entrypoints + "</span> entrypoints</div>" +
+      "<div class='row'>max distance " + s.max_distance + "</div>" +
+      "<p style='margin-top:10px;opacity:.7'>gold = seed · dashed ring = inferred · solid ring = cross-boundary</p>";
+  }
+
+  // Impact details for a tapped node (class, distance, confidence, edge path).
+  function impactDetail(d) {
+    if (!IMPACT || d.impact_distance == null && !d.seed) return "";
+    if (d.seed) return "<p><span class='tag'>seed</span></p>";
+    const path = (d.impact_path || []).join(" → ");
+    return "<p><span class='tag'>" + esc(d.impact_class) + "</span> " +
+      "distance " + esc(d.impact_distance) + ", " + esc(d.impact_conf) + "</p>" +
+      (path ? "<p><small>path: " + esc(path) + "</small></p>" : "");
+  }
+
+  const nodeTitle = (d) =>
+    d.protocol ? ((d.method ? d.method + " " : "") + (d.path || d.label)) : (d.qualified_name || d.label);
+
+  // Cross-boundary links of `n`, grouped for the detail panel.
+  function apiLinks(n) {
+    let h = "";
+    const rows = [];
+    n.connectedEdges().forEach((e) => {
+      const k = e.data("kind");
+      if (!CROSS_BOUNDARY.has(k)) return;
+      const outgoing = e.source().id() === n.id();
+      const other = outgoing ? e.target() : e.source();
+      const od = other.data();
+      rows.push({
+        kind: k, dir: outgoing ? "→" : "←",
+        label: (od.method ? od.method + " " : "") + (od.path || od.qualified_name || od.label),
+        loc: (od.file || "") + (od.line ? ":" + od.line : ""),
+        conf: e.data("confidence"),
+      });
+    });
+    if (rows.length) {
+      h += "<h3>links</h3>";
+      rows.forEach((r) => {
+        h += "<p><span class='tag'>" + esc(r.kind) + " " + r.dir + "</span> " +
+          esc(r.label) + " <small>(" + esc(r.loc) + ", " + esc(r.conf) + ")</small></p>";
+      });
+    }
+    return h;
+  }
+
+  cy.on("tap", "node", (evt) => {
+    const n = evt.target;
+    const d = n.data();
+    const info = document.getElementById("info");
+    info.style.display = "block";
+    info.innerHTML = "<h3>" + esc(nodeTitle(d)) + "</h3>" +
+      "<span class='tag'>" + esc(d.kind) + "</span> " +
+      (d.protocol ? "<span class='tag'>" + esc(d.protocol) + "</span> " : "") +
+      (d.language ? "<span class='tag'>" + esc(d.language) + "</span>" : "") +
+      "<p>" + esc(d.file || "") + (d.line ? ":" + esc(d.line) : "") + "</p>" +
+      impactDetail(d) +
+      (d.protocol ? apiLinks(n) : "") +
+      (d.doc ? "<pre>" + esc(d.doc) + "</pre>" : "");
+    cy.elements().addClass("faded");
+    n.removeClass("faded");
+    n.neighborhood().removeClass("faded");
+  });
+  cy.on("tap", (evt) => { if (evt.target === cy) {
+    cy.elements().removeClass("faded");
+    document.getElementById("info").style.display = "none";
+  }});
+
+  document.getElementById("filter").addEventListener("input", (e) => {
+    const q = e.target.value.toLowerCase();
+    if (!q) { cy.elements().removeClass("faded"); return; }
+    cy.elements().addClass("faded");
+    const hit = cy.nodes().filter((n) =>
+      (n.data("label") || "").toLowerCase().includes(q) ||
+      (n.data("qualified_name") || "").toLowerCase().includes(q));
+    hit.removeClass("faded");
+    hit.neighborhood().removeClass("faded");
+  });
+
+  document.getElementById("protoFilter").addEventListener("change", (e) => {
+    const p = e.target.value;
+    if (!p) { cy.elements().removeClass("faded"); return; }
+    cy.elements().addClass("faded");
+    const api = cy.nodes().filter((n) => n.data("protocol") === p);
+    api.removeClass("faded");
+    const inc = api.connectedEdges();
+    inc.removeClass("faded");
+    inc.connectedNodes().removeClass("faded");
+  });
+
+  document.getElementById("hideContains").addEventListener("change", (e) => {
+    const edges = cy.edges('[kind = "contains"]');
+    if (e.target.checked) edges.style("display", "none");
+    else edges.style("display", "element");
+  });
+});
+</script>
+</body>
+</html>
