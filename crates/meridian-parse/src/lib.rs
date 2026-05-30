@@ -6,6 +6,7 @@ pub mod dynamic;
 pub mod extract;
 pub mod graphql;
 pub mod grpc;
+pub mod import_symbols;
 pub mod imports;
 pub mod registry;
 pub mod rest;
@@ -20,6 +21,7 @@ pub use build::{
 pub use client::{RawClientCall, extract_client_calls};
 pub use dynamic::{DynamicGrammar, load_dynamic};
 pub use extract::{ParsedFile, parse_source, parse_with};
+pub use import_symbols::extract_import_symbols;
 pub use imports::resolve_import;
 pub use rest::{
     RawEndpoint, RawMount, extract_axum, extract_axum_mounts, extract_utoipa, extract_utoipa_mounts,
