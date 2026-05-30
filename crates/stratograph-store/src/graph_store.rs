@@ -83,4 +83,15 @@ pub trait GraphStore: Adjacency {
     ) -> Result<Vec<ClassifiedItem>>;
     fn stats(&self) -> Result<Stats>;
     fn export_graph(&self, limit: usize) -> Result<(Vec<Node>, Vec<Edge>)>;
+    /// Export nodes/edges with kind filters pushed into the query, so a trimmed
+    /// view doesn't transfer the whole graph (#194). `node_kinds`/`edge_kinds`
+    /// of `None` mean "all kinds"; `Some(&[])` means none. `limit` caps nodes.
+    /// Edges are filtered by their own kind and both endpoints' kinds; the
+    /// caller still prunes edges to any node dropped by `limit`.
+    fn export_filtered(
+        &self,
+        node_kinds: Option<&[String]>,
+        edge_kinds: Option<&[String]>,
+        limit: usize,
+    ) -> Result<(Vec<Node>, Vec<Edge>)>;
 }

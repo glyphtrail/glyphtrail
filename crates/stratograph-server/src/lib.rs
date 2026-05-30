@@ -1,6 +1,5 @@
 #![forbid(unsafe_code)]
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -51,11 +50,11 @@ struct NeighborParams {
     id: String,
 }
 
-/// Parse a comma-separated query value into a set of kinds. An **absent** param
+/// Parse a comma-separated query value into a list of kinds. An **absent** param
 /// (`None`) means "no filter, keep all"; a **present** one (even empty, e.g.
 /// `kinds=`) is an explicit selection — so unchecking every box yields an empty
-/// set that matches nothing, rather than silently falling back to everything.
-fn csv_set(value: &Option<String>) -> Option<HashSet<String>> {
+/// list that matches nothing, rather than silently falling back to everything.
+fn csv_vec(value: &Option<String>) -> Option<Vec<String>> {
     value.as_ref().map(|v| {
         v.split(',')
             .map(str::trim)
@@ -71,14 +70,24 @@ async fn index() -> Html<&'static str> {
 
 async fn api_graph(State(state): State<AppState>, Query(p): Query<GraphParams>) -> Json<Value> {
     let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
-    let (nodes, edges) = store.export_graph(20000).unwrap_or_default();
+    let node_kinds = csv_vec(&p.kinds);
+    let edge_kinds = csv_vec(&p.edges);
+    let limit = p.limit.unwrap_or(2000);
+    let (nodes, edges) = store
+        .export_filtered(node_kinds.as_deref(), edge_kinds.as_deref(), limit)
+        .unwrap_or_default();
     let ops = store.all_operations().unwrap_or_default();
-    let sel = stratograph_viz::Selection {
-        kinds: csv_set(&p.kinds),
-        edge_kinds: csv_set(&p.edges),
-        limit: p.limit.unwrap_or(2000),
-    };
-    let (nodes, edges) = stratograph_viz::select_graph(&nodes, &edges, &sel);
+    // Kinds were filtered in the query; `select_graph` only enforces the node
+    // cap and prunes edges to any node the cap dropped.
+    let (nodes, edges) = stratograph_viz::select_graph(
+        &nodes,
+        &edges,
+        &stratograph_viz::Selection {
+            kinds: None,
+            edge_kinds: None,
+            limit,
+        },
+    );
     Json(stratograph_viz::to_elements(&nodes, &edges, &ops, None))
 }
 
