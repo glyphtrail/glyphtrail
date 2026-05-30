@@ -23,7 +23,9 @@ pub use impact::{
     parse_confidence,
 };
 pub use lang::Language;
-pub use manifest::{CargoDependency, CargoPackage, DepKind, DepSource, parse_cargo_manifest};
+pub use manifest::{
+    CargoDependency, CargoPackage, DepKind, DepSource, parse_cargo_manifest, workspace_members,
+};
 pub use matcher::{ClientCall, Endpoint, Match, Matcher};
 pub use model::{CodeGraph, Confidence, Edge, EdgeKind, Node, NodeId, NodeKind, PendingLink, Span};
 pub use registry::{Registry, RegistryEntry, RepoHealth, default_registry_path};

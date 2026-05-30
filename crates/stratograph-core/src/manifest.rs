@@ -157,6 +157,28 @@ fn parse_dependency(key: &str, spec: &Value, kind: DepKind) -> CargoDependency {
     }
 }
 
+/// The workspace `members` entries declared in a manifest's `[workspace]`
+/// table, in declaration order. Each is a path or path glob (e.g. `crates/*`)
+/// relative to the manifest directory; expanding the globs against the
+/// filesystem is the caller's job. Empty when there is no `[workspace]` table.
+pub fn workspace_members(text: &str) -> Vec<String> {
+    let Ok(table) = toml::from_str::<toml::Table>(text) else {
+        return Vec::new();
+    };
+    table
+        .get("workspace")
+        .and_then(|w| w.get("members"))
+        .and_then(Value::as_array)
+        .map(|members| {
+            members
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,6 +289,17 @@ mod tests {
         check!(dep(&pkg, "runtime").kind == DepKind::Normal);
         check!(dep(&pkg, "testonly").kind == DepKind::Dev);
         check!(dep(&pkg, "builder").kind == DepKind::Build);
+    }
+
+    #[test]
+    fn reads_workspace_members() {
+        let text = "[workspace]\nmembers = [\"crates/*\", \"tools/cli\"]\n";
+        check!(workspace_members(text) == vec!["crates/*".to_string(), "tools/cli".to_string()]);
+    }
+
+    #[test]
+    fn no_workspace_table_yields_no_members() {
+        check!(workspace_members("[package]\nname = \"x\"\n").is_empty());
     }
 
     #[test]
