@@ -13,7 +13,7 @@ use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use lbug::{Connection, Database, SystemConfig, Value};
+use lbug::{Connection, Database, LogicalType, SystemConfig, Value};
 use meridian_core::{
     Adjacency, ClassifiedItem, Confidence, Direction, Edge, EdgeKind, ImpactPolicy, Node, NodeId,
     NodeKind, OperationKey, PendingLink, Span, classify, compute_impact, is_cross_boundary_path,
@@ -96,20 +96,13 @@ impl LadybugStore {
         Ok(rows)
     }
 
-    /// Prepare + execute one statement, attaching the query as error context.
-    fn exec(&self, conn: &Connection, cypher: &str, params: Vec<(&str, Value)>) -> Result<()> {
-        let mut st = conn.prepare(cypher).with_context(|| cypher.to_string())?;
-        conn.execute(&mut st, params)
-            .with_context(|| cypher.to_string())?;
-        Ok(())
-    }
-
-    /// Prepare `cypher` **once** and execute it for each parameter row, reusing
-    /// the statement — far faster than re-preparing per row, which dominated the
-    /// insert hot paths (#170). Only valid when the query text is identical for
-    /// every row (no inlined values) and each bound parameter keeps a consistent
-    /// type by name across rows, so lbug's param-type cache never collides.
-    fn exec_prepared(
+    /// Execute `cypher` **once** over all `rows` passed as a single `$rows`
+    /// LIST-of-STRUCT parameter, so the body runs server-side with
+    /// `UNWIND $rows AS r …`. This collapses thousands of per-row FFI executes
+    /// (and per-row query planning) into one call — the dominant cost of the
+    /// resolve phase (measured ~3ms/row → ~20-65x faster in bulk). Every row must
+    /// carry the same field set, in the same order, with consistent value types.
+    fn exec_unwind(
         &self,
         conn: &Connection,
         cypher: &str,
@@ -118,11 +111,15 @@ impl LadybugStore {
         if rows.is_empty() {
             return Ok(());
         }
+        let structs: Vec<Value> = rows
+            .into_iter()
+            .map(|r| Value::Struct(r.into_iter().map(|(k, v)| (k.to_string(), v)).collect()))
+            .collect();
+        let child: LogicalType = (&structs[0]).into();
+        let list = Value::List(child, structs);
         let mut st = conn.prepare(cypher).with_context(|| cypher.to_string())?;
-        for params in rows {
-            conn.execute(&mut st, params)
-                .with_context(|| cypher.to_string())?;
-        }
+        conn.execute(&mut st, vec![("rows", list)])
+            .with_context(|| cypher.to_string())?;
         Ok(())
     }
 
@@ -139,20 +136,6 @@ fn s(v: &str) -> Value {
     Value::String(v.to_string())
 }
 
-/// Open an explicit transaction so a batch of writes commits once instead of
-/// per-statement (lbug auto-commits each statement, one fsync each — #170).
-fn begin(conn: &Connection) -> Result<()> {
-    conn.query("BEGIN TRANSACTION")
-        .context("begin transaction")?;
-    Ok(())
-}
-
-/// Commit the transaction opened by [`begin`]. On an error path the `?` skips
-/// this and the open transaction is rolled back when the connection drops.
-fn commit(conn: &Connection) -> Result<()> {
-    conn.query("COMMIT").context("commit transaction")?;
-    Ok(())
-}
 fn get_str(row: &[Value], idx: usize) -> String {
     match row.get(idx) {
         Some(Value::String(s)) => s.clone(),
@@ -315,6 +298,27 @@ impl GraphStore for LadybugStore {
         Ok(())
     }
 
+    fn set_files(&mut self, files: &[(String, Option<String>, String)]) -> Result<()> {
+        // One UNWIND instead of a fresh connection + auto-commit per file (the
+        // per-file loop was the resolve phase's second-slowest stage).
+        let conn = self.conn()?;
+        let rows: Vec<Vec<(&str, Value)>> = files
+            .iter()
+            .map(|(path, language, hash)| {
+                vec![
+                    ("p", s(path)),
+                    ("l", s(language.as_deref().unwrap_or(""))),
+                    ("h", s(hash)),
+                ]
+            })
+            .collect();
+        self.exec_unwind(
+            &conn,
+            "UNWIND $rows AS r MERGE (f:File {path:r.p}) SET f.language=r.l, f.hash=r.h",
+            rows,
+        )
+    }
+
     fn delete_file_data(&mut self, path: &str) -> Result<()> {
         self.run(
             "MATCH (n:Node {file:$f}) DETACH DELETE n",
@@ -338,32 +342,26 @@ impl GraphStore for LadybugStore {
 
     fn insert_graph(&mut self, nodes: &[Node], edges: &[Edge]) -> Result<()> {
         let conn = self.conn()?;
-        // Batch all row writes into one transaction: lbug otherwise auto-commits
-        // (one fsync) per statement, which dominated insert time on a real repo
-        // (#170). One commit per call is roughly 2x faster.
-        begin(&conn)?;
-        for n in nodes {
-            let (sb, eb, sl, el) = n
-                .span
-                .map(|sp| {
-                    (
-                        sp.start_byte as i64,
-                        sp.end_byte as i64,
-                        sp.start_line as i64,
-                        sp.end_line as i64,
-                    )
-                })
-                .unwrap_or((-1, -1, -1, -1));
-            // Integer columns are inlined (not bound) so no INT64 parameter is
-            // ever created; see `lit`.
-            self.exec(
-                &conn,
-                &format!(
-                    "MERGE (n:Node {{id:$id}}) SET n.kind=$kind, n.name=$name, \
-                     n.qualified_name=$qn, n.file=$file, n.language=$lang, \
-                     n.start_byte={sb}, n.end_byte={eb}, n.start_line={sl}, \
-                     n.end_line={el}, n.doc=$doc"
-                ),
+        // Pass all rows as one `$rows` LIST-of-STRUCT param and let `UNWIND` drive
+        // the MERGE server-side: one FFI execute + one query plan for the whole
+        // batch instead of thousands of per-row crossings, which dominated the
+        // resolve phase (#170 batched into a txn; this removes the per-row cost
+        // itself). Integers ride inside the struct as INT64, so no top-level INT64
+        // parameter is ever created.
+        let node_rows: Vec<Vec<(&str, Value)>> = nodes
+            .iter()
+            .map(|n| {
+                let (sb, eb, sl, el) = n
+                    .span
+                    .map(|sp| {
+                        (
+                            sp.start_byte as i64,
+                            sp.end_byte as i64,
+                            sp.start_line as i64,
+                            sp.end_line as i64,
+                        )
+                    })
+                    .unwrap_or((-1, -1, -1, -1));
                 vec![
                     ("id", s(&n.id.0)),
                     ("kind", s(n.kind.as_str())),
@@ -371,12 +369,22 @@ impl GraphStore for LadybugStore {
                     ("qn", s(&n.qualified_name)),
                     ("file", s(&n.file)),
                     ("lang", s(n.language.as_deref().unwrap_or(""))),
+                    ("sb", Value::Int64(sb)),
+                    ("eb", Value::Int64(eb)),
+                    ("sl", Value::Int64(sl)),
+                    ("el", Value::Int64(el)),
                     ("doc", s(n.doc.as_deref().unwrap_or(""))),
-                ],
-            )?;
-        }
-        // The edge query text is constant and all params are strings, so prepare
-        // it once and execute per edge (#170). Edges dominate insert volume.
+                ]
+            })
+            .collect();
+        self.exec_unwind(
+            &conn,
+            "UNWIND $rows AS r MERGE (n:Node {id:r.id}) SET n.kind=r.kind, \
+             n.name=r.name, n.qualified_name=r.qn, n.file=r.file, n.language=r.lang, \
+             n.start_byte=r.sb, n.end_byte=r.eb, n.start_line=r.sl, n.end_line=r.el, \
+             n.doc=r.doc",
+            node_rows,
+        )?;
         let edge_rows: Vec<Vec<(&str, Value)>> = edges
             .iter()
             .map(|e| {
@@ -388,15 +396,14 @@ impl GraphStore for LadybugStore {
                 ]
             })
             .collect();
-        self.exec_prepared(
+        self.exec_unwind(
             &conn,
-            "MATCH (a:Node {id:$src}), (b:Node {id:$dst}) \
-             MERGE (a)-[e:Edge {kind:$ekind}]->(b) \
-             ON CREATE SET e.confidence=$conf \
-             ON MATCH SET e.confidence = CASE WHEN $conf = 'extracted' THEN 'extracted' ELSE e.confidence END",
+            "UNWIND $rows AS r MATCH (a:Node {id:r.src}), (b:Node {id:r.dst}) \
+             MERGE (a)-[e:Edge {kind:r.ekind}]->(b) \
+             ON CREATE SET e.confidence=r.conf \
+             ON MATCH SET e.confidence = CASE WHEN r.conf = 'extracted' THEN 'extracted' ELSE e.confidence END",
             edge_rows,
-        )?;
-        commit(&conn)
+        )
     }
 
     fn insert_operations(&mut self, ops: &[(NodeId, OperationKey)]) -> Result<()> {
@@ -413,42 +420,41 @@ impl GraphStore for LadybugStore {
                 ]
             })
             .collect();
-        begin(&conn)?;
-        self.exec_prepared(
+        self.exec_unwind(
             &conn,
-            "MERGE (o:ApiOp {node_id:$id}) SET o.protocol=$p, o.method=$m, o.path=$path, o.signature=$sig",
+            "UNWIND $rows AS r MERGE (o:ApiOp {node_id:r.id}) \
+             SET o.protocol=r.p, o.method=r.m, o.path=r.path, o.signature=r.sig",
             rows,
-        )?;
-        commit(&conn)
+        )
     }
 
     fn insert_pending(&mut self, links: &[PendingLink]) -> Result<()> {
         let conn = self.conn()?;
-        begin(&conn)?;
-        for l in links {
-            let rowid = format!(
-                "{}|{}|{}|{}",
-                l.anchor.0,
-                l.name,
-                l.kind.as_str(),
-                l.name_is_src
-            );
-            self.exec(
-                &conn,
-                &format!(
-                    "MERGE (p:Pending {{pk:$r}}) SET p.anchor=$a, p.name=$n, \
-                     p.kind=$k, p.name_is_src={}",
-                    l.name_is_src as i64
-                ),
+        let rows: Vec<Vec<(&str, Value)>> = links
+            .iter()
+            .map(|l| {
+                let rowid = format!(
+                    "{}|{}|{}|{}",
+                    l.anchor.0,
+                    l.name,
+                    l.kind.as_str(),
+                    l.name_is_src
+                );
                 vec![
                     ("r", s(&rowid)),
                     ("a", s(&l.anchor.0)),
                     ("n", s(&l.name)),
                     ("k", s(l.kind.as_str())),
-                ],
-            )?;
-        }
-        commit(&conn)
+                    ("nis", Value::Int64(l.name_is_src as i64)),
+                ]
+            })
+            .collect();
+        self.exec_unwind(
+            &conn,
+            "UNWIND $rows AS r MERGE (p:Pending {pk:r.r}) \
+             SET p.anchor=r.a, p.name=r.n, p.kind=r.k, p.name_is_src=r.nis",
+            rows,
+        )
     }
 
     fn insert_imports(&mut self, imports: &[(String, String, String)]) -> Result<()> {
@@ -458,20 +464,19 @@ impl GraphStore for LadybugStore {
             .map(|(importer, raw, language)| {
                 let rowid = format!("{importer}|{raw}|{language}");
                 vec![
-                    ("im_rowid", s(&rowid)),
-                    ("im_importer", s(importer)),
-                    ("im_raw", s(raw)),
-                    ("im_lang", s(language)),
+                    ("pk", s(&rowid)),
+                    ("importer", s(importer)),
+                    ("raw", s(raw)),
+                    ("lang", s(language)),
                 ]
             })
             .collect();
-        begin(&conn)?;
-        self.exec_prepared(
+        self.exec_unwind(
             &conn,
-            "MERGE (i:Import {pk:$im_rowid}) SET i.importer=$im_importer, i.raw=$im_raw, i.language=$im_lang",
+            "UNWIND $rows AS r MERGE (i:Import {pk:r.pk}) \
+             SET i.importer=r.importer, i.raw=r.raw, i.language=r.lang",
             rows,
-        )?;
-        commit(&conn)
+        )
     }
 
     fn delete_edges_by_confidence(&mut self, confidence: Confidence) -> Result<usize> {

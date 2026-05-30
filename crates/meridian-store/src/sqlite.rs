@@ -176,6 +176,27 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Stamp many file records in a single transaction (one prepared upsert
+    /// reused per row) instead of one auto-committed statement each.
+    pub fn set_files(&mut self, files: &[(String, Option<String>, String)]) -> Result<()> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO files(path, language, hash, indexed_at) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(path) DO UPDATE SET language=?2, hash=?3, indexed_at=?4",
+            )?;
+            for (path, language, hash) in files {
+                stmt.execute(params![path, language.as_deref(), hash, now])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Insert nodes and edges. Existing rows are merged (nodes by id, edges by
     /// (src,dst,kind)). On an edge conflict an `Extracted` row always wins over
     /// an `Inferred` one regardless of insertion order, so an inferred edge

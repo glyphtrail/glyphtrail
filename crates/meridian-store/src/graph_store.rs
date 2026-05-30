@@ -20,6 +20,15 @@ pub trait GraphStore: Adjacency {
     // --- write path (analyze) ---
     fn clear(&mut self) -> Result<()>;
     fn set_file(&mut self, path: &str, language: Option<&str>, hash: &str) -> Result<()>;
+    /// Stamp many file records at once. Backends override this to write them in a
+    /// single transaction; the default falls back to one [`Self::set_file`] per
+    /// row. Each tuple is `(path, language, content hash)`.
+    fn set_files(&mut self, files: &[(String, Option<String>, String)]) -> Result<()> {
+        for (path, language, hash) in files {
+            self.set_file(path, language.as_deref(), hash)?;
+        }
+        Ok(())
+    }
     fn delete_file_data(&mut self, path: &str) -> Result<()>;
     fn delete_nodes_by_kind(&mut self, kind: NodeKind) -> Result<()>;
     fn insert_graph(&mut self, nodes: &[Node], edges: &[Edge]) -> Result<()>;
@@ -75,6 +84,9 @@ impl GraphStore for SqliteStore {
     }
     fn set_file(&mut self, path: &str, language: Option<&str>, hash: &str) -> Result<()> {
         SqliteStore::set_file(self, path, language, hash)
+    }
+    fn set_files(&mut self, files: &[(String, Option<String>, String)]) -> Result<()> {
+        SqliteStore::set_files(self, files)
     }
     fn delete_file_data(&mut self, path: &str) -> Result<()> {
         SqliteStore::delete_file_data(self, path)
