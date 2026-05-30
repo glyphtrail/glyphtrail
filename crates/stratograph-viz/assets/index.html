@@ -42,12 +42,21 @@
   #summary .row { margin: 2px 0; }
   #summary .num { color: #f0c674; font-weight: bold; }
   #status { font-size: 12px; opacity: 0.7; }
+  #results {
+    position: fixed; top: 84px; left: 12px; width: 340px; max-height: 55vh; overflow: auto;
+    background: #161b22; border: 1px solid #333; border-radius: 6px; z-index: 11; display: none;
+  }
+  #results .r { padding: 6px 10px; cursor: pointer; border-bottom: 1px solid #21262d;
+    color: #c9d1d9; font-size: 12px; }
+  #results .r:last-child { border-bottom: none; }
+  #results .r:hover { background: #21262d; }
+  #results .r small { opacity: 0.6; }
 </style>
 </head>
 <body>
 <div id="toolbar">
   <strong>stratograph</strong>
-  <input id="filter" type="text" placeholder="filter by name…" />
+  <input id="filter" type="text" placeholder="search symbols…" />
   <select id="protoFilter" title="isolate an API protocol">
     <option value="">all protocols</option>
     <option value="rest">REST</option>
@@ -58,6 +67,7 @@
   <span class="group" id="edgeGroups"><span>edges</span></span>
   <span id="status"></span>
 </div>
+<div id="results"></div>
 <div id="cy"></div>
 <div id="summary"></div>
 <div id="info"></div>
@@ -139,10 +149,14 @@ function buildToggles(containerId, groups, offSet, onChange) {
     host.appendChild(lbl);
     boxes[name] = cb;
   }
-  // Flatten checked groups to the concrete kinds the server filters on.
-  return () => Object.entries(groups)
-    .filter(([name]) => boxes[name].checked)
-    .flatMap(([, kinds]) => kinds);
+  return {
+    // The concrete kinds the server filters on, from the checked groups.
+    kinds: () => Object.entries(groups)
+      .filter(([name]) => boxes[name].checked)
+      .flatMap(([, kinds]) => kinds),
+    // Group names currently unchecked, for persisting the selection.
+    offGroups: () => Object.keys(groups).filter((name) => !boxes[name].checked),
+  };
 }
 
 function setStatus(cy, note) {
@@ -268,11 +282,29 @@ async function expand(id) {
   }
 }
 
-// A static export is already a curated subgraph (e.g. an impact view), so show
-// every kind it contains; the trimmed defaults are only for the live serve graph.
+// Persist the toggle selection across reloads (serve mode only); a static
+// export is a fixed curated subgraph, so it always shows every kind it contains.
+const STORE_KEY = "stratograph-view-v1";
+let nodeT, edgeT;
+function loadSaved() {
+  try { return JSON.parse(localStorage.getItem(STORE_KEY)); } catch (_) { return null; }
+}
+function saveState() {
+  if (STATIC || !nodeT) return;
+  try {
+    localStorage.setItem(STORE_KEY,
+      JSON.stringify({ nodeOff: nodeT.offGroups(), edgeOff: edgeT.offGroups() }));
+  } catch (_) {}
+}
+const saved = STATIC ? null : loadSaved();
+const nodeOff = STATIC ? new Set() : new Set(saved?.nodeOff ?? [...NODE_OFF]);
+const edgeOff = STATIC ? new Set() : new Set(saved?.edgeOff ?? [...EDGE_OFF]);
 const onToggle = STATIC ? applyStaticFilter : reload;
-getNodeKinds = buildToggles("nodeGroups", NODE_GROUPS, STATIC ? new Set() : NODE_OFF, onToggle);
-getEdgeKinds = buildToggles("edgeGroups", EDGE_GROUPS, STATIC ? new Set() : EDGE_OFF, onToggle);
+const onChange = () => { saveState(); onToggle(); };
+nodeT = buildToggles("nodeGroups", NODE_GROUPS, nodeOff, onChange);
+edgeT = buildToggles("edgeGroups", EDGE_GROUPS, edgeOff, onChange);
+getNodeKinds = nodeT.kinds;
+getEdgeKinds = edgeT.kinds;
 
 // Initial render.
 if (STATIC) {
@@ -341,8 +373,8 @@ function apiLinks(n) {
   return h;
 }
 
-cy.on("tap", "node", (evt) => {
-  const n = evt.target;
+// Render the detail panel for a node and wire its expand button.
+function openDetail(n) {
   const d = n.data();
   const info = document.getElementById("info");
   info.style.display = "block";
@@ -357,7 +389,21 @@ cy.on("tap", "node", (evt) => {
     (d.doc ? "<pre>" + esc(d.doc) + "</pre>" : "");
   const btn = document.getElementById("expandBtn");
   if (btn) btn.addEventListener("click", () => expand(d.id));
-  cy.elements().removeClass("faded");
+}
+
+// Center and isolate `n`, fading the rest — shared by tap and search-to-seed.
+function focusNode(n) {
+  cy.$(":selected").unselect();
+  n.select();
+  cy.animate({ center: { eles: n }, zoom: Math.max(cy.zoom(), 1.2) }, { duration: 250 });
+  cy.elements().addClass("faded");
+  n.removeClass("faded");
+  n.neighborhood().removeClass("faded");
+}
+
+cy.on("tap", "node", (evt) => {
+  const n = evt.target;
+  openDetail(n);
   cy.elements().addClass("faded");
   n.removeClass("faded");
   n.neighborhood().removeClass("faded");
@@ -367,15 +413,60 @@ cy.on("tap", (evt) => { if (evt.target === cy) {
   document.getElementById("info").style.display = "none";
 }});
 
-document.getElementById("filter").addEventListener("input", (e) => {
-  const q = e.target.value.toLowerCase();
-  if (!q) { cy.elements().removeClass("faded"); return; }
-  cy.elements().addClass("faded");
-  const hit = cy.nodes().filter((n) =>
-    (n.data("label") || "").toLowerCase().includes(q) ||
-    (n.data("qualified_name") || "").toLowerCase().includes(q));
-  hit.removeClass("faded");
-  hit.neighborhood().removeClass("faded");
+const filterEl = document.getElementById("filter");
+const resultsEl = document.getElementById("results");
+const hideResults = () => { resultsEl.style.display = "none"; resultsEl.innerHTML = ""; };
+
+// Load a searched node (and its neighbours) into the graph, then center on it —
+// the "start from a symbol" entry point that complements the structural view.
+async function seedNode(id) {
+  await expand(id);
+  const n = cy.getElementById(id);
+  if (n.length) { focusNode(n); openDetail(n); }
+}
+
+// Server full-text search over the whole index (not just the loaded subgraph),
+// shown as a clickable dropdown of results.
+async function doSearch(q) {
+  let list;
+  try {
+    list = await (await fetch("/api/search?q=" + encodeURIComponent(q) + "&limit=12")).json();
+  } catch (_) { return; }
+  if (!Array.isArray(list) || !list.length) {
+    resultsEl.innerHTML = "<div class='r'><small>no matches</small></div>";
+    resultsEl.style.display = "block";
+    return;
+  }
+  resultsEl.innerHTML = list.map((n) =>
+    "<div class='r' data-id='" + esc(n.id) + "'>" + esc(n.name) +
+    " <small>" + esc(n.kind) + " · " + esc(n.file || "") +
+    (n.span ? ":" + esc(n.span.start_line) : "") + "</small></div>").join("");
+  resultsEl.style.display = "block";
+  resultsEl.querySelectorAll(".r[data-id]").forEach((el) =>
+    el.addEventListener("click", () => { hideResults(); seedNode(el.getAttribute("data-id")); }));
+}
+
+let searchTimer;
+filterEl.addEventListener("input", (e) => {
+  const q = e.target.value.trim();
+  if (STATIC) {
+    // No server: fall back to fading matches in the loaded graph.
+    const lq = q.toLowerCase();
+    if (!lq) { cy.elements().removeClass("faded"); return; }
+    cy.elements().addClass("faded");
+    const hit = cy.nodes().filter((n) =>
+      (n.data("label") || "").toLowerCase().includes(lq) ||
+      (n.data("qualified_name") || "").toLowerCase().includes(lq));
+    hit.removeClass("faded");
+    hit.neighborhood().removeClass("faded");
+    return;
+  }
+  clearTimeout(searchTimer);
+  if (q.length < 2) { hideResults(); return; }
+  searchTimer = setTimeout(() => doSearch(q), 200);
+});
+document.addEventListener("click", (e) => {
+  if (e.target !== filterEl && !resultsEl.contains(e.target)) hideResults();
 });
 
 document.getElementById("protoFilter").addEventListener("change", (e) => {
