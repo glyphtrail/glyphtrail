@@ -13,10 +13,11 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow, bail};
 use stratograph_core::config::RepoPaths;
 use stratograph_core::{
-    Adjacency, ClassifiedItem, Confidence, FederatedAdjacency, FederatedReport, Groups,
-    ImpactPolicy, META_EXTERNAL_USES, META_PACKAGES, NodeId, NodeKind, PackageIdentity, Registry,
-    RepoHealth, RepoIdentity, RepoImpact, classify, compute_impact, default_groups_path,
-    default_registry_path, is_cross_boundary_path, qualify, resolve_links, unqualify,
+    Adjacency, ClassifiedItem, Confidence, CrateLevelHit, FederatedAdjacency, FederatedReport,
+    Groups, ImpactPolicy, IndexedPackage, META_EXTERNAL_USES, META_PACKAGES, NodeId, NodeKind,
+    PackageIdentity, Registry, RepoHealth, RepoIdentity, RepoImpact, classify, compute_impact,
+    default_groups_path, default_registry_path, is_cross_boundary_path, qualify, resolve_links,
+    unqualify,
 };
 
 use crate::{ChangeSpec, GraphStore, LadybugStore, changed_files, seed_nodes};
@@ -44,6 +45,17 @@ fn is_symbol_node(kind: NodeKind) -> bool {
         kind,
         NodeKind::Repo | NodeKind::Directory | NodeKind::File | NodeKind::Comment
     )
+}
+
+/// The package that owns `file`: the one whose directory is the longest matching
+/// prefix (an empty dir is the repo root, matching anything but losing to a
+/// deeper dir). Returns the package name.
+fn owning_package<'a>(packages: &'a [IndexedPackage], file: &str) -> Option<&'a str> {
+    packages
+        .iter()
+        .filter(|p| p.dir.is_empty() || file == p.dir || file.starts_with(&format!("{}/", p.dir)))
+        .max_by_key(|p| p.dir.len())
+        .map(|p| p.package.name.as_str())
 }
 
 /// Compute the cross-repo blast radius: seed in the repo at `current_root` and
@@ -133,18 +145,54 @@ pub fn federated_impact(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    // Origin packages each seed belongs to, for crate-level propagation (#237):
+    // a crate-level consumer of one of these packages is flagged as potentially
+    // affected even though no specific symbol resolved.
+    let origin_packages: &[IndexedPackage] = identities
+        .iter()
+        .find(|r| r.repo == current)
+        .map(|r| r.identity.packages.as_slice())
+        .unwrap_or(&[]);
+    let mut seed_packages: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for seed in &local_seeds {
+        if let Some(node) = current_store.get_node(&seed.0)?
+            && let Some(pkg) = owning_package(origin_packages, &node.file)
+        {
+            seed_packages.insert(pkg.to_string());
+        }
+    }
+
     let mut cross: HashMap<NodeId, Vec<(NodeId, Confidence)>> = HashMap::new();
+    let mut crate_level: Vec<CrateLevelHit> = Vec::new();
     for link in resolve_links(&identities) {
-        let (Some(node_id), Some(consumer)) = (&link.to_node, stores.get(&link.from_repo)) else {
-            continue; // crate-level links carry no producer node to seed from
-        };
-        let producer = qualify(&link.to_repo, &NodeId(node_id.clone()));
-        for node in consumer.nodes_in_file(&link.from_file)? {
-            if is_symbol_node(node.kind) {
-                cross
-                    .entry(producer.clone())
-                    .or_default()
-                    .push((qualify(&link.from_repo, &node.id), Confidence::Inferred));
+        match &link.to_node {
+            // Symbol-level link: add a cross-edge from the producer export to the
+            // consumer's symbols in the importing file.
+            Some(node_id) => {
+                let Some(consumer) = stores.get(&link.from_repo) else {
+                    continue;
+                };
+                let producer = qualify(&link.to_repo, &NodeId(node_id.clone()));
+                for node in consumer.nodes_in_file(&link.from_file)? {
+                    if is_symbol_node(node.kind) {
+                        cross
+                            .entry(producer.clone())
+                            .or_default()
+                            .push((qualify(&link.from_repo, &node.id), Confidence::Inferred));
+                    }
+                }
+            }
+            // Crate-level link (unresolved symbol): flag the consumer when it
+            // depends on a producer package the seeds actually touch.
+            None => {
+                if link.to_repo == current && seed_packages.contains(&link.to_package) {
+                    crate_level.push(CrateLevelHit {
+                        repo: link.from_repo.clone(),
+                        package: link.from_package.clone(),
+                        file: link.from_file.clone(),
+                        via: link.to_package.clone(),
+                    });
+                }
             }
         }
     }
@@ -194,5 +242,5 @@ pub fn federated_impact(
             items,
         })
         .collect();
-    Ok(FederatedReport::new(repos))
+    Ok(FederatedReport::new(repos, crate_level))
 }
