@@ -759,9 +759,24 @@ fn external_uses(
             .find(|d| dep_matches_import(pkg.ecosystem, &d.code_name, &raw))
         {
             // Cargo names the symbol in the path; .NET supplies candidate symbols
-            // (and their use-site nodes) from the file's unresolved references.
+            // (and their use-site nodes) from the file. Candidates are the
+            // PascalCase identifiers the file references (C# types and methods,
+            // covering type-only uses the call-based pending refs miss) plus the
+            // unresolved-reference names; the link step keeps only those matching
+            // a producer export. Use-sites are the unresolved-reference anchors
+            // (precise where there are calls; file-level otherwise).
             let (from_nodes, symbols) = match pkg.ecosystem {
-                Ecosystem::Dotnet => unresolved.get(&file).cloned().unwrap_or_default(),
+                Ecosystem::Dotnet => {
+                    let (anchors, mut names) = unresolved.get(&file).cloned().unwrap_or_default();
+                    let bytes = sources
+                        .entry(file.clone())
+                        .or_insert_with(|| std::fs::read(root.join(&file)).ok());
+                    let mut symbols = pascal_case_idents(bytes.as_deref().unwrap_or(&[]));
+                    symbols.append(&mut names);
+                    symbols.sort();
+                    symbols.dedup();
+                    (anchors, symbols)
+                }
                 _ => (
                     use_site_nodes(store, root, &file, &raw, &mut sources)?,
                     Vec::new(),
@@ -783,6 +798,33 @@ fn external_uses(
     });
     uses.dedup();
     Ok(uses)
+}
+
+/// Distinct PascalCase identifiers in `src` — a C# convention for type and
+/// method names, so this captures the producer symbols a consumer references
+/// (including type-only uses that aren't calls). Over-broad on purpose: the link
+/// step keeps only those that match a referenced package's exports, and comment/
+/// string noise simply matches nothing. Identifiers are `[A-Z][A-Za-z0-9_]+`.
+fn pascal_case_idents(src: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(src);
+    let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut cur = String::new();
+    let flush = |cur: &mut String, set: &mut std::collections::BTreeSet<String>| {
+        if cur.len() >= 2 && cur.starts_with(|c: char| c.is_ascii_uppercase()) {
+            set.insert(std::mem::take(cur));
+        } else {
+            cur.clear();
+        }
+    };
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            cur.push(ch);
+        } else {
+            flush(&mut cur, &mut set);
+        }
+    }
+    flush(&mut cur, &mut set);
+    set.into_iter().collect()
 }
 
 /// File → (use-site node ids, referenced symbol names) of its pending refs.
@@ -965,7 +1007,9 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// by [`analysis_revision`], so this is only for logic the queries don't encode.
 /// 2: .NET/NuGet package identity (`.csproj` publishes + `using`/PackageReference
 /// consumes), so existing indexes re-analyze to gain cross-repo .NET links.
-const ANALYSIS_REVISION: u32 = 2;
+/// 3: .NET symbol-level candidates from referenced PascalCase identifiers (type
+/// uses, not just calls), so cross-repo .NET links resolve to symbols and chain.
+const ANALYSIS_REVISION: u32 = 3;
 
 /// Fingerprint of everything that determines analysis output: the crate
 /// version, the manual revision counter, and the built-in tree-sitter query
@@ -2231,12 +2275,13 @@ mod tests {
             .iter()
             .find(|u| u.ecosystem == Ecosystem::Dotnet && u.package == "Acme.Core")
             .unwrap_or_else(|| panic!("expected Acme.Core external use, got {uses:?}"));
-        // Symbol-level: the file's unresolved references (the `new CoreThing()` /
-        // `t.Process()` calls) become candidate symbols + use-sites, so the link
-        // step can land on a producer export rather than only the package.
+        // Symbol-level: the referenced type `CoreThing` becomes a candidate
+        // symbol (type uses, not just calls), so the link step can land on a
+        // producer export rather than only the package.
         check!(
-            !core.symbols.is_empty(),
-            "expected candidate symbols from unresolved refs, got {core:?}"
+            core.symbols.contains(&"CoreThing".to_string()),
+            "expected CoreThing candidate symbol, got {:?}",
+            core.symbols
         );
         check!(!core.from_nodes.is_empty());
         std::fs::remove_dir_all(&dir).ok();
