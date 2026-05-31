@@ -157,6 +157,19 @@ plus a Codeberg mirror) all resolve to the same repo. Two kinds, recorded at
 Numeric ids are entirely opt-in: with no token (and no `gh`), only the slug ids
 are recorded. Tokens are read from the environment and never logged.
 
+For tokens under a non-standard env var, or self-hosted Gitea/GitLab/Forgejo
+instances the tool can't recognise by host, map them in
+`~/.stratograph/forge.toml`:
+
+```toml
+[hosts."codeberg.org"]
+token_env = "CODEBERG_READ_ONLY_PAT"   # use this var instead of CODEBERG_TOKEN
+
+[hosts."git.example.com"]
+kind = "gitea"                          # github | gitlab | gitea
+token_env = "EXAMPLE_TOKEN"
+```
+
 ## Languages
 
 Coverage is driven by a tree-sitter grammar registry. Built in:

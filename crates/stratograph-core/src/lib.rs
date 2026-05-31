@@ -4,6 +4,7 @@ pub mod api;
 pub mod config;
 pub mod error;
 pub mod federated;
+pub mod forge_config;
 pub mod groups;
 pub mod identity;
 pub mod impact;
@@ -23,6 +24,7 @@ pub use api::{
 pub use config::{ApiConfig, Config, DynamicLanguage, SchemaFormat, SchemaSource};
 pub use error::{CoreError, Result};
 pub use federated::{FederatedAdjacency, qualify, unqualify};
+pub use forge_config::{ForgeConfig, ForgeHost, ForgeKind, default_forge_config_path};
 pub use groups::{Group, Groups, default_groups_path};
 pub use identity::{
     Ecosystem, ExternalUse, IndexedPackage, META_EXTERNAL_USES, META_PACKAGES, PackageExport,
