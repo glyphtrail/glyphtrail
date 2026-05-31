@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use stratograph_core::config::{IGNORE_FILE, RepoPaths};
+use stratograph_core::config::{IGNORE_FILE, INDEX_DIR, RepoPaths};
 use stratograph_core::{
     CargoPackage, ClientCall, CodeGraph, Confidence, Config, DynamicLanguage, Ecosystem, Edge,
     EdgeKind, Endpoint, ExternalUse, IndexedPackage, Language, META_EXTERNAL_USES, META_PACKAGES,
@@ -832,6 +832,47 @@ fn analysis_revision() -> String {
     hasher.finalize().to_hex()[..16].to_string()
 }
 
+/// The repo's current `HEAD` commit, or `None` when `root` isn't a git
+/// checkout, git is unavailable, or there are no commits yet. Best-effort: any
+/// failure just disables the commit short-circuit (#273), falling back to the
+/// content-hash fast path.
+fn git_head_commit(root: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!head.is_empty()).then_some(head)
+}
+
+/// Whether the git working tree at `root` is clean (no modified, staged, or
+/// untracked-non-ignored files), **disregarding our own `.stratograph/` index
+/// dir** — analyze creates it inside the repo, so it shows as untracked unless
+/// the repo gitignores it, and it must not count as a change. Only a clean tree
+/// lets the commit short-circuit trust that `HEAD` describes what's on disk.
+/// Non-git or any failure reports `false` (don't trust).
+fn git_tree_clean(root: &Path) -> bool {
+    let Some(out) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+    else {
+        return false;
+    };
+    // Each porcelain line is `XY <path>`; the path starts at column 3. The tree
+    // is clean if every reported entry is within the index dir we manage.
+    String::from_utf8_lossy(&out.stdout).lines().all(|line| {
+        let path = line.get(3..).unwrap_or("").trim_start_matches('"');
+        path.is_empty() || path == INDEX_DIR || path.starts_with(&format!("{INDEX_DIR}/"))
+    })
+}
+
 pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
     let root = path
         .canonicalize()
@@ -839,6 +880,36 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
     let paths = RepoPaths::new(&root);
     paths.ensure_index_dir()?;
     let mut store = backend::open(&paths)?;
+
+    // Commit short-circuit (#273): when the repo is a clean git checkout sitting
+    // on the same HEAD it was last analyzed at — and the analysis logic is
+    // unchanged — nothing can have changed, so skip even discovery. This is
+    // cheaper than the content-hash fast path below (two `git` calls vs walking
+    // and hashing every file), which matters when bulk-scanning many repos. A
+    // dirty tree or non-git repo falls through to the content-hash path. The
+    // stored `head_commit` is only trusted because it's written solely after a
+    // clean-tree analysis (see the write path below).
+    let revision = analysis_revision();
+    let head_commit = git_head_commit(&root);
+    let tree_clean = head_commit.is_some() && git_tree_clean(&root);
+    if let Some(head) = &head_commit
+        && tree_clean
+        && store.get_meta("head_commit")?.as_deref() == Some(head.as_str())
+        && store.get_meta("analysis_revision")?.as_deref() == Some(revision.as_str())
+    {
+        tracing::info!(
+            "HEAD {} unchanged since last analysis; skipping",
+            &head[..8.min(head.len())]
+        );
+        let stats = store.stats()?;
+        return Ok(AnalyzeOutcome {
+            up_to_date: true,
+            files: stats.files,
+            nodes: stats.nodes,
+            edges: stats.edges,
+            languages: stats.languages,
+        });
+    }
 
     let cfg = Config::load(&root)?;
     let files = discover(
@@ -872,7 +943,6 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
     // captures the crate version, the query sources, and a manual revision
     // counter, so a change to the *extraction logic* — not just a release —
     // forces a rebuild even on an unchanged tree.
-    let revision = analysis_revision();
     let current_set: std::collections::BTreeSet<(String, String)> = files
         .iter()
         .map(|f| (f.rel_path.clone(), f.hash.clone()))
@@ -1309,6 +1379,14 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
 
     store.set_meta("tool_version", VERSION)?;
     store.set_meta("analysis_revision", &revision)?;
+    // Record HEAD for the commit short-circuit (#273) only when the tree was
+    // clean, so a later run at this commit can trust the index matches it. If
+    // the tree was dirty (or non-git), store an empty sentinel so the
+    // short-circuit can't fire against this dirty-or-unknown state.
+    match (&head_commit, tree_clean) {
+        (Some(head), true) => store.set_meta("head_commit", head)?,
+        _ => store.set_meta("head_commit", "")?,
+    }
     // Resolve the export index from the now-complete graph and persist the full
     // package identity (#220). Read-only borrow ends before the meta write.
     let indexed = index_packages(&*store, &discovered)?;
@@ -1561,6 +1639,51 @@ mod tests {
         let rels: Vec<&str> = found.iter().map(|f| f.rel_path.as_str()).collect();
         check!(rels == ["main.rs"], "expected only main.rs, got {rels:?}");
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(ok, "git {args:?} failed");
+    }
+
+    // #273: a clean git checkout on an unchanged HEAD short-circuits to
+    // "up to date"; a new commit busts it; a dirty tree never short-circuits.
+    #[test]
+    fn commit_short_circuit_tracks_head_and_dirtiness() {
+        let dir = temp_repo("commit-sc");
+        git(&dir, &["init", "-q"]);
+        git(&dir, &["config", "user.email", "t@example.com"]);
+        git(&dir, &["config", "user.name", "Test"]);
+        std::fs::write(dir.join("a.rs"), "fn a() {}\n").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "init"]);
+
+        check!(!run(&dir, false).unwrap().up_to_date); // first build
+        check!(run(&dir, false).unwrap().up_to_date); // clean + same HEAD -> skip
+
+        // HEAD is recorded so the next run can trust it.
+        let head = git_head_commit(&dir).unwrap();
+        let store = LadybugStore::open(&RepoPaths::new(&dir).index_dir.join("ladybug")).unwrap();
+        check!(store.get_meta("head_commit").unwrap().as_deref() == Some(head.as_str()));
+        drop(store);
+
+        // A new commit moves HEAD -> re-index, then stable again.
+        std::fs::write(dir.join("a.rs"), "fn a() {}\nfn b() {}\n").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "more"]);
+        check!(!run(&dir, false).unwrap().up_to_date); // HEAD moved
+        check!(run(&dir, false).unwrap().up_to_date); // stable at new HEAD
+
+        // A dirty tree at the recorded HEAD must not short-circuit.
+        std::fs::write(dir.join("a.rs"), "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();
+        check!(!run(&dir, false).unwrap().up_to_date); // dirty content -> re-index
         std::fs::remove_dir_all(&dir).ok();
     }
 
