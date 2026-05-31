@@ -4,3 +4,4 @@ graph.html
 # Default output dirs/files of the wiki and story commands.
 /wiki/
 /STORY.md
+.env

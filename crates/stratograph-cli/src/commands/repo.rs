@@ -1,8 +1,9 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Subcommand;
-use stratograph_core::{Registry, RepoHealth, default_registry_path};
+use stratograph_core::{Registry, RepoHealth, default_registry_path, repo_ids};
 
 #[derive(Subcommand)]
 pub enum RepoCmd {
@@ -108,13 +109,24 @@ pub fn run(cmd: RepoCmd) -> Result<()> {
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_else(|| "repo".into())
             });
-            let added = Registry::mutate(&path, |reg| reg.add(name.clone(), root.clone()))?;
+            // Stable forge identities from the repo's git remotes (#233), so the
+            // same repo is recognisable across renames, clones, and name
+            // collisions, and mirrors all resolve to one repo.
+            let ids = repo_ids(&git_remote_urls(&root));
+            let added = Registry::mutate(&path, |reg| {
+                let added = reg.add(name.clone(), root.clone());
+                reg.set_ids(&name, ids.clone());
+                added
+            })?;
             println!(
                 "{} '{}' -> {}",
                 if added { "registered" } else { "updated" },
                 name,
                 root.display()
             );
+            for id in &ids {
+                println!("  id {} ({})", id.id, id.source);
+            }
         }
         RepoCmd::List => {
             let registry = Registry::mutate(&path, |reg| {
@@ -133,6 +145,9 @@ pub fn run(cmd: RepoCmd) -> Result<()> {
                     }
                 };
                 println!("{:<20} {}{}", e.name, e.root.display(), note);
+                for id in &e.ids {
+                    println!("{:<20} ↳ {}", "", id.source);
+                }
             }
         }
         RepoCmd::Remove { name } => {
@@ -157,6 +172,47 @@ pub fn run(cmd: RepoCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The URLs of a repo's git remotes, de-duplicated. Best-effort: a non-git
+/// directory or any git failure yields no URLs (the repo just gets no stable
+/// ids — its name stays the handle).
+fn git_remote_urls(root: &Path) -> Vec<String> {
+    let remotes = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .arg("remote")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let mut urls = Vec::new();
+    for name in remotes {
+        if let Some(out) = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .arg("remote")
+            .arg("get-url")
+            .arg(&name)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+        {
+            let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !url.is_empty() && !urls.contains(&url) {
+                urls.push(url);
+            }
+        }
+    }
+    urls
 }
 
 /// Render how long an entry has been missing, e.g. ` for 5d`. Empty when the
