@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod commands;
+mod ui;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
@@ -158,7 +159,9 @@ fn main() -> anyhow::Result<()> {
             if all {
                 commands::repo::analyze_all(update)
             } else {
+                let started = std::time::Instant::now();
                 let outcome = commands::analyze::run(&path, update)?;
+                let elapsed = started.elapsed();
                 if outcome.ignored {
                     println!(
                         "Skipped: {} is excluded by ~/.glyphtrailignore.",
@@ -166,26 +169,48 @@ fn main() -> anyhow::Result<()> {
                     );
                     return Ok(());
                 }
-                if outcome.up_to_date {
-                    println!(
-                        "Index up to date ({} files); nothing changed.",
-                        outcome.files
-                    );
+                if ui::pretty() {
+                    // glyphtrail.dev styling for humans.
+                    if outcome.up_to_date {
+                        println!(
+                            "  {} files · {} symbols · {} edges",
+                            ui::count(outcome.files),
+                            ui::count(outcome.nodes),
+                            ui::count(outcome.edges)
+                        );
+                        println!("  ✓ up to date in {}", ui::duration(elapsed));
+                    } else {
+                        println!(
+                            "  parsed {} files · {} symbols · {} edges",
+                            ui::count(outcome.files),
+                            ui::count(outcome.nodes),
+                            ui::count(outcome.edges)
+                        );
+                        println!("  ✓ graph ready in {}", ui::duration(elapsed));
+                    }
                 } else {
-                    println!(
-                        "Indexed {} files: {} nodes, {} edges",
-                        outcome.files, outcome.nodes, outcome.edges
-                    );
-                }
-                if !outcome.languages.is_empty() {
-                    println!(
-                        "Languages: {}",
-                        commands::status::format_languages(&outcome.languages)
-                    );
-                }
-                // Hint (read-only): onboarding files are written only by `setup`.
-                if !path.join(".claude/skills/glyphtrail/SKILL.md").exists() {
-                    println!("Tip: run `glyphtrail setup` to onboard coding agents (MCP/CLI).");
+                    // Plain, parse-friendly output for agents/scripts.
+                    if outcome.up_to_date {
+                        println!(
+                            "Index up to date ({} files); nothing changed.",
+                            outcome.files
+                        );
+                    } else {
+                        println!(
+                            "Indexed {} files: {} nodes, {} edges",
+                            outcome.files, outcome.nodes, outcome.edges
+                        );
+                    }
+                    if !outcome.languages.is_empty() {
+                        println!(
+                            "Languages: {}",
+                            commands::status::format_languages(&outcome.languages)
+                        );
+                    }
+                    // Hint (read-only): onboarding files are written only by `setup`.
+                    if !path.join(".claude/skills/glyphtrail/SKILL.md").exists() {
+                        println!("Tip: run `glyphtrail setup` to onboard coding agents (MCP/CLI).");
+                    }
                 }
                 Ok(())
             }

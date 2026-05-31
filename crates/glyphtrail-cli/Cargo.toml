@@ -12,6 +12,7 @@ name = "glyphtrail"
 path = "src/main.rs"
 
 [dependencies]
+detect-coding-agent.workspace = true
 glyphtrail-core.workspace = true
 glyphtrail-forge-id.workspace = true
 glyphtrail-parse.workspace = true
