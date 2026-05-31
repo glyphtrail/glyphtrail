@@ -103,6 +103,12 @@ enum Command {
         /// Repository root (defaults to the current directory).
         #[arg(default_value = ".")]
         path: PathBuf,
+        /// Write the files even when `path` is not inside a git repository.
+        #[arg(long)]
+        force: bool,
+        /// Write global agent files to the user's home directory instead of `path`.
+        #[arg(long)]
+        home: bool,
     },
     /// Manage the global repository registry (~/.stratograph/registry.json).
     Repo {
@@ -214,7 +220,7 @@ fn main() -> anyhow::Result<()> {
         Command::Wiki(args) => commands::wiki::run(args),
         Command::Story(args) => commands::story::run(args),
         Command::Mcp { repo } => stratograph_mcp::serve_stdio(repo),
-        Command::Setup { path } => commands::setup::run(&path),
+        Command::Setup { path, force, home } => commands::setup::run(&path, force, home),
         Command::Repo { cmd } => commands::repo::run(cmd),
         Command::Group { cmd } => commands::group::run(cmd),
         Command::Status {

@@ -9,11 +9,16 @@
 //! markers and is replaced in place on re-run, and it carries no stats — so it
 //! doesn't dirty the files on every commit (a pitfall of similar tools). Run by
 //! the user explicitly; `analyze` never modifies repo files, it only hints.
+//!
+//! Safe outside a repo (#245): writing agent files into a random directory is
+//! usually a mistake, so a target that isn't inside a git repository errors —
+//! unless `--force` (write here anyway) or `--home` (write the global agent
+//! files to the user's home directory) is given.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 
 const BEGIN: &str = "<!-- stratograph:begin (managed section — edits are overwritten) -->";
 const END: &str = "<!-- stratograph:end -->";
@@ -78,25 +83,65 @@ stratograph MCP server (`stratograph mcp`) or CLI rather than `ls`/`grep`:
 
 See `.claude/skills/stratograph/SKILL.md` for details."#;
 
-/// Onboard the repo at `root`: write the skill, upsert the managed section in
-/// `CLAUDE.md`/`AGENTS.md`, and ignore `.stratograph/`. Idempotent.
-pub fn run(root: &Path) -> Result<()> {
-    let root = root
-        .canonicalize()
-        .with_context(|| format!("cannot resolve path {}", root.display()))?;
+/// Onboard agents: write the skill, upsert the managed section in
+/// `CLAUDE.md`/`AGENTS.md`, and (inside a repo) ignore `.stratograph/`.
+/// Idempotent.
+///
+/// `home` targets the user's home directory (global agent config) instead of
+/// `path`. Otherwise, when `path` is not inside a git repository, this errors
+/// unless `force` is set — so the files don't land in a random directory by
+/// mistake.
+pub fn run(path: &Path, force: bool, home: bool) -> Result<()> {
+    let target = if home {
+        home_dir()
+            .ok_or_else(|| anyhow!("cannot locate home directory (set HOME or USERPROFILE)"))?
+    } else {
+        path.canonicalize()
+            .with_context(|| format!("cannot resolve path {}", path.display()))?
+    };
 
-    write_skill(&root)?;
-    println!("wrote .claude/skills/stratograph/SKILL.md");
-
-    for name in ["CLAUDE.md", "AGENTS.md"] {
-        let created = upsert_section(&root.join(name))?;
-        println!("{} {name}", if created { "created" } else { "updated" });
+    let in_repo = in_git_repo(&target);
+    if !home && !force && !in_repo {
+        bail!(
+            "{} is not inside a git repository.\n  \
+             Run setup inside a repo, or pass --force to write here anyway, \
+             or --home to write global agent files to your home directory.",
+            target.display()
+        );
     }
 
-    if ensure_gitignore(&root)? {
+    write_skill(&target)?;
+    println!(
+        "wrote {}",
+        target.join(".claude/skills/stratograph/SKILL.md").display()
+    );
+
+    for name in ["CLAUDE.md", "AGENTS.md"] {
+        let created = upsert_section(&target.join(name))?;
+        println!(
+            "{} {}",
+            if created { "created" } else { "updated" },
+            target.join(name).display()
+        );
+    }
+
+    // `.gitignore` only makes sense inside a repository.
+    if in_repo && ensure_gitignore(&target)? {
         println!("added .stratograph/ to .gitignore");
     }
     Ok(())
+}
+
+/// Whether `path` is inside a git repository (it or an ancestor has `.git`).
+fn in_git_repo(path: &Path) -> bool {
+    path.ancestors().any(|p| p.join(".git").exists())
+}
+
+/// The user's home directory from `HOME` (or `USERPROFILE` on Windows).
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
 }
 
 fn write_skill(root: &Path) -> Result<()> {
@@ -177,10 +222,11 @@ mod tests {
     #[test]
     fn setup_writes_files_and_is_idempotent() {
         let dir = temp_dir("idem");
+        std::fs::create_dir_all(dir.join(".git")).unwrap(); // make it a repo
         std::fs::write(dir.join("CLAUDE.md"), "# My project\n\nNotes.\n").unwrap();
         std::fs::write(dir.join(".gitignore"), "target/\n").unwrap();
 
-        run(&dir).unwrap();
+        run(&dir, false, false).unwrap();
         let claude1 = std::fs::read_to_string(dir.join("CLAUDE.md")).unwrap();
         check!(claude1.starts_with("# My project")); // preserved existing content
         check!(claude1.contains(BEGIN) && claude1.contains("Code graph (stratograph)"));
@@ -198,12 +244,28 @@ mod tests {
         check!(gi.contains("target/") && gi.contains(".stratograph/"));
 
         // Re-run: no duplication.
-        run(&dir).unwrap();
+        run(&dir, false, false).unwrap();
         let claude2 = std::fs::read_to_string(dir.join("CLAUDE.md")).unwrap();
         check!(claude2 == claude1);
         check!(claude2.matches(BEGIN).count() == 1);
         let gi2 = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
         check!(gi2.matches(".stratograph/").count() == 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // #245: outside a git repo, setup errors by default but `--force` writes
+    // anyway (and skips the repo-only .gitignore step).
+    #[test]
+    fn setup_outside_repo_errors_unless_forced() {
+        let dir = temp_dir("no-repo"); // no .git
+        check!(run(&dir, false, false).is_err());
+        check!(!dir.join("CLAUDE.md").exists()); // nothing written on error
+
+        run(&dir, true, false).unwrap(); // --force
+        check!(dir.join(".claude/skills/stratograph/SKILL.md").exists());
+        check!(dir.join("CLAUDE.md").exists());
+        check!(!dir.join(".gitignore").exists()); // not a repo -> no gitignore
 
         std::fs::remove_dir_all(&dir).ok();
     }
