@@ -171,21 +171,29 @@ fn main() -> anyhow::Result<()> {
                 }
                 if ui::pretty() {
                     // glyphtrail.dev styling for humans.
+                    let verb = if outcome.up_to_date {
+                        "  "
+                    } else {
+                        "  parsed "
+                    };
+                    println!(
+                        "{verb}{} files · {} symbols · {} edges",
+                        ui::count(outcome.files),
+                        ui::count(outcome.nodes),
+                        ui::count(outcome.edges)
+                    );
+                    if !outcome.languages.is_empty() {
+                        let langs = outcome
+                            .languages
+                            .iter()
+                            .map(|(lang, n)| format!("{lang} {}", ui::count(*n)))
+                            .collect::<Vec<_>>()
+                            .join(" · ");
+                        println!("  {langs}");
+                    }
                     if outcome.up_to_date {
-                        println!(
-                            "  {} files · {} symbols · {} edges",
-                            ui::count(outcome.files),
-                            ui::count(outcome.nodes),
-                            ui::count(outcome.edges)
-                        );
                         println!("  ✓ up to date in {}", ui::duration(elapsed));
                     } else {
-                        println!(
-                            "  parsed {} files · {} symbols · {} edges",
-                            ui::count(outcome.files),
-                            ui::count(outcome.nodes),
-                            ui::count(outcome.edges)
-                        );
                         println!("  ✓ graph ready in {}", ui::duration(elapsed));
                     }
                 } else {
