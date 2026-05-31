@@ -39,6 +39,13 @@ pub trait GraphStore: Adjacency {
     fn delete_file_data(&mut self, path: &str) -> Result<()>;
     fn delete_nodes_by_kind(&mut self, kind: NodeKind) -> Result<()>;
     fn insert_graph(&mut self, nodes: &[Node], edges: &[Edge]) -> Result<()>;
+    /// Insert nodes. `fresh` signals a full rebuild against a just-cleared store
+    /// with a primary-key-unique node set, letting a backend bulk-load (avoiding
+    /// a per-row MERGE that can't use the id index). The default merges.
+    fn insert_nodes(&mut self, nodes: &[Node], fresh: bool) -> Result<()> {
+        let _ = fresh;
+        self.insert_graph(nodes, &[])
+    }
     /// Insert edges. `fresh` signals a full rebuild against a just-cleared store
     /// with a de-duplicated edge set, letting a backend skip MERGE's per-edge
     /// existence check (which goes quadratic on high-degree hub nodes). The

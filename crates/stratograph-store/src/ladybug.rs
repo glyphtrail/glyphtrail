@@ -167,15 +167,75 @@ impl LadybugStore {
             .collect())
     }
 
-    /// Bulk-load `edges` via `COPY Edge FROM <csv>`. Kùzu maps the first two CSV
-    /// columns to the FROM/TO node primary keys through the PK index (O(n)),
-    /// rather than the per-row node scan a property-`MATCH` from `UNWIND` does.
-    /// The CSV is a temp file, removed after; fields are quoted/escaped so any
-    /// id is safe. COPY appends, so it can run once per edge batch/pass.
-    fn copy_edges(&self, edges: &[Edge]) -> Result<()> {
-        if edges.is_empty() {
+    /// Bulk-load CSV `body` into `table` via `COPY <table> FROM <tmpfile>`. Kùzu
+    /// uses the optimized loader (hash-join on the primary key, O(n)) instead of
+    /// the per-row node scan a property-`MATCH` from `UNWIND` does in this
+    /// engine. The CSV is a temp file, removed after. COPY appends, so it can run
+    /// once per batch/pass; the caller must pass primary-key-unique rows.
+    fn copy_into(&self, table: &str, body: String) -> Result<()> {
+        if body.is_empty() {
             return Ok(());
         }
+        // Unique temp path per call (multiple COPYs run within one analysis).
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "stratograph-copy-{table}-{}-{seq}.csv",
+            std::process::id()
+        ));
+        std::fs::write(&path, body)?;
+        // PARALLEL=FALSE: a quoted field may contain a newline (e.g. a multi-line
+        // doc comment), which the parallel CSV reader rejects. Serial parsing is
+        // still O(n) and far faster than the per-row MERGE this replaces.
+        let result = self
+            .conn()?
+            .query(&format!(
+                "COPY {table} FROM '{}' (PARALLEL=FALSE)",
+                path.display()
+            ))
+            .map(|_| ())
+            .with_context(|| format!("COPY {table} FROM {}", path.display()));
+        let _ = std::fs::remove_file(&path);
+        result
+    }
+
+    /// Bulk-load nodes (CSV columns match the `Node` table order). The caller
+    /// guarantees primary-key-unique `nodes` — COPY rejects a duplicate id.
+    fn copy_nodes(&self, nodes: &[Node]) -> Result<()> {
+        let mut csv = String::with_capacity(nodes.len() * 96);
+        for n in nodes {
+            let (sb, eb, sl, el) = n
+                .span
+                .map(|s| {
+                    (
+                        s.start_byte as i64,
+                        s.end_byte as i64,
+                        s.start_line as i64,
+                        s.end_line as i64,
+                    )
+                })
+                .unwrap_or((-1, -1, -1, -1));
+            csv.push_str(&csv_field(&n.id.0));
+            csv.push(',');
+            csv.push_str(&csv_field(n.kind.as_str()));
+            csv.push(',');
+            csv.push_str(&csv_field(&n.name));
+            csv.push(',');
+            csv.push_str(&csv_field(&n.qualified_name));
+            csv.push(',');
+            csv.push_str(&csv_field(&n.file));
+            csv.push(',');
+            csv.push_str(&csv_field(n.language.as_deref().unwrap_or("")));
+            csv.push_str(&format!(",{sb},{eb},{sl},{el},"));
+            csv.push_str(&csv_field(n.doc.as_deref().unwrap_or("")));
+            csv.push('\n');
+        }
+        self.copy_into("Node", csv)
+    }
+
+    /// Bulk-load edges (CSV columns match the `Edge` rel table: from-pk, to-pk,
+    /// kind, confidence). The caller guarantees `(src, dst, kind)`-unique edges.
+    fn copy_edges(&self, edges: &[Edge]) -> Result<()> {
         let mut csv = String::with_capacity(edges.len() * 48);
         for e in edges {
             csv.push_str(&csv_field(&e.src.0));
@@ -187,21 +247,7 @@ impl LadybugStore {
             csv.push_str(&csv_field(e.confidence.as_str()));
             csv.push('\n');
         }
-        // Unique temp path per call (multiple COPYs run within one analysis).
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "stratograph-edges-{}-{seq}.csv",
-            std::process::id()
-        ));
-        std::fs::write(&path, csv)?;
-        let result = self
-            .conn()?
-            .query(&format!("COPY Edge FROM '{}'", path.display()))
-            .map(|_| ())
-            .with_context(|| format!("COPY Edge FROM {}", path.display()));
-        let _ = std::fs::remove_file(&path);
-        result
+        self.copy_into("Edge", csv)
     }
 }
 
@@ -495,6 +541,18 @@ impl GraphStore for LadybugStore {
             node_rows,
         )?;
         self.exec_unwind(&conn, MERGE_EDGES, edge_rows(edges))
+    }
+
+    fn insert_nodes(&mut self, nodes: &[Node], fresh: bool) -> Result<()> {
+        // Same story as edges: `MERGE (n:Node {id})` from UNWIND does NOT use the
+        // primary-key index in this engine, so it scans the node table per row —
+        // O(nodes²) on a large repo. A fresh rebuild gets a pk-unique node set, so
+        // bulk-load via COPY (hash-loaded on the pk, O(n)). Updates MERGE.
+        if fresh {
+            self.copy_nodes(nodes)
+        } else {
+            self.insert_graph(nodes, &[])
+        }
     }
 
     fn insert_edges(&mut self, edges: &[Edge], fresh: bool) -> Result<()> {
@@ -997,6 +1055,34 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("stratograph-lbug-{tag}-{nanos}"))
+    }
+
+    // Fresh-build bulk load (COPY) must survive special characters in fields —
+    // newlines (multi-line doc comments), commas and quotes — round-tripping
+    // intact. This is why COPY runs with PARALLEL=FALSE + RFC4180 quoting.
+    #[test]
+    fn copy_nodes_and_edges_preserve_special_chars() {
+        let dir = tmp_dir("copy-special");
+        let mut lb = LadybugStore::open(&dir).unwrap();
+        let mut a = node("a", "na,me\"x");
+        a.doc = Some("first line\n\"quoted, comma\"\nthird line".into());
+        let b = node("b", "b");
+        lb.insert_nodes(&[a.clone(), b.clone()], true).unwrap();
+        let edge = Edge {
+            src: NodeId("a".into()),
+            dst: NodeId("b".into()),
+            kind: EdgeKind::Calls,
+            confidence: Confidence::Extracted,
+        };
+        lb.insert_edges(&[edge], true).unwrap();
+
+        let got = lb.get_node("a").unwrap().unwrap();
+        check!(got.name == a.name);
+        check!(got.doc == a.doc);
+        let neighbors = lb.neighbors("a", None, true).unwrap();
+        check!(neighbors.len() == 1);
+        check!(neighbors[0].0.id == NodeId("b".into()));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
