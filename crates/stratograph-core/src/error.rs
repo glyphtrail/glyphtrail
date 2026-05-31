@@ -33,6 +33,8 @@ pub enum CoreError {
         #[source]
         source: Box<toml::de::Error>,
     },
+    #[error("could not lock {path}: {message}")]
+    Lock { path: PathBuf, message: String },
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;

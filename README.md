@@ -173,6 +173,26 @@ kind = "gitea"                          # github | gitlab | gitea
 token_env = "EXAMPLE_TOKEN"
 ```
 
+### Concurrent writes and recovery
+
+The registry (`~/.stratograph/registry.json`) and groups files are updated under
+a portable lock file (`registry.lock`) that works on network / FUSE / sync
+filesystems (e.g. pCloud), where OS advisory locks (`flock`) are unreliable and
+can leave a *permanent* lock when a writer dies. The lock self-heals: a lock
+held by a dead process on this host, or one older than a couple of minutes, is
+stolen automatically on the next run, so a crashed `repo add` never wedges the
+registry.
+
+If the lock is genuinely busy (another `repo add` is mid-write), `repo add`
+**doesn't fail or block** — it writes the entry to a spillover file
+(`registry.spill.*.json`) beside the registry, and the next run that holds the
+lock merges it in. Spillovers are written atomically (temp + rename), so a
+reader never sees a half-written file. This makes bulk registration (indexing
+many repos at once) loss-proof even on a slow or contended drive.
+
+As a manual escape hatch, `stratograph repo unlock` force-releases the lock. It
+is rarely needed given the self-healing above, and only removes the lock file.
+
 ## Languages
 
 Coverage is driven by a tree-sitter grammar registry. Built in:

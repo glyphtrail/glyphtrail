@@ -10,7 +10,6 @@
 
 use std::path::{Path, PathBuf};
 
-use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::{CoreError, Result};
@@ -61,28 +60,21 @@ impl Groups {
         Ok(())
     }
 
-    /// Serialize a load → modify → save cycle under an exclusive advisory lock on
-    /// a sibling `groups.lock`, so concurrent writers can't lose an update
-    /// (mirrors [`crate::Registry::mutate`], #129). Returns the closure's value.
+    /// Serialize a load → modify → save cycle under the portable file lock on a
+    /// sibling `groups.lock`, so concurrent writers can't lose an update
+    /// (mirrors [`crate::Registry::mutate`], #129). The lock works on
+    /// network/FUSE filesystems and self-heals a stale lock (see
+    /// [`crate::filelock`]). Returns the closure's value.
     pub fn mutate<R>(path: &Path, f: impl FnOnce(&mut Groups) -> R) -> Result<R> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let lock_path = path.with_extension("lock");
-        let lock = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)?;
-        FileExt::lock_exclusive(&lock)?;
-        let outcome = (|| {
+        crate::filelock::with_lock(&crate::registry::lock_path(path), || {
             let mut groups = Groups::load(path)?;
             let value = f(&mut groups);
             groups.save(path)?;
             Ok(value)
-        })();
-        let _ = FileExt::unlock(&lock);
-        outcome
+        })
     }
 
     /// Add `repos` to the group named `name`, creating it if absent. Repo names

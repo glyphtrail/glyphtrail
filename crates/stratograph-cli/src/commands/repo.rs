@@ -3,7 +3,10 @@ use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Subcommand;
-use stratograph_core::{Registry, RepoHealth, default_registry_path, repo_ids};
+use stratograph_core::{
+    RecordOutcome, Registry, RegistryEntry, RepoHealth, default_registry_path, filelock, lock_path,
+    repo_ids,
+};
 use stratograph_forge_id::{ForgeConfig, forge_numeric_ids};
 
 #[derive(Subcommand)]
@@ -27,6 +30,11 @@ pub enum RepoCmd {
         #[arg(long, default_value_t = 30)]
         older_than_days: u64,
     },
+    /// Force-release a stuck registry lock (escape hatch for a lock left by a
+    /// dead writer on a network/FUSE filesystem). Safe: only removes the lock
+    /// file; the registry self-heals stale locks automatically, so this is
+    /// rarely needed.
+    Unlock,
 }
 
 fn registry_path() -> Result<PathBuf> {
@@ -124,17 +132,28 @@ pub fn run(cmd: RepoCmd) -> Result<()> {
                     ids.push(numeric);
                 }
             }
-            let added = Registry::mutate(&path, |reg| {
-                let added = reg.add(name.clone(), root.clone());
-                reg.set_ids(&name, ids.clone());
-                added
-            })?;
-            println!(
-                "{} '{}' -> {}",
-                if added { "registered" } else { "updated" },
-                name,
-                root.display()
-            );
+            // Loss-proof write: applies under the lock, or defers to a spillover
+            // file when the lock is busy (a later run merges it in) instead of
+            // failing — important when indexing many repos on a slow/contended
+            // network filesystem.
+            let entry = RegistryEntry {
+                name: name.clone(),
+                root: root.clone(),
+                missing_since: None,
+                ids: ids.clone(),
+            };
+            match Registry::record(&path, vec![entry])? {
+                RecordOutcome::Applied => {
+                    println!("registered '{}' -> {}", name, root.display());
+                }
+                RecordOutcome::Spilled => {
+                    println!(
+                        "registry busy; queued '{}' -> {} (merged on the next run)",
+                        name,
+                        root.display()
+                    );
+                }
+            }
             for id in &ids {
                 println!("  id {} ({})", id.id, id.source);
             }
@@ -181,6 +200,10 @@ pub fn run(cmd: RepoCmd) -> Result<()> {
                 }
             }
         }
+        RepoCmd::Unlock => match filelock::force_unlock(&lock_path(&path))? {
+            Some(desc) => println!("released registry lock ({desc})"),
+            None => println!("no registry lock held"),
+        },
     }
     Ok(())
 }

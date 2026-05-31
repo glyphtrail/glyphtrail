@@ -4,6 +4,7 @@ pub mod api;
 pub mod config;
 pub mod error;
 pub mod federated;
+pub mod filelock;
 pub mod groups;
 pub mod identity;
 pub mod impact;
@@ -39,7 +40,9 @@ pub use manifest::{
 };
 pub use matcher::{ClientCall, Endpoint, Match, Matcher};
 pub use model::{CodeGraph, Confidence, Edge, EdgeKind, Node, NodeId, NodeKind, PendingLink, Span};
-pub use registry::{Registry, RegistryEntry, RepoHealth, default_registry_path};
+pub use registry::{
+    RecordOutcome, Registry, RegistryEntry, RepoHealth, default_registry_path, lock_path,
+};
 pub use rewrite::{PrefixRewrite, RewriteCandidate, RewriteEngine};
 pub use scrub::scrub_secrets;
 pub use stratograph_forge_id::{
