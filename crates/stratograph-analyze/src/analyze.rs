@@ -805,6 +805,10 @@ fn expand_member(root: &Path, pattern: &str) -> Vec<PathBuf> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalyzeOutcome {
     pub up_to_date: bool,
+    /// The repo was skipped because its path is excluded by the user-wide
+    /// ignore file (#269); nothing was analyzed.
+    #[serde(default)]
+    pub ignored: bool,
     pub files: usize,
     pub nodes: usize,
     pub edges: usize,
@@ -839,11 +843,56 @@ fn analysis_revision() -> String {
     hasher.finalize().to_hex()[..16].to_string()
 }
 
-/// Path of the optional user-wide ignore file (#269): `~/.stratograph/ignore`,
-/// a sibling of the registry. Gitignore-format patterns here apply to every
-/// repo analyzed, which is convenient when bulk-indexing a whole work tree.
+/// Path of the optional user-wide ignore file (#269): `~/.stratographignore`,
+/// the home-level counterpart of a repo's `.stratographignore`. It serves two
+/// roles: gitignore-format patterns apply to every repo's file walk, and a line
+/// that is an absolute (or `~`) path excludes that whole repo/tree from
+/// analysis (see [`excluded_trees`]) — handy when bulk-indexing a work tree but
+/// skipping a few giant repos.
 fn user_ignore_path() -> Option<PathBuf> {
-    stratograph_core::default_registry_path().map(|p| p.with_file_name("ignore"))
+    // `~/.stratograph/registry.json` -> `~/.stratographignore`.
+    stratograph_core::default_registry_path()
+        .and_then(|p| p.parent().map(|d| d.with_file_name(".stratographignore")))
+}
+
+/// Absolute directory paths listed in the user-wide ignore file, each excluding
+/// itself and everything under it from analysis (#269). Lines are gitignore
+/// patterns *except* those starting with `/` or `~`, which are taken as
+/// filesystem paths. Best-effort: canonicalized when they exist.
+fn excluded_trees(user_ignore: Option<&Path>) -> Vec<PathBuf> {
+    let Some(text) = user_ignore.and_then(|p| std::fs::read_to_string(p).ok()) else {
+        return Vec::new();
+    };
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| {
+            let path = if let Some(rest) = l.strip_prefix("~/") {
+                home.as_ref()?.join(rest)
+            } else if l.starts_with('/') {
+                PathBuf::from(l)
+            } else {
+                return None; // a relative gitignore pattern, not a tree exclusion
+            };
+            Some(path.canonicalize().unwrap_or(path))
+        })
+        .collect()
+}
+
+/// Whether `root` is excluded by the user-wide ignore: equal to, or nested
+/// under, one of its path entries (#269).
+fn is_excluded(root: &Path, trees: &[PathBuf]) -> bool {
+    trees.iter().any(|t| root == t || root.starts_with(t))
+}
+
+/// Whether `path` is excluded by `~/.stratographignore` (#269): it is, or is
+/// under, a path listed there. Lets `repo scan` skip an excluded repo without
+/// analyzing it. Canonicalizes `path` to match the canonicalized exclusions.
+pub fn is_path_excluded(path: &Path) -> bool {
+    let canonical = path.canonicalize();
+    let root = canonical.as_deref().unwrap_or(path);
+    is_excluded(root, &excluded_trees(user_ignore_path().as_deref()))
 }
 
 /// The repo's current `HEAD` commit, or `None` when `root` isn't a git
@@ -891,6 +940,25 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
     let root = path
         .canonicalize()
         .with_context(|| format!("cannot resolve path {}", path.display()))?;
+
+    // User-wide exclusions (#269): skip a repo (or any path under it) listed in
+    // ~/.stratographignore before touching it — so analyzing a subfolder of an
+    // excluded giant repo does nothing rather than indexing it.
+    if is_excluded(&root, &excluded_trees(user_ignore_path().as_deref())) {
+        tracing::info!(
+            "{} is excluded by ~/.stratographignore; skipping",
+            root.display()
+        );
+        return Ok(AnalyzeOutcome {
+            up_to_date: false,
+            ignored: true,
+            files: 0,
+            nodes: 0,
+            edges: 0,
+            languages: Vec::new(),
+        });
+    }
+
     let paths = RepoPaths::new(&root);
     paths.ensure_index_dir()?;
     let mut store = backend::open(&paths)?;
@@ -918,6 +986,7 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
         let stats = store.stats()?;
         return Ok(AnalyzeOutcome {
             up_to_date: true,
+            ignored: false,
             files: stats.files,
             nodes: stats.nodes,
             edges: stats.edges,
@@ -972,6 +1041,7 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
         let stats = store.stats()?;
         return Ok(AnalyzeOutcome {
             up_to_date: true,
+            ignored: false,
             files: stats.files,
             nodes: stats.nodes,
             edges: stats.edges,
@@ -1427,6 +1497,7 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
     let stats = store.stats()?;
     Ok(AnalyzeOutcome {
         up_to_date: false,
+        ignored: false,
         files: stats.files,
         nodes: stats.nodes,
         edges: stats.edges,
@@ -1684,6 +1755,26 @@ mod tests {
         let found = discover(&dir, &[], &[], false, None).unwrap();
         check!(found.len() == 2);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // #269: an absolute-path line excludes that tree (and everything under it);
+    // gitignore patterns and comments are not tree exclusions.
+    #[test]
+    fn excluded_trees_takes_only_path_lines() {
+        let dir = temp_repo("excl-trees");
+        let f = dir.join("ignore");
+        std::fs::write(&f, "# a comment\n/abs/big-repo\n*.lock\nrel/dir\n").unwrap();
+        check!(excluded_trees(Some(&f)) == vec![PathBuf::from("/abs/big-repo")]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn is_excluded_matches_path_and_descendants_only() {
+        let trees = vec![PathBuf::from("/work/big")];
+        check!(is_excluded(Path::new("/work/big"), &trees));
+        check!(is_excluded(Path::new("/work/big/sub/dir"), &trees));
+        check!(!is_excluded(Path::new("/work/other"), &trees));
+        check!(!is_excluded(Path::new("/work/big-2"), &trees)); // not a component prefix
     }
 
     fn git(dir: &std::path::Path, args: &[&str]) {

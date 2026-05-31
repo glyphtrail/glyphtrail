@@ -159,6 +159,13 @@ fn main() -> anyhow::Result<()> {
                 commands::repo::analyze_all(update)
             } else {
                 let outcome = commands::analyze::run(&path, update)?;
+                if outcome.ignored {
+                    println!(
+                        "Skipped: {} is excluded by ~/.stratographignore.",
+                        path.display()
+                    );
+                    return Ok(());
+                }
                 if outcome.up_to_date {
                     println!(
                         "Index up to date ({} files); nothing changed.",
