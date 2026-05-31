@@ -895,6 +895,38 @@ pub fn is_path_excluded(path: &Path) -> bool {
     is_excluded(root, &excluded_trees(user_ignore_path().as_deref()))
 }
 
+/// An edge's identity in the graph model: one edge per `(src, dst, kind)`.
+type EdgeKey = (String, String, EdgeKind);
+fn edge_key(e: &Edge) -> EdgeKey {
+    (e.src.0.clone(), e.dst.0.clone(), e.kind)
+}
+
+/// Persist `edges`, avoiding MERGE's per-edge existence scan on a full rebuild —
+/// that scan grows with a node's degree and stalls on a high-degree hub in a
+/// large repo (#282, extended to the resolve-phase inserts here). On a `fresh`
+/// build the store holds exactly the keys in `seen` (seeded from the extracted
+/// edges), so CREATE only the keys not yet seen and record them; an edge whose
+/// key already exists is a no-op (MERGE wouldn't have changed it, since the
+/// resolve passes never raise an existing edge's confidence). An incremental
+/// update keeps MERGE (the in-memory `seen` can't see edges already on disk).
+fn persist_edges<S: GraphStore + ?Sized>(
+    store: &mut S,
+    seen: &mut std::collections::HashSet<EdgeKey>,
+    edges: &[Edge],
+    fresh: bool,
+) -> Result<()> {
+    if fresh {
+        let new: Vec<Edge> = edges
+            .iter()
+            .filter(|e| seen.insert(edge_key(e)))
+            .cloned()
+            .collect();
+        store.insert_edges(&new, true)
+    } else {
+        store.insert_edges(edges, false)
+    }
+}
+
 /// The repo's current `HEAD` commit, or `None` when `root` isn't a git
 /// checkout, git is unavailable, or there are no commits yet. Best-effort: any
 /// failure just disables the commit short-circuit (#273), falling back to the
@@ -1343,7 +1375,7 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
             })
         })
         .collect();
-    store.insert_graph(&[], &inferred)?;
+    persist_edges(&mut *store, &mut seen, &inferred, fresh)?;
     resolve_progress.inc(1);
 
     // Rebuild IMPORTS edges from the resolved import set: real file targets
@@ -1384,7 +1416,8 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
             }
         }
     }
-    store.insert_graph(&import_nodes, &import_edges)?;
+    store.insert_graph(&import_nodes, &[])?;
+    persist_edges(&mut *store, &mut seen, &import_edges, fresh)?;
     resolve_progress.inc(1);
 
     // Cross-boundary linking: resolve client calls and schema operations
@@ -1426,7 +1459,7 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
         kind: EdgeKind::Exposes,
         confidence: m.confidence,
     }));
-    store.insert_graph(&[], &edges)?;
+    persist_edges(&mut *store, &mut seen, &edges, fresh)?;
     resolve_progress.inc(1);
 
     // Cross-file router-variable MOUNTS (#167): a synthetic `Router` node whose
@@ -1447,7 +1480,7 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
             })
         })
         .collect();
-    store.insert_graph(&[], &router_edges)?;
+    persist_edges(&mut *store, &mut seen, &router_edges, fresh)?;
     resolve_progress.inc(1);
 
     // Stamp the per-file hashes for the changed set in one batch so the next
