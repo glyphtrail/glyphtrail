@@ -111,8 +111,15 @@ pub fn run(cmd: RepoCmd) -> Result<()> {
             });
             // Stable forge identities from the repo's git remotes (#233), so the
             // same repo is recognisable across renames, clones, and name
-            // collisions, and mirrors all resolve to one repo.
-            let ids = repo_ids(&git_remote_urls(&root));
+            // collisions, and mirrors all resolve to one repo. Slug ids always;
+            // forge-API numeric ids (rename-proof) added when a token is present.
+            let remotes = git_remote_urls(&root);
+            let mut ids = repo_ids(&remotes);
+            for numeric in super::forge::forge_numeric_ids(&remotes) {
+                if !ids.iter().any(|i| i.id == numeric.id) {
+                    ids.push(numeric);
+                }
+            }
             let added = Registry::mutate(&path, |reg| {
                 let added = reg.add(name.clone(), root.clone());
                 reg.set_ids(&name, ids.clone());

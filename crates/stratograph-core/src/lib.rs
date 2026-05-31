@@ -41,6 +41,6 @@ pub use manifest::{
 pub use matcher::{ClientCall, Endpoint, Match, Matcher};
 pub use model::{CodeGraph, Confidence, Edge, EdgeKind, Node, NodeId, NodeKind, PendingLink, Span};
 pub use registry::{Registry, RegistryEntry, RepoHealth, default_registry_path};
-pub use repo_id::{RepoId, canonicalize_remote, repo_ids, repo_uuid};
+pub use repo_id::{RepoId, canonicalize_remote, forge_numeric_repo_id, repo_ids, repo_uuid};
 pub use rewrite::{PrefixRewrite, RewriteCandidate, RewriteEngine};
 pub use scrub::scrub_secrets;
