@@ -4,6 +4,7 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Subcommand;
 use stratograph_core::{Registry, RepoHealth, default_registry_path, repo_ids};
+use stratograph_forge_id::{ForgeConfig, forge_numeric_ids};
 
 #[derive(Subcommand)]
 pub enum RepoCmd {
@@ -115,7 +116,10 @@ pub fn run(cmd: RepoCmd) -> Result<()> {
             // forge-API numeric ids (rename-proof) added when a token is present.
             let remotes = git_remote_urls(&root);
             let mut ids = repo_ids(&remotes);
-            for numeric in super::forge::forge_numeric_ids(&remotes) {
+            // Forge-API numeric ids (rename-proof), using the forge token map at
+            // ~/.stratograph/forge.toml (sibling of the registry) when present.
+            let forge_config = ForgeConfig::load_or_default(&path.with_file_name("forge.toml"));
+            for numeric in forge_numeric_ids(&remotes, &forge_config) {
                 if !ids.iter().any(|i| i.id == numeric.id) {
                     ids.push(numeric);
                 }

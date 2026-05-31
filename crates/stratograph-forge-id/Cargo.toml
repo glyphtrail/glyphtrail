@@ -1,5 +1,6 @@
 [package]
-name = "stratograph-core"
+name = "stratograph-forge-id"
+description = "Stable repository identities from git forge remotes: canonical slug + UUIDv5, plus optional forge-API numeric ids (GitHub/GitLab/Gitea-Forgejo)."
 version.workspace = true
 authors.workspace = true
 rust-version.workspace = true
@@ -10,11 +11,10 @@ repository.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
-blake3.workspace = true
 toml.workspace = true
-stratograph-forge-id.workspace = true
-fs4 = { version = "0.13", features = ["sync"] }
+thiserror.workspace = true
+uuid.workspace = true
+ureq.workspace = true
 
 [dev-dependencies]
 assert2.workspace = true

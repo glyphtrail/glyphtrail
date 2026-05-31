@@ -1542,6 +1542,7 @@ dependencies = [
  "serde_norway",
  "stratograph-analyze",
  "stratograph-core",
+ "stratograph-forge-id",
  "stratograph-mcp",
  "stratograph-parse",
  "stratograph-server",
@@ -1562,8 +1563,21 @@ dependencies = [
  "fs4 0.13.1",
  "serde",
  "serde_json",
+ "stratograph-forge-id",
  "thiserror",
  "toml",
+]
+
+[[package]]
+name = "stratograph-forge-id"
+version = "0.1.0"
+dependencies = [
+ "assert2",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "toml",
+ "ureq",
  "uuid",
 ]
 

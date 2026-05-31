@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 stratograph-core.workspace = true
+stratograph-forge-id.workspace = true
 stratograph-parse.workspace = true
 stratograph-store.workspace = true
 stratograph-analyze.workspace = true

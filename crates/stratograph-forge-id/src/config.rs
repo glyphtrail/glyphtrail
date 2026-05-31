@@ -1,11 +1,11 @@
-//! Forge token configuration (#233), stored at `~/.stratograph/forge.toml`.
+//! Forge token configuration: a host → token-env / forge-kind mapping.
 //!
-//! The forge-API numeric-id resolver recognises the public forges by host
+//! The [`crate::api`] numeric-id resolver recognises the public forges by host
 //! (github.com, gitlab.com, codeberg.org) and reads well-known token env vars.
 //! This config layers on top: it maps an arbitrary host to the env var holding
-//! its token (so a token under a non-standard name, like `CODEBERG_READ_ONLY_PAT`,
-//! is usable without aliasing) and — for self-hosted instances the tool can't
-//! recognise by host — declares the forge `kind`.
+//! its token (so a token under a non-standard name is usable without aliasing)
+//! and — for self-hosted instances the tool can't recognise by host — declares
+//! the forge `kind`.
 //!
 //! ```toml
 //! [hosts."codeberg.org"]
@@ -16,15 +16,15 @@
 //! token_env = "EXAMPLE_TOKEN"
 //! ```
 //!
-//! Pure: this only loads the mapping. Resolving the env var and making the API
-//! call is the caller's job (the core stays process- and network-free).
+//! This only loads the mapping from a TOML file the caller chooses; resolving
+//! env vars and making the API call is the resolver's job.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{CoreError, Result};
+use crate::error::ForgeIdError;
 
 /// A recognised forge API flavour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,7 +45,7 @@ pub struct ForgeHost {
     pub token_env: Option<String>,
 }
 
-/// Host → forge configuration, read from `~/.stratograph/forge.toml`.
+/// Host → forge configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForgeConfig {
     #[serde(default)]
@@ -54,37 +54,33 @@ pub struct ForgeConfig {
 
 impl ForgeConfig {
     /// Load the config from `path`, returning an empty config when the file is
-    /// absent. A malformed file is an error.
-    pub fn load(path: &Path) -> Result<ForgeConfig> {
+    /// absent. A malformed file is an error. The host application decides where
+    /// the file lives and may treat any error as empty (a best-effort load).
+    pub fn load(path: &Path) -> Result<ForgeConfig, ForgeIdError> {
         match std::fs::read_to_string(path) {
-            Ok(text) => toml::from_str(&text).map_err(|source| CoreError::ConfigParse {
+            Ok(text) => toml::from_str(&text).map_err(|source| ForgeIdError::Parse {
                 path: path.to_path_buf(),
                 source: Box::new(source),
             }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ForgeConfig::default()),
-            Err(e) => Err(CoreError::Io(e)),
+            Err(source) => Err(ForgeIdError::Read {
+                path: path.to_path_buf(),
+                source,
+            }),
         }
     }
 
-    /// Load from the default path, treating a missing path or any read/parse
-    /// failure as an empty config — the resolver then falls back to built-in
-    /// host recognition + well-known env vars.
-    pub fn load_default() -> ForgeConfig {
-        default_forge_config_path()
-            .and_then(|p| ForgeConfig::load(&p).ok())
-            .unwrap_or_default()
+    /// Load from `path`, treating a missing/garbled file as an empty config —
+    /// the resolver then falls back to built-in host recognition + well-known
+    /// env vars.
+    pub fn load_or_default(path: &Path) -> ForgeConfig {
+        ForgeConfig::load(path).unwrap_or_default()
     }
 
     /// Configuration for `host`, if any.
     pub fn for_host(&self, host: &str) -> Option<&ForgeHost> {
         self.hosts.get(host)
     }
-}
-
-/// The default forge-config path, `~/.stratograph/forge.toml`.
-pub fn default_forge_config_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-    Some(PathBuf::from(home).join(".stratograph").join("forge.toml"))
 }
 
 #[cfg(test)]

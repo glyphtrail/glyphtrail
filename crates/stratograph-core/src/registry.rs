@@ -10,8 +10,7 @@ use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::config::RepoPaths;
-use crate::repo_id::RepoId;
-use crate::{CoreError, Result};
+use crate::{CoreError, RepoId, Result};
 
 /// Liveness of a registered repository on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -300,7 +299,7 @@ mod tests {
     // independent of its registry name.
     #[test]
     fn find_by_id_matches_any_forge_id() {
-        use crate::repo_id::RepoId;
+        use crate::RepoId;
         let mut reg = Registry::default();
         reg.add("strato".into(), PathBuf::from("/a"));
         reg.set_ids(

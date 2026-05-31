@@ -4,6 +4,7 @@ members = [
     "crates/stratograph-core",
     "crates/stratograph-parse",
     "crates/stratograph-store",
+    "crates/stratograph-forge-id",
     "crates/stratograph-analyze",
     "crates/stratograph-viz",
     "crates/stratograph-server",
@@ -23,12 +24,14 @@ repository = "https://github.com/sunsided/stratograph"
 stratograph-core = { path = "crates/stratograph-core" }
 stratograph-parse = { path = "crates/stratograph-parse" }
 stratograph-store = { path = "crates/stratograph-store" }
+stratograph-forge-id = { path = "crates/stratograph-forge-id" }
 stratograph-analyze = { path = "crates/stratograph-analyze" }
 stratograph-viz = { path = "crates/stratograph-viz" }
 stratograph-server = { path = "crates/stratograph-server" }
 stratograph-mcp = { path = "crates/stratograph-mcp" }
 
 uuid = { version = "1", features = ["v5"] }
+ureq = { version = "2", features = ["json"] }
 
 anyhow = "1"
 thiserror = "2"
