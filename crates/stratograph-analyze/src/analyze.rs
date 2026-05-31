@@ -741,6 +741,13 @@ fn external_uses(
             .max_by_key(|p| p.dir.len())
     };
 
+    // A C# `using` names a namespace, not a symbol, so symbol-level matching
+    // can't read the consumed types off the import path. Instead use the file's
+    // *unresolved* references (pending links) as candidate symbols + their
+    // anchor nodes as use-sites; the link step keeps only those that match a
+    // producer's exports. Built once, keyed by file.
+    let unresolved = unresolved_refs_by_file(store)?;
+
     // Cache file source bytes so a file imported by several deps is read once.
     let mut sources: HashMap<String, Option<Vec<u8>>> = HashMap::new();
     let mut uses = Vec::new();
@@ -751,7 +758,15 @@ fn external_uses(
             .iter()
             .find(|d| dep_matches_import(pkg.ecosystem, &d.code_name, &raw))
         {
-            let from_nodes = use_site_nodes(store, root, &file, &raw, &mut sources)?;
+            // Cargo names the symbol in the path; .NET supplies candidate symbols
+            // (and their use-site nodes) from the file's unresolved references.
+            let (from_nodes, symbols) = match pkg.ecosystem {
+                Ecosystem::Dotnet => unresolved.get(&file).cloned().unwrap_or_default(),
+                _ => (
+                    use_site_nodes(store, root, &file, &raw, &mut sources)?,
+                    Vec::new(),
+                ),
+            };
             uses.push(ExternalUse {
                 ecosystem: pkg.ecosystem,
                 from_package: pkg.name.clone(),
@@ -759,6 +774,7 @@ fn external_uses(
                 package: dep.name.clone(),
                 path: raw,
                 from_nodes,
+                symbols,
             });
         }
     }
@@ -767,6 +783,35 @@ fn external_uses(
     });
     uses.dedup();
     Ok(uses)
+}
+
+/// File → (use-site node ids, referenced symbol names) of its pending refs.
+type RefsByFile = HashMap<String, (Vec<String>, Vec<String>)>;
+
+/// Per file, the `(use-site node ids, referenced names)` of its pending
+/// references — calls/constructions the parser recorded as candidates for
+/// cross-file (and cross-repo) resolution. Used for the .NET symbol-level path:
+/// a C# `using` names only a namespace, so these supply the consumed-type
+/// candidates and their use-sites, which the link step then filters to those
+/// that match a referenced package's exports. De-duplicated per file.
+fn unresolved_refs_by_file(store: &dyn GraphStore) -> Result<RefsByFile> {
+    let node_file: HashMap<String, String> = store.node_files()?.into_iter().collect();
+    let mut by_file: RefsByFile = HashMap::new();
+    for p in store.all_pending()? {
+        let Some(file) = node_file.get(&p.anchor.0) else {
+            continue;
+        };
+        let entry = by_file.entry(file.clone()).or_default();
+        entry.0.push(p.anchor.0.clone());
+        entry.1.push(p.name.clone());
+    }
+    for (anchors, names) in by_file.values_mut() {
+        anchors.sort();
+        anchors.dedup();
+        names.sort();
+        names.dedup();
+    }
+    Ok(by_file)
 }
 
 /// Symbols in `file` whose source span references one of the import's imported
@@ -918,7 +963,9 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// change the analyzed graph without touching the crate version or the query
 /// files. Changes to the tree-sitter query sources are picked up automatically
 /// by [`analysis_revision`], so this is only for logic the queries don't encode.
-const ANALYSIS_REVISION: u32 = 1;
+/// 2: .NET/NuGet package identity (`.csproj` publishes + `using`/PackageReference
+/// consumes), so existing indexes re-analyze to gain cross-repo .NET links.
+const ANALYSIS_REVISION: u32 = 2;
 
 /// Fingerprint of everything that determines analysis output: the crate
 /// version, the manual revision counter, and the built-in tree-sitter query
@@ -2157,7 +2204,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             proj.join("Item.cs"),
-            "using Acme.Core;\nnamespace Acme.Models { public class Item { } }\n",
+            "using Acme.Core;\nnamespace Acme.Models {\n  public class Item {\n    public void Run() { var t = new CoreThing(); t.Process(); }\n  }\n}\n",
         )
         .unwrap();
         run(&dir, false).unwrap();
@@ -2180,11 +2227,18 @@ mod tests {
 
         let uses: Vec<ExternalUse> =
             serde_json::from_str(&store.get_meta("external_uses").unwrap().unwrap()).unwrap();
+        let core = uses
+            .iter()
+            .find(|u| u.ecosystem == Ecosystem::Dotnet && u.package == "Acme.Core")
+            .unwrap_or_else(|| panic!("expected Acme.Core external use, got {uses:?}"));
+        // Symbol-level: the file's unresolved references (the `new CoreThing()` /
+        // `t.Process()` calls) become candidate symbols + use-sites, so the link
+        // step can land on a producer export rather than only the package.
         check!(
-            uses.iter()
-                .any(|u| u.ecosystem == Ecosystem::Dotnet && u.package == "Acme.Core"),
-            "expected Acme.Core external use, got {uses:?}"
+            !core.symbols.is_empty(),
+            "expected candidate symbols from unresolved refs, got {core:?}"
         );
+        check!(!core.from_nodes.is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 

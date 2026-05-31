@@ -94,6 +94,13 @@ pub struct ExternalUse {
     /// attributed, in which case consumers fall back to file-level landing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub from_nodes: Vec<String>,
+    /// Candidate producer-symbol names this use references, when they can't be
+    /// read off `path`. A Rust `use foo::Bar` names `Bar` in the path, but a C#
+    /// `using Some.Namespace` names only the namespace, so the consumed types are
+    /// supplied here (from the file's unresolved references) for the link step to
+    /// match against the producer's exports. Empty → derive names from `path`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub symbols: Vec<String>,
 }
 
 /// A repo's full persisted package identity: the packages it publishes (with
@@ -151,6 +158,7 @@ mod tests {
                 package: "widget".into(),
                 path: "widget::go".into(),
                 from_nodes: vec!["node-caller".into()],
+                symbols: Vec::new(),
             }],
         };
         let packages_json = serde_json::to_string(&identity.packages).unwrap();
