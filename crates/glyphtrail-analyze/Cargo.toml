@@ -18,7 +18,7 @@ serde_norway.workspace = true
 ignore.workspace = true
 blake3.workspace = true
 tracing.workspace = true
-indicatif = "0.17"
+indicatif = "0.18"
 globset = "0.4"
 rayon = "1"
 

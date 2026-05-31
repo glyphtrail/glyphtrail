@@ -65,11 +65,12 @@ impl Llm {
             "messages": [{ "role": "user", "content": user }],
         });
         let resp: Value = ureq::post("https://api.anthropic.com/v1/messages")
-            .set("x-api-key", &self.key)
-            .set("anthropic-version", "2023-06-01")
-            .set("content-type", "application/json")
+            .header("x-api-key", self.key.as_str())
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
             .send_json(body)?
-            .into_json()?;
+            .into_body()
+            .read_json()?;
         resp["content"][0]["text"]
             .as_str()
             .map(str::to_string)
@@ -92,10 +93,11 @@ impl Llm {
             ],
         });
         let resp: Value = ureq::post(&url)
-            .set("Authorization", &format!("Bearer {}", self.key))
-            .set("content-type", "application/json")
+            .header("Authorization", format!("Bearer {}", self.key))
+            .header("content-type", "application/json")
             .send_json(body)?
-            .into_json()?;
+            .into_body()
+            .read_json()?;
         resp["choices"][0]["message"]["content"]
             .as_str()
             .map(str::to_string)
