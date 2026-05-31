@@ -75,7 +75,14 @@ pub fn resolve_links(repos: &[RepoIdentity]) -> Vec<CrossRepoLink> {
             let Some(prods) = producers.get(u.package.as_str()) else {
                 continue; // dependency isn't produced by any repo in the set
             };
-            let symbols = imported_symbols(&u.path);
+            // Names to match against the producer's exports: explicit candidates
+            // when the import path doesn't name symbols (e.g. a C# namespace
+            // `using`), else parsed from the path (Rust `use foo::Bar`).
+            let symbols = if u.symbols.is_empty() {
+                imported_symbols(&u.path)
+            } else {
+                u.symbols.clone()
+            };
             for &(ri, pi) in prods {
                 if ri == ci {
                     continue; // same repo — covered by intra-repo edges
@@ -194,6 +201,7 @@ mod tests {
             package: dep.to_string(),
             path: path.to_string(),
             from_nodes: Vec::new(),
+            symbols: Vec::new(),
         }
     }
 
@@ -254,6 +262,27 @@ mod tests {
         let links = resolve_links(&[producer, consumer]);
         let syms: Vec<_> = links.iter().filter_map(|l| l.to_symbol.clone()).collect();
         check!(syms == vec!["a".to_string(), "b".to_string()]);
+    }
+
+    // Explicit `symbols` (a C# `using Namespace` that names no symbol in its
+    // path) drive symbol-level matching against the producer's exports.
+    #[test]
+    fn explicit_symbols_match_exports_symbol_level() {
+        let producer = repo(
+            "models-repo",
+            vec![pkg("Acme.Models", &["ItemId", "Tag"])],
+            vec![],
+        );
+        let mut u = uses("Acme.Service", "Acme.Models", "Acme.Models");
+        u.symbols = vec!["ItemId".to_string()];
+        u.from_nodes = vec!["caller-node".to_string()];
+        let consumer = repo("service-repo", vec![pkg("Acme.Service", &[])], vec![u]);
+        let links = resolve_links(&[producer, consumer]);
+        check!(links.len() == 1);
+        check!(links[0].kind == LinkKind::Symbol);
+        check!(links[0].to_repo == "models-repo");
+        check!(links[0].to_symbol == Some("ItemId".to_string()));
+        check!(links[0].from_nodes == vec!["caller-node".to_string()]);
     }
 
     #[test]
