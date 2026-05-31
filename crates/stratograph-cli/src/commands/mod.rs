@@ -5,7 +5,6 @@ pub use stratograph_analyze::{analyze, backend};
 
 pub mod cypher;
 pub mod drift;
-pub mod forge;
 pub mod group;
 pub mod impact;
 pub mod llm;

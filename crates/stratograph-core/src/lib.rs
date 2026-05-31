@@ -4,7 +4,6 @@ pub mod api;
 pub mod config;
 pub mod error;
 pub mod federated;
-pub mod forge_config;
 pub mod groups;
 pub mod identity;
 pub mod impact;
@@ -14,7 +13,6 @@ pub mod manifest;
 pub mod matcher;
 pub mod model;
 pub mod registry;
-pub mod repo_id;
 pub mod rewrite;
 pub mod scrub;
 
@@ -24,7 +22,6 @@ pub use api::{
 pub use config::{ApiConfig, Config, DynamicLanguage, SchemaFormat, SchemaSource};
 pub use error::{CoreError, Result};
 pub use federated::{FederatedAdjacency, qualify, unqualify};
-pub use forge_config::{ForgeConfig, ForgeHost, ForgeKind, default_forge_config_path};
 pub use groups::{Group, Groups, default_groups_path};
 pub use identity::{
     Ecosystem, ExternalUse, IndexedPackage, META_EXTERNAL_USES, META_PACKAGES, PackageExport,
@@ -43,6 +40,9 @@ pub use manifest::{
 pub use matcher::{ClientCall, Endpoint, Match, Matcher};
 pub use model::{CodeGraph, Confidence, Edge, EdgeKind, Node, NodeId, NodeKind, PendingLink, Span};
 pub use registry::{Registry, RegistryEntry, RepoHealth, default_registry_path};
-pub use repo_id::{RepoId, canonicalize_remote, forge_numeric_repo_id, repo_ids, repo_uuid};
 pub use rewrite::{PrefixRewrite, RewriteCandidate, RewriteEngine};
 pub use scrub::scrub_secrets;
+pub use stratograph_forge_id::{
+    ForgeConfig, ForgeHost, ForgeKind, RepoId, canonicalize_remote, forge_numeric_repo_id,
+    repo_ids, repo_uuid,
+};

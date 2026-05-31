@@ -4,29 +4,29 @@
 //! A forge's numeric repo id survives owner/repo renames on the forge, unlike
 //! the slug. Resolving it needs the forge's API and a token, so this is
 //! best-effort and opt-in: for each remote on a recognised forge that has a
-//! token in its well-known env var, query the API for the numeric id and derive
-//! a [`stratograph_core::forge_numeric_repo_id`]. No token (or any network/API
-//! failure) simply yields no numeric id — the slug ids still stand. Tokens are
-//! read from the environment and never logged.
+//! token in its well-known env var (or one mapped by the [`ForgeConfig`]), query
+//! the API for the numeric id and derive a [`forge_numeric_repo_id`]. No token
+//! (or any network/API failure) simply yields no numeric id — the slug ids
+//! still stand. Tokens are read from the environment and never logged.
 //!
 //! Well-known token env vars: `GITHUB_TOKEN` (github.com), `GITLAB_TOKEN`
 //! (gitlab.com), `CODEBERG_TOKEN` (codeberg.org / Gitea-Forgejo). For GitHub,
 //! when `GITHUB_TOKEN` is unset we fall back to the `gh` CLI (which uses its own
-//! auth) — an infrequent shell-out. A config map for arbitrary hosts/var-names
-//! is a planned follow-on.
+//! auth) — an infrequent shell-out. The [`ForgeConfig`] maps arbitrary hosts to
+//! a token env var and forge kind (for self-hosted instances).
 
 use std::process::Command;
 
 use serde_json::Value;
-use stratograph_core::{
-    ForgeConfig, ForgeKind, RepoId, canonicalize_remote, forge_numeric_repo_id,
-};
 
-/// Best-effort forge-API numeric ids for a repo's git remotes. Deterministic:
-/// sorted and de-duplicated. Empty when no remote is on a recognised forge with
-/// an available token.
-pub fn forge_numeric_ids(remote_urls: &[String]) -> Vec<RepoId> {
-    let config = ForgeConfig::load_default();
+use crate::config::{ForgeConfig, ForgeKind};
+use crate::id::{RepoId, canonicalize_remote, forge_numeric_repo_id};
+
+/// Best-effort forge-API numeric ids for a repo's git remotes, using `config`
+/// (host → token-env / forge-kind) layered over built-in host recognition.
+/// Deterministic: sorted and de-duplicated. Empty when no remote is on a
+/// recognised forge with an available token.
+pub fn forge_numeric_ids(remote_urls: &[String], config: &ForgeConfig) -> Vec<RepoId> {
     let mut ids = Vec::new();
     for url in remote_urls {
         let Some(canonical) = canonicalize_remote(url) else {
@@ -38,7 +38,7 @@ pub fn forge_numeric_ids(remote_urls: &[String]) -> Vec<RepoId> {
         else {
             continue;
         };
-        if let Some(numeric) = fetch_numeric_id(&config, host, owner, repo) {
+        if let Some(numeric) = fetch_numeric_id(config, host, owner, repo) {
             ids.push(forge_numeric_repo_id(host, &numeric));
         }
     }
