@@ -10,8 +10,12 @@
 //! read from the environment and never logged.
 //!
 //! Well-known token env vars: `GITHUB_TOKEN` (github.com), `GITLAB_TOKEN`
-//! (gitlab.com), `CODEBERG_TOKEN` (codeberg.org / Gitea-Forgejo). A config map
-//! for arbitrary hosts/var-names is a planned follow-on.
+//! (gitlab.com), `CODEBERG_TOKEN` (codeberg.org / Gitea-Forgejo). For GitHub,
+//! when `GITHUB_TOKEN` is unset we fall back to the `gh` CLI (which uses its own
+//! auth) — an infrequent shell-out. A config map for arbitrary hosts/var-names
+//! is a planned follow-on.
+
+use std::process::Command;
 
 use serde_json::Value;
 use stratograph_core::{RepoId, canonicalize_remote, forge_numeric_repo_id};
@@ -45,14 +49,15 @@ pub fn forge_numeric_ids(remote_urls: &[String]) -> Vec<RepoId> {
 /// token is set, or the request/parse fails.
 fn fetch_numeric_id(host: &str, owner: &str, repo: &str) -> Option<String> {
     let (url, header, value) = match host {
-        "github.com" => {
-            let token = std::env::var("GITHUB_TOKEN").ok()?;
-            (
+        "github.com" => match std::env::var("GITHUB_TOKEN") {
+            Ok(token) => (
                 format!("https://api.github.com/repos/{owner}/{repo}"),
                 "Authorization",
                 format!("Bearer {token}"),
-            )
-        }
+            ),
+            // No env token: fall back to the `gh` CLI, which carries its own auth.
+            Err(_) => return gh_numeric_id(owner, repo),
+        },
         "gitlab.com" => {
             let token = std::env::var("GITLAB_TOKEN").ok()?;
             // GitLab identifies a project by its URL-encoded full path.
@@ -86,4 +91,19 @@ fn fetch_numeric_id(host: &str, owner: &str, repo: &str) -> Option<String> {
     json.get("id")
         .and_then(Value::as_i64)
         .map(|n| n.to_string())
+}
+
+/// GitHub numeric id via the `gh` CLI (`gh api repos/{owner}/{repo} --jq .id`),
+/// the fallback when `GITHUB_TOKEN` isn't set. `None` if `gh` is absent,
+/// unauthenticated, or returns a non-numeric result.
+fn gh_numeric_id(owner: &str, repo: &str) -> Option<String> {
+    let output = Command::new("gh")
+        .args(["api", &format!("repos/{owner}/{repo}"), "--jq", ".id"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())).then_some(id)
 }
