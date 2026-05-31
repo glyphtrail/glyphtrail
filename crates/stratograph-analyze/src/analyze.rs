@@ -6,10 +6,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use stratograph_core::config::{IGNORE_FILE, INDEX_DIR, RepoPaths};
 use stratograph_core::{
-    CargoPackage, ClientCall, CodeGraph, Confidence, Config, DynamicLanguage, Ecosystem, Edge,
-    EdgeKind, Endpoint, ExternalUse, IndexedPackage, Language, META_EXTERNAL_USES, META_PACKAGES,
-    Matcher, Node, NodeId, NodeKind, OperationKey, PackageExport, PendingLink, Protocol,
-    RewriteEngine, SchemaFormat, parse_cargo_manifest, workspace_members,
+    ClientCall, CodeGraph, Confidence, Config, DynamicLanguage, Ecosystem, Edge, EdgeKind,
+    Endpoint, ExternalUse, IndexedPackage, Language, META_EXTERNAL_USES, META_PACKAGES, Matcher,
+    Node, NodeId, NodeKind, OperationKey, PackageExport, PendingLink, Protocol, RewriteEngine,
+    SchemaFormat, parse_cargo_manifest, parse_csproj, workspace_members,
 };
 use stratograph_parse::{
     DynamicGrammar, PendingEdge, build_client_graph, build_file_graph, build_graphql_client_graph,
@@ -446,27 +446,50 @@ fn discover(
     Ok(out)
 }
 
-/// A Cargo package found on disk, paired with the repo-relative directory of
-/// its manifest. The directory lets a workspace's many crates be told apart by
-/// file location, so each symbol can be attributed to the crate that owns it.
+/// A package a repo publishes, paired with the repo-relative directory of its
+/// manifest. The directory lets a workspace's many packages be told apart by
+/// file location, so each symbol is attributed to the package that owns it.
+/// Ecosystem-neutral so the same producer/consumer machinery serves Cargo and
+/// .NET (and future ecosystems).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DiscoveredPackage {
+    ecosystem: Ecosystem,
     /// Manifest directory, repo-root-relative and forward-slashed; "" is the
     /// repo root.
     dir: String,
-    #[serde(flatten)]
-    package: CargoPackage,
+    /// Package name as other repos depend on it (the cross-repo match key).
+    name: String,
+    version: Option<String>,
+    /// Declared dependencies, the consumer side of cross-repo links.
+    deps: Vec<DiscoveredDep>,
 }
 
-/// Discover the Cargo packages a repo publishes (#220): the root `Cargo.toml`
-/// plus every workspace member (member globs like `crates/*` expanded against
-/// the filesystem), each paired with its repo-relative manifest directory. A
-/// virtual workspace root contributes no package of its own, only its members.
-/// Packages are de-duplicated by name and sorted, so the result is stable
-/// across runs. Cargo.toml is not a parsed source language, so this is a
-/// separate, best-effort pass: an unreadable or malformed manifest is skipped
-/// rather than failing the analysis.
+/// A declared dependency: its real package name (recorded on the cross-repo
+/// link) and the name code references it by (Cargo: rename/underscored crate;
+/// .NET: the package id used as a `using` namespace).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DiscoveredDep {
+    name: String,
+    code_name: String,
+}
+
+/// Discover the packages a repo publishes (#220), across ecosystems: Cargo
+/// crates and .NET/NuGet projects. De-duplicated by `(ecosystem, name)` and
+/// sorted, so the result is stable across runs. Manifests are not parsed source
+/// languages, so this is a separate, best-effort pass: an unreadable or
+/// malformed manifest is skipped rather than failing the analysis.
 fn discover_packages(root: &Path) -> Vec<DiscoveredPackage> {
+    let mut packages = discover_cargo_packages(root);
+    packages.extend(discover_dotnet_packages(root));
+    packages.sort_by(|a, b| (a.ecosystem as u8, &a.name).cmp(&(b.ecosystem as u8, &b.name)));
+    packages.dedup_by(|a, b| a.ecosystem == b.ecosystem && a.name == b.name);
+    packages
+}
+
+/// Cargo crates: the root `Cargo.toml` plus every workspace member (globs like
+/// `crates/*` expanded against the filesystem). A virtual workspace root
+/// contributes only its members.
+fn discover_cargo_packages(root: &Path) -> Vec<DiscoveredPackage> {
     let root_manifest = root.join("Cargo.toml");
     let mut manifests: Vec<PathBuf> = vec![root_manifest.clone()];
     if let Ok(text) = std::fs::read_to_string(&root_manifest) {
@@ -476,23 +499,82 @@ fn discover_packages(root: &Path) -> Vec<DiscoveredPackage> {
             }
         }
     }
-
     let mut packages = Vec::new();
     for manifest in manifests {
         if let Ok(text) = std::fs::read_to_string(&manifest)
             && let Ok(Some(package)) = parse_cargo_manifest(&text)
         {
-            let dir = manifest
-                .parent()
-                .and_then(|p| p.strip_prefix(root).ok())
-                .map(|p| p.to_string_lossy().replace('\\', "/"))
-                .unwrap_or_default();
-            packages.push(DiscoveredPackage { dir, package });
+            let dir = rel_dir(root, &manifest);
+            packages.push(DiscoveredPackage {
+                ecosystem: Ecosystem::Cargo,
+                dir,
+                name: package.name,
+                version: package.version,
+                deps: package
+                    .dependencies
+                    .iter()
+                    .map(|d| DiscoveredDep {
+                        name: d.name.clone(),
+                        code_name: dep_code_name(d),
+                    })
+                    .collect(),
+            });
         }
     }
-    packages.sort_by(|a, b| a.package.name.cmp(&b.package.name));
-    packages.dedup_by(|a, b| a.package.name == b.package.name);
     packages
+}
+
+/// .NET projects: every `.csproj` under the repo (skipping hidden dirs and the
+/// build outputs `bin`/`obj`). Each publishes a NuGet package id and references
+/// others via `<PackageReference>` — the producer/consumer sides of cross-repo
+/// links among .NET repos sharing packages through a private NuGet feed.
+fn discover_dotnet_packages(root: &Path) -> Vec<DiscoveredPackage> {
+    let mut packages = Vec::new();
+    for entry in WalkBuilder::new(root).hidden(true).build().flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("csproj") {
+            continue;
+        }
+        if path
+            .components()
+            .any(|c| matches!(c.as_os_str().to_str(), Some("bin") | Some("obj")))
+        {
+            continue; // build output, not a source project
+        }
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("project");
+        let proj = parse_csproj(&text, stem);
+        packages.push(DiscoveredPackage {
+            ecosystem: Ecosystem::Dotnet,
+            dir: rel_dir(root, path),
+            name: proj.package_id,
+            version: proj.version,
+            deps: proj
+                .package_refs
+                .into_iter()
+                .map(|r| DiscoveredDep {
+                    name: r.clone(),
+                    code_name: r,
+                })
+                .collect(),
+        });
+    }
+    packages
+}
+
+/// A manifest's repo-root-relative, forward-slashed parent directory (`""` for
+/// the repo root).
+fn rel_dir(root: &Path, manifest: &Path) -> String {
+    manifest
+        .parent()
+        .and_then(|p| p.strip_prefix(root).ok())
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default()
 }
 
 /// Whether a node kind is a definition another crate could import — the kinds
@@ -580,9 +662,9 @@ fn index_packages(
             exports.sort_by(|a, b| (&a.node_id, &a.name).cmp(&(&b.node_id, &b.name)));
             exports.dedup_by(|a, b| a.node_id == b.node_id && a.name == b.name);
             IndexedPackage {
-                ecosystem: Ecosystem::Cargo,
-                name: d.package.name.clone(),
-                version: d.package.version.clone(),
+                ecosystem: d.ecosystem,
+                name: d.name.clone(),
+                version: d.version.clone(),
                 dir: d.dir.clone(),
                 exports,
             }
@@ -625,6 +707,22 @@ fn import_root(path: &str) -> Option<&str> {
         .find(|s| !s.is_empty() && *s != "{")
 }
 
+/// Whether an import `raw` references the dependency whose code name is
+/// `code_name`, per ecosystem. Cargo matches the import's root crate segment
+/// (`foo::bar` → `foo`); .NET matches a `using` namespace against the NuGet
+/// package id, exactly or as a namespace prefix (`using Acme.Core.Sub` uses
+/// `Acme.Core`). Other ecosystems aren't produced yet.
+fn dep_matches_import(ecosystem: Ecosystem, code_name: &str, raw: &str) -> bool {
+    match ecosystem {
+        Ecosystem::Cargo => import_root(raw) == Some(code_name),
+        Ecosystem::Dotnet => {
+            let ns = raw.trim();
+            ns == code_name || ns.starts_with(&format!("{code_name}."))
+        }
+        Ecosystem::Npm | Ecosystem::Go | Ecosystem::Python => false,
+    }
+}
+
 /// Identify the imports that reference an external crate, the consumer side of
 /// cross-repo links (#220). For each import record `(file, raw, lang)`, find the
 /// package owning `file` (longest-directory match) and match the import's root
@@ -648,19 +746,15 @@ fn external_uses(
     let mut uses = Vec::new();
     for (file, raw, _lang) in store.all_imports()? {
         let Some(pkg) = owner(&file) else { continue };
-        let Some(root_seg) = import_root(&raw) else {
-            continue;
-        };
         if let Some(dep) = pkg
-            .package
-            .dependencies
+            .deps
             .iter()
-            .find(|d| dep_code_name(d) == root_seg)
+            .find(|d| dep_matches_import(pkg.ecosystem, &d.code_name, &raw))
         {
             let from_nodes = use_site_nodes(store, root, &file, &raw, &mut sources)?;
             uses.push(ExternalUse {
-                ecosystem: Ecosystem::Cargo,
-                from_package: pkg.package.name.clone(),
+                ecosystem: pkg.ecosystem,
+                from_package: pkg.name.clone(),
                 from_file: file.clone(),
                 package: dep.name.clone(),
                 path: raw,
@@ -2020,6 +2114,78 @@ mod tests {
         check!(import_root("::widget::go") == Some("widget"));
         check!(import_root("widget") == Some("widget"));
         check!(import_root("") == None);
+    }
+
+    #[test]
+    fn dep_matches_import_per_ecosystem() {
+        // Cargo: first crate segment.
+        check!(dep_matches_import(Ecosystem::Cargo, "widget", "widget::go"));
+        check!(!dep_matches_import(Ecosystem::Cargo, "widget", "other::go"));
+        // .NET: exact namespace or a namespace prefix; not a sibling sharing a stem.
+        check!(dep_matches_import(
+            Ecosystem::Dotnet,
+            "Acme.Core",
+            "Acme.Core"
+        ));
+        check!(dep_matches_import(
+            Ecosystem::Dotnet,
+            "Acme.Core",
+            "Acme.Core.Sub"
+        ));
+        check!(!dep_matches_import(
+            Ecosystem::Dotnet,
+            "Acme.Core",
+            "Acme.CoreX"
+        ));
+        check!(!dep_matches_import(Ecosystem::Dotnet, "Acme.Core", "Other"));
+    }
+
+    // .NET cross-repo identity: a .csproj publishes a NuGet package id (export
+    // = its public types) and a `using` of a referenced package is tagged as an
+    // external use — the producer and consumer sides a NuGet link matches.
+    #[test]
+    fn analyze_persists_dotnet_package_identity() {
+        let dir = temp_repo("dotnet-identity");
+        let proj = dir.join("Acme.Models");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("Acme.Models.csproj"),
+            "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup>\
+             <PackageId>Acme.Models</PackageId><Version>1.2.0</Version></PropertyGroup>\
+             <ItemGroup><PackageReference Include=\"Acme.Core\" Version=\"1.0.0\" /></ItemGroup></Project>",
+        )
+        .unwrap();
+        std::fs::write(
+            proj.join("Item.cs"),
+            "using Acme.Core;\nnamespace Acme.Models { public class Item { } }\n",
+        )
+        .unwrap();
+        run(&dir, false).unwrap();
+
+        let store = LadybugStore::open(&RepoPaths::new(&dir).index_dir.join("ladybug")).unwrap();
+        let packages: Vec<IndexedPackage> =
+            serde_json::from_str(&store.get_meta("packages").unwrap().unwrap()).unwrap();
+        let models = packages
+            .iter()
+            .find(|p| p.name == "Acme.Models")
+            .expect("Acme.Models package recorded");
+        check!(models.ecosystem == Ecosystem::Dotnet);
+        check!(models.version == Some("1.2.0".to_string()));
+        check!(models.dir == "Acme.Models");
+        check!(
+            models.exports.iter().any(|e| e.name == "Item"),
+            "expected Item export, got {:?}",
+            models.exports.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+
+        let uses: Vec<ExternalUse> =
+            serde_json::from_str(&store.get_meta("external_uses").unwrap().unwrap()).unwrap();
+        check!(
+            uses.iter()
+                .any(|u| u.ecosystem == Ecosystem::Dotnet && u.package == "Acme.Core"),
+            "expected Acme.Core external use, got {uses:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // #220: imports referencing a declared dependency are tagged as external

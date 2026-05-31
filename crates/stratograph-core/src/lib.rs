@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod config;
+pub mod dotnet;
 pub mod error;
 pub mod federated;
 pub mod filelock;
@@ -21,6 +22,7 @@ pub use api::{
     HttpMethod, OperationKey, Protocol, normalize_path, operations_matching, path_signature,
 };
 pub use config::{ApiConfig, Config, DynamicLanguage, SchemaFormat, SchemaSource};
+pub use dotnet::{CsprojProject, parse_csproj};
 pub use error::{CoreError, Result};
 pub use federated::{FederatedAdjacency, qualify, unqualify};
 pub use groups::{Group, Groups, default_groups_path};

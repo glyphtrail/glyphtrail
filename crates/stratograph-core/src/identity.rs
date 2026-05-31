@@ -23,9 +23,10 @@ pub const META_EXTERNAL_USES: &str = "external_uses";
 
 /// The package ecosystem an identity belongs to. Cross-repo matching is
 /// language-agnostic, but a few rules differ per ecosystem (e.g. Go matches by
-/// module-path prefix, Python maps a distribution name to its import name), so
-/// the tag is recorded for the link step to branch on. Only `Cargo` is produced
-/// today; the rest are placeholders for #248/#249/#250.
+/// module-path prefix, Python maps a distribution name to its import name, .NET
+/// matches a `using` namespace against a NuGet package id), so the tag is
+/// recorded for the link step to branch on. `Cargo` and `Dotnet` are produced
+/// today; npm/go/python are placeholders for #248/#249/#250.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Ecosystem {
@@ -36,6 +37,10 @@ pub enum Ecosystem {
     Npm,
     Go,
     Python,
+    /// .NET / NuGet (e.g. packages served through a private feed): a repo
+    /// publishes packages named by `.csproj` and consumes them via
+    /// `<PackageReference>` + `using` namespaces.
+    Dotnet,
 }
 
 /// One exported symbol of a package: a definition another crate could name.
