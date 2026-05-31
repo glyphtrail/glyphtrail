@@ -1006,7 +1006,23 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
         .cloned()
         .collect();
     stage("persisting nodes and edges");
-    store.insert_graph(&graph.nodes, &extracted)?;
+    // Persist in batches so a large repo shows steady progress (and bounded
+    // memory) instead of one opaque, seemingly-hung call. All nodes go in first;
+    // edges then match the already-inserted endpoints. Empty slices are no-ops.
+    const PERSIST_BATCH: usize = 4096;
+    let (n_nodes, n_edges) = (graph.nodes.len(), extracted.len());
+    let mut done = 0;
+    for chunk in graph.nodes.chunks(PERSIST_BATCH) {
+        store.insert_graph(chunk, &[])?;
+        done += chunk.len();
+        resolve_progress.set_message(format!("persisting nodes {done}/{n_nodes}"));
+    }
+    done = 0;
+    for chunk in extracted.chunks(PERSIST_BATCH) {
+        store.insert_graph(&[], chunk)?;
+        done += chunk.len();
+        resolve_progress.set_message(format!("persisting edges {done}/{n_edges}"));
+    }
     resolve_progress.inc(1);
 
     stage("recording API operations and imports");
