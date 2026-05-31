@@ -6,6 +6,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+description = "Glyphtrail storage: the LadybugDB-backed code graph store."
 
 [dependencies]
 glyphtrail-core.workspace = true

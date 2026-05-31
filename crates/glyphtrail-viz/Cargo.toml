@@ -6,6 +6,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+description = "Glyphtrail visualization: a self-contained interactive code-graph HTML page."
 
 [dependencies]
 glyphtrail-core.workspace = true

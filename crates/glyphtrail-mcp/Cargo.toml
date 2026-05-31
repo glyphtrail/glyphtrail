@@ -6,6 +6,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+description = "Glyphtrail MCP server: code-graph tools over the Model Context Protocol."
 
 [dependencies]
 glyphtrail-core.workspace = true

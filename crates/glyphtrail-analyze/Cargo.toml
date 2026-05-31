@@ -6,6 +6,8 @@ rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+description = "Glyphtrail analysis: walk a repository and build or update its code graph."
 
 [dependencies]
 glyphtrail-core.workspace = true
