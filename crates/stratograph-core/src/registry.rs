@@ -6,11 +6,28 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::config::RepoPaths;
 use crate::{CoreError, RepoId, Result};
+
+/// Sibling lock file for a registry path (`registry.lock`).
+pub fn lock_path(registry_path: &Path) -> PathBuf {
+    registry_path.with_extension("lock")
+}
+
+/// Prefix of spillover files (`registry.spill.<pid>.<nanos>.json`): deferred
+/// adds written when the lock can't be acquired, merged in by the next
+/// lock-holding run. See [`Registry::record`].
+const SPILL_PREFIX: &str = "registry.spill.";
+
+/// Result of [`Registry::record`]: the add was applied to the registry, or
+/// deferred to a spillover file because the lock was busy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordOutcome {
+    Applied,
+    Spilled,
+}
 
 /// Liveness of a registered repository on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,11 +123,12 @@ impl Registry {
         Ok(())
     }
 
-    /// Serialize a load → modify → save cycle under an exclusive OS advisory
-    /// lock on a sibling `registry.lock` file, so concurrent `repo` writers in
-    /// separate processes can't lose an update (last-rename-wins, #129). The
-    /// registry is (re)loaded *inside* the lock so each writer sees the latest
-    /// state, and persisted before the lock drops. Returns the closure's value.
+    /// Serialize a load → modify → save cycle under the portable file lock on a
+    /// sibling `registry.lock`, so concurrent `repo` writers can't lose an update
+    /// (last-write-wins, #129). The registry is (re)loaded *inside* the lock so
+    /// each writer sees the latest state, and persisted before the lock drops.
+    /// The lock works on network/FUSE filesystems and self-heals a stale lock
+    /// (see [`crate::filelock`]). Returns the closure's value.
     ///
     /// Hold the lock only for the quick mutation; never run long work (analysis)
     /// inside `f`.
@@ -118,22 +136,47 @@ impl Registry {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let lock_path = path.with_extension("lock");
-        let lock = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)?;
-        // Blocks until the exclusive lock is acquired; released on drop too.
-        FileExt::lock_exclusive(&lock)?;
-        let outcome = (|| {
+        crate::filelock::with_lock(&lock_path(path), || {
             let mut reg = Registry::load(path)?;
+            ingest_spillovers(path, &mut reg); // string in any deferred adds first
             let value = f(&mut reg);
             reg.save(path)?;
             Ok(value)
-        })();
-        let _ = FileExt::unlock(&lock);
-        outcome
+        })
+    }
+
+    /// Upsert `entries` into the registry, deferring to a spillover file when the
+    /// lock is busy rather than failing (#129). When the lock is obtained, any
+    /// pending spillovers are merged first; otherwise the entries are written to
+    /// `registry.spill.<pid>.<nanos>.json` (atomically) and a later
+    /// lock-holding run strings them in. Returns whether the write applied
+    /// directly or spilled.
+    ///
+    /// This is the loss-proof path for `repo add`/scan on slow or contended
+    /// filesystems; arbitrary mutations still go through [`Self::mutate`], which
+    /// errors rather than spilling (its change can't be replayed generically).
+    pub fn record(path: &Path, entries: Vec<RegistryEntry>) -> Result<RecordOutcome> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let applied = crate::filelock::with_lock(&lock_path(path), || {
+            let mut reg = Registry::load(path)?;
+            ingest_spillovers(path, &mut reg);
+            for e in &entries {
+                reg.add(e.name.clone(), e.root.clone());
+                reg.set_ids(&e.name, e.ids.clone());
+            }
+            reg.save(path)?;
+            Ok(())
+        });
+        match applied {
+            Ok(()) => Ok(RecordOutcome::Applied),
+            Err(CoreError::Lock { .. }) => {
+                write_spillover(path, &entries)?;
+                Ok(RecordOutcome::Spilled)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Register a repo, replacing any existing entry with the same name.
@@ -223,6 +266,59 @@ impl Registry {
     pub fn get(&self, name: &str) -> Option<&RegistryEntry> {
         self.repos.iter().find(|e| e.name == name)
     }
+}
+
+/// Merge any spillover files (`registry.spill.*.json`) beside `registry_path`
+/// into `reg`, then delete them. Must be called while holding the lock. Each
+/// spillover is a `Vec<RegistryEntry>` of deferred adds; entries are upserted
+/// (last-write-wins, same as a direct add). Tolerant: a malformed or empty
+/// spillover is skipped *and removed* (it can only be leftover garbage — a
+/// spillover being written is still a `.tmp`, see [`write_spillover`]).
+fn ingest_spillovers(registry_path: &Path, reg: &mut Registry) {
+    let Some(dir) = registry_path.parent() else {
+        return;
+    };
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in read.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !(name.starts_with(SPILL_PREFIX) && name.ends_with(".json")) {
+            continue; // skips the `.tmp` of an in-flight spillover
+        }
+        let p = entry.path();
+        if let Ok(text) = std::fs::read_to_string(&p)
+            && let Ok(spilled) = serde_json::from_str::<Vec<RegistryEntry>>(&text)
+        {
+            for e in spilled {
+                reg.add(e.name.clone(), e.root);
+                reg.set_ids(&e.name, e.ids);
+            }
+        }
+        let _ = std::fs::remove_file(&p); // consumed (or undecodable garbage)
+    }
+}
+
+/// Write `entries` to a uniquely-named spillover file beside `registry_path`,
+/// for a later lock-holding run to [`ingest_spillovers`]. Written to a `.tmp`
+/// then atomically renamed into place, so a reader never observes a partially
+/// written spillover.
+fn write_spillover(registry_path: &Path, entries: &[RegistryEntry]) -> Result<PathBuf> {
+    let dir = registry_path.parent().unwrap_or_else(|| Path::new("."));
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let stem = format!("{SPILL_PREFIX}{}.{nanos}.json", std::process::id());
+    let final_path = dir.join(&stem);
+    let tmp = dir.join(format!("{stem}.tmp"));
+    std::fs::write(
+        &tmp,
+        serde_json::to_vec(entries).expect("entries serialize"),
+    )?;
+    std::fs::rename(&tmp, &final_path)?; // atomic publish
+    Ok(final_path)
 }
 
 /// The default registry path, `~/.stratograph/registry.json`, from `HOME` (or
@@ -319,10 +415,9 @@ mod tests {
         check!(reg.find_by_id("nope").is_none());
     }
 
-    // #129: many processes (here, threads — each opens its own fd, so the OS
-    // advisory lock still serializes them) racing on `mutate` must not lose any
-    // update. Without the lock the load→modify→save RMW would drop writes and
-    // the final count would fall short of N.
+    // #129: many writers racing on `mutate` must not lose any update. The
+    // portable file lock serializes the load→modify→save RMW; without it writes
+    // would be dropped and the final count would fall short of N.
     #[test]
     fn mutate_serializes_concurrent_writers() {
         let nanos = std::time::SystemTime::now()
@@ -365,5 +460,76 @@ mod tests {
         reg.save(&path).unwrap();
         check!(Registry::load(&path).unwrap() == reg);
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    fn reg_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("stratograph-reg-{tag}-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn entry(name: &str, root: &str) -> RegistryEntry {
+        RegistryEntry {
+            name: name.into(),
+            root: PathBuf::from(root),
+            missing_since: None,
+            ids: Vec::new(),
+        }
+    }
+
+    // `record` applies under the lock and reports it.
+    #[test]
+    fn record_applies_when_lock_is_free() {
+        let dir = reg_dir("rec");
+        let path = dir.join("registry.json");
+        check!(
+            Registry::record(&path, vec![entry("api", "/a")]).unwrap() == RecordOutcome::Applied
+        );
+        check!(Registry::load(&path).unwrap().get("api").unwrap().root == PathBuf::from("/a"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // A spillover file left by a deferred add is merged in (and deleted) by the
+    // next lock-holding write, so no add is lost on a contended lock.
+    #[test]
+    fn ingest_merges_and_removes_spillovers() {
+        let dir = reg_dir("spill");
+        let path = dir.join("registry.json");
+        // Seed an existing registry, then drop a spillover beside it by hand.
+        Registry::record(&path, vec![entry("existing", "/old")]).unwrap();
+        let spill = write_spillover(&path, &[entry("queued", "/new")]).unwrap();
+        check!(spill.exists());
+
+        // Any lock-holding op ingests it.
+        Registry::mutate(&path, |_| {}).unwrap();
+        let reg = Registry::load(&path).unwrap();
+        check!(reg.get("queued").unwrap().root == PathBuf::from("/new"));
+        check!(reg.get("existing").is_some());
+        check!(!spill.exists()); // consumed
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // An in-flight spillover (still a `.tmp`) and undecodable garbage must not
+    // corrupt the registry: the `.tmp` is left alone, garbage `.json` is dropped.
+    #[test]
+    fn ingest_skips_tmp_and_drops_garbage() {
+        let dir = reg_dir("spill-safe");
+        let path = dir.join("registry.json");
+        Registry::record(&path, vec![entry("base", "/b")]).unwrap();
+        let tmp = dir.join(format!("{SPILL_PREFIX}999.123.json.tmp"));
+        std::fs::write(&tmp, b"{ partial").unwrap(); // mid-write, not yet renamed
+        let garbage = dir.join(format!("{SPILL_PREFIX}999.456.json"));
+        std::fs::write(&garbage, b"not json at all").unwrap();
+
+        Registry::mutate(&path, |_| {}).unwrap();
+        let reg = Registry::load(&path).unwrap();
+        check!(reg.repos.len() == 1); // only "base"; nothing garbage merged
+        check!(tmp.exists()); // in-flight tmp untouched
+        check!(!garbage.exists()); // decoded-as-garbage .json dropped
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
