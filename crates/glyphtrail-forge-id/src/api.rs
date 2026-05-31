@@ -106,13 +106,15 @@ fn fetch_numeric_id(config: &ForgeConfig, host: &str, owner: &str, repo: &str) -
         }
     };
 
-    let response = ureq::get(&url)
-        .set(header, &value)
-        .set("Accept", "application/json")
-        .set("User-Agent", "glyphtrail")
+    let json: Value = ureq::get(&url)
+        .header(header, value.as_str())
+        .header("Accept", "application/json")
+        .header("User-Agent", "glyphtrail")
         .call()
+        .ok()?
+        .into_body()
+        .read_json()
         .ok()?;
-    let json: Value = response.into_json().ok()?;
     json.get("id")
         .and_then(Value::as_i64)
         .map(|n| n.to_string())
