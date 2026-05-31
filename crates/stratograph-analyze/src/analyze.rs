@@ -769,6 +769,33 @@ pub struct AnalyzeOutcome {
     pub languages: Vec<(String, usize)>,
 }
 
+/// Crate version, recorded in index meta (informational).
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Manual analysis-logic revision (#251): bump when a change to the Rust
+/// extraction logic (matchers, graph building, schema/identity passes) could
+/// change the analyzed graph without touching the crate version or the query
+/// files. Changes to the tree-sitter query sources are picked up automatically
+/// by [`analysis_revision`], so this is only for logic the queries don't encode.
+const ANALYSIS_REVISION: u32 = 1;
+
+/// Fingerprint of everything that determines analysis output: the crate
+/// version, the manual revision counter, and the built-in tree-sitter query
+/// sources. Stored in index meta; a mismatch busts the no-op fast path so an
+/// extractor change re-indexes an unchanged tree (#251).
+fn analysis_revision() -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(VERSION.as_bytes());
+    hasher.update(&ANALYSIS_REVISION.to_le_bytes());
+    for lang in Language::ALL {
+        if let Some(src) = stratograph_parse::registry::query_source(&lang) {
+            hasher.update(src.as_bytes());
+            hasher.update(&[0]);
+        }
+    }
+    hasher.finalize().to_hex()[..16].to_string()
+}
+
 pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
     let root = path
         .canonicalize()
@@ -804,10 +831,12 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
 
     // Fast path (#110): when every discovered file matches the stored
     // (path, hash) set, the package identity is unchanged, and the index was
-    // produced by this tool version, nothing has changed — skip parsing,
-    // re-resolution and writes entirely. A version mismatch forces a rebuild so
-    // extractor changes between releases take effect even on an unchanged tree.
-    const VERSION: &str = env!("CARGO_PKG_VERSION");
+    // produced by the same analysis revision, nothing has changed — skip
+    // parsing, re-resolution and writes entirely. The analysis revision (#251)
+    // captures the crate version, the query sources, and a manual revision
+    // counter, so a change to the *extraction logic* — not just a release —
+    // forces a rebuild even on an unchanged tree.
+    let revision = analysis_revision();
     let current_set: std::collections::BTreeSet<(String, String)> = files
         .iter()
         .map(|f| (f.rel_path.clone(), f.hash.clone()))
@@ -817,7 +846,7 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
     if !files.is_empty()
         && current_set == stored_set
         && store.get_meta("packages_fingerprint")?.as_deref() == Some(packages_fingerprint.as_str())
-        && store.get_meta("tool_version")?.as_deref() == Some(VERSION)
+        && store.get_meta("analysis_revision")?.as_deref() == Some(revision.as_str())
     {
         let stats = store.stats()?;
         return Ok(AnalyzeOutcome {
@@ -1222,6 +1251,7 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
     resolve_progress.inc(1);
 
     store.set_meta("tool_version", VERSION)?;
+    store.set_meta("analysis_revision", &revision)?;
     // Resolve the export index from the now-complete graph and persist the full
     // package identity (#220). Read-only borrow ends before the meta write.
     let indexed = index_packages(&*store, &discovered)?;
@@ -1515,6 +1545,33 @@ mod tests {
             names.iter().any(|n| n == "caller"),
             "caller of the call site should be impacted, got {names:?}"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // #251: an unchanged tree fast-paths, but a changed analysis revision (a
+    // stand-in for an extractor-logic change) busts it and forces a re-index.
+    #[test]
+    fn fast_path_busts_on_analysis_revision_change() {
+        let dir = temp_repo("rev-bust");
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"r\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+
+        check!(!run(&dir, false).unwrap().up_to_date); // first build
+        check!(run(&dir, false).unwrap().up_to_date); // unchanged + same revision -> fast path
+
+        // Stale the stored revision, as an analyzer-logic change would.
+        {
+            let mut store =
+                LadybugStore::open(&RepoPaths::new(&dir).index_dir.join("ladybug")).unwrap();
+            store.set_meta("analysis_revision", "stale").unwrap();
+        }
+        check!(!run(&dir, false).unwrap().up_to_date); // revision mismatch -> re-index
 
         std::fs::remove_dir_all(&dir).ok();
     }
