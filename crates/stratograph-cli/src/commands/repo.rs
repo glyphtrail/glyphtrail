@@ -54,7 +54,16 @@ pub enum RepoCmd {
         hidden: bool,
     },
     /// List registered repositories and their health.
-    List,
+    List {
+        /// Only show repos with a contributor whose name or email matches this
+        /// substring (case-insensitive).
+        #[arg(long)]
+        author: Option<String>,
+        /// Only show repos you've contributed to (matches your `git config
+        /// user.email`). Shorthand for `--author <your-email>`.
+        #[arg(long)]
+        mine: bool,
+    },
     /// Remove a repository from the registry by name.
     Remove { name: String },
     /// Drop registry entries whose root has been missing for too long.
@@ -196,15 +205,33 @@ pub fn run(cmd: RepoCmd) -> Result<()> {
                 hidden,
             },
         )?,
-        RepoCmd::List => {
+        RepoCmd::List { author, mine } => {
             let registry = Registry::mutate(&path, |reg| {
                 reg.refresh_health();
                 reg.clone()
             })?;
-            if registry.repos.is_empty() {
-                println!("(no repositories registered)");
+            // `--mine` is `--author <your git email>`; an explicit `--author`
+            // wins. With neither, no contributor filter (#265).
+            let filter = match (author, mine) {
+                (Some(a), _) => Some(a),
+                (None, true) => match git_user_email() {
+                    Some(email) => Some(email),
+                    None => bail!("`--mine` needs a git email; set `git config user.email`"),
+                },
+                (None, false) => None,
+            };
+            let shown: Vec<&RegistryEntry> = registry
+                .repos
+                .iter()
+                .filter(|e| filter.as_deref().is_none_or(|f| e.has_contributor(f)))
+                .collect();
+            if shown.is_empty() {
+                match &filter {
+                    Some(f) => println!("(no registered repos with contributor matching '{f}')"),
+                    None => println!("(no repositories registered)"),
+                }
             }
-            for e in &registry.repos {
+            for e in shown {
                 let note = match e.health() {
                     RepoHealth::Indexed => String::new(),
                     RepoHealth::Unindexed => "  (not indexed)".into(),
@@ -349,7 +376,66 @@ fn entry_for(registry_path: &Path, root: &Path, name: Option<String>) -> Registr
         alt_roots: Vec::new(),
         missing_since: None,
         ids,
+        contributors: git_contributors(root),
     }
+}
+
+/// Cap on stored contributors per repo (#265): the top authors by commit count,
+/// enough to answer "is this one of my repos?" without bloating the registry.
+const MAX_CONTRIBUTORS: usize = 100;
+
+/// The repo's git authors, most commits first (`git shortlog -sne HEAD`),
+/// capped at [`MAX_CONTRIBUTORS`]. Best-effort: a non-git repo or any failure
+/// yields none.
+fn git_contributors(root: &Path) -> Vec<stratograph_core::Contributor> {
+    use stratograph_core::Contributor;
+    let Some(out) = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["shortlog", "-sne", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+    else {
+        return Vec::new();
+    };
+    let mut contributors = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let Some((count, who)) = line.trim_start().split_once('\t') else {
+            continue;
+        };
+        let Ok(commits) = count.trim().parse::<u32>() else {
+            continue;
+        };
+        let who = who.trim();
+        let (name, email) = match (who.rfind('<'), who.rfind('>')) {
+            (Some(lt), Some(gt)) if gt > lt => {
+                (who[..lt].trim().to_string(), who[lt + 1..gt].to_string())
+            }
+            _ => (who.to_string(), String::new()),
+        };
+        contributors.push(Contributor {
+            name,
+            email,
+            commits,
+        });
+        if contributors.len() >= MAX_CONTRIBUTORS {
+            break;
+        }
+    }
+    contributors
+}
+
+/// The user's configured git email (`git config --get user.email`), for
+/// `repo list --mine` (#265).
+fn git_user_email() -> Option<String> {
+    let out = Command::new("git")
+        .args(["config", "--get", "user.email"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let email = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!email.is_empty()).then_some(email)
 }
 
 /// One-line outcome message for a [`Resolution`] from registering `name` at

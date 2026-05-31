@@ -77,6 +77,31 @@ pub struct RegistryEntry {
     /// name collisions. Empty for a repo with no recognised remotes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ids: Vec<RepoId>,
+    /// Top git authors by commit count (#265), recorded at registration so
+    /// "which repos did I work on?" is answerable across the whole registry
+    /// without touching each repo's git history. Capped; empty for a non-git
+    /// repo.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contributors: Vec<Contributor>,
+}
+
+/// A git author and how many commits they have in a repo (#265).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Contributor {
+    pub name: String,
+    pub email: String,
+    pub commits: u32,
+}
+
+impl RegistryEntry {
+    /// Whether `needle` matches a contributor's email or name, case-insensitively
+    /// (substring). Drives `repo list --author` / `--mine` (#265).
+    pub fn has_contributor(&self, needle: &str) -> bool {
+        let needle = needle.to_lowercase();
+        self.contributors.iter().any(|c| {
+            c.email.to_lowercase().contains(&needle) || c.name.to_lowercase().contains(&needle)
+        })
+    }
 }
 
 impl RegistryEntry {
@@ -242,6 +267,7 @@ impl Registry {
                     alt_roots: Vec::new(),
                     missing_since: None,
                     ids: Vec::new(),
+                    contributors: Vec::new(),
                 });
                 true
             }
@@ -279,6 +305,9 @@ impl Registry {
                     existing.ids.push(id);
                 }
             }
+            if !entry.contributors.is_empty() {
+                existing.contributors = entry.contributors; // refresh from this scan
+            }
             existing.missing_since = None;
             return Resolution::SameRepo {
                 into: existing.name.clone(),
@@ -291,6 +320,7 @@ impl Registry {
             existing.alt_roots = entry.alt_roots;
             existing.missing_since = None;
             existing.ids = entry.ids;
+            existing.contributors = entry.contributors;
             return Resolution::Updated;
         }
         // 3. New repo.
@@ -578,6 +608,7 @@ mod tests {
             alt_roots: Vec::new(),
             missing_since: None,
             ids: Vec::new(),
+            contributors: Vec::new(),
         }
     }
 
@@ -617,6 +648,21 @@ mod tests {
                 }
         );
         check!(reg.repos[0].alt_roots.len() == 1);
+    }
+
+    // #265: contributor match drives `repo list --author/--mine`.
+    #[test]
+    fn has_contributor_matches_name_or_email_case_insensitively() {
+        let mut e = entry("proj", "/p");
+        e.contributors = vec![Contributor {
+            name: "Jane Doe".into(),
+            email: "jane@example.com".into(),
+            commits: 42,
+        }];
+        check!(e.has_contributor("JANE@example.com"));
+        check!(e.has_contributor("jane doe"));
+        check!(e.has_contributor("example.com"));
+        check!(!e.has_contributor("bob"));
     }
 
     // A repo with no forge id can't be id-merged; it stays name-keyed.
