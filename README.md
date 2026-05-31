@@ -146,6 +146,37 @@ dependency is tied to the producer repo whose crate publishes it. The MCP
 enumerates the registry, so an agent gets the cross-repo blast radius in one
 call.
 
+#### How it works (many local databases, one registry)
+
+There is no central database. Each repo owns its index at
+`<repo>/.stratograph/ladybug`, built independently by `analyze`. The only shared
+state is the user-wide registry at `~/.stratograph/registry.json`, which just
+maps repo names to their roots (plus forge ids and groups) — it holds no graph
+data.
+
+A federated query (`impact --downstream` / `--group`, or the MCP `impact` tool)
+stitches those independent indexes together at query time:
+
+1. **Select the members** — the whole registry, or a named group. The current
+   repo (matched to a registry entry by path) is always included.
+2. **Open each member's index** read-only and pull its persisted *package
+   identity*: the packages it publishes (with their public exports) and its
+   *external uses* (imports that reference a declared dependency). Both were
+   computed and stored during that repo's own `analyze`.
+3. **Resolve cross-repo links** by matching a consumer's external use to the
+   producer repo whose package name (and exported symbol) it references. This
+   yields edges from a producer's export to the exact consumer symbols that use
+   it (falling back to file-level, then crate-level, when a symbol can't be
+   pinned down).
+4. **Traverse** the normal impact engine over the union, where those cross-repo
+   edges connect the per-repo graphs, and report the blast radius grouped by
+   repo (origin first, then downstream).
+
+Because linking is derived from package metadata, a repo only participates once
+it has been analyzed (so its identity is on disk) and registered; a repo with no
+recognized package/dependency relationship to the others simply contributes no
+cross edges. Linking is Cargo-only today.
+
 `repo scan` walks for version-control roots (`.git`/`.svn`/`.bzr`/`.hg`),
 skipping dot-directories (`--hidden` to include them) and treating each repo as
 a boundary (`--recursive` to also find nested repos / submodules). A submodule's
