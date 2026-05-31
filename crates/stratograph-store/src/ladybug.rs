@@ -27,6 +27,17 @@ use crate::graph_store::GraphStore;
 /// bounded chunks instead of one unbounded execute.
 const UNWIND_BATCH: usize = 4096;
 
+/// Upsert edges, deduping on `(src, dst, kind)` and keeping/raising confidence.
+const MERGE_EDGES: &str = "UNWIND $rows AS r MATCH (a:Node {id:r.src}), (b:Node {id:r.dst}) \
+     MERGE (a)-[e:Edge {kind:r.ekind}]->(b) \
+     ON CREATE SET e.confidence=r.conf \
+     ON MATCH SET e.confidence = CASE WHEN r.conf = 'extracted' THEN 'extracted' ELSE e.confidence END";
+
+/// Create edges unconditionally — for a fresh rebuild against an empty store
+/// with a pre-deduplicated edge set, avoiding MERGE's quadratic existence scan.
+const CREATE_EDGES: &str = "UNWIND $rows AS r MATCH (a:Node {id:r.src}), (b:Node {id:r.dst}) \
+     CREATE (a)-[e:Edge {kind:r.ekind, confidence:r.conf}]->(b)";
+
 const SCHEMA: &[&str] = &[
     "CREATE NODE TABLE IF NOT EXISTS Node(id STRING, kind STRING, name STRING, qualified_name STRING, file STRING, language STRING, start_byte INT64, end_byte INT64, start_line INT64, end_line INT64, doc STRING, PRIMARY KEY(id))",
     "CREATE REL TABLE IF NOT EXISTS Edge(FROM Node TO Node, kind STRING, confidence STRING)",
@@ -163,6 +174,21 @@ impl LadybugStore {
 
 fn s(v: &str) -> Value {
     Value::String(v.to_string())
+}
+
+/// `$rows` structs for an edge insert ([`MERGE_EDGES`] / [`CREATE_EDGES`]).
+fn edge_rows(edges: &[Edge]) -> Vec<Vec<(&str, Value)>> {
+    edges
+        .iter()
+        .map(|e| {
+            vec![
+                ("src", s(&e.src.0)),
+                ("dst", s(&e.dst.0)),
+                ("ekind", s(e.kind.as_str())),
+                ("conf", s(e.confidence.as_str())),
+            ]
+        })
+        .collect()
 }
 
 /// A non-empty list of strings as a Cypher `Value::List`, for `IN $param`
@@ -429,25 +455,18 @@ impl GraphStore for LadybugStore {
              n.doc=r.doc",
             node_rows,
         )?;
-        let edge_rows: Vec<Vec<(&str, Value)>> = edges
-            .iter()
-            .map(|e| {
-                vec![
-                    ("src", s(&e.src.0)),
-                    ("dst", s(&e.dst.0)),
-                    ("ekind", s(e.kind.as_str())),
-                    ("conf", s(e.confidence.as_str())),
-                ]
-            })
-            .collect();
-        self.exec_unwind(
-            &conn,
-            "UNWIND $rows AS r MATCH (a:Node {id:r.src}), (b:Node {id:r.dst}) \
-             MERGE (a)-[e:Edge {kind:r.ekind}]->(b) \
-             ON CREATE SET e.confidence=r.conf \
-             ON MATCH SET e.confidence = CASE WHEN r.conf = 'extracted' THEN 'extracted' ELSE e.confidence END",
-            edge_rows,
-        )
+        self.exec_unwind(&conn, MERGE_EDGES, edge_rows(edges))
+    }
+
+    fn insert_edges(&mut self, edges: &[Edge], fresh: bool) -> Result<()> {
+        let conn = self.conn()?;
+        // On a fresh rebuild the store was just cleared and the caller passes a
+        // de-duplicated edge set, so plain CREATE is correct — and crucially it
+        // skips MERGE's per-row existence check, which scans a node's growing
+        // adjacency and goes quadratic on a high-degree hub node, stalling the
+        // persist on a large repo. An incremental update still MERGEs.
+        let cypher = if fresh { CREATE_EDGES } else { MERGE_EDGES };
+        self.exec_unwind(&conn, cypher, edge_rows(edges))
     }
 
     fn insert_operations(&mut self, ops: &[(NodeId, OperationKey)]) -> Result<()> {

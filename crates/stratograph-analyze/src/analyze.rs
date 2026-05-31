@@ -1106,18 +1106,27 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
     ingest_schemas(&root, &cfg, &mut graph, &mut operations);
     resolve_progress.inc(1);
 
-    // Persist nodes and high-confidence (extracted) edges first.
+    // Persist nodes and high-confidence (extracted) edges first. Dedup edges on
+    // (src, dst, kind) — the graph model is one edge per such triple — so a full
+    // rebuild can CREATE them directly (see below) without MERGE's per-edge
+    // existence check.
+    let mut seen = std::collections::HashSet::new();
     let extracted: Vec<Edge> = graph
         .edges
         .iter()
         .filter(|e| e.confidence == Confidence::Extracted)
+        .filter(|e| seen.insert((e.src.0.clone(), e.dst.0.clone(), e.kind)))
         .cloned()
         .collect();
     stage("persisting nodes and edges");
     // Persist in batches so a large repo shows steady progress (and bounded
     // memory) instead of one opaque, seemingly-hung call. All nodes go in first;
     // edges then match the already-inserted endpoints. Empty slices are no-ops.
+    // A full (non-update) build starts from a cleared store, so edges CREATE
+    // directly instead of MERGE — the existence check otherwise stalls on a
+    // high-degree hub node in a large repo.
     const PERSIST_BATCH: usize = 4096;
+    let fresh = !update;
     let (n_nodes, n_edges) = (graph.nodes.len(), extracted.len());
     let mut done = 0;
     for chunk in graph.nodes.chunks(PERSIST_BATCH) {
@@ -1127,7 +1136,7 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
     }
     done = 0;
     for chunk in extracted.chunks(PERSIST_BATCH) {
-        store.insert_graph(&[], chunk)?;
+        store.insert_edges(chunk, fresh)?;
         done += chunk.len();
         resolve_progress.set_message(format!("persisting edges {done}/{n_edges}"));
     }
