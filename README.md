@@ -130,6 +130,7 @@ stratograph repo scan ~/code            # register already-indexed repos under a
 stratograph repo scan ~/code --analyze  # index each repo found, then register it
 stratograph repo scan ~/code --all      # register every repo, indexed or not
 stratograph repo list                   # registered repos + health + forge ids
+stratograph repo list --mine            # only repos you've contributed to
 stratograph group add svc api core      # optional: a named subset to scope to
 
 stratograph analyze .                   # index each repo as usual
@@ -184,6 +185,10 @@ shares a forge id with an existing entry, it's folded in as an additional
 location (shown as `also at …` in `repo list`) rather than a duplicate, so the
 repo isn't double-counted in federated impact. Symlinks collapse automatically
 via path canonicalization.
+
+Each repo records its top git authors at registration, so `repo list --mine`
+(or `--author <name-or-email>`) narrows a large registry to the repos you've
+worked on without scanning each repo's history.
 
 For tokens under a non-standard env var, or self-hosted Gitea/GitLab/Forgejo
 instances the tool can't recognise by host, map them in

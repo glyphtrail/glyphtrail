@@ -41,8 +41,8 @@ pub use manifest::{
 pub use matcher::{ClientCall, Endpoint, Match, Matcher};
 pub use model::{CodeGraph, Confidence, Edge, EdgeKind, Node, NodeId, NodeKind, PendingLink, Span};
 pub use registry::{
-    RecordOutcome, Registry, RegistryEntry, RepoHealth, Resolution, default_registry_path,
-    lock_path,
+    Contributor, RecordOutcome, Registry, RegistryEntry, RepoHealth, Resolution,
+    default_registry_path, lock_path,
 };
 pub use rewrite::{PrefixRewrite, RewriteCandidate, RewriteEngine};
 pub use scrub::scrub_secrets;
