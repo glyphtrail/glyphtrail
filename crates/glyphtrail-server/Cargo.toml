@@ -1,0 +1,25 @@
+[package]
+name = "glyphtrail-server"
+authors.workspace = true
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+glyphtrail-core.workspace = true
+glyphtrail-store.workspace = true
+glyphtrail-viz.workspace = true
+glyphtrail-mcp.workspace = true
+axum.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+pulldown-cmark.workspace = true
+
+[dev-dependencies]
+assert2.workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "glyphtrail-store"
+authors.workspace = true
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+glyphtrail-core.workspace = true
+anyhow.workspace = true
+# LadybugDB (Cypher) is the sole storage backend (#8). Pulls a prebuilt liblbug
+# (or builds it via cmake), so a C++ toolchain is required to build this crate.
+lbug = "0.17.0"
+
+[dev-dependencies]
+assert2.workspace = true

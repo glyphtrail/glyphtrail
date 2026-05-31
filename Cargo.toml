@@ -1,15 +1,15 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/stratograph-core",
-    "crates/stratograph-parse",
-    "crates/stratograph-store",
-    "crates/stratograph-forge-id",
-    "crates/stratograph-analyze",
-    "crates/stratograph-viz",
-    "crates/stratograph-server",
-    "crates/stratograph-mcp",
-    "crates/stratograph-cli",
+    "crates/glyphtrail-core",
+    "crates/glyphtrail-parse",
+    "crates/glyphtrail-store",
+    "crates/glyphtrail-forge-id",
+    "crates/glyphtrail-analyze",
+    "crates/glyphtrail-viz",
+    "crates/glyphtrail-server",
+    "crates/glyphtrail-mcp",
+    "crates/glyphtrail-cli",
 ]
 
 [workspace.package]
@@ -18,17 +18,17 @@ edition = "2024"
 authors = ["Markus Mayer <widemeadows@gmail.com>"]
 license = "EUPL-1.2"
 rust-version = "1.95"
-repository = "https://github.com/sunsided/stratograph"
+repository = "https://github.com/glyphtrail/glyphtrail"
 
 [workspace.dependencies]
-stratograph-core = { path = "crates/stratograph-core" }
-stratograph-parse = { path = "crates/stratograph-parse" }
-stratograph-store = { path = "crates/stratograph-store" }
-stratograph-forge-id = { path = "crates/stratograph-forge-id" }
-stratograph-analyze = { path = "crates/stratograph-analyze" }
-stratograph-viz = { path = "crates/stratograph-viz" }
-stratograph-server = { path = "crates/stratograph-server" }
-stratograph-mcp = { path = "crates/stratograph-mcp" }
+glyphtrail-core = { path = "crates/glyphtrail-core" }
+glyphtrail-parse = { path = "crates/glyphtrail-parse" }
+glyphtrail-store = { path = "crates/glyphtrail-store" }
+glyphtrail-forge-id = { path = "crates/glyphtrail-forge-id" }
+glyphtrail-analyze = { path = "crates/glyphtrail-analyze" }
+glyphtrail-viz = { path = "crates/glyphtrail-viz" }
+glyphtrail-server = { path = "crates/glyphtrail-server" }
+glyphtrail-mcp = { path = "crates/glyphtrail-mcp" }
 
 uuid = { version = "1", features = ["v5"] }
 ureq = { version = "2", features = ["json"] }
@@ -77,8 +77,8 @@ tree-sitter-zig = "1.1.2"
 lto = "thin"
 
 # Always build the LadybugDB native dependency (`lbug`) optimized, regardless of
-# stratograph's own profile. Its C++ core is unusably slow unoptimized, and a debug
-# build of stratograph shouldn't pay to compile a debug `lbug`. The `opt-level`
+# glyphtrail's own profile. Its C++ core is unusably slow unoptimized, and a debug
+# build of glyphtrail shouldn't pay to compile a debug `lbug`. The `opt-level`
 # also makes the `cmake` build script select CMAKE_BUILD_TYPE=Release.
 [profile.dev.package.lbug]
 opt-level = 3

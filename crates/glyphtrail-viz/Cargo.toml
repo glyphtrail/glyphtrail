@@ -1,0 +1,18 @@
+[package]
+name = "glyphtrail-viz"
+authors.workspace = true
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+glyphtrail-core.workspace = true
+glyphtrail-store.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+assert2.workspace = true

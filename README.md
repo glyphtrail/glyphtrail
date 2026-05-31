@@ -1,12 +1,12 @@
-# Stratograph
+# Glyphtrail
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/sunsided/stratograph/main/.readme/hero.jpg" alt="Stratograph" />
+  <img src="https://raw.githubusercontent.com/glyphtrail/glyphtrail/main/.readme/hero.jpg" alt="Glyphtrail" />
 </p>
 
 [![unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)](https://github.com/rust-secure-code/safety-dance/)
 
-Stratograph maps codebases as **semantic and historical graphs**, so you can query
+Glyphtrail maps codebases as **semantic and historical graphs**, so you can query
 structure, trace lineage, and discover recurring ideas across time.
 
 It parses source with [tree-sitter](https://tree-sitter.github.io/), extracts
@@ -19,71 +19,71 @@ Built native in Rust.
 ## Install
 
 Prebuilt binaries for Linux, macOS (Intel + Apple Silicon) and Windows are
-attached to each [tagged release](https://github.com/sunsided/stratograph/releases).
+attached to each [tagged release](https://github.com/glyphtrail/glyphtrail/releases).
 
 Or build from source:
 
 ```sh
-cargo install --git https://github.com/sunsided/stratograph stratograph-cli
+cargo install --git https://github.com/glyphtrail/glyphtrail glyphtrail-cli
 # or, from a checkout:
-cargo build --release   # binary at target/release/stratograph
+cargo build --release   # binary at target/release/glyphtrail
 ```
 
 ## Usage
 
 ```sh
-# Index the current repository (writes .stratograph/ladybug)
-stratograph analyze .
+# Index the current repository (writes .glyphtrail/ladybug)
+glyphtrail analyze .
 
 # Re-index only files that changed
-stratograph analyze . --update
+glyphtrail analyze . --update
 
 # Query the graph
-stratograph query def <name>            # locate a definition
-stratograph query callers <name>        # who calls it
-stratograph query callees <name>        # what it calls
-stratograph query neighbors <name>      # direct graph neighbours
-stratograph query search <text>         # full-text search (names + doc comments)
-stratograph query impact <name>         # transitive blast radius if it changes
+glyphtrail query def <name>            # locate a definition
+glyphtrail query callers <name>        # who calls it
+glyphtrail query callees <name>        # what it calls
+glyphtrail query neighbors <name>      # direct graph neighbours
+glyphtrail query search <text>         # full-text search (names + doc comments)
+glyphtrail query impact <name>         # transitive blast radius if it changes
 #   add --json (or --yaml, compact for agents) for machine-readable output
 
 # Impact analysis (blast radius from a symbol, file, or change set)
-stratograph impact <name>                       # seed: a symbol
-stratograph impact --file src/api.rs            # seed: every symbol in a file
-stratograph impact --since main..HEAD           # seed: changed symbols vs a git range
-stratograph impact --staged | --diff            # seed: staged / working-tree changes
+glyphtrail impact <name>                       # seed: a symbol
+glyphtrail impact --file src/api.rs            # seed: every symbol in a file
+glyphtrail impact --since main..HEAD           # seed: changed symbols vs a git range
+glyphtrail impact --staged | --diff            # seed: staged / working-tree changes
 #   [--cross-boundary] reach API consumers (HANDLES/INVOKES/EXPOSES/MOUNTS)
 #   [--edges calls,imports,impl,api] [--depth N] [--min-confidence extracted|inferred]
 #   [--format text|json|md]   [--gate]  exit 2 when the change touches the API surface
 
 # Visualize
-stratograph viz --output graph.html     # self-contained interactive page
-stratograph serve --port 7700           # live explorer at http://127.0.0.1:7700
+glyphtrail viz --output graph.html     # self-contained interactive page
+glyphtrail serve --port 7700           # live explorer at http://127.0.0.1:7700
 
 # Agent integration (Model Context Protocol)
-stratograph mcp                         # MCP server over stdio (query/endpoints/impact/…)
-#   `stratograph serve` also exposes the same tools at POST /mcp (JSON-RPC)
-stratograph setup                       # onboard agents: write .claude/skills + a
+glyphtrail mcp                         # MCP server over stdio (query/endpoints/impact/…)
+#   `glyphtrail serve` also exposes the same tools at POST /mcp (JSON-RPC)
+glyphtrail setup                       # onboard agents: write .claude/skills + a
 #   managed CLAUDE.md/AGENTS.md section pointing them at the MCP/CLI, and gitignore
 #   the index. Idempotent and stats-free (won't dirty the files on every commit).
 
 # Generate a docs wiki from the graph via an LLM
-stratograph wiki --provider claude        # or openai / openrouter (reads *_API_KEY)
-stratograph wiki --dry-run                # write the prompts only (no network/keys)
+glyphtrail wiki --provider claude        # or openai / openrouter (reads *_API_KEY)
+glyphtrail wiki --dry-run                # write the prompts only (no network/keys)
 #   --base-url lets an OpenAI-compatible gateway (e.g. Kilo) stand in
 
 # Stats
-stratograph status
+glyphtrail status
 ```
 
 ### Excluding sensitive files
 
 `analyze` honors `.gitignore`/`.git/info/exclude`, skips dotfiles, and reads
-exclusion lists from `.stratographignore`, `.aiignore`, `.aiexclude`, and
+exclusion lists from `.glyphtrailignore`, `.aiignore`, `.aiexclude`, and
 `.claudeignore`. List any file with secrets/key material there to keep it out of
 the index entirely — and therefore out of every agent-facing surface (wiki, MCP).
 
-A **user-wide** ignore file at `~/.stratographignore` applies to every repo you
+A **user-wide** ignore file at `~/.glyphtrailignore` applies to every repo you
 analyze — handy when bulk-indexing a whole work directory. It does two things:
 
 - **gitignore-format patterns** (e.g. `*.generated.rs`) exclude matching files in
@@ -109,16 +109,16 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0           # need the base ref for the diff
-      - run: cargo install --path crates/stratograph-cli   # or download a release binary
-      - run: stratograph analyze .
+      - run: cargo install --path crates/glyphtrail-cli   # or download a release binary
+      - run: glyphtrail analyze .
       - name: Impact report
         run: |
-          stratograph impact --since "origin/${{ github.base_ref }}...HEAD" \
+          glyphtrail impact --since "origin/${{ github.base_ref }}...HEAD" \
             --cross-boundary --format md >> "$GITHUB_STEP_SUMMARY"
       # Optional: fail the job if the PR changes the API/contract surface.
       - name: Drift gate
         run: |
-          stratograph impact --since "origin/${{ github.base_ref }}...HEAD" \
+          glyphtrail impact --since "origin/${{ github.base_ref }}...HEAD" \
             --cross-boundary --gate
 ```
 
@@ -130,19 +130,19 @@ or a path dependency), `impact --downstream` reports which of those repos break
 and where, not just your own.
 
 ```bash
-stratograph repo add .                  # register the current repo
-stratograph repo scan ~/code            # register already-indexed repos under a tree
-stratograph repo scan ~/code --analyze  # index each repo found, then register it
-stratograph repo scan ~/code --all      # register every repo, indexed or not
-stratograph repo list                   # registered repos + health + forge ids
-stratograph repo list --mine            # only repos you've contributed to
-stratograph group add svc api core      # optional: a named subset to scope to
+glyphtrail repo add .                  # register the current repo
+glyphtrail repo scan ~/code            # register already-indexed repos under a tree
+glyphtrail repo scan ~/code --analyze  # index each repo found, then register it
+glyphtrail repo scan ~/code --all      # register every repo, indexed or not
+glyphtrail repo list                   # registered repos + health + forge ids
+glyphtrail repo list --mine            # only repos you've contributed to
+glyphtrail group add svc api core      # optional: a named subset to scope to
 
-stratograph analyze .                   # index each repo as usual
+glyphtrail analyze .                   # index each repo as usual
 
 # Blast radius extended into downstream repos that depend on this one:
-stratograph impact MySymbol --downstream            # federate over the registry
-stratograph impact --since main..HEAD --group svc   # scope to a group
+glyphtrail impact MySymbol --downstream            # federate over the registry
+glyphtrail impact --since main..HEAD --group svc   # scope to a group
 ```
 
 Cross-repo links are matched by package name (Cargo today): a consumer's
@@ -154,8 +154,8 @@ call.
 #### How it works (many local databases, one registry)
 
 There is no central database. Each repo owns its index at
-`<repo>/.stratograph/ladybug`, built independently by `analyze`. The only shared
-state is the user-wide registry at `~/.stratograph/registry.json`, which just
+`<repo>/.glyphtrail/ladybug`, built independently by `analyze`. The only shared
+state is the user-wide registry at `~/.glyphtrail/registry.json`, which just
 maps repo names to their roots (plus forge ids and groups) — it holds no graph
 data.
 
@@ -211,12 +211,12 @@ plus a Codeberg mirror) all resolve to the same repo. Two kinds, recorded at
 Numeric ids are entirely opt-in: with no token (and no `gh`), only the slug ids
 are recorded. Tokens are read from the environment and never logged.
 
-`stratograph repo refresh [name]` re-derives ids for registered repos from their
+`glyphtrail repo refresh [name]` re-derives ids for registered repos from their
 current git remotes, in place — handy when remotes change or to repair ids
 written by an older version, without re-analyzing.
 
 The same repo can live at more than one path — a symlink, a second clone, a
-backup copy. Stratograph keeps **one entry per repo**: when a path you register
+backup copy. Glyphtrail keeps **one entry per repo**: when a path you register
 shares a forge id with an existing entry, it's folded in as an additional
 location (shown as `also at …` in `repo list`) rather than a duplicate, so the
 repo isn't double-counted in federated impact. Symlinks collapse automatically
@@ -228,7 +228,7 @@ worked on without scanning each repo's history.
 
 For tokens under a non-standard env var, or self-hosted Gitea/GitLab/Forgejo
 instances the tool can't recognise by host, map them in
-`~/.stratograph/forge.toml`:
+`~/.glyphtrail/forge.toml`:
 
 ```toml
 [hosts."codeberg.org"]
@@ -241,7 +241,7 @@ token_env = "EXAMPLE_TOKEN"
 
 ### Concurrent writes and recovery
 
-The registry (`~/.stratograph/registry.json`) and groups files are updated under
+The registry (`~/.glyphtrail/registry.json`) and groups files are updated under
 a portable lock file (`registry.lock`) that works on network / FUSE / sync
 filesystems (e.g. pCloud), where OS advisory locks (`flock`) are unreliable and
 can leave a *permanent* lock when a writer dies. The lock self-heals: a lock
@@ -256,18 +256,18 @@ lock merges it in. Spillovers are written atomically (temp + rename), so a
 reader never sees a half-written file. This makes bulk registration (indexing
 many repos at once) loss-proof even on a slow or contended drive.
 
-As a manual escape hatch, `stratograph repo unlock` force-releases the lock. It
+As a manual escape hatch, `glyphtrail repo unlock` force-releases the lock. It
 is rarely needed given the self-healing above, and only removes the lock file.
 
 ## Languages
 
 Coverage is driven by a tree-sitter grammar registry. Built in:
 Rust, Python, JavaScript, TypeScript/TSX, Go, Java, C, C++, C#, Ruby, Kotlin. Adding a built-in
-language is a grammar in `stratograph-parse/src/registry.rs` plus a query file under
-`stratograph-parse/queries/`.
+language is a grammar in `glyphtrail-parse/src/registry.rs` plus a query file under
+`glyphtrail-parse/queries/`.
 
 Extra languages can also be loaded at runtime without rebuilding — point
-`.stratograph/config.toml` at a tree-sitter grammar and a query (the grammar is
+`.glyphtrail/config.toml` at a tree-sitter grammar and a query (the grammar is
 compiled on demand; needs a C toolchain):
 
 ```toml
@@ -292,21 +292,21 @@ A Cargo workspace:
 
 | Crate | Responsibility |
 |-------|----------------|
-| `stratograph-core`   | domain model, language detection, config |
-| `stratograph-parse`  | tree-sitter registry, extraction, graph building |
-| `stratograph-store`  | LadybugDB (Cypher) storage and graph queries |
-| `stratograph-viz`    | Cytoscape graph rendering (HTML/JSON) |
-| `stratograph-server` | `axum` server for the interactive explorer |
-| `stratograph-mcp`    | Model Context Protocol server (stdio) exposing the query tools |
-| `stratograph-cli`    | the `stratograph` binary |
+| `glyphtrail-core`   | domain model, language detection, config |
+| `glyphtrail-parse`  | tree-sitter registry, extraction, graph building |
+| `glyphtrail-store`  | LadybugDB (Cypher) storage and graph queries |
+| `glyphtrail-viz`    | Cytoscape graph rendering (HTML/JSON) |
+| `glyphtrail-server` | `axum` server for the interactive explorer |
+| `glyphtrail-mcp`    | Model Context Protocol server (stdio) exposing the query tools |
+| `glyphtrail-cli`    | the `glyphtrail` binary |
 
 Storage sits behind the `GraphStore` trait. **LadybugDB** (Cypher, native graph
-traversal) is the storage backend; the `.stratograph/ladybug` index is the source
+traversal) is the storage backend; the `.glyphtrail/ladybug` index is the source
 of truth.
 
 ```sh
-stratograph analyze .                    # writes .stratograph/ladybug
-stratograph cypher "MATCH (n:Node) RETURN n.name LIMIT 10"   # raw Cypher
+glyphtrail analyze .                    # writes .glyphtrail/ladybug
+glyphtrail cypher "MATCH (n:Node) RETURN n.name LIMIT 10"   # raw Cypher
 ```
 
 LadybugDB links the `lbug` crate, which downloads a prebuilt `liblbug` or builds
@@ -326,8 +326,8 @@ build-essential`).
 
 ```sh
 # Clone and build
-git clone https://github.com/sunsided/stratograph
-cd stratograph
+git clone https://github.com/glyphtrail/glyphtrail
+cd glyphtrail
 cargo build --workspace
 
 # Install pre-commit hooks (runs on every `git commit`)
