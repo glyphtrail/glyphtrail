@@ -110,6 +110,53 @@ jobs:
             --cross-boundary --gate
 ```
 
+### Cross-repo blast radius
+
+Register repositories once, then trace a change's impact *across* them — when you
+change a crate that other locally-indexed repos depend on (via crates.io, git,
+or a path dependency), `impact --downstream` reports which of those repos break
+and where, not just your own.
+
+```bash
+stratograph repo add .                  # register the current repo
+stratograph repo list                   # registered repos + health + forge ids
+stratograph group add svc api core      # optional: a named subset to scope to
+
+stratograph analyze .                   # index each repo as usual
+
+# Blast radius extended into downstream repos that depend on this one:
+stratograph impact MySymbol --downstream            # federate over the registry
+stratograph impact --since main..HEAD --group svc   # scope to a group
+```
+
+Cross-repo links are matched by package name (Cargo today): a consumer's
+dependency is tied to the producer repo whose crate publishes it. The MCP
+`impact` tool takes the same `downstream`/`group` arguments, and `list_repos`
+enumerates the registry, so an agent gets the cross-repo blast radius in one
+call.
+
+### Repository identity
+
+Each registered repo gets stable **forge identities** derived from its git
+remotes, so it is recognised across folder renames, multiple clones, and name
+collisions with published crates — and a repo's mirrors (e.g. a GitHub origin
+plus a Codeberg mirror) all resolve to the same repo. Two kinds, recorded at
+`repo add`:
+
+- **Slug** (always, offline): `host/owner/repo` from each remote → a UUIDv5.
+- **Numeric** (optional, rename-proof): the forge's numeric repo id via its API,
+  which survives a rename *on the forge*. Resolved only when a token is
+  available, per forge:
+
+  | Forge | Host | Token env var |
+  | --- | --- | --- |
+  | GitHub | `github.com` | `GITHUB_TOKEN` (else falls back to the `gh` CLI) |
+  | GitLab | `gitlab.com` | `GITLAB_TOKEN` |
+  | Gitea / Forgejo | `codeberg.org` | `CODEBERG_TOKEN` |
+
+Numeric ids are entirely opt-in: with no token (and no `gh`), only the slug ids
+are recorded. Tokens are read from the environment and never logged.
+
 ## Languages
 
 Coverage is driven by a tree-sitter grammar registry. Built in:
