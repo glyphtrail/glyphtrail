@@ -98,7 +98,9 @@ fn registry_path() -> Result<PathBuf> {
 pub fn analyze_all(update: bool) -> Result<()> {
     each_repo("analyze", |root| {
         let outcome = super::analyze::run(root, update)?;
-        if outcome.up_to_date {
+        if outcome.ignored {
+            println!("  skipped (excluded by ~/.stratographignore)");
+        } else if outcome.up_to_date {
             println!("  up to date ({} files)", outcome.files);
         } else {
             println!(
@@ -558,15 +560,23 @@ fn scan(registry_path: &Path, dir: &Path, opts: ScanOpts) -> Result<()> {
     let mut roots = Vec::new();
     find_repo_roots(&root, opts.recursive, opts.hidden, &mut roots, &walk);
     walk.finish_and_clear();
+    // Drop repos excluded by ~/.stratographignore (#269) before doing any work.
+    let before = roots.len();
+    roots.retain(|r| !super::analyze::is_path_excluded(r));
+    let excluded = before - roots.len();
     if roots.is_empty() {
         println!("no repositories found under {}", root.display());
         return Ok(());
     }
-    println!(
+    print!(
         "found {} repositories under {}",
         roots.len(),
         root.display()
     );
+    if excluded > 0 {
+        print!(" ({excluded} excluded by ~/.stratographignore)");
+    }
+    println!();
 
     let (mut registered, mut merged, mut queued, mut analyzed, mut skipped, mut failed) =
         (0u32, 0, 0, 0, 0, 0);

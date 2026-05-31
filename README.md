@@ -83,9 +83,14 @@ exclusion lists from `.stratographignore`, `.aiignore`, `.aiexclude`, and
 `.claudeignore`. List any file with secrets/key material there to keep it out of
 the index entirely — and therefore out of every agent-facing surface (wiki, MCP).
 
-A **user-wide** ignore file at `~/.stratograph/ignore` (gitignore-format)
-applies to every repo you analyze — handy when bulk-indexing a whole work
-directory. A repo's own ignore files can re-include a pattern with `!`.
+A **user-wide** ignore file at `~/.stratographignore` applies to every repo you
+analyze — handy when bulk-indexing a whole work directory. It does two things:
+
+- **gitignore-format patterns** (e.g. `*.generated.rs`) exclude matching files in
+  every repo's walk; a repo's own ignore files can re-include with `!`.
+- **absolute (or `~/…`) path lines** exclude that whole repo/tree — analyzing it,
+  or any subfolder of it, does nothing. Useful to skip a few giant repos while
+  bulk-scanning a work directory.
 
 ### Impact reports in CI
 
