@@ -32,6 +32,7 @@ glyphtrail-mcp = { path = "crates/glyphtrail-mcp" }
 
 uuid = { version = "1", features = ["v5"] }
 ureq = { version = "2", features = ["json"] }
+detect-coding-agent = "0"
 
 anyhow = "1"
 thiserror = "2"
