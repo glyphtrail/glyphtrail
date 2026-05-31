@@ -3,6 +3,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Subcommand;
+use indicatif::{ProgressBar, ProgressStyle};
 use stratograph_core::{
     RecordOutcome, Registry, RegistryEntry, RepoHealth, default_registry_path, filelock, lock_path,
     repo_ids,
@@ -20,26 +21,37 @@ pub enum RepoCmd {
         #[arg(long)]
         name: Option<String>,
     },
-    /// Recursively find repositories under a directory and register them all.
+    /// Recursively find repositories under a directory and register them.
     ///
-    /// Walks the tree for version-control roots (`.git`, `.svn`, `.bzr`, `.hg`)
-    /// and registers each one — handy for pointing at a whole workspace at once.
-    /// Registration always runs, even for an already-indexed repo, so a repo
-    /// whose earlier registration failed gets picked up.
+    /// Walks the tree for version-control roots (`.git`, `.svn`, `.bzr`, `.hg`).
+    /// By default only repos that are already indexed are registered (so a repo
+    /// whose earlier registration failed is recovered without pulling in every
+    /// stray checkout); use `--analyze` to index each as it's found, or `--all`
+    /// to register everything regardless. Handy for pointing at a whole
+    /// workspace at once.
     Scan {
         /// Directory to scan (defaults to the current directory).
         #[arg(default_value = ".")]
         dir: PathBuf,
-        /// Also analyze each repo after registering it.
+        /// Analyze each repo as it's found (then register it). `--update` keeps
+        /// it incremental.
         #[arg(long)]
         analyze: bool,
         /// With --analyze, only reparse files changed since the last index.
         #[arg(long)]
         update: bool,
-        /// Descend into repositories to also register nested repos (submodules,
+        /// Register every repo found, including ones with no index yet. By
+        /// default only already-indexed repos are registered.
+        #[arg(long)]
+        all: bool,
+        /// Descend into repositories to also find nested repos (submodules,
         /// vendored checkouts). By default a repo root is a boundary.
         #[arg(long)]
-        nested: bool,
+        recursive: bool,
+        /// Descend into dot-directories (`.git`, `.cache`, `.claude`, …). Off by
+        /// default so worktrees and tool caches aren't scanned.
+        #[arg(long)]
+        hidden: bool,
     },
     /// List registered repositories and their health.
     List,
@@ -161,8 +173,20 @@ pub fn run(cmd: RepoCmd) -> Result<()> {
             dir,
             analyze,
             update,
-            nested,
-        } => scan(&path, &dir, analyze, update, nested)?,
+            all,
+            recursive,
+            hidden,
+        } => scan(
+            &path,
+            &dir,
+            ScanOpts {
+                analyze,
+                update,
+                all,
+                recursive,
+                hidden,
+            },
+        )?,
         RepoCmd::List => {
             let registry = Registry::mutate(&path, |reg| {
                 reg.refresh_health();
@@ -239,6 +263,15 @@ fn entry_for(registry_path: &Path, root: &Path, name: Option<String>) -> Registr
     }
 }
 
+/// Options for [`scan`], mirroring the `repo scan` flags.
+struct ScanOpts {
+    analyze: bool,
+    update: bool,
+    all: bool,
+    recursive: bool,
+    hidden: bool,
+}
+
 /// Version-control markers that mark a directory as a repository root.
 const VCS_MARKERS: [&str; 4] = [".git", ".svn", ".bzr", ".hg"];
 
@@ -248,14 +281,34 @@ fn is_repo_root(dir: &Path) -> bool {
     VCS_MARKERS.iter().any(|m| dir.join(m).exists())
 }
 
-/// Collect repository roots under `start` (depth-first). A repo root is a
-/// boundary by default (its contents aren't scanned for nested repos) unless
-/// `nested` is set. Symlinked directories are not followed, so cycles can't
-/// trap the walk.
-fn find_repo_roots(start: &Path, nested: bool, out: &mut Vec<PathBuf>) {
+/// Whether `root` already has a built index (`.stratograph/ladybug`). Cheap
+/// filesystem check, so unindexed repos can be skipped without shelling out to
+/// git for their identities.
+fn is_indexed(root: &Path) -> bool {
+    stratograph_core::config::RepoPaths::new(root)
+        .index_dir
+        .join("ladybug")
+        .exists()
+}
+
+/// Collect repository roots under `start` (depth-first), ticking `pb` per
+/// directory entered so a slow (e.g. network) walk shows progress. A repo root
+/// is a boundary unless `recursive` is set (then nested repos / submodules are
+/// also found). Dot-directories are skipped unless `hidden` is set, so tool
+/// caches and worktrees (`.git`, `.cache`, `.claude/worktree`) aren't scanned.
+/// Symlinked directories are never followed, so cycles can't trap the walk.
+fn find_repo_roots(
+    start: &Path,
+    recursive: bool,
+    hidden: bool,
+    out: &mut Vec<PathBuf>,
+    pb: &ProgressBar,
+) {
+    pb.inc(1);
+    pb.set_message(format!("{} repos", out.len()));
     if is_repo_root(start) {
         out.push(start.to_path_buf());
-        if !nested {
+        if !recursive {
             return; // boundary: don't descend into the repo
         }
     }
@@ -268,69 +321,135 @@ fn find_repo_roots(start: &Path, nested: bool, out: &mut Vec<PathBuf>) {
             Ok(ft) if ft.is_dir() => {}
             _ => continue,
         }
-        find_repo_roots(&entry.path(), nested, out);
+        // Skip dot-directories unless asked; their `.git` etc. is still detected
+        // via `is_repo_root` on the parent, so real repos aren't missed.
+        if !hidden
+            && entry
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with('.'))
+        {
+            continue;
+        }
+        find_repo_roots(&entry.path(), recursive, hidden, out, pb);
     }
 }
 
-/// Recursively register every repository under `dir` (#263). Registration runs
-/// for every repo found, independent of `--analyze`: an already-indexed repo is
-/// still (re)registered, so one whose earlier registration failed (e.g. a stuck
-/// lock) is recovered. With `analyze`, each repo is indexed after it's recorded.
-fn scan(registry_path: &Path, dir: &Path, analyze: bool, update: bool, nested: bool) -> Result<()> {
+/// A steady-ticking spinner on stderr, auto-hidden when stderr isn't a TTY.
+fn spinner(msg: &str) -> ProgressBar {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} {prefix}: {pos} dirs, {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    pb.set_prefix(msg.to_string());
+    pb.enable_steady_tick(std::time::Duration::from_millis(120));
+    pb
+}
+
+/// Recursively register repositories under `dir` (#263). The walk and per-repo
+/// work both show progress, since either can be slow on a network drive.
+///
+/// By default only already-indexed repos are registered, so a repo whose prior
+/// registration was lost (e.g. to a stuck lock) is recovered without pulling in
+/// every stray checkout. `--analyze` indexes each repo as it's found (so it then
+/// qualifies); `--all` registers everything regardless.
+fn scan(registry_path: &Path, dir: &Path, opts: ScanOpts) -> Result<()> {
     let root = dir
         .canonicalize()
         .with_context(|| format!("cannot resolve path {}", dir.display()))?;
+
+    let walk = spinner(&format!("scanning {}", root.display()));
     let mut roots = Vec::new();
-    find_repo_roots(&root, nested, &mut roots);
+    find_repo_roots(&root, opts.recursive, opts.hidden, &mut roots, &walk);
+    walk.finish_and_clear();
     if roots.is_empty() {
         println!("no repositories found under {}", root.display());
         return Ok(());
     }
+    println!(
+        "found {} repositories under {}",
+        roots.len(),
+        root.display()
+    );
 
-    let (mut registered, mut queued, mut analyzed, mut failed) = (0u32, 0u32, 0u32, 0u32);
+    let (mut registered, mut queued, mut analyzed, mut skipped, mut failed) = (0u32, 0, 0, 0, 0);
+    let bar = ProgressBar::new(roots.len() as u64);
+    bar.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} [{pos}/{len}] {wide_msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_bar()),
+    );
+    bar.enable_steady_tick(std::time::Duration::from_millis(120));
     for repo in &roots {
-        let entry = entry_for(registry_path, repo, None);
-        let name = entry.name.clone();
-        // Always register first, regardless of index state, so a repo whose
-        // prior registration was lost is recovered even when it's up to date.
-        match Registry::record(registry_path, vec![entry])? {
-            RecordOutcome::Applied => {
-                registered += 1;
-                println!("registered '{}' -> {}", name, repo.display());
-            }
-            RecordOutcome::Spilled => {
-                queued += 1;
-                println!(
-                    "registry busy; queued '{}' -> {} (merged on the next run)",
-                    name,
-                    repo.display()
-                );
-            }
-        }
-        if analyze {
-            match super::analyze::run(repo, update) {
-                Ok(outcome) if outcome.up_to_date => {
-                    println!("  index up to date ({} files)", outcome.files);
-                }
-                Ok(outcome) => {
+        let name = repo
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "repo".into());
+        bar.set_message(name.clone());
+
+        // Analyze first when asked, so a freshly-indexed repo then qualifies for
+        // registration below.
+        if opts.analyze {
+            match super::analyze::run(repo, opts.update) {
+                Ok(o) if o.up_to_date => bar.suspend(|| {
+                    println!("{name}: index up to date ({} files)", o.files);
+                }),
+                Ok(o) => {
                     analyzed += 1;
-                    println!(
-                        "  indexed {} files: {} nodes, {} edges",
-                        outcome.files, outcome.nodes, outcome.edges
-                    );
+                    bar.suspend(|| {
+                        println!(
+                            "{name}: indexed {} files: {} nodes, {} edges",
+                            o.files, o.nodes, o.edges
+                        );
+                    });
                 }
                 Err(err) => {
                     failed += 1;
-                    eprintln!("  analyze failed: {err:#}");
+                    bar.suspend(|| eprintln!("{name}: analyze failed: {err:#}"));
                 }
             }
         }
+
+        // Register only indexed repos unless `--all`. Registration always runs
+        // for a qualifying repo even if it was already indexed, recovering one
+        // whose earlier registration was lost.
+        if !opts.all && !is_indexed(repo) {
+            skipped += 1;
+            bar.suspend(|| {
+                println!("{name}: skipped (no index; run with --analyze or --all)");
+            });
+            bar.inc(1);
+            continue;
+        }
+        let entry = entry_for(registry_path, repo, Some(name.clone()));
+        match Registry::record(registry_path, vec![entry])? {
+            RecordOutcome::Applied => {
+                registered += 1;
+                bar.suspend(|| println!("registered '{}' -> {}", name, repo.display()));
+            }
+            RecordOutcome::Spilled => {
+                queued += 1;
+                bar.suspend(|| {
+                    println!(
+                        "registry busy; queued '{}' -> {} (merged on the next run)",
+                        name,
+                        repo.display()
+                    )
+                });
+            }
+        }
+        bar.inc(1);
     }
+    bar.finish_and_clear();
+
     print!("scan: {registered} registered");
     if queued > 0 {
         print!(", {queued} queued");
     }
-    if analyze {
+    if skipped > 0 {
+        print!(", {skipped} skipped");
+    }
+    if opts.analyze {
         print!(", {analyzed} analyzed, {failed} failed");
     }
     println!();
@@ -404,45 +523,56 @@ mod tests {
             .as_nanos();
         let dir = std::env::temp_dir().join(format!("stratograph-scan-{nanos}"));
         // alpha is a git repo; sub/beta an svn repo; alpha/vendor/gamma a nested
-        // git repo; notrepo holds no VCS marker.
+        // git repo; notrepo holds no VCS marker; .hidden/delta lives under a
+        // dot-directory.
         for sub in [
             "alpha/.git",
             "sub/beta/.svn",
             "alpha/vendor/gamma/.git",
             "notrepo/src",
+            ".hidden/delta/.git",
         ] {
             std::fs::create_dir_all(dir.join(sub)).unwrap();
         }
         dir
     }
 
-    #[test]
-    fn scan_stops_at_repo_boundaries_by_default() {
-        let dir = scratch();
-        let mut roots = Vec::new();
-        find_repo_roots(&dir, false, &mut roots);
-        let names: Vec<_> = roots
+    fn names_of(roots: &[PathBuf]) -> Vec<String> {
+        roots
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
-            .collect();
-        check!(roots.len() == 2); // alpha + beta; gamma is inside alpha (a boundary)
+            .collect()
+    }
+
+    #[test]
+    fn scan_stops_at_repo_boundaries_and_skips_dot_dirs() {
+        let dir = scratch();
+        let mut roots = Vec::new();
+        find_repo_roots(&dir, false, false, &mut roots, &ProgressBar::hidden());
+        let names = names_of(&roots);
         check!(names.contains(&"alpha".to_string()));
         check!(names.contains(&"beta".to_string()));
-        check!(!names.contains(&"gamma".to_string()));
+        check!(!names.contains(&"gamma".to_string())); // inside alpha (a boundary)
+        check!(!names.contains(&"delta".to_string())); // inside a dot-directory
+        check!(roots.len() == 2);
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn scan_nested_descends_into_repos() {
+    fn scan_recursive_descends_into_repos() {
         let dir = scratch();
         let mut roots = Vec::new();
-        find_repo_roots(&dir, true, &mut roots);
-        let names: Vec<_> = roots
-            .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
-            .collect();
-        check!(names.contains(&"gamma".to_string())); // submodule now found
-        check!(roots.len() == 3);
+        find_repo_roots(&dir, true, false, &mut roots, &ProgressBar::hidden());
+        check!(names_of(&roots).contains(&"gamma".to_string())); // submodule now found
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn scan_hidden_descends_into_dot_dirs() {
+        let dir = scratch();
+        let mut roots = Vec::new();
+        find_repo_roots(&dir, false, true, &mut roots, &ProgressBar::hidden());
+        check!(names_of(&roots).contains(&"delta".to_string())); // dot-dir repo found
         std::fs::remove_dir_all(&dir).ok();
     }
 

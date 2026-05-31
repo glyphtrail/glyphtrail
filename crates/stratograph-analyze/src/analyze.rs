@@ -84,6 +84,11 @@ const DEFAULT_IGNORE_DIRS: &[&str] = &[
     ".bzr",
 ];
 
+/// Version-control markers that mark a directory as a (nested) repository root.
+/// A subdirectory holding one of these is a submodule / vendored checkout and is
+/// pruned from the walk so its code lands only in its own index.
+const NESTED_VCS_MARKERS: [&str; 4] = [".git", ".svn", ".bzr", ".hg"];
+
 /// Credential/key-material file globs never walked during discovery (#136), so
 /// their contents stay out of the index and any agent-facing output. Kept to
 /// unambiguous secret/key files to avoid excluding legitimate source.
@@ -304,6 +309,19 @@ fn discover(
         .git_ignore(true)
         .git_exclude(true)
         .add_custom_ignore_filename(IGNORE_FILE);
+
+    // Treat a nested repository (submodule, vendored checkout) as a boundary:
+    // its files belong to *that* repo's index, not this one. Without this a
+    // parent indexes its submodules' code, and `repo scan --recursive` then
+    // indexes the same files again under the submodule. The root itself
+    // (depth 0) is never pruned even though it holds a VCS directory.
+    walker.filter_entry(|entry| {
+        if entry.depth() == 0 || !entry.file_type().is_some_and(|t| t.is_dir()) {
+            return true;
+        }
+        let dir = entry.path();
+        !NESTED_VCS_MARKERS.iter().any(|m| dir.join(m).exists())
+    });
     // Honor agent-exclusion files so sensitive data (secrets, key material) can
     // be kept out of the index entirely — and therefore out of any agent-facing
     // output (wiki, MCP, …). Listed alongside `.gitignore` and dotfile hiding.
@@ -1503,6 +1521,26 @@ mod tests {
         let found = discover(&dir, &[], &["generated".to_string()], false).unwrap();
         let rels: Vec<&str> = found.iter().map(|f| f.rel_path.as_str()).collect();
         check!(rels == ["main.rs"], "expected only main.rs, got {rels:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // A nested repository (submodule / vendored checkout) is a boundary: its
+    // code stays out of the parent's index so `repo scan --recursive` doesn't
+    // index those files twice. The parent's own VCS dir does not prune the root.
+    #[test]
+    fn discovery_stops_at_nested_repo_boundaries() {
+        let dir = temp_repo("nested-repo");
+        std::fs::create_dir_all(dir.join(".git")).unwrap(); // parent is a repo
+        std::fs::write(dir.join("main.rs"), "fn f() {}\n").unwrap();
+        // A submodule under a non-ignored path, with its own `.git` and source.
+        let sub = dir.join("libs").join("sub");
+        std::fs::create_dir_all(sub.join(".git")).unwrap();
+        std::fs::write(sub.join("lib.rs"), "fn g() {}\n").unwrap();
+
+        let found = discover(&dir, &[], &[], false).unwrap();
+        let rels: Vec<&str> = found.iter().map(|f| f.rel_path.as_str()).collect();
+        check!(rels == ["main.rs"], "submodule code leaked in: {rels:?}");
 
         std::fs::remove_dir_all(&dir).ok();
     }

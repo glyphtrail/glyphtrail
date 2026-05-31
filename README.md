@@ -122,8 +122,9 @@ and where, not just your own.
 
 ```bash
 stratograph repo add .                  # register the current repo
-stratograph repo scan ~/code            # find & register every repo under a tree
-stratograph repo scan ~/code --analyze  # ...and index each one too
+stratograph repo scan ~/code            # register already-indexed repos under a tree
+stratograph repo scan ~/code --analyze  # index each repo found, then register it
+stratograph repo scan ~/code --all      # register every repo, indexed or not
 stratograph repo list                   # registered repos + health + forge ids
 stratograph group add svc api core      # optional: a named subset to scope to
 
@@ -139,6 +140,13 @@ dependency is tied to the producer repo whose crate publishes it. The MCP
 `impact` tool takes the same `downstream`/`group` arguments, and `list_repos`
 enumerates the registry, so an agent gets the cross-repo blast radius in one
 call.
+
+`repo scan` walks for version-control roots (`.git`/`.svn`/`.bzr`/`.hg`),
+skipping dot-directories (`--hidden` to include them) and treating each repo as
+a boundary (`--recursive` to also find nested repos / submodules). A submodule's
+code is never indexed as part of its parent — analysis stops at nested-repo
+boundaries — so it lands only in its own index. The walk and per-repo work show
+progress, which matters on slow network-backed drives.
 
 ### Repository identity
 

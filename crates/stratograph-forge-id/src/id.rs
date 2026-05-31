@@ -85,37 +85,40 @@ pub fn canonicalize_remote(url: &str) -> Option<String> {
     let had_scheme = trimmed.contains("://");
     // Drop the scheme.
     let after_scheme = trimmed.split("://").last().unwrap_or(trimmed);
-    // Drop userinfo (`user@`), which precedes the host.
+    // Some remotes wrap the authority to carry a port in scp form, e.g.
+    // `[git@host:port]:owner/repo`. Note the brackets, then drop userinfo
+    // (`user@`, which precedes the host) and the brackets themselves.
+    let had_brackets = after_scheme.contains('[');
     let host_path = match after_scheme.split_once('@') {
         Some((user, rest)) if !user.contains('/') => rest,
         _ => after_scheme,
     };
+    let host_path = host_path.replace(['[', ']'], "");
 
-    // Split authority from path. Scp-style (`host:owner/repo`, no scheme) uses
-    // `:` as the separator; with a scheme a `:` in the authority is a port.
-    let (authority, path) = if let Some((auth, path)) = host_path.split_once('/') {
-        // A scheme-less scp URL like `host:owner/repo` lands here with
-        // authority `host:owner`; fix it up below.
-        (auth, path.to_string())
-    } else if let Some((auth, path)) = host_path.split_once(':') {
-        // `host:owner/repo` with no `/` before the `:` and none captured above.
-        (auth, path.to_string())
-    } else {
-        return None;
-    };
+    // Tokenize on both `/` and `:` so URL (`host/owner/repo`), scp
+    // (`host:owner/repo`), and ported forms (`host:port/owner/repo`,
+    // `[host:port]:owner/repo`) all decompose to host + path segments.
+    let mut segs = host_path.split(['/', ':']).filter(|s| !s.is_empty());
+    let host = segs.next()?.to_lowercase();
+    let rest: Vec<&str> = segs.collect();
 
-    let (host, path) = match authority.split_once(':') {
-        // scp-style `host:owner` -> host=`host`, prepend `owner` to the path.
-        Some((host, owner)) if !had_scheme && !owner.is_empty() => {
-            (host, format!("{owner}/{path}"))
+    // A leading all-digit segment is a port — but only where a port is
+    // syntactically possible (a scheme, or a bracketed authority). Without
+    // either, `host:123/repo` is scp-style and `123` is the owner, so it stays.
+    let port_possible = had_scheme || had_brackets;
+    let path_segs = match rest.split_first() {
+        Some((first, tail))
+            if port_possible && !first.is_empty() && first.chars().all(|c| c.is_ascii_digit()) =>
+        {
+            tail
         }
-        // `host:port` with a scheme -> drop the port.
-        Some((host, _port)) => (host, path),
-        None => (authority, path),
+        _ => &rest[..],
     };
 
-    let canonical = format!("{}/{}", host, path).to_lowercase();
-    (canonical.matches('/').count() >= 2).then_some(canonical)
+    if path_segs.len() < 2 {
+        return None; // need at least owner/repo
+    }
+    Some(format!("{host}/{}", path_segs.join("/")).to_lowercase())
 }
 
 #[cfg(test)]
@@ -145,6 +148,22 @@ mod tests {
         check!(
             canonicalize_remote("https://git.example.com:8443/team/repo.git")
                 == Some("git.example.com/team/repo".to_string())
+        );
+        // ssh:// with a non-standard port -> port dropped.
+        check!(
+            canonicalize_remote("ssh://git@git.nyris.io:10022/nyris/img.git")
+                == Some("git.nyris.io/nyris/img".to_string())
+        );
+        // Bracketed scp form carrying a port (`[user@host:port]:owner/repo`),
+        // which previously leaked `port]:` into the path.
+        check!(
+            canonicalize_remote("[git@git.nyris.io:10022]:nyris/img.git")
+                == Some("git.nyris.io/nyris/img".to_string())
+        );
+        // Plain scp with no scheme/brackets: a numeric owner is NOT a port.
+        check!(
+            canonicalize_remote("git@github.com:123/repo.git")
+                == Some("github.com/123/repo".to_string())
         );
     }
 
