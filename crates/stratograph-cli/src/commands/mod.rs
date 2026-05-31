@@ -11,6 +11,7 @@ pub mod llm;
 pub mod query;
 pub mod repo;
 pub mod serve;
+pub mod setup;
 pub mod status;
 pub mod story;
 pub mod viz;

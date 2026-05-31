@@ -98,6 +98,12 @@ enum Command {
         #[arg(long, default_value = ".")]
         repo: PathBuf,
     },
+    /// Onboard coding agents: write skill + CLAUDE.md/AGENTS.md section + gitignore.
+    Setup {
+        /// Repository root (defaults to the current directory).
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
     /// Manage the global repository registry (~/.stratograph/registry.json).
     Repo {
         #[command(subcommand)]
@@ -164,6 +170,10 @@ fn main() -> anyhow::Result<()> {
                         commands::status::format_languages(&outcome.languages)
                     );
                 }
+                // Hint (read-only): onboarding files are written only by `setup`.
+                if !path.join(".claude/skills/stratograph/SKILL.md").exists() {
+                    println!("Tip: run `stratograph setup` to onboard coding agents (MCP/CLI).");
+                }
                 Ok(())
             }
         }
@@ -204,6 +214,7 @@ fn main() -> anyhow::Result<()> {
         Command::Wiki(args) => commands::wiki::run(args),
         Command::Story(args) => commands::story::run(args),
         Command::Mcp { repo } => stratograph_mcp::serve_stdio(repo),
+        Command::Setup { path } => commands::setup::run(&path),
         Command::Repo { cmd } => commands::repo::run(cmd),
         Command::Group { cmd } => commands::group::run(cmd),
         Command::Status {

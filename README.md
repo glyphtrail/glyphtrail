@@ -63,6 +63,9 @@ stratograph serve --port 7700           # live explorer at http://127.0.0.1:7700
 # Agent integration (Model Context Protocol)
 stratograph mcp                         # MCP server over stdio (query/endpoints/impact/…)
 #   `stratograph serve` also exposes the same tools at POST /mcp (JSON-RPC)
+stratograph setup                       # onboard agents: write .claude/skills + a
+#   managed CLAUDE.md/AGENTS.md section pointing them at the MCP/CLI, and gitignore
+#   the index. Idempotent and stats-free (won't dirty the files on every commit).
 
 # Generate a docs wiki from the graph via an LLM
 stratograph wiki --provider claude        # or openai / openrouter (reads *_API_KEY)
