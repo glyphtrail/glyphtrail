@@ -901,6 +901,28 @@ fn edge_key(e: &Edge) -> EdgeKey {
     (e.src.0.clone(), e.dst.0.clone(), e.kind)
 }
 
+/// Persist `nodes`, bulk-loading on a full rebuild. `MERGE (n:Node {id})` from
+/// UNWIND can't use the id index in this engine (O(nodes²)); a fresh build
+/// bulk-loads via COPY, which needs a primary-key-unique set, so de-duplicate by
+/// id against `seen` (recording the ids). An update keeps MERGE.
+fn persist_nodes<S: GraphStore + ?Sized>(
+    store: &mut S,
+    seen: &mut std::collections::HashSet<String>,
+    nodes: &[Node],
+    fresh: bool,
+) -> Result<()> {
+    if fresh {
+        let new: Vec<Node> = nodes
+            .iter()
+            .filter(|n| seen.insert(n.id.0.clone()))
+            .cloned()
+            .collect();
+        store.insert_nodes(&new, true)
+    } else {
+        store.insert_nodes(nodes, false)
+    }
+}
+
 /// Persist `edges`, avoiding MERGE's per-edge existence scan on a full rebuild —
 /// that scan grows with a node's degree and stalls on a high-degree hub in a
 /// large repo (#282, extended to the resolve-phase inserts here). On a `fresh`
@@ -1210,7 +1232,7 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
 
     // Persist nodes and high-confidence (extracted) edges first. Dedup edges on
     // (src, dst, kind) — the graph model is one edge per such triple — so a full
-    // rebuild can CREATE them directly (see below) without MERGE's per-edge
+    // rebuild can bulk-load them directly (see below) without MERGE's per-edge
     // existence check.
     let mut seen = std::collections::HashSet::new();
     let extracted: Vec<Edge> = graph
@@ -1224,15 +1246,18 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
     // Persist in batches so a large repo shows steady progress (and bounded
     // memory) instead of one opaque, seemingly-hung call. All nodes go in first;
     // edges then match the already-inserted endpoints. Empty slices are no-ops.
-    // A full (non-update) build starts from a cleared store, so edges CREATE
-    // directly instead of MERGE — the existence check otherwise stalls on a
-    // high-degree hub node in a large repo.
+    // A full (non-update) build starts from a cleared store, so nodes and edges
+    // bulk-load (COPY) instead of MERGE — MERGE from UNWIND can't use the id
+    // index in this engine, so it scans per row and stalls a large repo.
     const PERSIST_BATCH: usize = 4096;
     let fresh = !update;
+    // Ids already persisted, so resolve-phase nodes (e.g. module placeholders)
+    // can be de-duplicated against them before their own bulk load.
+    let mut node_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let (n_nodes, n_edges) = (graph.nodes.len(), extracted.len());
     let mut done = 0;
     for chunk in graph.nodes.chunks(PERSIST_BATCH) {
-        store.insert_graph(chunk, &[])?;
+        persist_nodes(&mut *store, &mut node_seen, chunk, fresh)?;
         done += chunk.len();
         resolve_progress.set_message(format!("persisting nodes {done}/{n_nodes}"));
     }
@@ -1416,7 +1441,7 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
             }
         }
     }
-    store.insert_graph(&import_nodes, &[])?;
+    persist_nodes(&mut *store, &mut node_seen, &import_nodes, fresh)?;
     persist_edges(&mut *store, &mut seen, &import_edges, fresh)?;
     resolve_progress.inc(1);
 
