@@ -1,0 +1,20 @@
+[package]
+name = "glyphtrail-mcp"
+authors.workspace = true
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+glyphtrail-core.workspace = true
+glyphtrail-store.workspace = true
+glyphtrail-analyze.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+assert2.workspace = true

@@ -4,7 +4,7 @@ vars:
   PROFILE: '{{ .PROFILE | default "debug" }}'
   PROFILE_FLAG: '{{ if eq .PROFILE "release" }}--release{{ end }}'
   PROFILE_DIR: '{{ if eq .PROFILE "release" }}release{{ else }}debug{{ end }}'
-  BIN: stratograph
+  BIN: glyphtrail
   PORT: '{{ .PORT | default "7700" }}'
 
 tasks:
@@ -34,34 +34,34 @@ tasks:
   # Runs the CLI binary via `cargo run`. Pass subcommands and flags after `--`.
   # Example: `task run -- analyze ./my-repo`
   run:
-    desc: Run the Stratograph CLI (pass args after --)
+    desc: Run the Glyphtrail CLI (pass args after --)
     preconditions:
       - sh: command -v cargo
         msg: "cargo not found — install Rust from https://rustup.rs/"
     cmds:
-      - cargo run -p stratograph-cli {{.PROFILE_FLAG}} -- {{.CLI_ARGS}}
+      - cargo run -p glyphtrail-cli {{.PROFILE_FLAG}} -- {{.CLI_ARGS}}
 
-  # Indexes a repository and writes the graph to `.stratograph/`.
+  # Indexes a repository and writes the graph to `.glyphtrail/`.
   # Override target: `task analyze TARGET=/path/to/repo`
   analyze:
     desc: Analyze a repo path (defaults to current directory)
     vars:
       TARGET: '{{ .TARGET | default "." }}'
     cmds:
-      - cargo run -p stratograph-cli {{.PROFILE_FLAG}} -- analyze {{.TARGET}} {{.CLI_ARGS}}
+      - cargo run -p glyphtrail-cli {{.PROFILE_FLAG}} -- analyze {{.TARGET}} {{.CLI_ARGS}}
 
   # Queries the graph index. Requires a prior `task analyze` run.
   # Example: `task query -- def main`
   query:
     desc: 'Query the graph (pass args after --, e.g. task query -- def main)'
     cmds:
-      - cargo run -p stratograph-cli {{.PROFILE_FLAG}} -- query {{.CLI_ARGS}}
+      - cargo run -p glyphtrail-cli {{.PROFILE_FLAG}} -- query {{.CLI_ARGS}}
 
   # Starts the HTTP graph explorer. Override port: `task serve PORT=8080`
   serve:
     desc: Start the interactive graph explorer on PORT (default 7700)
     cmds:
-      - cargo run -p stratograph-cli {{.PROFILE_FLAG}} -- serve --port {{.PORT}} {{.CLI_ARGS}}
+      - cargo run -p glyphtrail-cli {{.PROFILE_FLAG}} -- serve --port {{.PORT}} {{.CLI_ARGS}}
 
   # Renders the graph as a single portable HTML file.
   # Override output path: `task viz OUT=out/graph.html`
@@ -70,15 +70,15 @@ tasks:
     vars:
       OUT: '{{ .OUT | default "graph.html" }}'
     cmds:
-      - cargo run -p stratograph-cli {{.PROFILE_FLAG}} -- viz --output {{.OUT}} {{.CLI_ARGS}}
+      - cargo run -p glyphtrail-cli {{.PROFILE_FLAG}} -- viz --output {{.OUT}} {{.CLI_ARGS}}
 
-  # Prints node/edge counts and index metadata for the current `.stratograph/` index.
+  # Prints node/edge counts and index metadata for the current `.glyphtrail/` index.
   status:
     desc: Show index statistics
     aliases:
       - stats
     cmds:
-      - cargo run -p stratograph-cli {{.PROFILE_FLAG}} -- status {{.CLI_ARGS}}
+      - cargo run -p glyphtrail-cli {{.PROFILE_FLAG}} -- status {{.CLI_ARGS}}
 
   # Reports API contract drift between code endpoints and the blessed schema.
   # Requires a prior `task analyze` and a configured `[[api.schemas]]`.
@@ -86,14 +86,14 @@ tasks:
   drift:
     desc: Report API drift (code endpoints vs blessed schema)
     cmds:
-      - cargo run -p stratograph-cli {{.PROFILE_FLAG}} -- drift {{.CLI_ARGS}}
+      - cargo run -p glyphtrail-cli {{.PROFILE_FLAG}} -- drift {{.CLI_ARGS}}
 
   # Drift check that exits non-zero (code 2) when the API surface has drifted.
   # Intended for CI pipelines guarding the code↔contract boundary.
   drift:gate:
     desc: Fail if API contract drift is found (CI gate)
     cmds:
-      - cargo run -p stratograph-cli {{.PROFILE_FLAG}} -- drift --gate {{.CLI_ARGS}}
+      - cargo run -p glyphtrail-cli {{.PROFILE_FLAG}} -- drift --gate {{.CLI_ARGS}}
 
   # Emits a shell completion script to stdout.
   # Override shell: `task completions SHELL_KIND=zsh`
@@ -102,7 +102,7 @@ tasks:
     vars:
       SHELL_KIND: '{{ .SHELL_KIND | default "bash" }}'
     cmds:
-      - cargo run -p stratograph-cli {{.PROFILE_FLAG}} -- completions {{.SHELL_KIND}}
+      - cargo run -p glyphtrail-cli {{.PROFILE_FLAG}} -- completions {{.SHELL_KIND}}
 
   # Runs all unit and integration tests across the workspace.
   test:
@@ -186,12 +186,12 @@ tasks:
     cmds:
       - cargo clean
 
-  # Removes the `.stratograph/` index. Prompts for confirmation before deleting.
+  # Removes the `.glyphtrail/` index. Prompts for confirmation before deleting.
   clean:index:
-    desc: Remove the local .stratograph index directory
-    prompt: "Delete .stratograph/ (local graph index)?"
+    desc: Remove the local .glyphtrail index directory
+    prompt: "Delete .glyphtrail/ (local graph index)?"
     cmds:
-      - rm -rf .stratograph
+      - rm -rf .glyphtrail
 
   # Removes the generated `graph.html` visualization file.
   clean:viz:

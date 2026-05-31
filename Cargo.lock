@@ -619,6 +619,169 @@ dependencies = [
 ]
 
 [[package]]
+name = "glyphtrail-analyze"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "assert2",
+ "blake3",
+ "globset",
+ "glyphtrail-core",
+ "glyphtrail-parse",
+ "glyphtrail-store",
+ "ignore",
+ "indicatif",
+ "rayon",
+ "serde",
+ "serde_json",
+ "serde_norway",
+ "tracing",
+]
+
+[[package]]
+name = "glyphtrail-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "assert2",
+ "blake3",
+ "clap",
+ "clap_complete",
+ "globset",
+ "glyphtrail-analyze",
+ "glyphtrail-core",
+ "glyphtrail-forge-id",
+ "glyphtrail-mcp",
+ "glyphtrail-parse",
+ "glyphtrail-server",
+ "glyphtrail-store",
+ "glyphtrail-viz",
+ "ignore",
+ "indicatif",
+ "rayon",
+ "serde",
+ "serde_json",
+ "serde_norway",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "ureq",
+]
+
+[[package]]
+name = "glyphtrail-core"
+version = "0.1.0"
+dependencies = [
+ "assert2",
+ "blake3",
+ "glyphtrail-forge-id",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
+name = "glyphtrail-forge-id"
+version = "0.1.0"
+dependencies = [
+ "assert2",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "toml",
+ "ureq",
+ "uuid",
+]
+
+[[package]]
+name = "glyphtrail-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "assert2",
+ "glyphtrail-analyze",
+ "glyphtrail-core",
+ "glyphtrail-store",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "glyphtrail-parse"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "assert2",
+ "glyphtrail-core",
+ "tree-sitter",
+ "tree-sitter-bash",
+ "tree-sitter-c",
+ "tree-sitter-c-sharp",
+ "tree-sitter-cpp",
+ "tree-sitter-elixir",
+ "tree-sitter-go",
+ "tree-sitter-haskell",
+ "tree-sitter-java",
+ "tree-sitter-javascript",
+ "tree-sitter-kotlin-ng",
+ "tree-sitter-language",
+ "tree-sitter-loader",
+ "tree-sitter-lua",
+ "tree-sitter-ocaml",
+ "tree-sitter-php",
+ "tree-sitter-python",
+ "tree-sitter-ruby",
+ "tree-sitter-rust",
+ "tree-sitter-scala",
+ "tree-sitter-swift",
+ "tree-sitter-typescript",
+ "tree-sitter-zig",
+]
+
+[[package]]
+name = "glyphtrail-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "assert2",
+ "axum",
+ "glyphtrail-core",
+ "glyphtrail-mcp",
+ "glyphtrail-store",
+ "glyphtrail-viz",
+ "pulldown-cmark",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower-http",
+ "tracing",
+]
+
+[[package]]
+name = "glyphtrail-store"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "assert2",
+ "glyphtrail-core",
+ "lbug",
+]
+
+[[package]]
+name = "glyphtrail-viz"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "assert2",
+ "glyphtrail-core",
+ "glyphtrail-store",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1493,169 +1656,6 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
-
-[[package]]
-name = "stratograph-analyze"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "assert2",
- "blake3",
- "globset",
- "ignore",
- "indicatif",
- "rayon",
- "serde",
- "serde_json",
- "serde_norway",
- "stratograph-core",
- "stratograph-parse",
- "stratograph-store",
- "tracing",
-]
-
-[[package]]
-name = "stratograph-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "assert2",
- "blake3",
- "clap",
- "clap_complete",
- "globset",
- "ignore",
- "indicatif",
- "rayon",
- "serde",
- "serde_json",
- "serde_norway",
- "stratograph-analyze",
- "stratograph-core",
- "stratograph-forge-id",
- "stratograph-mcp",
- "stratograph-parse",
- "stratograph-server",
- "stratograph-store",
- "stratograph-viz",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "ureq",
-]
-
-[[package]]
-name = "stratograph-core"
-version = "0.1.0"
-dependencies = [
- "assert2",
- "blake3",
- "serde",
- "serde_json",
- "stratograph-forge-id",
- "thiserror",
- "toml",
-]
-
-[[package]]
-name = "stratograph-forge-id"
-version = "0.1.0"
-dependencies = [
- "assert2",
- "serde",
- "serde_json",
- "thiserror",
- "toml",
- "ureq",
- "uuid",
-]
-
-[[package]]
-name = "stratograph-mcp"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "assert2",
- "serde",
- "serde_json",
- "stratograph-analyze",
- "stratograph-core",
- "stratograph-store",
- "tracing",
-]
-
-[[package]]
-name = "stratograph-parse"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "assert2",
- "stratograph-core",
- "tree-sitter",
- "tree-sitter-bash",
- "tree-sitter-c",
- "tree-sitter-c-sharp",
- "tree-sitter-cpp",
- "tree-sitter-elixir",
- "tree-sitter-go",
- "tree-sitter-haskell",
- "tree-sitter-java",
- "tree-sitter-javascript",
- "tree-sitter-kotlin-ng",
- "tree-sitter-language",
- "tree-sitter-loader",
- "tree-sitter-lua",
- "tree-sitter-ocaml",
- "tree-sitter-php",
- "tree-sitter-python",
- "tree-sitter-ruby",
- "tree-sitter-rust",
- "tree-sitter-scala",
- "tree-sitter-swift",
- "tree-sitter-typescript",
- "tree-sitter-zig",
-]
-
-[[package]]
-name = "stratograph-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "assert2",
- "axum",
- "pulldown-cmark",
- "serde",
- "serde_json",
- "stratograph-core",
- "stratograph-mcp",
- "stratograph-store",
- "stratograph-viz",
- "tokio",
- "tower-http",
- "tracing",
-]
-
-[[package]]
-name = "stratograph-store"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "assert2",
- "lbug",
- "stratograph-core",
-]
-
-[[package]]
-name = "stratograph-viz"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "assert2",
- "serde",
- "serde_json",
- "stratograph-core",
- "stratograph-store",
-]
 
 [[package]]
 name = "streaming-iterator"

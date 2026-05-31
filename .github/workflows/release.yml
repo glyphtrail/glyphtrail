@@ -1,6 +1,6 @@
 name: release
 
-# Build cross-platform `stratograph` binaries on a version tag and attach them to
+# Build cross-platform `glyphtrail` binaries on a version tag and attach them to
 # the GitHub Release. Publishing to crates.io is intentionally left manual.
 on:
   push:
@@ -46,16 +46,16 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - name: Build
-        run: cargo build --release --locked -p stratograph-cli --target ${{ matrix.target }}
+        run: cargo build --release --locked -p glyphtrail-cli --target ${{ matrix.target }}
       - name: Package
         shell: bash
         run: |
-          staging="stratograph-${{ github.ref_name }}-${{ matrix.target }}"
+          staging="glyphtrail-${{ github.ref_name }}-${{ matrix.target }}"
           mkdir "$staging"
           if [ "$RUNNER_OS" = "Windows" ]; then
-            cp "target/${{ matrix.target }}/release/stratograph.exe" "$staging/"
+            cp "target/${{ matrix.target }}/release/glyphtrail.exe" "$staging/"
           else
-            cp "target/${{ matrix.target }}/release/stratograph" "$staging/"
+            cp "target/${{ matrix.target }}/release/glyphtrail" "$staging/"
           fi
           cp README.md LICENSE-EUPL-1.2 "$staging/"
           if [ "$RUNNER_OS" = "Windows" ]; then
