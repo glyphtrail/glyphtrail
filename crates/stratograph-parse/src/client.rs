@@ -618,11 +618,20 @@ fn js_string(node: Node, src: &[u8]) -> Option<String> {
     Some(s)
 }
 
-fn walk<'a>(node: Node<'a>, f: &mut dyn FnMut(Node<'a>)) {
-    f(node);
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        walk(child, f);
+/// Pre-order walk of the whole subtree, visiting each node left-to-right.
+/// Iterative (explicit stack) rather than recursive so a deeply nested AST —
+/// generated code, minified blobs — can't overflow the thread stack on a large
+/// repo. Visit order matches the previous recursive version.
+fn walk<'a>(root: Node<'a>, f: &mut dyn FnMut(Node<'a>)) {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        f(node);
+        let mut cursor = node.walk();
+        let start = stack.len();
+        stack.extend(node.children(&mut cursor));
+        // Children were appended in order; reverse just the new tail so they pop
+        // (and are visited) left-to-right.
+        stack[start..].reverse();
     }
 }
 
@@ -663,6 +672,21 @@ mod tests {
     fn fetch_get_string_url() {
         let calls = extract_client_calls("fetch(\"/api/users\");", &Language::JavaScript);
         check!(call(&calls, HttpMethod::Get, "/api/users").is_some());
+    }
+
+    // A deeply nested AST must not overflow the stack: `walk` is iterative, so
+    // even thousands of nesting levels (generated code) are handled. The old
+    // recursive walk overflowed a worker (~2MB) stack here. Still finds the call.
+    #[test]
+    fn deeply_nested_ast_does_not_overflow() {
+        let depth = 20_000;
+        let src = format!(
+            "{}fetch(\"/api/deep\"){}",
+            "[".repeat(depth),
+            "]".repeat(depth)
+        );
+        let calls = extract_client_calls(&src, &Language::JavaScript);
+        check!(call(&calls, HttpMethod::Get, "/api/deep").is_some());
     }
 
     #[test]
