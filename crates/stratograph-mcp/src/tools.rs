@@ -114,9 +114,9 @@ pub fn definitions() -> Vec<Value> {
         tool(
             "list_repos",
             "List repositories indexed in the global registry, each with its \
-             on-disk health (indexed/unindexed/missing) and the groups it \
-             belongs to. Use this to discover what is indexed before a \
-             cross-repo query — no shell required.",
+             on-disk health (indexed/unindexed/missing), the groups it belongs \
+             to, and its stable forge ids (slug + optional numeric). Use this to \
+             discover what is indexed before a cross-repo query — no shell required.",
             json!({}),
             &[],
         ),
@@ -269,6 +269,8 @@ fn list_repos() -> Result<Value, String> {
                 "root": e.root,
                 "health": health,
                 "groups": member_of,
+                // Stable forge identities (#233): slug + optional numeric ids.
+                "ids": serde_json::to_value(&e.ids).unwrap_or_default(),
             })
         })
         .collect();
