@@ -22,6 +22,11 @@ use stratograph_core::{
 use crate::Stats;
 use crate::graph_store::GraphStore;
 
+/// Max rows per `UNWIND` batch (see [`LadybugStore::exec_unwind`]). Bounds the
+/// `$rows` param + query-plan intermediates so a large repo persists in steady,
+/// bounded chunks instead of one unbounded execute.
+const UNWIND_BATCH: usize = 4096;
+
 const SCHEMA: &[&str] = &[
     "CREATE NODE TABLE IF NOT EXISTS Node(id STRING, kind STRING, name STRING, qualified_name STRING, file STRING, language STRING, start_byte INT64, end_byte INT64, start_line INT64, end_line INT64, doc STRING, PRIMARY KEY(id))",
     "CREATE REL TABLE IF NOT EXISTS Edge(FROM Node TO Node, kind STRING, confidence STRING)",
@@ -129,15 +134,21 @@ impl LadybugStore {
         if rows.is_empty() {
             return Ok(());
         }
-        let structs: Vec<Value> = rows
-            .into_iter()
-            .map(|r| Value::Struct(r.into_iter().map(|(k, v)| (k.to_string(), v)).collect()))
-            .collect();
-        let child: LogicalType = (&structs[0]).into();
-        let list = Value::List(child, structs);
+        // Execute in bounded batches rather than one giant `$rows` param. A
+        // single list of every node/edge on a large repo balloons memory and the
+        // query plan's intermediates (and gives no progress), which made the
+        // persist phase look hung. Each batch reuses the prepared statement.
         let mut st = conn.prepare(cypher).with_context(|| cypher.to_string())?;
-        conn.execute(&mut st, vec![("rows", list)])
-            .with_context(|| cypher.to_string())?;
+        for batch in rows.chunks(UNWIND_BATCH) {
+            let structs: Vec<Value> = batch
+                .iter()
+                .map(|r| Value::Struct(r.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()))
+                .collect();
+            let child: LogicalType = (&structs[0]).into();
+            let list = Value::List(child, structs);
+            conn.execute(&mut st, vec![("rows", list)])
+                .with_context(|| cypher.to_string())?;
+        }
         Ok(())
     }
 
