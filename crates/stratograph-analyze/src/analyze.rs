@@ -28,6 +28,24 @@ use rayon::prelude::*;
 /// length of [`resolve_bar`]. Keep in sync with the `stage(...)` calls in `run`.
 const RESOLVE_STAGES: u64 = 10;
 
+/// Worker-thread stack for the parallel parse pool. AST extraction recurses, and
+/// a deeply nested file overflows the default (~2MB) worker stack on a large
+/// repo; this is a generous safety net on top of the iterative walkers.
+const PARSE_STACK_BYTES: usize = 256 * 1024 * 1024;
+
+/// Shared rayon pool for parsing, built once with [`PARSE_STACK_BYTES`] stacks
+/// and reused across every repo in a `repo scan`, so we don't churn pools per
+/// repo or rely on the small default global-pool stacks.
+fn parse_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .stack_size(PARSE_STACK_BYTES)
+            .build()
+            .expect("build parse thread pool")
+    })
+}
+
 /// A determinate bar for the reference-resolution phase: a `{bar} {pos}/{len}`
 /// over the fixed stage count with `{msg}` naming the stage in flight, so the
 /// user sees both how far along the phase is and what it is doing. Auto-hidden
@@ -962,16 +980,21 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
 
     // Parse + build per-file fragments in parallel — CPU-bound and independent
     // per file (#169). rayon's `par_iter().filter_map().collect()` preserves
-    // input order, so node insertion below stays deterministic.
-    let outputs: Vec<FileOutput> = changed
-        .par_iter()
-        .filter_map(|f| {
-            parse_progress.set_message(f.rel_path.clone());
-            let out = parse_file(f, &repo_id, &dyn_grammars);
-            parse_progress.inc(1);
-            out
-        })
-        .collect();
+    // input order, so node insertion below stays deterministic. Run on a pool
+    // with a large worker stack: extraction recurses over the AST, and a deeply
+    // nested file (generated code, minified blobs) overflows the default ~2MB
+    // worker stack — observed as a "stack overflow" abort on a huge repo.
+    let outputs: Vec<FileOutput> = parse_pool().install(|| {
+        changed
+            .par_iter()
+            .filter_map(|f| {
+                parse_progress.set_message(f.rel_path.clone());
+                let out = parse_file(f, &repo_id, &dyn_grammars);
+                parse_progress.inc(1);
+                out
+            })
+            .collect()
+    });
     parse_progress.finish_and_clear();
 
     // Merge the fragments into the global accumulators, in file order.
