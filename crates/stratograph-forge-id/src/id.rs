@@ -151,14 +151,19 @@ mod tests {
         );
         // ssh:// with a non-standard port -> port dropped.
         check!(
-            canonicalize_remote("ssh://git@git.nyris.io:10022/nyris/img.git")
-                == Some("git.nyris.io/nyris/img".to_string())
+            canonicalize_remote("ssh://git@git.internal.example:2222/team/svc.git")
+                == Some("git.internal.example/team/svc".to_string())
         );
         // Bracketed scp form carrying a port (`[user@host:port]:owner/repo`),
         // which previously leaked `port]:` into the path.
         check!(
-            canonicalize_remote("[git@git.nyris.io:10022]:nyris/img.git")
-                == Some("git.nyris.io/nyris/img".to_string())
+            canonicalize_remote("[git@git.internal.example:2222]:team/svc.git")
+                == Some("git.internal.example/team/svc".to_string())
+        );
+        // ...including a hyphenated subgroup-style owner.
+        check!(
+            canonicalize_remote("[git@git.internal.example:2222]:sub-group/svc.git")
+                == Some("git.internal.example/sub-group/svc".to_string())
         );
         // Plain scp with no scheme/brackets: a numeric owner is NOT a port.
         check!(
