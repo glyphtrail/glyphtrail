@@ -1,7 +1,7 @@
 # Glyphtrail
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/glyphtrail/glyphtrail/main/.readme/hero.jpg" alt="Glyphtrail" />
+  <img src="https://raw.githubusercontent.com/glyphtrail/glyphtrail/refs/heads/main/.readme/hero.jpg" alt="Glyphtrail" />
 </p>
 
 [![unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)](https://github.com/rust-secure-code/safety-dance/)
