@@ -31,7 +31,7 @@ glyphtrail-server = { path = "crates/glyphtrail-server" }
 glyphtrail-mcp = { path = "crates/glyphtrail-mcp" }
 
 uuid = { version = "1", features = ["v5"] }
-ureq = { version = "2", features = ["json"] }
+ureq = { version = "3", features = ["json"] }
 detect-coding-agent = "0"
 
 anyhow = "1"
@@ -40,7 +40,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_norway = "0.9"
 toml = "1.1"
-assert2 = "0.3"
+assert2 = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 blake3 = "1.8"
@@ -63,10 +63,10 @@ tree-sitter-c = "0.24"
 tree-sitter-cpp = "0.23"
 tree-sitter-c-sharp = "0.23"
 tree-sitter-ruby = "0.23"
-pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
-tree-sitter-bash = "0.23"
-tree-sitter-php = "0.23"
-tree-sitter-scala = "0.23"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+tree-sitter-bash = "0.25"
+tree-sitter-php = "0.24"
+tree-sitter-scala = "0.26"
 tree-sitter-ocaml = "0.25"
 tree-sitter-haskell = "0.23"
 tree-sitter-lua = "0.5"

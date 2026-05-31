@@ -32,8 +32,8 @@ serde_norway.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tokio.workspace = true
-ureq = { version = "2", features = ["json"] }
-indicatif = "0.17"
+ureq = { version = "3", features = ["json"] }
+indicatif = "0.18"
 globset = "0.4"
 rayon = "1"
 
