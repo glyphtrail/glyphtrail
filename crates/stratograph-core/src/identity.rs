@@ -14,12 +14,29 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{CargoPackage, NodeKind};
+use crate::NodeKind;
 
 /// Index-meta key holding the JSON `Vec<IndexedPackage>` (producer side).
 pub const META_PACKAGES: &str = "packages";
 /// Index-meta key holding the JSON `Vec<ExternalUse>` (consumer side).
 pub const META_EXTERNAL_USES: &str = "external_uses";
+
+/// The package ecosystem an identity belongs to. Cross-repo matching is
+/// language-agnostic, but a few rules differ per ecosystem (e.g. Go matches by
+/// module-path prefix, Python maps a distribution name to its import name), so
+/// the tag is recorded for the link step to branch on. Only `Cargo` is produced
+/// today; the rest are placeholders for #248/#249/#250.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Ecosystem {
+    /// The default, so indexes written before the ecosystem tag (all Cargo)
+    /// deserialize cleanly.
+    #[default]
+    Cargo,
+    Npm,
+    Go,
+    Python,
+}
 
 /// One exported symbol of a package: a definition another crate could name.
 /// Visibility is not resolved — a consumer can only reference `pub` items, so a
@@ -35,14 +52,21 @@ pub struct PackageExport {
     pub node_id: String,
 }
 
-/// A package's identity together with its resolved export index.
+/// A package's identity together with its resolved export index. Ecosystem-
+/// neutral: only the name (the cross-repo match key), version, and exports are
+/// kept — the dependency list is consumed during analysis to produce
+/// [`ExternalUse`]s and is not needed by the link step.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexedPackage {
+    #[serde(default)]
+    pub ecosystem: Ecosystem,
+    /// Package name as other repos depend on it (the cross-repo match key).
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     /// Manifest directory, repo-root-relative and forward-slashed; "" is the
     /// repo root.
     pub dir: String,
-    #[serde(flatten)]
-    pub package: CargoPackage,
     pub exports: Vec<PackageExport>,
 }
 
@@ -50,6 +74,9 @@ pub struct IndexedPackage {
 /// import whose root path segment matched a declared dependency.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalUse {
+    /// Ecosystem of the consuming package (governs how the link step matches).
+    #[serde(default)]
+    pub ecosystem: Ecosystem,
     /// The consumer package (by name) that owns the importing file.
     pub from_package: String,
     pub from_file: String,
@@ -100,12 +127,10 @@ mod tests {
     fn from_meta_round_trips_persisted_json() {
         let identity = PackageIdentity {
             packages: vec![IndexedPackage {
+                ecosystem: Ecosystem::Cargo,
+                name: "widget".into(),
+                version: Some("1.0.0".into()),
                 dir: "crates/widget".into(),
-                package: crate::parse_cargo_manifest(
-                    "[package]\nname = \"widget\"\nversion = \"1.0.0\"\n",
-                )
-                .unwrap()
-                .unwrap(),
                 exports: vec![PackageExport {
                     name: "go".into(),
                     qualified_name: "go".into(),
@@ -115,6 +140,7 @@ mod tests {
                 }],
             }],
             external_uses: vec![ExternalUse {
+                ecosystem: Ecosystem::Cargo,
                 from_package: "app".into(),
                 from_file: "crates/app/src/lib.rs".into(),
                 package: "widget".into(),
@@ -126,6 +152,17 @@ mod tests {
         let uses_json = serde_json::to_string(&identity.external_uses).unwrap();
         let loaded = PackageIdentity::from_meta(Some(&packages_json), Some(&uses_json));
         check!(loaded == identity);
+    }
+
+    #[test]
+    fn from_meta_defaults_ecosystem_for_pre_tag_indexes() {
+        // A `packages` blob written before the ecosystem tag (no `ecosystem`
+        // field, with the old flattened name/version) still deserializes.
+        let old = r#"[{"name":"widget","version":"1.0.0","dir":"","exports":[]}]"#;
+        let id = PackageIdentity::from_meta(Some(old), None);
+        check!(id.packages.len() == 1);
+        check!(id.packages[0].ecosystem == Ecosystem::Cargo);
+        check!(id.packages[0].name == "widget");
     }
 
     #[test]
