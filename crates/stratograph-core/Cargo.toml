@@ -13,6 +13,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 blake3.workspace = true
 toml.workspace = true
+uuid.workspace = true
 fs4 = { version = "0.13", features = ["sync"] }
 
 [dev-dependencies]

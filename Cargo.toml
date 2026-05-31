@@ -28,6 +28,8 @@ stratograph-viz = { path = "crates/stratograph-viz" }
 stratograph-server = { path = "crates/stratograph-server" }
 stratograph-mcp = { path = "crates/stratograph-mcp" }
 
+uuid = { version = "1", features = ["v5"] }
+
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
