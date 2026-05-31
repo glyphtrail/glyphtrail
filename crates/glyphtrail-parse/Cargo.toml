@@ -6,6 +6,8 @@ rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+description = "Glyphtrail parsing: tree-sitter extraction with REST/RPC endpoint and client matchers."
 
 [dependencies]
 glyphtrail-core.workspace = true

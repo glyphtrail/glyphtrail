@@ -19,16 +19,20 @@ authors = ["Markus Mayer <widemeadows@gmail.com>"]
 license = "EUPL-1.2"
 rust-version = "1.95"
 repository = "https://github.com/glyphtrail/glyphtrail"
+homepage = "https://glyphtrail.dev"
 
+# Inter-crate deps carry both `path` (used in this workspace) and `version`
+# (required by `cargo publish`; crates.io drops the path and resolves the
+# version). Keep the version in lockstep with `workspace.package.version`.
 [workspace.dependencies]
-glyphtrail-core = { path = "crates/glyphtrail-core" }
-glyphtrail-parse = { path = "crates/glyphtrail-parse" }
-glyphtrail-store = { path = "crates/glyphtrail-store" }
-glyphtrail-forge-id = { path = "crates/glyphtrail-forge-id" }
-glyphtrail-analyze = { path = "crates/glyphtrail-analyze" }
-glyphtrail-viz = { path = "crates/glyphtrail-viz" }
-glyphtrail-server = { path = "crates/glyphtrail-server" }
-glyphtrail-mcp = { path = "crates/glyphtrail-mcp" }
+glyphtrail-core = { path = "crates/glyphtrail-core", version = "0.1.0" }
+glyphtrail-parse = { path = "crates/glyphtrail-parse", version = "0.1.0" }
+glyphtrail-store = { path = "crates/glyphtrail-store", version = "0.1.0" }
+glyphtrail-forge-id = { path = "crates/glyphtrail-forge-id", version = "0.1.0" }
+glyphtrail-analyze = { path = "crates/glyphtrail-analyze", version = "0.1.0" }
+glyphtrail-viz = { path = "crates/glyphtrail-viz", version = "0.1.0" }
+glyphtrail-server = { path = "crates/glyphtrail-server", version = "0.1.0" }
+glyphtrail-mcp = { path = "crates/glyphtrail-mcp", version = "0.1.0" }
 
 uuid = { version = "1", features = ["v5"] }
 ureq = { version = "3", features = ["json"] }

@@ -6,6 +6,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+description = "Glyphtrail server: an HTTP code-graph explorer."
 
 [dependencies]
 glyphtrail-core.workspace = true
