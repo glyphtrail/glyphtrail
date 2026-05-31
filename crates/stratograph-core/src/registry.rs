@@ -10,6 +10,7 @@ use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::config::RepoPaths;
+use crate::repo_id::RepoId;
 use crate::{CoreError, Result};
 
 /// Liveness of a registered repository on disk.
@@ -34,6 +35,12 @@ pub struct RegistryEntry {
     /// while tolerating transient glitches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub missing_since: Option<i64>,
+    /// Stable forge identities of this repo (#233), derived from its git
+    /// remotes — an origin plus any mirrors. Independent of the folder/repo
+    /// name, so the same repo is recognisable across renames, clones, and
+    /// name collisions. Empty for a repo with no recognised remotes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ids: Vec<RepoId>,
 }
 
 impl RegistryEntry {
@@ -144,10 +151,25 @@ impl Registry {
                     name,
                     root,
                     missing_since: None,
+                    ids: Vec::new(),
                 });
                 true
             }
         }
+    }
+
+    /// Set the stable forge identities for a named entry (#233), replacing any
+    /// existing set. No-op if no entry has that name.
+    pub fn set_ids(&mut self, name: &str, ids: Vec<RepoId>) {
+        if let Some(e) = self.repos.iter_mut().find(|e| e.name == name) {
+            e.ids = ids;
+        }
+    }
+
+    /// Find a registered repo by any of its stable forge ids (#233), so the same
+    /// repo is recognisable across renames, clones, and name collisions.
+    pub fn find_by_id(&self, id: &str) -> Option<&RegistryEntry> {
+        self.repos.iter().find(|e| e.ids.iter().any(|r| r.id == id))
     }
 
     /// Reconcile `missing_since` with the current filesystem: stamp newly-missing
@@ -272,6 +294,30 @@ mod tests {
         check!(reg.remove("api"));
         check!(!reg.remove("api"));
         check!(reg.repos.is_empty());
+    }
+
+    // #233: a repo is findable by any of its forge ids (origin or a mirror),
+    // independent of its registry name.
+    #[test]
+    fn find_by_id_matches_any_forge_id() {
+        use crate::repo_id::RepoId;
+        let mut reg = Registry::default();
+        reg.add("strato".into(), PathBuf::from("/a"));
+        reg.set_ids(
+            "strato",
+            vec![
+                RepoId {
+                    id: "uuid-gh".into(),
+                    source: "github.com/o/r".into(),
+                },
+                RepoId {
+                    id: "uuid-cb".into(),
+                    source: "codeberg.org/o/r".into(),
+                },
+            ],
+        );
+        check!(reg.find_by_id("uuid-cb").map(|e| e.name.as_str()) == Some("strato"));
+        check!(reg.find_by_id("nope").is_none());
     }
 
     // #129: many processes (here, threads — each opens its own fd, so the OS
