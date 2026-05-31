@@ -305,6 +305,7 @@ fn discover(
     dyn_langs: &[DynamicLanguage],
     extra_ignore_dirs: &[String],
     record_sensitive: bool,
+    user_ignore: Option<&Path>,
 ) -> Result<Vec<DiscoveredFile>> {
     // Matcher for credential/key file names, used either to exclude them from the
     // walk (default) or to record their existence content-free (#136).
@@ -345,6 +346,12 @@ fn discover(
     // output (wiki, MCP, …). Listed alongside `.gitignore` and dotfile hiding.
     for ignore_file in [".aiignore", ".aiexclude", ".claudeignore"] {
         walker.add_custom_ignore_filename(ignore_file);
+    }
+    // A user-wide ignore file (#269): gitignore-format patterns applied to every
+    // repo, handy when bulk-indexing whole work directories. Lower precedence
+    // than a repo's own ignore files, which can re-include with `!`.
+    if let Some(user_ignore) = user_ignore.filter(|p| p.is_file()) {
+        walker.add_ignore(user_ignore);
     }
 
     // Prune build/output/dependency dirs even when not gitignored (#144). An
@@ -832,6 +839,13 @@ fn analysis_revision() -> String {
     hasher.finalize().to_hex()[..16].to_string()
 }
 
+/// Path of the optional user-wide ignore file (#269): `~/.stratograph/ignore`,
+/// a sibling of the registry. Gitignore-format patterns here apply to every
+/// repo analyzed, which is convenient when bulk-indexing a whole work tree.
+fn user_ignore_path() -> Option<PathBuf> {
+    stratograph_core::default_registry_path().map(|p| p.with_file_name("ignore"))
+}
+
 /// The repo's current `HEAD` commit, or `None` when `root` isn't a git
 /// checkout, git is unavailable, or there are no commits yet. Best-effort: any
 /// failure just disables the commit short-circuit (#273), falling back to the
@@ -917,6 +931,7 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
         &cfg.languages,
         &cfg.ignore_dirs,
         cfg.security.record_sensitive_files,
+        user_ignore_path().as_deref(),
     )?;
     tracing::info!("discovered {} source files", files.len());
 
@@ -1635,10 +1650,30 @@ mod tests {
             std::fs::create_dir_all(dir.join(d)).unwrap();
             std::fs::write(dir.join(d).join("x.rs"), "fn g() {}\n").unwrap();
         }
-        let found = discover(&dir, &[], &["generated".to_string()], false).unwrap();
+        let found = discover(&dir, &[], &["generated".to_string()], false, None).unwrap();
         let rels: Vec<&str> = found.iter().map(|f| f.rel_path.as_str()).collect();
         check!(rels == ["main.rs"], "expected only main.rs, got {rels:?}");
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // #269: a user-wide ignore file (gitignore-format) excludes matching files
+    // across any repo.
+    #[test]
+    fn discovery_honors_a_user_wide_ignore_file() {
+        let dir = temp_repo("user-ignore");
+        std::fs::write(dir.join("main.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(dir.join("scratch.rs"), "fn b() {}\n").unwrap();
+        let user_ignore = dir.join("user-ignore-patterns");
+        std::fs::write(&user_ignore, "scratch.rs\n").unwrap();
+
+        let found = discover(&dir, &[], &[], false, Some(&user_ignore)).unwrap();
+        let rels: Vec<&str> = found.iter().map(|f| f.rel_path.as_str()).collect();
+        check!(rels == ["main.rs"], "expected only main.rs, got {rels:?}");
+
+        // Without it, both files are discovered.
+        let found = discover(&dir, &[], &[], false, None).unwrap();
+        check!(found.len() == 2);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1700,7 +1735,7 @@ mod tests {
         std::fs::create_dir_all(sub.join(".git")).unwrap();
         std::fs::write(sub.join("lib.rs"), "fn g() {}\n").unwrap();
 
-        let found = discover(&dir, &[], &[], false).unwrap();
+        let found = discover(&dir, &[], &[], false, None).unwrap();
         let rels: Vec<&str> = found.iter().map(|f| f.rel_path.as_str()).collect();
         check!(rels == ["main.rs"], "submodule code leaked in: {rels:?}");
 
@@ -2088,7 +2123,7 @@ mod tests {
         for s in [".env", "id_rsa", "server.pem", "prod.tfvars", "app.key"] {
             std::fs::write(dir.join(s), "SECRET=value\n").unwrap();
         }
-        let found = discover(&dir, &[], &[], false).unwrap();
+        let found = discover(&dir, &[], &[], false, None).unwrap();
         let rels: Vec<&str> = found.iter().map(|f| f.rel_path.as_str()).collect();
         check!(
             rels == ["main.rs"],
@@ -2107,7 +2142,7 @@ mod tests {
         std::fs::write(dir.join(".env"), "SECRET=value\n").unwrap();
         std::fs::write(dir.join("id_rsa"), "PRIVATE KEY\n").unwrap();
 
-        let found = discover(&dir, &[], &[], true).unwrap();
+        let found = discover(&dir, &[], &[], true, None).unwrap();
         let env = found
             .iter()
             .find(|f| f.rel_path == ".env")
