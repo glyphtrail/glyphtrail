@@ -594,9 +594,11 @@ fn scan(registry_path: &Path, dir: &Path, opts: ScanOpts) -> Result<()> {
         bar.set_message(name.clone());
 
         // Analyze first when asked, so a freshly-indexed repo then qualifies for
-        // registration below.
+        // registration below. Suspend the scan bar for the whole analysis so its
+        // own parse/resolve bars own the terminal — otherwise the two fight and
+        // flicker.
         if opts.analyze {
-            match super::analyze::run(repo, opts.update) {
+            match bar.suspend(|| super::analyze::run(repo, opts.update)) {
                 Ok(o) if o.up_to_date => bar.suspend(|| {
                     println!("{name}: index up to date ({} files)", o.files);
                 }),

@@ -28,15 +28,11 @@ use crate::graph_store::GraphStore;
 const UNWIND_BATCH: usize = 4096;
 
 /// Upsert edges, deduping on `(src, dst, kind)` and keeping/raising confidence.
+/// Used for incremental updates; a fresh build bulk-loads via `copy_edges`.
 const MERGE_EDGES: &str = "UNWIND $rows AS r MATCH (a:Node {id:r.src}), (b:Node {id:r.dst}) \
      MERGE (a)-[e:Edge {kind:r.ekind}]->(b) \
      ON CREATE SET e.confidence=r.conf \
      ON MATCH SET e.confidence = CASE WHEN r.conf = 'extracted' THEN 'extracted' ELSE e.confidence END";
-
-/// Create edges unconditionally — for a fresh rebuild against an empty store
-/// with a pre-deduplicated edge set, avoiding MERGE's quadratic existence scan.
-const CREATE_EDGES: &str = "UNWIND $rows AS r MATCH (a:Node {id:r.src}), (b:Node {id:r.dst}) \
-     CREATE (a)-[e:Edge {kind:r.ekind, confidence:r.conf}]->(b)";
 
 const SCHEMA: &[&str] = &[
     "CREATE NODE TABLE IF NOT EXISTS Node(id STRING, kind STRING, name STRING, qualified_name STRING, file STRING, language STRING, start_byte INT64, end_byte INT64, start_line INT64, end_line INT64, doc STRING, PRIMARY KEY(id))",
@@ -170,10 +166,53 @@ impl LadybugStore {
             .map(|r| row_to_node(r))
             .collect())
     }
+
+    /// Bulk-load `edges` via `COPY Edge FROM <csv>`. Kùzu maps the first two CSV
+    /// columns to the FROM/TO node primary keys through the PK index (O(n)),
+    /// rather than the per-row node scan a property-`MATCH` from `UNWIND` does.
+    /// The CSV is a temp file, removed after; fields are quoted/escaped so any
+    /// id is safe. COPY appends, so it can run once per edge batch/pass.
+    fn copy_edges(&self, edges: &[Edge]) -> Result<()> {
+        if edges.is_empty() {
+            return Ok(());
+        }
+        let mut csv = String::with_capacity(edges.len() * 48);
+        for e in edges {
+            csv.push_str(&csv_field(&e.src.0));
+            csv.push(',');
+            csv.push_str(&csv_field(&e.dst.0));
+            csv.push(',');
+            csv.push_str(&csv_field(e.kind.as_str()));
+            csv.push(',');
+            csv.push_str(&csv_field(e.confidence.as_str()));
+            csv.push('\n');
+        }
+        // Unique temp path per call (multiple COPYs run within one analysis).
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "stratograph-edges-{}-{seq}.csv",
+            std::process::id()
+        ));
+        std::fs::write(&path, csv)?;
+        let result = self
+            .conn()?
+            .query(&format!("COPY Edge FROM '{}'", path.display()))
+            .map(|_| ())
+            .with_context(|| format!("COPY Edge FROM {}", path.display()));
+        let _ = std::fs::remove_file(&path);
+        result
+    }
 }
 
 fn s(v: &str) -> Value {
     Value::String(v.to_string())
+}
+
+/// CSV-quote a field for Kùzu's COPY reader (RFC4180: wrap in quotes, double any
+/// embedded quote) so a comma/quote/newline in an id can't break a row.
+fn csv_field(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
 }
 
 /// `$rows` structs for an edge insert ([`MERGE_EDGES`] / [`CREATE_EDGES`]).
@@ -459,14 +498,19 @@ impl GraphStore for LadybugStore {
     }
 
     fn insert_edges(&mut self, edges: &[Edge], fresh: bool) -> Result<()> {
-        let conn = self.conn()?;
         // On a fresh rebuild the store was just cleared and the caller passes a
-        // de-duplicated edge set, so plain CREATE is correct — and crucially it
-        // skips MERGE's per-row existence check, which scans a node's growing
-        // adjacency and goes quadratic on a high-degree hub node, stalling the
-        // persist on a large repo. An incremental update still MERGEs.
-        let cypher = if fresh { CREATE_EDGES } else { MERGE_EDGES };
-        self.exec_unwind(&conn, cypher, edge_rows(edges))
+        // de-duplicated edge set, so bulk-load via COPY: Kùzu hash-joins the
+        // endpoints on the Node primary key in O(n). A per-row `MATCH (:Node
+        // {id})` from UNWIND does NOT use the PK index in this engine — it scans
+        // the node table per edge, going O(nodes × edges) and stalling a large
+        // repo's persist (whether the verb is MERGE or CREATE). An incremental
+        // update still MERGEs (small batches; can't dedup against on-disk edges).
+        if fresh {
+            self.copy_edges(edges)
+        } else {
+            let conn = self.conn()?;
+            self.exec_unwind(&conn, MERGE_EDGES, edge_rows(edges))
+        }
     }
 
     fn insert_operations(&mut self, ops: &[(NodeId, OperationKey)]) -> Result<()> {
