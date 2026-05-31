@@ -20,6 +20,27 @@ pub enum RepoCmd {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Recursively find repositories under a directory and register them all.
+    ///
+    /// Walks the tree for version-control roots (`.git`, `.svn`, `.bzr`, `.hg`)
+    /// and registers each one — handy for pointing at a whole workspace at once.
+    /// Registration always runs, even for an already-indexed repo, so a repo
+    /// whose earlier registration failed gets picked up.
+    Scan {
+        /// Directory to scan (defaults to the current directory).
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+        /// Also analyze each repo after registering it.
+        #[arg(long)]
+        analyze: bool,
+        /// With --analyze, only reparse files changed since the last index.
+        #[arg(long)]
+        update: bool,
+        /// Descend into repositories to also register nested repos (submodules,
+        /// vendored checkouts). By default a repo root is a boundary.
+        #[arg(long)]
+        nested: bool,
+    },
     /// List registered repositories and their health.
     List,
     /// Remove a repository from the registry by name.
@@ -113,35 +134,13 @@ pub fn run(cmd: RepoCmd) -> Result<()> {
             let root = repo
                 .canonicalize()
                 .with_context(|| format!("cannot resolve path {}", repo.display()))?;
-            let name = name.unwrap_or_else(|| {
-                root.file_name()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "repo".into())
-            });
-            // Stable forge identities from the repo's git remotes (#233), so the
-            // same repo is recognisable across renames, clones, and name
-            // collisions, and mirrors all resolve to one repo. Slug ids always;
-            // forge-API numeric ids (rename-proof) added when a token is present.
-            let remotes = git_remote_urls(&root);
-            let mut ids = repo_ids(&remotes);
-            // Forge-API numeric ids (rename-proof), using the forge token map at
-            // ~/.stratograph/forge.toml (sibling of the registry) when present.
-            let forge_config = ForgeConfig::load_or_default(&path.with_file_name("forge.toml"));
-            for numeric in forge_numeric_ids(&remotes, &forge_config) {
-                if !ids.iter().any(|i| i.id == numeric.id) {
-                    ids.push(numeric);
-                }
-            }
+            let entry = entry_for(&path, &root, name);
+            let ids = entry.ids.clone();
+            let name = entry.name.clone();
             // Loss-proof write: applies under the lock, or defers to a spillover
             // file when the lock is busy (a later run merges it in) instead of
             // failing — important when indexing many repos on a slow/contended
             // network filesystem.
-            let entry = RegistryEntry {
-                name: name.clone(),
-                root: root.clone(),
-                missing_since: None,
-                ids: ids.clone(),
-            };
             match Registry::record(&path, vec![entry])? {
                 RecordOutcome::Applied => {
                     println!("registered '{}' -> {}", name, root.display());
@@ -158,6 +157,12 @@ pub fn run(cmd: RepoCmd) -> Result<()> {
                 println!("  id {} ({})", id.id, id.source);
             }
         }
+        RepoCmd::Scan {
+            dir,
+            analyze,
+            update,
+            nested,
+        } => scan(&path, &dir, analyze, update, nested)?,
         RepoCmd::List => {
             let registry = Registry::mutate(&path, |reg| {
                 reg.refresh_health();
@@ -205,6 +210,130 @@ pub fn run(cmd: RepoCmd) -> Result<()> {
             None => println!("no registry lock held"),
         },
     }
+    Ok(())
+}
+
+/// Build a [`RegistryEntry`] for `root`: its name (the given override, else the
+/// directory name) plus its stable forge identities (#233) derived from its git
+/// remotes — slug ids always, forge-API numeric ids when a token is configured
+/// (via `~/.stratograph/forge.toml`, the sibling of `registry_path`).
+fn entry_for(registry_path: &Path, root: &Path, name: Option<String>) -> RegistryEntry {
+    let name = name.unwrap_or_else(|| {
+        root.file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "repo".into())
+    });
+    let remotes = git_remote_urls(root);
+    let mut ids = repo_ids(&remotes);
+    let forge_config = ForgeConfig::load_or_default(&registry_path.with_file_name("forge.toml"));
+    for numeric in forge_numeric_ids(&remotes, &forge_config) {
+        if !ids.iter().any(|i| i.id == numeric.id) {
+            ids.push(numeric);
+        }
+    }
+    RegistryEntry {
+        name,
+        root: root.to_path_buf(),
+        missing_since: None,
+        ids,
+    }
+}
+
+/// Version-control markers that mark a directory as a repository root.
+const VCS_MARKERS: [&str; 4] = [".git", ".svn", ".bzr", ".hg"];
+
+/// Whether `dir` is a repository root (holds a VCS marker). `.git` may be a file
+/// (worktrees, submodules) or a directory, so existence is enough.
+fn is_repo_root(dir: &Path) -> bool {
+    VCS_MARKERS.iter().any(|m| dir.join(m).exists())
+}
+
+/// Collect repository roots under `start` (depth-first). A repo root is a
+/// boundary by default (its contents aren't scanned for nested repos) unless
+/// `nested` is set. Symlinked directories are not followed, so cycles can't
+/// trap the walk.
+fn find_repo_roots(start: &Path, nested: bool, out: &mut Vec<PathBuf>) {
+    if is_repo_root(start) {
+        out.push(start.to_path_buf());
+        if !nested {
+            return; // boundary: don't descend into the repo
+        }
+    }
+    let Ok(entries) = std::fs::read_dir(start) else {
+        return; // unreadable dir (permissions) — skip, don't abort the scan
+    };
+    for entry in entries.flatten() {
+        // Only descend into real directories; skip symlinks to avoid cycles.
+        match entry.file_type() {
+            Ok(ft) if ft.is_dir() => {}
+            _ => continue,
+        }
+        find_repo_roots(&entry.path(), nested, out);
+    }
+}
+
+/// Recursively register every repository under `dir` (#263). Registration runs
+/// for every repo found, independent of `--analyze`: an already-indexed repo is
+/// still (re)registered, so one whose earlier registration failed (e.g. a stuck
+/// lock) is recovered. With `analyze`, each repo is indexed after it's recorded.
+fn scan(registry_path: &Path, dir: &Path, analyze: bool, update: bool, nested: bool) -> Result<()> {
+    let root = dir
+        .canonicalize()
+        .with_context(|| format!("cannot resolve path {}", dir.display()))?;
+    let mut roots = Vec::new();
+    find_repo_roots(&root, nested, &mut roots);
+    if roots.is_empty() {
+        println!("no repositories found under {}", root.display());
+        return Ok(());
+    }
+
+    let (mut registered, mut queued, mut analyzed, mut failed) = (0u32, 0u32, 0u32, 0u32);
+    for repo in &roots {
+        let entry = entry_for(registry_path, repo, None);
+        let name = entry.name.clone();
+        // Always register first, regardless of index state, so a repo whose
+        // prior registration was lost is recovered even when it's up to date.
+        match Registry::record(registry_path, vec![entry])? {
+            RecordOutcome::Applied => {
+                registered += 1;
+                println!("registered '{}' -> {}", name, repo.display());
+            }
+            RecordOutcome::Spilled => {
+                queued += 1;
+                println!(
+                    "registry busy; queued '{}' -> {} (merged on the next run)",
+                    name,
+                    repo.display()
+                );
+            }
+        }
+        if analyze {
+            match super::analyze::run(repo, update) {
+                Ok(outcome) if outcome.up_to_date => {
+                    println!("  index up to date ({} files)", outcome.files);
+                }
+                Ok(outcome) => {
+                    analyzed += 1;
+                    println!(
+                        "  indexed {} files: {} nodes, {} edges",
+                        outcome.files, outcome.nodes, outcome.edges
+                    );
+                }
+                Err(err) => {
+                    failed += 1;
+                    eprintln!("  analyze failed: {err:#}");
+                }
+            }
+        }
+    }
+    print!("scan: {registered} registered");
+    if queued > 0 {
+        print!(", {queued} queued");
+    }
+    if analyze {
+        print!(", {analyzed} analyzed, {failed} failed");
+    }
+    println!();
     Ok(())
 }
 
@@ -261,4 +390,68 @@ fn missing_for(missing_since: Option<i64>) -> String {
         .unwrap_or(since);
     let days = (now - since).max(0) / 86_400;
     format!(" for {days}d")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use assert2::check;
+
+    fn scratch() -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("stratograph-scan-{nanos}"));
+        // alpha is a git repo; sub/beta an svn repo; alpha/vendor/gamma a nested
+        // git repo; notrepo holds no VCS marker.
+        for sub in [
+            "alpha/.git",
+            "sub/beta/.svn",
+            "alpha/vendor/gamma/.git",
+            "notrepo/src",
+        ] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn scan_stops_at_repo_boundaries_by_default() {
+        let dir = scratch();
+        let mut roots = Vec::new();
+        find_repo_roots(&dir, false, &mut roots);
+        let names: Vec<_> = roots
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        check!(roots.len() == 2); // alpha + beta; gamma is inside alpha (a boundary)
+        check!(names.contains(&"alpha".to_string()));
+        check!(names.contains(&"beta".to_string()));
+        check!(!names.contains(&"gamma".to_string()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn scan_nested_descends_into_repos() {
+        let dir = scratch();
+        let mut roots = Vec::new();
+        find_repo_roots(&dir, true, &mut roots);
+        let names: Vec<_> = roots
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        check!(names.contains(&"gamma".to_string())); // submodule now found
+        check!(roots.len() == 3);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn is_repo_root_recognizes_markers() {
+        let dir = scratch();
+        check!(is_repo_root(&dir.join("alpha")));
+        check!(is_repo_root(&dir.join("sub/beta")));
+        check!(!is_repo_root(&dir.join("notrepo")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
