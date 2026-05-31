@@ -63,6 +63,15 @@ pub enum RepoCmd {
         #[arg(long, default_value_t = 30)]
         older_than_days: u64,
     },
+    /// Re-derive forge identities for registered repos from their current git
+    /// remotes, updating the registry in place.
+    ///
+    /// Useful after an id-format fix or when remotes change: it recomputes ids
+    /// without re-analyzing. Entries whose root is missing are left untouched.
+    Refresh {
+        /// Only refresh this repo (defaults to all registered repos).
+        name: Option<String>,
+    },
     /// Force-release a stuck registry lock (escape hatch for a lock left by a
     /// dead writer on a network/FUSE filesystem). Safe: only removes the lock
     /// file; the registry self-heals stale locks automatically, so this is
@@ -229,11 +238,87 @@ pub fn run(cmd: RepoCmd) -> Result<()> {
                 }
             }
         }
+        RepoCmd::Refresh { name } => refresh(&path, name.as_deref())?,
         RepoCmd::Unlock => match filelock::force_unlock(&lock_path(&path))? {
             Some(desc) => println!("released registry lock ({desc})"),
             None => println!("no registry lock held"),
         },
     }
+    Ok(())
+}
+
+/// Re-derive forge ids for registered repos from their current git remotes,
+/// updating the registry in place. The slow per-repo git work runs outside the
+/// lock; the registry is then re-loaded under the lock to apply the new ids, so
+/// a concurrent writer isn't blocked while remotes are read (which can be slow
+/// on a network drive). Entries whose root is missing are left untouched.
+fn refresh(registry_path: &Path, only: Option<&str>) -> Result<()> {
+    let registry = Registry::mutate(registry_path, |reg| {
+        reg.refresh_health();
+        reg.clone()
+    })?;
+    let targets: Vec<&RegistryEntry> = registry
+        .repos
+        .iter()
+        .filter(|e| only.is_none_or(|n| e.name == n))
+        .collect();
+    if targets.is_empty() {
+        match only {
+            Some(n) => bail!("no repository named '{n}' in the registry"),
+            None => {
+                println!("(no repositories registered)");
+                return Ok(());
+            }
+        }
+    }
+
+    let bar = ProgressBar::new(targets.len() as u64);
+    bar.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} [{pos}/{len}] {wide_msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_bar()),
+    );
+    bar.enable_steady_tick(std::time::Duration::from_millis(120));
+
+    let (mut changed, mut unchanged, mut missing) = (0u32, 0u32, 0u32);
+    let mut updates: Vec<(String, Vec<stratograph_core::RepoId>)> = Vec::new();
+    for e in &targets {
+        bar.set_message(e.name.clone());
+        if !e.root.exists() {
+            missing += 1;
+            bar.suspend(|| println!("{}: skipped (root is missing)", e.name));
+            bar.inc(1);
+            continue;
+        }
+        let fresh = entry_for(registry_path, &e.root, Some(e.name.clone()));
+        if fresh.ids == e.ids {
+            unchanged += 1;
+        } else {
+            changed += 1;
+            let (name, old) = (e.name.clone(), e.ids.clone());
+            let new = fresh.ids.clone();
+            bar.suspend(|| {
+                println!("{name}: ids updated");
+                for id in &old {
+                    println!("  - {}", id.source);
+                }
+                for id in &new {
+                    println!("  + {}", id.source);
+                }
+            });
+            updates.push((name, new));
+        }
+        bar.inc(1);
+    }
+    bar.finish_and_clear();
+
+    if !updates.is_empty() {
+        Registry::mutate(registry_path, |reg| {
+            for (name, ids) in &updates {
+                reg.set_ids(name, ids.clone());
+            }
+        })?;
+    }
+    println!("refresh: {changed} updated, {unchanged} unchanged, {missing} missing");
     Ok(())
 }
 

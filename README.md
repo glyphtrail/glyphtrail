@@ -170,6 +170,10 @@ plus a Codeberg mirror) all resolve to the same repo. Two kinds, recorded at
 Numeric ids are entirely opt-in: with no token (and no `gh`), only the slug ids
 are recorded. Tokens are read from the environment and never logged.
 
+`stratograph repo refresh [name]` re-derives ids for registered repos from their
+current git remotes, in place — handy when remotes change or to repair ids
+written by an older version, without re-analyzing.
+
 For tokens under a non-standard env var, or self-hosted Gitea/GitLab/Forgejo
 instances the tool can't recognise by host, map them in
 `~/.stratograph/forge.toml`:
