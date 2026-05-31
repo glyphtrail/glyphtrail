@@ -62,6 +62,18 @@ pub fn repo_uuid(canonical: &str) -> String {
     Uuid::new_v5(&NAMESPACE, canonical.as_bytes()).to_string()
 }
 
+/// A stable id from a forge's *numeric* repo id (GitHub/Gitea/GitLab), which
+/// survives forge-side renames — the numeric id is stable even when the
+/// `owner/repo` slug changes. The canonical `source` is `host#numeric` (e.g.
+/// `codeberg.org#1982264`), distinct from the slug form `host/owner/repo`.
+pub fn forge_numeric_repo_id(host: &str, numeric_id: &str) -> RepoId {
+    let source = format!("{}#{}", host.to_lowercase(), numeric_id);
+    RepoId {
+        id: repo_uuid(&source),
+        source,
+    }
+}
+
 /// Canonicalize a git remote URL to `host/owner/repo`: strip the scheme,
 /// userinfo, port and a trailing `.git`/`/`, normalise scp-style
 /// (`git@host:owner/repo`), and lowercase. Returns `None` for a URL that doesn't
@@ -152,6 +164,17 @@ mod tests {
         check!(https == ssh);
         // Stable (UUIDv5) and well-formed.
         check!(https.len() == 36);
+    }
+
+    #[test]
+    fn forge_numeric_id_is_stable_and_rename_proof() {
+        let a = forge_numeric_repo_id("codeberg.org", "1982264");
+        check!(a.source == "codeberg.org#1982264");
+        check!(a.id.len() == 36);
+        // Same forge + numeric => same id regardless of any slug rename.
+        check!(a == forge_numeric_repo_id("Codeberg.org", "1982264"));
+        // Distinct from the slug id for the same repo.
+        check!(a.id != repo_uuid("codeberg.org/sunsided/stratograph"));
     }
 
     #[test]
