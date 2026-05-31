@@ -174,6 +174,13 @@ are recorded. Tokens are read from the environment and never logged.
 current git remotes, in place — handy when remotes change or to repair ids
 written by an older version, without re-analyzing.
 
+The same repo can live at more than one path — a symlink, a second clone, a
+backup copy. Stratograph keeps **one entry per repo**: when a path you register
+shares a forge id with an existing entry, it's folded in as an additional
+location (shown as `also at …` in `repo list`) rather than a duplicate, so the
+repo isn't double-counted in federated impact. Symlinks collapse automatically
+via path canonicalization.
+
 For tokens under a non-standard env var, or self-hosted Gitea/GitLab/Forgejo
 instances the tool can't recognise by host, map them in
 `~/.stratograph/forge.toml`:

@@ -267,6 +267,8 @@ fn list_repos() -> Result<Value, String> {
             json!({
                 "name": e.name,
                 "root": e.root,
+                // Additional known locations of the same repo (#272), if any.
+                "alt_roots": e.alt_roots,
                 "health": health,
                 "groups": member_of,
                 // Stable forge identities (#233): slug + optional numeric ids.
@@ -291,7 +293,7 @@ fn target_db(default_db: &Path, args: &Value) -> Result<PathBuf, String> {
         && let Ok(registry) = Registry::load(&path)
         && let Some(entry) = registry.get(selector)
     {
-        return Ok(RepoPaths::new(&entry.root).db_path);
+        return Ok(RepoPaths::new(entry.active_root()).db_path);
     }
     Ok(RepoPaths::new(Path::new(selector)).db_path)
 }

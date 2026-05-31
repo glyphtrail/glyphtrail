@@ -115,7 +115,7 @@ fn run_portfolio(args: StoryArgs) -> Result<()> {
     // rather than aborting the whole portfolio.
     let mut histories: Vec<(String, Vec<Commit>)> = Vec::new();
     for e in &selected {
-        match git_history(&e.root, args.max_commits) {
+        match git_history(e.active_root(), args.max_commits) {
             Ok(commits) if !commits.is_empty() => histories.push((e.name.clone(), commits)),
             Ok(_) => eprintln!("  {}: no commits, skipped", e.name),
             Err(err) => eprintln!("  {}: {err:#}", e.name),

@@ -76,7 +76,10 @@ pub fn federated_impact(
     let current = registry
         .repos
         .iter()
-        .find(|e| e.root.canonicalize().map(|r| r == here).unwrap_or(false))
+        .find(|e| {
+            e.roots()
+                .any(|root| root.canonicalize().map(|r| r == here).unwrap_or(false))
+        })
         .map(|e| e.name.clone())
         .ok_or_else(|| {
             anyhow!(
@@ -109,7 +112,9 @@ pub fn federated_impact(
         if entry.health() != RepoHealth::Indexed {
             continue;
         }
-        let ladybug = RepoPaths::new(&entry.root).index_dir.join("ladybug");
+        let ladybug = RepoPaths::new(entry.active_root())
+            .index_dir
+            .join("ladybug");
         stores.insert(name.clone(), Box::new(LadybugStore::open(&ladybug)?));
     }
     let current_store = stores
