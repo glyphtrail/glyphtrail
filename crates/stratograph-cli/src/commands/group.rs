@@ -130,8 +130,8 @@ fn status(path: &std::path::Path, only: Option<&str>) -> Result<()> {
             let note = match registry.get(repo) {
                 None => "unregistered".to_string(),
                 Some(e) => match e.health() {
-                    RepoHealth::Indexed => format!("indexed  {}", e.root.display()),
-                    RepoHealth::Unindexed => format!("not indexed  {}", e.root.display()),
+                    RepoHealth::Indexed => format!("indexed  {}", e.active_root().display()),
+                    RepoHealth::Unindexed => format!("not indexed  {}", e.active_root().display()),
                     RepoHealth::Missing => format!("missing  {}", e.root.display()),
                 },
             };
@@ -169,7 +169,7 @@ fn links(groups_path: &Path, name: Option<&str>) -> Result<()> {
             eprintln!("note: '{repo_name}' is not indexed; skipping");
             continue;
         }
-        let store = backend::open_existing(&RepoPaths::new(&entry.root))?;
+        let store = backend::open_existing(&RepoPaths::new(entry.active_root()))?;
         let identity = PackageIdentity::from_meta(
             store.get_meta(META_PACKAGES)?.as_deref(),
             store.get_meta(META_EXTERNAL_USES)?.as_deref(),

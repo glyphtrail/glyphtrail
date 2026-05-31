@@ -5,8 +5,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::Subcommand;
 use indicatif::{ProgressBar, ProgressStyle};
 use stratograph_core::{
-    RecordOutcome, Registry, RegistryEntry, RepoHealth, default_registry_path, filelock, lock_path,
-    repo_ids,
+    RecordOutcome, Registry, RegistryEntry, RepoHealth, Resolution, default_registry_path,
+    filelock, lock_path, repo_ids,
 };
 use stratograph_forge_id::{ForgeConfig, forge_numeric_ids};
 
@@ -126,13 +126,13 @@ fn each_repo(verb: &str, op: impl Fn(&std::path::Path) -> Result<()>) -> Result<
     }
     let (mut ok, mut failed, mut skipped) = (0u32, 0u32, 0u32);
     for e in &registry.repos {
-        println!("== {} ({}) ==", e.name, e.root.display());
+        println!("== {} ({}) ==", e.name, e.active_root().display());
         if e.health() == RepoHealth::Missing {
             skipped += 1;
             println!("  skipped: root is missing");
             continue;
         }
-        match op(&e.root) {
+        match op(e.active_root()) {
             Ok(()) => ok += 1,
             Err(err) => {
                 failed += 1;
@@ -163,8 +163,8 @@ pub fn run(cmd: RepoCmd) -> Result<()> {
             // failing — important when indexing many repos on a slow/contended
             // network filesystem.
             match Registry::record(&path, vec![entry])? {
-                RecordOutcome::Applied => {
-                    println!("registered '{}' -> {}", name, root.display());
+                RecordOutcome::Applied(res) => {
+                    println!("{}", describe_record(&res[0], &name, &root))
                 }
                 RecordOutcome::Spilled => {
                     println!(
@@ -213,6 +213,9 @@ pub fn run(cmd: RepoCmd) -> Result<()> {
                     }
                 };
                 println!("{:<20} {}{}", e.name, e.root.display(), note);
+                for alt in &e.alt_roots {
+                    println!("{:<20} ↳ also at {}", "", alt.display());
+                }
                 for id in &e.ids {
                     println!("{:<20} ↳ {}", "", id.source);
                 }
@@ -283,13 +286,13 @@ fn refresh(registry_path: &Path, only: Option<&str>) -> Result<()> {
     let mut updates: Vec<(String, Vec<stratograph_core::RepoId>)> = Vec::new();
     for e in &targets {
         bar.set_message(e.name.clone());
-        if !e.root.exists() {
+        if e.roots().all(|r| !r.exists()) {
             missing += 1;
             bar.suspend(|| println!("{}: skipped (root is missing)", e.name));
             bar.inc(1);
             continue;
         }
-        let fresh = entry_for(registry_path, &e.root, Some(e.name.clone()));
+        let fresh = entry_for(registry_path, e.active_root(), Some(e.name.clone()));
         if fresh.ids == e.ids {
             unchanged += 1;
         } else {
@@ -343,8 +346,29 @@ fn entry_for(registry_path: &Path, root: &Path, name: Option<String>) -> Registr
     RegistryEntry {
         name,
         root: root.to_path_buf(),
+        alt_roots: Vec::new(),
         missing_since: None,
         ids,
+    }
+}
+
+/// One-line outcome message for a [`Resolution`] from registering `name` at
+/// `root`.
+fn describe_record(res: &Resolution, name: &str, root: &Path) -> String {
+    match res {
+        Resolution::Added => format!("registered '{name}' -> {}", root.display()),
+        Resolution::Updated => format!("updated '{name}' -> {}", root.display()),
+        Resolution::SameRepo {
+            into,
+            new_path: true,
+        } => format!(
+            "'{name}' is the same repo as '{into}'; recorded extra path {}",
+            root.display()
+        ),
+        Resolution::SameRepo {
+            into,
+            new_path: false,
+        } => format!("'{name}' is already registered as '{into}'"),
     }
 }
 
@@ -458,7 +482,8 @@ fn scan(registry_path: &Path, dir: &Path, opts: ScanOpts) -> Result<()> {
         root.display()
     );
 
-    let (mut registered, mut queued, mut analyzed, mut skipped, mut failed) = (0u32, 0, 0, 0, 0);
+    let (mut registered, mut merged, mut queued, mut analyzed, mut skipped, mut failed) =
+        (0u32, 0, 0, 0, 0, 0);
     let bar = ProgressBar::new(roots.len() as u64);
     bar.set_style(
         ProgressStyle::with_template("{spinner:.cyan} [{pos}/{len}] {wide_msg}")
@@ -508,9 +533,13 @@ fn scan(registry_path: &Path, dir: &Path, opts: ScanOpts) -> Result<()> {
         }
         let entry = entry_for(registry_path, repo, Some(name.clone()));
         match Registry::record(registry_path, vec![entry])? {
-            RecordOutcome::Applied => {
-                registered += 1;
-                bar.suspend(|| println!("registered '{}' -> {}", name, repo.display()));
+            RecordOutcome::Applied(res) => {
+                match &res[0] {
+                    Resolution::SameRepo { .. } => merged += 1,
+                    _ => registered += 1,
+                }
+                let line = describe_record(&res[0], &name, repo);
+                bar.suspend(|| println!("{line}"));
             }
             RecordOutcome::Spilled => {
                 queued += 1;
@@ -528,6 +557,9 @@ fn scan(registry_path: &Path, dir: &Path, opts: ScanOpts) -> Result<()> {
     bar.finish_and_clear();
 
     print!("scan: {registered} registered");
+    if merged > 0 {
+        print!(", {merged} merged");
+    }
     if queued > 0 {
         print!(", {queued} queued");
     }

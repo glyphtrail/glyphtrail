@@ -21,12 +21,26 @@ pub fn lock_path(registry_path: &Path) -> PathBuf {
 /// lock-holding run. See [`Registry::record`].
 const SPILL_PREFIX: &str = "registry.spill.";
 
-/// Result of [`Registry::record`]: the add was applied to the registry, or
-/// deferred to a spillover file because the lock was busy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Result of [`Registry::record`]: the adds were applied to the registry (with
+/// a per-entry [`Resolution`], in input order), or deferred to a spillover file
+/// because the lock was busy.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordOutcome {
-    Applied,
+    Applied(Vec<Resolution>),
     Spilled,
+}
+
+/// How [`Registry::upsert_repo`] resolved one entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resolution {
+    /// A brand-new repository entry.
+    Added,
+    /// An existing same-named entry was refreshed in place.
+    Updated,
+    /// Recognised as the same repo (shared forge id) as an existing entry (#272),
+    /// named by `into`. `new_path` is true when this registration contributed a
+    /// location not already known for that repo.
+    SameRepo { into: String, new_path: bool },
 }
 
 /// Liveness of a registered repository on disk.
@@ -44,8 +58,14 @@ pub enum RepoHealth {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegistryEntry {
     pub name: String,
-    /// Absolute repository root (contains the `.stratograph/` index).
+    /// Primary absolute repository root (contains the `.stratograph/` index).
     pub root: PathBuf,
+    /// Additional known locations of the *same* repo — a symlink, a second
+    /// clone, a backup copy (#272). The same repo found at another path is
+    /// recognised by its forge id and folded in here instead of creating a
+    /// duplicate entry (which would double-count it in federated impact).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alt_roots: Vec<PathBuf>,
     /// Unix seconds when the root was first observed missing; cleared when it
     /// reappears. Drives `prune_missing` so dead entries don't collect dust,
     /// while tolerating transient glitches.
@@ -60,18 +80,47 @@ pub struct RegistryEntry {
 }
 
 impl RegistryEntry {
-    /// Current on-disk health of this entry.
+    /// All known locations of the repo: the primary root first, then any
+    /// alternates (#272).
+    pub fn roots(&self) -> impl Iterator<Item = &PathBuf> {
+        std::iter::once(&self.root).chain(self.alt_roots.iter())
+    }
+
+    /// The location to operate on: the first root that exists on disk, falling
+    /// back to the primary root when none do. Lets a repo's index be found at a
+    /// backup/symlink path when the primary is offline (#272).
+    pub fn active_root(&self) -> &PathBuf {
+        self.roots().find(|r| r.exists()).unwrap_or(&self.root)
+    }
+
+    /// Whether `path` (as given) is already one of this entry's roots.
+    fn has_root(&self, path: &Path) -> bool {
+        self.roots().any(|r| r == path)
+    }
+
+    /// Record an additional location of this repo, unless already known (#272).
+    fn add_path(&mut self, path: PathBuf) {
+        if !self.has_root(&path) {
+            self.alt_roots.push(path);
+        }
+    }
+
+    /// Current on-disk health, taken as the best across all known roots: indexed
+    /// if any location has an index, missing only if every location is gone.
     pub fn health(&self) -> RepoHealth {
-        if !self.root.exists() {
-            RepoHealth::Missing
-        } else if RepoPaths::new(&self.root)
-            .index_dir
-            .join("ladybug")
-            .exists()
-        {
-            RepoHealth::Indexed
-        } else {
+        let mut any_exists = false;
+        for root in self.roots() {
+            if root.exists() {
+                any_exists = true;
+                if RepoPaths::new(root).index_dir.join("ladybug").exists() {
+                    return RepoHealth::Indexed;
+                }
+            }
+        }
+        if any_exists {
             RepoHealth::Unindexed
+        } else {
+            RepoHealth::Missing
         }
     }
 }
@@ -162,15 +211,13 @@ impl Registry {
         let applied = crate::filelock::with_lock(&lock_path(path), || {
             let mut reg = Registry::load(path)?;
             ingest_spillovers(path, &mut reg);
-            for e in &entries {
-                reg.add(e.name.clone(), e.root.clone());
-                reg.set_ids(&e.name, e.ids.clone());
-            }
+            let resolutions: Vec<Resolution> =
+                entries.iter().map(|e| reg.upsert_repo(e.clone())).collect();
             reg.save(path)?;
-            Ok(())
+            Ok(resolutions)
         });
         match applied {
-            Ok(()) => Ok(RecordOutcome::Applied),
+            Ok(resolutions) => Ok(RecordOutcome::Applied(resolutions)),
             Err(CoreError::Lock { .. }) => {
                 write_spillover(path, &entries)?;
                 Ok(RecordOutcome::Spilled)
@@ -192,12 +239,63 @@ impl Registry {
                 self.repos.push(RegistryEntry {
                     name,
                     root,
+                    alt_roots: Vec::new(),
                     missing_since: None,
                     ids: Vec::new(),
                 });
                 true
             }
         }
+    }
+
+    /// Insert or fold in `entry`, the loss-proof registration primitive (used by
+    /// [`Self::record`]). Resolution order (#272):
+    ///
+    /// 1. **Same repo by forge id** — an existing entry shares any of `entry`'s
+    ///    ids: treat them as the same repo and fold `entry`'s path(s) in as
+    ///    additional locations (the first-registered entry keeps primacy), union
+    ///    the ids, and clear `missing_since`. This is what stops a working copy
+    ///    and its backup/symlink becoming two entries (and double-counting in
+    ///    federated impact).
+    /// 2. **Same name** — refresh that entry in place (the name-keyed behaviour
+    ///    that predates ids; a repo with no remotes has no id to match on).
+    /// 3. Otherwise a brand-new entry.
+    pub fn upsert_repo(&mut self, entry: RegistryEntry) -> Resolution {
+        // 1. Same repo (shared forge id) -> fold the path(s) in.
+        if !entry.ids.is_empty()
+            && let Some(existing) = self.repos.iter_mut().find(|e| {
+                e.ids
+                    .iter()
+                    .any(|id| entry.ids.iter().any(|nid| nid.id == id.id))
+            })
+        {
+            let before = existing.alt_roots.len();
+            let new_roots: Vec<PathBuf> = entry.roots().cloned().collect();
+            for r in new_roots {
+                existing.add_path(r);
+            }
+            for id in entry.ids {
+                if !existing.ids.iter().any(|e| e.id == id.id) {
+                    existing.ids.push(id);
+                }
+            }
+            existing.missing_since = None;
+            return Resolution::SameRepo {
+                into: existing.name.clone(),
+                new_path: existing.alt_roots.len() > before,
+            };
+        }
+        // 2. Same name -> refresh in place.
+        if let Some(existing) = self.repos.iter_mut().find(|e| e.name == entry.name) {
+            existing.root = entry.root;
+            existing.alt_roots = entry.alt_roots;
+            existing.missing_since = None;
+            existing.ids = entry.ids;
+            return Resolution::Updated;
+        }
+        // 3. New repo.
+        self.repos.push(entry);
+        Resolution::Added
     }
 
     /// Set the stable forge identities for a named entry (#233), replacing any
@@ -221,7 +319,9 @@ impl Registry {
         let now = now_secs();
         let mut changed = false;
         for e in &mut self.repos {
-            match (e.root.exists(), e.missing_since) {
+            // Missing only when *every* known location is gone (#272).
+            let exists = e.roots().any(|r| r.exists());
+            match (exists, e.missing_since) {
                 (false, None) => {
                     e.missing_since = Some(now);
                     changed = true;
@@ -292,8 +392,7 @@ fn ingest_spillovers(registry_path: &Path, reg: &mut Registry) {
             && let Ok(spilled) = serde_json::from_str::<Vec<RegistryEntry>>(&text)
         {
             for e in spilled {
-                reg.add(e.name.clone(), e.root);
-                reg.set_ids(&e.name, e.ids);
+                reg.upsert_repo(e); // id-merges, like a direct add (#272)
             }
         }
         let _ = std::fs::remove_file(&p); // consumed (or undecodable garbage)
@@ -476,9 +575,58 @@ mod tests {
         RegistryEntry {
             name: name.into(),
             root: PathBuf::from(root),
+            alt_roots: Vec::new(),
             missing_since: None,
             ids: Vec::new(),
         }
+    }
+
+    fn entry_with_id(name: &str, root: &str, id: &str) -> RegistryEntry {
+        RegistryEntry {
+            ids: vec![RepoId {
+                id: id.into(),
+                source: format!("forge/{id}"),
+            }],
+            ..entry(name, root)
+        }
+    }
+
+    // #272: the same repo (shared forge id) discovered at a second path folds
+    // in as an alternate location instead of creating a duplicate entry.
+    #[test]
+    fn upsert_merges_same_repo_by_id_into_one_entry() {
+        let mut reg = Registry::default();
+        check!(reg.upsert_repo(entry_with_id("proj", "/work/proj", "uuid-1")) == Resolution::Added);
+        let res = reg.upsert_repo(entry_with_id("proj-backup", "/backup/proj", "uuid-1"));
+        check!(
+            res == Resolution::SameRepo {
+                into: "proj".into(),
+                new_path: true
+            }
+        );
+        check!(reg.repos.len() == 1); // one repo, two paths
+        let e = &reg.repos[0];
+        check!(e.root == PathBuf::from("/work/proj")); // first registered keeps primacy
+        check!(e.alt_roots == vec![PathBuf::from("/backup/proj")]);
+        // Re-adding a known path folds in nothing new.
+        check!(
+            reg.upsert_repo(entry_with_id("proj", "/work/proj", "uuid-1"))
+                == Resolution::SameRepo {
+                    into: "proj".into(),
+                    new_path: false
+                }
+        );
+        check!(reg.repos[0].alt_roots.len() == 1);
+    }
+
+    // A repo with no forge id can't be id-merged; it stays name-keyed.
+    #[test]
+    fn upsert_without_ids_is_name_keyed() {
+        let mut reg = Registry::default();
+        check!(reg.upsert_repo(entry("a", "/a")) == Resolution::Added);
+        check!(reg.upsert_repo(entry("a", "/a2")) == Resolution::Updated);
+        check!(reg.repos.len() == 1);
+        check!(reg.repos[0].root == PathBuf::from("/a2"));
     }
 
     // `record` applies under the lock and reports it.
@@ -486,9 +634,10 @@ mod tests {
     fn record_applies_when_lock_is_free() {
         let dir = reg_dir("rec");
         let path = dir.join("registry.json");
-        check!(
-            Registry::record(&path, vec![entry("api", "/a")]).unwrap() == RecordOutcome::Applied
-        );
+        check!(matches!(
+            Registry::record(&path, vec![entry("api", "/a")]).unwrap(),
+            RecordOutcome::Applied(_)
+        ));
         check!(Registry::load(&path).unwrap().get("api").unwrap().root == PathBuf::from("/a"));
         std::fs::remove_dir_all(&dir).ok();
     }

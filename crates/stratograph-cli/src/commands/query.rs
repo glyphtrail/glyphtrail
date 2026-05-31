@@ -497,7 +497,7 @@ pub fn run_registry(
     if emit == Emit::Text {
         for e in &selected {
             println!("== {} ({}) ==", e.name, e.root.display());
-            match open_store(&e.root).and_then(|s| execute(s.as_ref(), &cmd)) {
+            match open_store(e.active_root()).and_then(|s| execute(s.as_ref(), &cmd)) {
                 Ok(r) => r.print_text(),
                 Err(err) => println!("  error: {err:#}"),
             }
@@ -507,7 +507,7 @@ pub fn run_registry(
 
     let mut arr = Vec::new();
     for e in &selected {
-        let value = match open_store(&e.root).and_then(|s| execute(s.as_ref(), &cmd)) {
+        let value = match open_store(e.active_root()).and_then(|s| execute(s.as_ref(), &cmd)) {
             Ok(r) => r.to_value(),
             Err(err) => serde_json::json!({ "error": format!("{err:#}") }),
         };
