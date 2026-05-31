@@ -115,7 +115,18 @@ pub fn federated_impact(
         let ladybug = RepoPaths::new(entry.active_root())
             .index_dir
             .join("ladybug");
-        stores.insert(name.clone(), Box::new(LadybugStore::open(&ladybug)?));
+        // Skip a member whose index won't open (corrupt or incompatible file)
+        // rather than aborting the whole federated query — one bad index among
+        // many registered repos shouldn't sink the run. The current repo's index
+        // is checked separately below, so a real failure there still errors.
+        match LadybugStore::open(&ladybug) {
+            Ok(store) => {
+                stores.insert(name.clone(), Box::new(store));
+            }
+            Err(e) => {
+                eprintln!("note: skipping repo '{name}': cannot open its index ({e})");
+            }
+        }
     }
     let current_store = stores
         .get(&current)
