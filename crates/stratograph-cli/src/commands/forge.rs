@@ -18,12 +18,15 @@
 use std::process::Command;
 
 use serde_json::Value;
-use stratograph_core::{RepoId, canonicalize_remote, forge_numeric_repo_id};
+use stratograph_core::{
+    ForgeConfig, ForgeKind, RepoId, canonicalize_remote, forge_numeric_repo_id,
+};
 
 /// Best-effort forge-API numeric ids for a repo's git remotes. Deterministic:
 /// sorted and de-duplicated. Empty when no remote is on a recognised forge with
 /// an available token.
 pub fn forge_numeric_ids(remote_urls: &[String]) -> Vec<RepoId> {
+    let config = ForgeConfig::load_default();
     let mut ids = Vec::new();
     for url in remote_urls {
         let Some(canonical) = canonicalize_remote(url) else {
@@ -35,7 +38,7 @@ pub fn forge_numeric_ids(remote_urls: &[String]) -> Vec<RepoId> {
         else {
             continue;
         };
-        if let Some(numeric) = fetch_numeric_id(host, owner, repo) {
+        if let Some(numeric) = fetch_numeric_id(&config, host, owner, repo) {
             ids.push(forge_numeric_repo_id(host, &numeric));
         }
     }
@@ -44,41 +47,63 @@ pub fn forge_numeric_ids(remote_urls: &[String]) -> Vec<RepoId> {
     ids
 }
 
-/// Query a recognised forge's API for `owner/repo`'s numeric id, using the
-/// forge's well-known token env var. `None` when the host isn't recognised, no
-/// token is set, or the request/parse fails.
-fn fetch_numeric_id(host: &str, owner: &str, repo: &str) -> Option<String> {
-    let (url, header, value) = match host {
-        "github.com" => match std::env::var("GITHUB_TOKEN") {
-            Ok(token) => (
+/// The forge a host speaks: a config-declared `kind` (for self-hosted instances)
+/// wins, else the built-in recognition of the public forges.
+fn forge_kind(config: &ForgeConfig, host: &str) -> Option<ForgeKind> {
+    config.for_host(host).and_then(|h| h.kind).or(match host {
+        "github.com" => Some(ForgeKind::GitHub),
+        "gitlab.com" => Some(ForgeKind::GitLab),
+        "codeberg.org" => Some(ForgeKind::Gitea),
+        _ => None,
+    })
+}
+
+/// Resolve a token: the config-mapped env var for the host wins, else the
+/// kind's well-known env var (when one applies).
+fn resolve_token(config: &ForgeConfig, host: &str, well_known: Option<&str>) -> Option<String> {
+    if let Some(var) = config.for_host(host).and_then(|h| h.token_env.as_deref())
+        && let Ok(token) = std::env::var(var)
+    {
+        return Some(token);
+    }
+    well_known.and_then(|w| std::env::var(w).ok())
+}
+
+/// Query a host's forge API for `owner/repo`'s numeric id. The forge kind and
+/// token come from the config (with built-in recognition + well-known env vars
+/// as the fallback), so self-hosted Gitea/GitLab work too. `None` when the host
+/// isn't a known forge, no token is available, or the request/parse fails.
+fn fetch_numeric_id(config: &ForgeConfig, host: &str, owner: &str, repo: &str) -> Option<String> {
+    let (url, header, value) = match forge_kind(config, host)? {
+        ForgeKind::GitHub => match resolve_token(config, host, Some("GITHUB_TOKEN")) {
+            Some(token) => (
                 format!("https://api.github.com/repos/{owner}/{repo}"),
                 "Authorization",
                 format!("Bearer {token}"),
             ),
-            // No env token: fall back to the `gh` CLI, which carries its own auth.
-            Err(_) => return gh_numeric_id(owner, repo),
+            // No token: fall back to the `gh` CLI, which carries its own auth.
+            None => return gh_numeric_id(owner, repo),
         },
-        "gitlab.com" => {
-            let token = std::env::var("GITLAB_TOKEN").ok()?;
+        ForgeKind::GitLab => {
+            let token = resolve_token(config, host, Some("GITLAB_TOKEN"))?;
             // GitLab identifies a project by its URL-encoded full path.
             let project = format!("{owner}/{repo}").replace('/', "%2F");
             (
-                format!("https://gitlab.com/api/v4/projects/{project}"),
+                format!("https://{host}/api/v4/projects/{project}"),
                 "PRIVATE-TOKEN",
                 token,
             )
         }
-        // Gitea / Forgejo. Codeberg is the recognised public host; other
-        // self-hosted instances arrive with the config-map follow-on.
-        "codeberg.org" => {
-            let token = std::env::var("CODEBERG_TOKEN").ok()?;
+        ForgeKind::Gitea => {
+            // Codeberg has a well-known var; self-hosted Gitea uses config token_env.
+            let well_known = (host == "codeberg.org").then_some("CODEBERG_TOKEN");
+            let token = resolve_token(config, host, well_known)?;
             (
                 format!("https://{host}/api/v1/repos/{owner}/{repo}"),
                 "Authorization",
                 format!("token {token}"),
             )
         }
-        _ => return None,
     };
 
     let response = ureq::get(&url)
