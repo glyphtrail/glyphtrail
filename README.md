@@ -122,6 +122,8 @@ and where, not just your own.
 
 ```bash
 stratograph repo add .                  # register the current repo
+stratograph repo scan ~/code            # find & register every repo under a tree
+stratograph repo scan ~/code --analyze  # ...and index each one too
 stratograph repo list                   # registered repos + health + forge ids
 stratograph group add svc api core      # optional: a named subset to scope to
 
