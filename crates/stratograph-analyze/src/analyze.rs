@@ -6,10 +6,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use stratograph_core::config::{IGNORE_FILE, RepoPaths};
 use stratograph_core::{
-    CargoPackage, ClientCall, CodeGraph, Confidence, Config, DynamicLanguage, Edge, EdgeKind,
-    Endpoint, ExternalUse, IndexedPackage, Language, META_EXTERNAL_USES, META_PACKAGES, Matcher,
-    Node, NodeId, NodeKind, OperationKey, PackageExport, PendingLink, Protocol, RewriteEngine,
-    SchemaFormat, parse_cargo_manifest, workspace_members,
+    CargoPackage, ClientCall, CodeGraph, Confidence, Config, DynamicLanguage, Ecosystem, Edge,
+    EdgeKind, Endpoint, ExternalUse, IndexedPackage, Language, META_EXTERNAL_USES, META_PACKAGES,
+    Matcher, Node, NodeId, NodeKind, OperationKey, PackageExport, PendingLink, Protocol,
+    RewriteEngine, SchemaFormat, parse_cargo_manifest, workspace_members,
 };
 use stratograph_parse::{
     DynamicGrammar, PendingEdge, build_client_graph, build_file_graph, build_graphql_client_graph,
@@ -537,8 +537,10 @@ fn index_packages(
             exports.sort_by(|a, b| (&a.node_id, &a.name).cmp(&(&b.node_id, &b.name)));
             exports.dedup_by(|a, b| a.node_id == b.node_id && a.name == b.name);
             IndexedPackage {
+                ecosystem: Ecosystem::Cargo,
+                name: d.package.name.clone(),
+                version: d.package.version.clone(),
                 dir: d.dir.clone(),
-                package: d.package.clone(),
                 exports,
             }
         })
@@ -586,11 +588,11 @@ fn import_root(path: &str) -> Option<&str> {
 /// segment against that package's declared dependencies. Read-only over `store`.
 fn external_uses(
     store: &dyn GraphStore,
-    indexed: &[IndexedPackage],
+    discovered: &[DiscoveredPackage],
     root: &Path,
 ) -> Result<Vec<ExternalUse>> {
-    let owner = |file: &str| -> Option<&IndexedPackage> {
-        indexed
+    let owner = |file: &str| -> Option<&DiscoveredPackage> {
+        discovered
             .iter()
             .filter(|p| {
                 p.dir.is_empty() || file == p.dir || file.starts_with(&format!("{}/", p.dir))
@@ -614,6 +616,7 @@ fn external_uses(
         {
             let from_nodes = use_site_nodes(store, root, &file, &raw, &mut sources)?;
             uses.push(ExternalUse {
+                ecosystem: Ecosystem::Cargo,
                 from_package: pkg.package.name.clone(),
                 from_file: file.clone(),
                 package: dep.name.clone(),
@@ -1225,7 +1228,7 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
     let packages_json = serde_json::to_string(&indexed).unwrap_or_else(|_| "[]".to_string());
     // Consumer side of cross-repo links (#220): imports referencing a declared
     // dependency. Resolved from the same identity, persisted for #221.
-    let uses_json = serde_json::to_string(&external_uses(&*store, &indexed, &root)?)
+    let uses_json = serde_json::to_string(&external_uses(&*store, &discovered, &root)?)
         .unwrap_or_else(|_| "[]".to_string());
     store.set_meta(META_PACKAGES, &packages_json)?;
     store.set_meta(META_EXTERNAL_USES, &uses_json)?;
@@ -1545,17 +1548,11 @@ mod tests {
         let packages: Vec<IndexedPackage> = serde_json::from_str(&json).unwrap();
         let widget = packages
             .iter()
-            .find(|p| p.package.name == "widget")
+            .find(|p| p.name == "widget")
             .expect("widget package recorded");
-        check!(widget.package.version == Some("0.3.0".to_string()));
+        check!(widget.ecosystem == Ecosystem::Cargo);
+        check!(widget.version == Some("0.3.0".to_string()));
         check!(widget.dir == "crates/widget");
-        let helper = widget
-            .package
-            .dependencies
-            .iter()
-            .find(|d| d.name == "helper")
-            .expect("helper dependency recorded");
-        check!(helper.source == stratograph_core::DepSource::Path("../helper".into()));
         // #220c: the member crate's pub fn is recorded as an export attributed
         // to the owning package (longest-dir match), not the virtual root.
         check!(
@@ -1703,7 +1700,7 @@ mod tests {
             serde_json::from_str(&store.get_meta("packages").unwrap().unwrap()).unwrap();
         let lib_pkg = packages
             .iter()
-            .find(|p| p.package.name == "lib")
+            .find(|p| p.name == "lib")
             .expect("lib package");
         let thing = lib_pkg
             .exports

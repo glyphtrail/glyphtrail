@@ -55,7 +55,7 @@ fn owning_package<'a>(packages: &'a [IndexedPackage], file: &str) -> Option<&'a 
         .iter()
         .filter(|p| p.dir.is_empty() || file == p.dir || file.starts_with(&format!("{}/", p.dir)))
         .max_by_key(|p| p.dir.len())
-        .map(|p| p.package.name.as_str())
+        .map(|p| p.name.as_str())
 }
 
 /// Compute the cross-repo blast radius: seed in the repo at `current_root` and

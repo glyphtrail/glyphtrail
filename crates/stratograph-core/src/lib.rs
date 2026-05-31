@@ -24,7 +24,8 @@ pub use error::{CoreError, Result};
 pub use federated::{FederatedAdjacency, qualify, unqualify};
 pub use groups::{Group, Groups, default_groups_path};
 pub use identity::{
-    ExternalUse, IndexedPackage, META_EXTERNAL_USES, META_PACKAGES, PackageExport, PackageIdentity,
+    Ecosystem, ExternalUse, IndexedPackage, META_EXTERNAL_USES, META_PACKAGES, PackageExport,
+    PackageIdentity,
 };
 pub use impact::{
     Adjacency, ClassifiedItem, CrateLevelHit, Direction, EdgeRule, FederatedReport, ImpactClass,

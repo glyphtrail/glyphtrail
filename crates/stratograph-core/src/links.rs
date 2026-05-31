@@ -65,10 +65,7 @@ pub fn resolve_links(repos: &[RepoIdentity]) -> Vec<CrossRepoLink> {
     let mut producers: HashMap<&str, Vec<(usize, usize)>> = HashMap::new();
     for (ri, r) in repos.iter().enumerate() {
         for (pi, p) in r.identity.packages.iter().enumerate() {
-            producers
-                .entry(p.package.name.as_str())
-                .or_default()
-                .push((ri, pi));
+            producers.entry(p.name.as_str()).or_default().push((ri, pi));
         }
     }
 
@@ -167,15 +164,15 @@ pub fn imported_symbols(path: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ExternalUse, IndexedPackage, NodeKind, PackageExport, parse_cargo_manifest};
+    use crate::{Ecosystem, ExternalUse, IndexedPackage, NodeKind, PackageExport};
     use assert2::check;
 
     fn pkg(name: &str, exports: &[&str]) -> IndexedPackage {
         IndexedPackage {
+            ecosystem: Ecosystem::Cargo,
+            name: name.to_string(),
+            version: None,
             dir: String::new(),
-            package: parse_cargo_manifest(&format!("[package]\nname = \"{name}\"\n"))
-                .unwrap()
-                .unwrap(),
             exports: exports
                 .iter()
                 .map(|n| PackageExport {
@@ -191,6 +188,7 @@ mod tests {
 
     fn uses(from_package: &str, dep: &str, path: &str) -> ExternalUse {
         ExternalUse {
+            ecosystem: Ecosystem::Cargo,
             from_package: from_package.to_string(),
             from_file: format!("{from_package}/src/lib.rs"),
             package: dep.to_string(),
