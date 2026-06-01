@@ -546,7 +546,9 @@ struct DefInfo {
     qualified: String,
 }
 
-/// Find the index of the smallest definition whose span encloses `byte`.
+/// The definition that owns the code at `byte`: the smallest def whose span
+/// encloses it, or — for a `line_oriented` language — the nearest preceding
+/// definition when nothing encloses it (an assembly label's span is one line).
 fn enclosing_def(defs: &[DefInfo], byte: usize, line_oriented: bool) -> Option<usize> {
     let probe = Span {
         start_byte: byte,
@@ -626,8 +628,9 @@ pub fn build_file_graph(
     source: &str,
 ) -> FileGraph {
     let mut fg = FileGraph::default();
-    // Assembly labels span one line, not the whole routine, so call attribution
-    // falls back to the nearest preceding label (#368). See `enclosing_def`.
+    // Assembly labels span one line, not the whole routine, so scope attribution
+    // (which routine a call/ref/base/comment belongs to) falls back to the nearest
+    // preceding label (#368). See `enclosing_def`.
     let line_oriented = matches!(lang, Language::Merlin6502);
 
     // Establish parent relationships by span nesting.
