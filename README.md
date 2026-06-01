@@ -227,6 +227,9 @@ glyphtrail analyze .                   # index each repo as usual
 # Blast radius extended into downstream repos that depend on this one:
 glyphtrail impact MySymbol --downstream            # federate over the registry
 glyphtrail impact --since main..HEAD --group svc   # scope to a group
+glyphtrail impact MySymbol --downstream --deep     # re-read identities from each
+#   member store (not the cached shortcut) and include indexed repos beside this
+#   one that were never `repo add`ed — for when the cache may be stale/incomplete
 ```
 
 Cross-repo links are matched by package name (Cargo today): a consumer's
