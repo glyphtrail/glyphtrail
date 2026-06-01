@@ -1,0 +1,53 @@
+# Per-crate labels (workspace members)
+cli:
+  - changed-files:
+      - any-glob-to-any-file: crates/glyphtrail-cli/**
+core:
+  - changed-files:
+      - any-glob-to-any-file: crates/glyphtrail-core/**
+languages:
+  - changed-files:
+      - any-glob-to-any-file: crates/glyphtrail-parse/**
+storage:
+  - changed-files:
+      - any-glob-to-any-file: crates/glyphtrail-store/**
+analyze:
+  - changed-files:
+      - any-glob-to-any-file: crates/glyphtrail-analyze/**
+viz:
+  - changed-files:
+      - any-glob-to-any-file: crates/glyphtrail-viz/**
+server:
+  - changed-files:
+      - any-glob-to-any-file: crates/glyphtrail-server/**
+mcp:
+  - changed-files:
+      - any-glob-to-any-file:
+          - crates/glyphtrail-mcp/**
+          - packaging/mcpb/**
+cross-repo:
+  - changed-files:
+      - any-glob-to-any-file: crates/glyphtrail-forge-id/**
+
+# Functional labels
+documentation:
+  - changed-files:
+      - any-glob-to-any-file: '**/*.md'
+github_actions:
+  - changed-files:
+      - any-glob-to-any-file: .github/**
+ci:
+  - changed-files:
+      - any-glob-to-any-file: Taskfile.dist.yaml
+dependencies:
+  - changed-files:
+      - any-glob-to-any-file:
+          - Cargo.toml
+          - Cargo.lock
+          - crates/*/Cargo.toml
+packaging:
+  - changed-files:
+      - any-glob-to-any-file: packaging/**
+testing:
+  - changed-files:
+      - any-glob-to-any-file: tests/**
