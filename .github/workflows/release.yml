@@ -72,7 +72,39 @@ jobs:
             tar czf "$staging.tar.gz" "$staging"
             echo "ASSET=$staging.tar.gz" >> "$GITHUB_ENV"
           fi
+      # Build a one-click MCP Bundle (.mcpb) for Claude Desktop (#303): a zip of
+      # the platform binary plus a manifest derived from packaging/mcpb. The bundle
+      # is arch-specific because it ships a native binary, so we build one per
+      # target and stamp the version / binary name / platform into the manifest.
+      - name: Package MCP bundle (.mcpb)
+        shell: bash
+        run: |
+          tag="${{ github.ref_name }}"
+          ver="${tag#v}"
+          case "${{ matrix.target }}" in
+            *windows*) bin="glyphtrail.exe"; platform="win32" ;;
+            *darwin*)  bin="glyphtrail";     platform="darwin" ;;
+            *)         bin="glyphtrail";     platform="linux" ;;
+          esac
+          bundle="glyphtrail-${tag}-${{ matrix.target }}.mcpb"
+          work="$(mktemp -d)"
+          cp "target/${{ matrix.target }}/release/$bin" "$work/"
+          jq --arg v "$ver" --arg bin "$bin" --arg plat "$platform" \
+            '.version = $v
+             | .server.entry_point = $bin
+             | .server.mcp_config.command = "${__dirname}/" + $bin
+             | .compatibility.platforms = [$plat]' \
+            packaging/mcpb/manifest.json > "$work/manifest.json"
+          out="$PWD/$bundle"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            ( cd "$work" && 7z a -tzip "$out" . >/dev/null )
+          else
+            ( cd "$work" && zip -r -q "$out" . )
+          fi
+          echo "MCPB=$bundle" >> "$GITHUB_ENV"
       - name: Upload to release
         uses: softprops/action-gh-release@v3
         with:
-          files: ${{ env.ASSET }}
+          files: |
+            ${{ env.ASSET }}
+            ${{ env.MCPB }}

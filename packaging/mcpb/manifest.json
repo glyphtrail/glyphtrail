@@ -1,0 +1,55 @@
+{
+  "manifest_version": "0.2",
+  "name": "glyphtrail",
+  "display_name": "Glyphtrail",
+  "version": "0.0.0",
+  "description": "Query your codebase as a semantic and historical graph.",
+  "long_description": "Glyphtrail maps a repository as a semantic and historical graph: definitions, calls, imports, inheritance, and cross-boundary API links. This bundle runs the bundled `glyphtrail` binary as an MCP server (stdio) so an agent can locate code, trace callers/callees, follow API flow, and compute the blast radius of a change. The repository must already be indexed with `glyphtrail analyze`.",
+  "author": {
+    "name": "Markus Mayer",
+    "url": "https://github.com/glyphtrail/glyphtrail"
+  },
+  "homepage": "https://glyphtrail.dev",
+  "documentation": "https://github.com/glyphtrail/glyphtrail#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/glyphtrail/glyphtrail"
+  },
+  "license": "EUPL-1.2",
+  "server": {
+    "type": "binary",
+    "entry_point": "glyphtrail",
+    "mcp_config": {
+      "command": "${__dirname}/glyphtrail",
+      "args": ["mcp", "--repo", "${user_config.repo}"]
+    }
+  },
+  "tools": [
+    { "name": "search", "description": "Full-text search over symbol names and doc comments." },
+    { "name": "definition", "description": "Locate definition(s) matching a name." },
+    { "name": "callers", "description": "Symbols that call the named symbol." },
+    { "name": "callees", "description": "Symbols the named symbol calls." },
+    { "name": "neighbors", "description": "Direct graph neighbours of the named symbol." },
+    { "name": "endpoints", "description": "List server-side API endpoints with their handlers." },
+    { "name": "clients", "description": "List client-side API call sites." },
+    { "name": "serves", "description": "Endpoint(s) serving a path (template- and value-aware)." },
+    { "name": "who_calls", "description": "Client call sites that invoke an endpoint." },
+    { "name": "api_impact", "description": "Cross-boundary view of an endpoint: clients, handlers, schema ops." },
+    { "name": "impact", "description": "Blast radius of a change: symbol, file, or git change set." },
+    { "name": "status", "description": "Index statistics for the repository." },
+    { "name": "outline", "description": "Symbol outline of a file or directory with signatures." },
+    { "name": "list_repos", "description": "List repositories indexed in the global registry." },
+    { "name": "analyze", "description": "(Re)index a repository so queries reflect the latest state." }
+  ],
+  "user_config": {
+    "repo": {
+      "type": "directory",
+      "title": "Repository",
+      "description": "The repository to query. Index it first with `glyphtrail analyze <path>`.",
+      "required": true
+    }
+  },
+  "compatibility": {
+    "platforms": ["darwin", "linux", "win32"]
+  }
+}
