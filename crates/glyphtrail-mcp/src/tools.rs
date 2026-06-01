@@ -673,7 +673,16 @@ fn analyze_tool(db: &Path, args: &Value) -> Result<Value, String> {
     let root = resolve_analyze_root(db)?;
     let update = args.get("update").and_then(Value::as_bool).unwrap_or(false);
     let outcome = glyphtrail_analyze::run(&root, update).map_err(err)?;
-    serde_json::to_value(&outcome).map_err(err)
+    let mut value = serde_json::to_value(&outcome).map_err(err)?;
+    // Render `languages` as a {lang: count} map (descending order preserved),
+    // matching the `status` tool instead of a YAML-awkward array of pairs (#346).
+    let languages: serde_json::Map<String, Value> = outcome
+        .languages
+        .iter()
+        .map(|(lang, n)| (lang.clone(), json!(*n)))
+        .collect();
+    value["languages"] = Value::Object(languages);
+    Ok(value)
 }
 
 /// Resolve and vet the repository root an `analyze` call will index.
@@ -1222,6 +1231,9 @@ mod tests {
         let parsed: Value = serde_norway::from_str(text).unwrap();
         check!(parsed["files"].as_u64().unwrap() >= 1);
         check!(parsed["nodes"].as_u64().unwrap() >= 1);
+        // languages is a {lang: count} map (#346), not an array of pairs.
+        check!(parsed["languages"].is_object());
+        check!(parsed["languages"]["rust"].as_u64().unwrap() >= 1);
         std::fs::remove_dir_all(&root).ok();
     }
 
