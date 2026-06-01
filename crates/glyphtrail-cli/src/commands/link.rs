@@ -1,20 +1,21 @@
-//! `glyphtrail link` — edit manual cross-repo link hints (#281) without
-//! hand-writing the nested TOML. Operates on one overlay at a time: the
-//! committed, team-shared `glyphtrail.links.toml` at the repo root by default,
-//! or the gitignored personal `.glyphtrail/links.toml` with `--local`.
+//! `glyphtrail link` — edit the cross-repo link hints (#281) that live in the
+//! unified config's `[[links]]` array, without hand-writing the nested TOML.
+//! Writes the committed `glyphtrail.toml` by default, or the gitignored personal
+//! `.glyphtrail/glyphtrail.toml` with `--local`; other config keys in the file
+//! are preserved.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 use clap::Subcommand;
-use glyphtrail_core::config::RepoPaths;
-use glyphtrail_core::link_hints::{HINTS_FILE, LOCAL_HINTS_FILE, LinkEnd, LinkHint, LinkHints};
+use glyphtrail_core::link_hints::{LinkEnd, LinkHint};
+
+use crate::commands::config_file;
 
 #[derive(Subcommand)]
 pub enum LinkCmd {
     /// List the declared hints (committed and local), with their indices.
     List {
-        /// Repository root.
         #[arg(long, default_value = ".")]
         repo: PathBuf,
     },
@@ -31,10 +32,9 @@ pub enum LinkCmd {
         /// Consumer repo (defaults to this repo, i.e. `.`).
         #[arg(long)]
         from_repo: Option<String>,
-        /// Write to the gitignored personal override instead of the committed file.
+        /// Write to the personal override instead of the committed file.
         #[arg(long)]
         local: bool,
-        /// Repository root.
         #[arg(long, default_value = ".")]
         repo: PathBuf,
     },
@@ -43,10 +43,8 @@ pub enum LinkCmd {
     Remove {
         /// 1-based index within the committed file (or the local file with --local).
         index: usize,
-        /// Operate on the gitignored personal override.
         #[arg(long)]
         local: bool,
-        /// Repository root.
         #[arg(long, default_value = ".")]
         repo: PathBuf,
     },
@@ -67,38 +65,42 @@ pub fn run(cmd: LinkCmd) -> Result<()> {
     }
 }
 
-/// The committed root file and the gitignored local override for `repo`.
-fn committed_file(repo: &Path) -> PathBuf {
-    repo.join(HINTS_FILE)
-}
-fn local_file(repo: &Path) -> PathBuf {
-    RepoPaths::new(repo).index_dir.join(LOCAL_HINTS_FILE)
-}
-
-/// One line describing a hint, e.g. `fetchUser -> user-svc:get_user`.
+/// One line describing a hint, e.g. `.:fetchUser -> user-svc:get_user`.
 fn describe(h: &LinkHint) -> String {
-    let end = |e: &LinkEnd, default_repo: &str| match (&e.repo, &e.symbol) {
+    let end = |e: &LinkEnd| match (&e.repo, &e.symbol) {
         (Some(r), Some(s)) => format!("{r}:{s}"),
         (Some(r), None) => r.clone(),
-        (None, Some(s)) => format!("{default_repo}:{s}"),
-        (None, None) => default_repo.to_string(),
+        (None, Some(s)) => format!(".:{s}"),
+        (None, None) => ".".to_string(),
     };
-    format!("{} -> {}", end(&h.from, "."), end(&h.to, "."))
+    format!("{} -> {}", end(&h.from), end(&h.to))
+}
+
+/// The `[[links]]` entries of a config file, as parsed hints (index-aligned).
+fn links_of(path: &Path) -> Result<Vec<LinkHint>> {
+    let table = config_file::load_table(path)?;
+    let Some(toml::Value::Array(items)) = table.get("links") else {
+        return Ok(Vec::new());
+    };
+    Ok(items
+        .iter()
+        .filter_map(|v| v.clone().try_into().ok())
+        .collect())
 }
 
 fn list(repo: &Path) -> Result<()> {
     let mut any = false;
     for (label, path) in [
-        ("shared", committed_file(repo)),
-        ("local", local_file(repo)),
+        ("committed", config_file::committed(repo)),
+        ("local", config_file::local(repo)),
     ] {
-        let hints = LinkHints::load_file(&path);
-        if hints.links.is_empty() {
+        let links = links_of(&path)?;
+        if links.is_empty() {
             continue;
         }
         any = true;
         println!("{label} ({}):", path.display());
-        for (i, h) in hints.links.iter().enumerate() {
+        for (i, h) in links.iter().enumerate() {
             println!("  {}. {}", i + 1, describe(h));
         }
     }
@@ -116,12 +118,8 @@ fn add(
     from_repo: Option<String>,
     from_symbol: Option<String>,
 ) -> Result<()> {
-    let path = if local {
-        local_file(repo)
-    } else {
-        committed_file(repo)
-    };
-    let mut hints = LinkHints::load_file(&path);
+    config_file::migrate_legacy(repo)?;
+    let path = config_file::target(repo, local);
     let hint = LinkHint {
         from: LinkEnd {
             // `.`/None means "this repo"; only record a real other repo.
@@ -133,28 +131,42 @@ fn add(
             symbol: to_symbol,
         },
     };
-    println!("added: {}  -> {}", describe(&hint), path.display());
-    hints.links.push(hint);
-    hints.save_file(&path)?;
+    let value = toml::Value::try_from(&hint)?;
+
+    let mut table = config_file::load_table(&path)?;
+    match table
+        .entry("links")
+        .or_insert_with(|| toml::Value::Array(Vec::new()))
+    {
+        toml::Value::Array(arr) => arr.push(value),
+        _ => bail!("`links` in {} is not an array", path.display()),
+    }
+    config_file::save(&path, &table)?;
+    println!("added: {}  ({})", describe(&hint), path.display());
     Ok(())
 }
 
 fn remove(repo: &Path, local: bool, index: usize) -> Result<()> {
-    let path = if local {
-        local_file(repo)
-    } else {
-        committed_file(repo)
+    config_file::migrate_legacy(repo)?;
+    let path = config_file::target(repo, local);
+    let mut table = config_file::load_table(&path)?;
+    let arr = match table.get_mut("links") {
+        Some(toml::Value::Array(arr)) => arr,
+        _ => bail!("no link hints in {}", path.display()),
     };
-    let mut hints = LinkHints::load_file(&path);
-    if index == 0 || index > hints.links.len() {
+    if index == 0 || index > arr.len() {
         bail!(
             "no hint at index {index} in {} ({} hint(s); see `glyphtrail link list`)",
             path.display(),
-            hints.links.len()
+            arr.len()
         );
     }
-    let removed = hints.links.remove(index - 1);
-    hints.save_file(&path)?;
-    println!("removed: {}  ({})", describe(&removed), path.display());
+    let removed = arr.remove(index - 1);
+    config_file::save(&path, &table)?;
+    let desc = removed
+        .try_into()
+        .map(|h: LinkHint| describe(&h))
+        .unwrap_or_else(|_| "hint".to_string());
+    println!("removed: {desc}  ({})", path.display());
     Ok(())
 }

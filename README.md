@@ -92,7 +92,7 @@ glyphtrail status
 #   when the index looks stale (HEAD moved, uncommitted changes, or analyzer
 #   upgraded) so you know to re-run `glyphtrail analyze`
 
-# Inspect/edit the per-repo config (.glyphtrail/config.toml) without hand-editing
+# Inspect/edit the per-repo config (glyphtrail.toml) without hand-editing
 glyphtrail config show
 glyphtrail config set security.record_sensitive_files true   # validated before write
 glyphtrail config get impact.test_globs
@@ -176,8 +176,11 @@ Prefer it managed? `glyphtrail setup` writes an agent skill plus a
 
 ### Configuration
 
-Per-repo settings live in an optional `.glyphtrail/config.toml` — every field has
-a default, so the file is only needed to override one. It holds:
+All per-repo settings live in one file: `glyphtrail.toml` at the repo root
+(committed, team-shared), with an optional `.glyphtrail/glyphtrail.toml` personal
+override (gitignored) merged on top — analysis settings override, `[[links]]`
+union. Every field has a default, so the file is only needed to change one. It
+holds:
 
 - `[[api.schemas]]` — blessed API schemas (OpenAPI / GraphQL SDL / protobuf /
   Hasura) to link code endpoints against and reconcile with `glyphtrail drift`.
@@ -185,6 +188,8 @@ a default, so the file is only needed to override one. It holds:
 - `[impact] test_globs` — globs that mark a file as a test in impact reports.
 - `[security] record_sensitive_files` — record sensitive files as content-less
   nodes (see below) instead of skipping them.
+- `[[links]]` — manual cross-repo link hints (see
+  [Cross-repo blast radius](#cross-repo-blast-radius)), edited with `glyphtrail link`.
 
 Edit it without hand-writing TOML; every change is validated against the schema
 before it is written, so a wrong key or type is rejected and the file untouched:
@@ -195,13 +200,13 @@ glyphtrail config set security.record_sensitive_files true
 glyphtrail config set impact.test_globs '["**/*_test.rs","tests/**"]'
 glyphtrail config get impact.test_globs
 glyphtrail config unset impact.test_globs
-glyphtrail config path                       # the file's location
+glyphtrail config set --local security.record_sensitive_files true   # personal override
 ```
 
-Values are parsed as TOML, so `true`, `42`, and `["a","b"]` keep their types.
-Manual cross-repo link hints are a separate file (`glyphtrail.links.toml`, plus a
-gitignored `.glyphtrail/links.toml` override) edited with `glyphtrail link` — see
-[Cross-repo blast radius](#cross-repo-blast-radius).
+Values are parsed as TOML, so `true`, `42`, and `["a","b"]` keep their types. (Old
+split files — `.glyphtrail/config.toml`, `glyphtrail.links.toml`,
+`.glyphtrail/links.toml` — are still read, and folded into `glyphtrail.toml` on the
+next `config`/`link` edit.)
 
 ### Excluding sensitive files
 
@@ -283,15 +288,15 @@ radius in one call.
 
 **Manual link hints.** Some real relationships can't be matched by package name —
 a service called over HTTP from another repo with no shared package. Declare those
-in `glyphtrail.links.toml` at the repo root (committed, team-shared) and/or
-`.glyphtrail/links.toml` (gitignored, personal); both are unioned and fed into the
-federated impact alongside the auto-resolved links. `from` is the consumer, `to`
-the producer (changing `to` impacts `from`); each side's `repo` defaults to `.`
-(this repo), so you only name the other one. Omit a `symbol` for a coarse
-whole-repo link.
+as `[[links]]` in `glyphtrail.toml` (committed) and/or `.glyphtrail/glyphtrail.toml`
+(personal); both are unioned and fed into the federated impact alongside the
+auto-resolved links. `from` is the consumer, `to` the producer (changing `to`
+impacts `from`); each side's `repo` defaults to `.` (this repo), so you only name
+the other one. Omit a `symbol` for a coarse whole-repo link. Edit them with
+`glyphtrail link add/list/remove` (a thin wrapper over the same file).
 
 ```toml
-# in web-client: we call user-svc's endpoint (no shared package)
+# in web-client's glyphtrail.toml: we call user-svc's endpoint (no shared package)
 [[links]]
 from = { symbol = "fetchUser" }            # repo "." = here
 to   = { repo = "user-svc", symbol = "get_user" }
@@ -424,7 +429,7 @@ language is a grammar in `glyphtrail-parse/src/registry.rs` plus a query file un
 `glyphtrail-parse/queries/`.
 
 Extra languages can also be loaded at runtime without rebuilding — point
-`.glyphtrail/config.toml` at a tree-sitter grammar and a query (the grammar is
+`glyphtrail.toml` at a tree-sitter grammar and a query (the grammar is
 compiled on demand; needs a C toolchain):
 
 ```toml

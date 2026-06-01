@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
-use glyphtrail_core::config::RepoPaths;
+use glyphtrail_core::config::{Config, RepoPaths};
 use glyphtrail_core::{
     Adjacency, ClassifiedItem, Confidence, CrateLevelHit, FederatedAdjacency, FederatedReport,
     Groups, ImpactPolicy, IndexedPackage, META_EXTERNAL_USES, META_PACKAGES, NodeId, NodeKind,
@@ -234,9 +234,12 @@ pub fn federated_impact(
     let mut hints: Vec<ResolvedHint> = Vec::new();
     for name in &names {
         if let Some(entry) = registry.get(name) {
-            let root = entry.active_root();
-            let index_dir = RepoPaths::new(root).index_dir;
-            for h in glyphtrail_core::LinkHints::load(root, &index_dir).links {
+            // Links live in the repo's unified config (`glyphtrail.toml` +
+            // personal override + legacy files), loaded best-effort.
+            let links = Config::load(entry.active_root())
+                .map(|c| c.links)
+                .unwrap_or_default();
+            for h in links {
                 hints.push(ResolvedHint {
                     from_repo: h.from.repo_or(name),
                     from_symbol: h.from.symbol,
