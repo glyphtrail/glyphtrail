@@ -202,13 +202,30 @@ fn require_repo_argument(defs: &mut [Value]) {
 /// failures are reported as `isError` results rather than protocol errors, per
 /// the MCP convention.
 pub fn call(default_db: Option<&Path>, name: &str, args: &Value) -> Value {
-    match dispatch(default_db, name, args) {
-        Ok(value) => text_result(&value, false),
+    let mut warn = None;
+    match dispatch(default_db, name, args, &mut warn) {
+        Ok(value) => {
+            let mut result = text_result(&value, false);
+            // A stale-index warning rides along as a second text block, so the
+            // data block stays at content[0] and the agent still sees the
+            // re-analyze nudge (#345).
+            if let Some(text) = warn
+                && let Some(content) = result["content"].as_array_mut()
+            {
+                content.push(json!({ "type": "text", "text": text }));
+            }
+            result
+        }
         Err(message) => text_result(&json!({ "error": message }), true),
     }
 }
 
-fn dispatch(default_db: Option<&Path>, name: &str, args: &Value) -> Result<Value, String> {
+fn dispatch(
+    default_db: Option<&Path>,
+    name: &str,
+    args: &Value,
+    warn: &mut Option<String>,
+) -> Result<Value, String> {
     // Registry-level tools span repos and need no per-repo store.
     if name == "list_repos" {
         return list_repos(args);
@@ -229,6 +246,9 @@ fn dispatch(default_db: Option<&Path>, name: &str, args: &Value) -> Result<Value
         return federated_impact_tool(&db, args);
     }
     let store = open(&db)?;
+    // Whatever the tool returns, flag a stale index so the agent re-analyzes
+    // before trusting results (#345). Computed once here, for every store tool.
+    *warn = stale_warning_for(&db, &*store);
     match name {
         "search" => {
             let limit = opt_usize(args, "limit").unwrap_or(30);
@@ -898,6 +918,27 @@ fn text_result(value: &Value, is_error: bool) -> Value {
     json!({ "content": [ { "type": "text", "text": text } ], "isError": is_error })
 }
 
+/// A stale-index warning for the repo behind `db`, or `None` when the index
+/// still matches the working tree. Reuses the same `index_staleness` check the
+/// `status` tool reports (#313), so every store-based tool carries the signal.
+fn stale_warning_for(db: &Path, store: &dyn GraphStore) -> Option<String> {
+    let root = db.parent().and_then(Path::parent)?;
+    stale_warning(&glyphtrail_analyze::index_staleness(root, store))
+}
+
+/// A strong, agent-facing nudge to re-`analyze` — only when the index is
+/// actually stale (#345). `Fresh`/`Unknown` produce no noise.
+fn stale_warning(staleness: &glyphtrail_analyze::Staleness) -> Option<String> {
+    match staleness {
+        glyphtrail_analyze::Staleness::Stale(why) => Some(format!(
+            "⚠ STALE INDEX: {why}. These results may be wrong — run `analyze` \
+             (the analyze tool, or `glyphtrail analyze`) for this repo before \
+             trusting them."
+        )),
+        _ => None,
+    }
+}
+
 fn req_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
     args.get(key)
         .and_then(Value::as_str)
@@ -1214,6 +1255,27 @@ mod tests {
         let db = build_db("unknown");
         let res = call(Some(&db), "nope", &json!({}));
         check!(res["isError"] == json!(true));
+        std::fs::remove_dir_all(db.parent().unwrap()).ok();
+    }
+
+    // The stale-index nudge (#345) fires only when stale, and names the fix.
+    #[test]
+    fn stale_warning_urges_reanalyze_only_when_stale() {
+        use glyphtrail_analyze::Staleness;
+        check!(stale_warning(&Staleness::Fresh).is_none());
+        check!(stale_warning(&Staleness::Unknown).is_none());
+        let w = stale_warning(&Staleness::Stale("repo is on a new commit".into())).unwrap();
+        check!(w.contains("STALE"));
+        check!(w.contains("analyze"));
+        check!(w.contains("repo is on a new commit"));
+    }
+
+    // A non-stale index adds no second content block — data stays at content[0].
+    #[test]
+    fn non_stale_index_adds_no_warning_block() {
+        let db = build_db("nonstale-warn");
+        let res = call(Some(&db), "status", &json!({}));
+        check!(res["content"].as_array().unwrap().len() == 1);
         std::fs::remove_dir_all(db.parent().unwrap()).ok();
     }
 
