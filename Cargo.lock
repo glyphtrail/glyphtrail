@@ -752,6 +752,7 @@ dependencies = [
  "glyphtrail-store",
  "serde",
  "serde_json",
+ "serde_norway",
  "tracing",
 ]
 
