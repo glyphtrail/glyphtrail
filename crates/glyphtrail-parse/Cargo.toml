@@ -37,6 +37,7 @@ anyhow.workspace = true
 tree-sitter-kotlin-ng = "1.1.0"
 tree-sitter-r = "1.2.0"
 tree-sitter-dart = "0.2.0"
+tree-sitter-merlin6502 = "4.0.0"
 
 [dev-dependencies]
 assert2.workspace = true

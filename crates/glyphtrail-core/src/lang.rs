@@ -31,6 +31,8 @@ pub enum Language {
     Zig,
     R,
     Dart,
+    /// Merlin 6502 assembly (#359).
+    Merlin6502,
     /// A language identified by name but not built in (dynamically loaded).
     Other(String),
 }
@@ -61,6 +63,7 @@ impl Language {
             Language::Zig => "zig",
             Language::R => "r",
             Language::Dart => "dart",
+            Language::Merlin6502 => "merlin6502",
             Language::Other(name) => name,
         }
     }
@@ -92,6 +95,9 @@ impl Language {
             "zig" => Language::Zig,
             "r" => Language::R,
             "dart" => Language::Dart,
+            // `.S` is also GNU-as; Merlin claims it (the `.S` repos we target are
+            // 6502). Per-repo dynamic `[[languages]]` can override if needed (#359).
+            "s" => Language::Merlin6502,
             _ => return None,
         })
     }
@@ -121,11 +127,12 @@ impl Language {
             "zig" => Language::Zig,
             "r" => Language::R,
             "dart" => Language::Dart,
+            "merlin6502" | "merlin" => Language::Merlin6502,
             _ => return None,
         })
     }
 
-    pub const ALL: [Language; 23] = [
+    pub const ALL: [Language; 24] = [
         Language::Rust,
         Language::Python,
         Language::JavaScript,
@@ -149,5 +156,6 @@ impl Language {
         Language::Zig,
         Language::R,
         Language::Dart,
+        Language::Merlin6502,
     ];
 }

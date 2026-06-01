@@ -778,6 +778,7 @@ dependencies = [
  "tree-sitter-language",
  "tree-sitter-loader",
  "tree-sitter-lua",
+ "tree-sitter-merlin6502",
  "tree-sitter-ocaml",
  "tree-sitter-php",
  "tree-sitter-python",
@@ -2220,6 +2221,16 @@ name = "tree-sitter-lua"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8daaf5f4235188a58603c39760d5fa5d4b920d36a299c934adddae757f32a10c"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-merlin6502"
+version = "4.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6dc294ec60805a418014c269cbd744a37938b95c8e34a311e285e64b54bf6f2a"
 dependencies = [
  "cc",
  "tree-sitter-language",

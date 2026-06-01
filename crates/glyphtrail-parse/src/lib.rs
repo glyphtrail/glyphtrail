@@ -92,6 +92,7 @@ mod tests {
             (Language::Zig, "fn f() void {}\n"),
             (Language::R, "f <- function() 1\n"),
             (Language::Dart, "void f() {}\n"),
+            (Language::Merlin6502, "f rts\n"),
         ];
         for (lang, src) in cases {
             let parsed = parse_source(&lang, src)
@@ -164,6 +165,7 @@ mod tests {
             (Language::Zig, "// note\nfn f() void { g(); }\n", "g"),
             (Language::R, "# note\nf <- function() { g() }\n", "g"),
             (Language::Dart, "// note\nvoid f() { g(); }\n", "g"),
+            (Language::Merlin6502, "* note\nf jsr g\n", "g"),
         ];
         for (lang, src, call) in cases {
             let parsed = parse_source(&lang, src)
