@@ -59,6 +59,15 @@ fn owning_package<'a>(packages: &'a [IndexedPackage], file: &str) -> Option<&'a 
         .map(|p| p.name.as_str())
 }
 
+/// A manual cross-repo hint (#281) with each side's repo resolved to a concrete
+/// registry name (`.`/absent already replaced by the declaring repo).
+struct ResolvedHint {
+    from_repo: String,
+    from_symbol: Option<String>,
+    to_repo: String,
+    to_symbol: Option<String>,
+}
+
 /// Compute the cross-repo blast radius: seed in the repo at `current_root` and
 /// traverse into downstream repos across the link table, scoped to the whole
 /// registry or a named group. The current repo must be registered and indexed.
@@ -218,16 +227,43 @@ pub fn federated_impact(
 
     let links = resolve_links(&identities);
 
+    // Manual cross-repo hints (#281): each in-scope repo may declare links the
+    // auto-resolver can't infer (an HTTP call with no shared package, say).
+    // `from` (consumer) depends on `to` (producer) — changing `to` impacts
+    // `from` — and a side's repo defaults to the declaring repo (".").
+    let mut hints: Vec<ResolvedHint> = Vec::new();
+    for name in &names {
+        if let Some(entry) = registry.get(name) {
+            let root = entry.active_root();
+            let index_dir = RepoPaths::new(root).index_dir;
+            for h in glyphtrail_core::LinkHints::load(root, &index_dir).links {
+                hints.push(ResolvedHint {
+                    from_repo: h.from.repo_or(name),
+                    from_symbol: h.from.symbol,
+                    to_repo: h.to.repo_or(name),
+                    to_symbol: h.to.symbol,
+                });
+            }
+        }
+    }
+
     // Only repos reachable from the current repo along producer -> consumer edges
     // (a consumer's external use of a producer is a link `to_repo -> from_repo`)
     // can receive impact from its seeds, so only those need their store opened —
-    // not the whole registry. BFS the repo-level link graph from the current repo.
+    // not the whole registry. BFS the repo-level link graph from the current repo;
+    // manual hints contribute their `to_repo -> from_repo` edges too.
     let mut consumers_of: HashMap<&str, Vec<&str>> = HashMap::new();
     for l in &links {
         consumers_of
             .entry(l.to_repo.as_str())
             .or_default()
             .push(l.from_repo.as_str());
+    }
+    for h in &hints {
+        consumers_of
+            .entry(h.to_repo.as_str())
+            .or_default()
+            .push(h.from_repo.as_str());
     }
     let mut reachable: HashSet<String> = HashSet::from([current.clone()]);
     let mut queue = vec![current.clone()];
@@ -343,6 +379,41 @@ pub fn federated_impact(
                     });
                 }
             }
+        }
+    }
+
+    // Manual hints (#281): a precise symbol↔symbol hint adds a cross-edge from the
+    // producer (`to`) symbol to the consumer (`from`) symbol — so changing the
+    // producer reaches the consumer, exactly like an auto-resolved link. A coarse
+    // hint (a side without a symbol) flags the whole `from` repo when the producer
+    // side is the repo being changed.
+    for h in &hints {
+        match (&h.to_symbol, &h.from_symbol) {
+            (Some(to_sym), Some(from_sym)) => {
+                let (Some(to_store), Some(from_store)) =
+                    (stores.get(&h.to_repo), stores.get(&h.from_repo))
+                else {
+                    continue; // a referenced repo isn't indexed/openable — skip
+                };
+                let consumers = from_store.find_by_name(from_sym)?;
+                for producer in to_store.find_by_name(to_sym)? {
+                    let edges = cross.entry(qualify(&h.to_repo, &producer.id)).or_default();
+                    for c in &consumers {
+                        edges.push((qualify(&h.from_repo, &c.id), Confidence::Inferred));
+                    }
+                }
+            }
+            // Coarse whole-repo hint: relevant when the producer side is the repo
+            // being changed (seeds live in `current`).
+            _ if h.to_repo == current && !local_seeds.is_empty() => {
+                crate_level.push(CrateLevelHit {
+                    repo: h.from_repo.clone(),
+                    package: h.from_repo.clone(),
+                    file: "(manual link hint)".to_string(),
+                    via: h.to_repo.clone(),
+                });
+            }
+            _ => {}
         }
     }
 
