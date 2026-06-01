@@ -50,7 +50,10 @@ const NODE_COLS: &str = "n.id, n.kind, n.name, n.qualified_name, n.file, n.langu
 /// Bumped when the node/rel schema shape changes. A stored `schema_version`
 /// other than this triggers a drop + recreate on open (#135); `analyze` then
 /// rebuilds the index from source.
-pub const SCHEMA_VERSION: &str = "1";
+///
+/// "2": the `Node` table gained a `signature` column (#344) — existing "1"
+/// indexes must be rebuilt, else a COPY of the new 12-field rows fails.
+pub const SCHEMA_VERSION: &str = "2";
 
 pub struct LadybugStore {
     db: Database,
@@ -1121,6 +1124,23 @@ mod tests {
             !lb.find_by_name("keeper").unwrap().is_empty(),
             "node should survive reopen, but the DB was wiped"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // An index written by an older schema (e.g. before the #344 signature column)
+    // is dropped + recreated on open, so the next analyze rebuilds it cleanly
+    // instead of failing to COPY rows into a stale-shaped table.
+    #[test]
+    fn outdated_schema_version_is_rebuilt_on_open() {
+        let dir = tmp_dir("schema-migrate");
+        {
+            let mut lb = LadybugStore::open(&dir).unwrap();
+            lb.insert_graph(&[node("a", "stale")], &[]).unwrap();
+            lb.set_meta("schema_version", "1").unwrap(); // a pre-#344 ("1") index
+        }
+        // Reopen: the version mismatch drops + recreates, wiping stale data.
+        let lb = LadybugStore::open(&dir).unwrap();
+        check!(lb.find_by_name("stale").unwrap().is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 
