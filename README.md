@@ -38,6 +38,10 @@ glyphtrail analyze .
 # Re-index only files that changed
 glyphtrail analyze . --update
 
+# Outline the shape of a file or directory (symbols + signatures)
+glyphtrail outline src/api.rs              # standard detail
+glyphtrail outline src --detail minimal    # names only, whole directory
+
 # Query the graph
 glyphtrail query def <name>            # locate a definition
 glyphtrail query callers <name>        # who calls it

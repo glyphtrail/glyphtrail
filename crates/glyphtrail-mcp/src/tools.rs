@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 
 use glyphtrail_core::config::RepoPaths;
 use glyphtrail_core::{
-    Confidence, EdgeKind, Groups, HttpMethod, ImpactPolicy, ImpactReport, Node, NodeId, NodeKind,
-    OperationKey, Protocol, Registry, RepoHealth, default_groups_path, default_registry_path,
-    operations_matching,
+    Confidence, Detail, EdgeKind, Groups, HttpMethod, ImpactPolicy, ImpactReport, Node, NodeId,
+    NodeKind, OperationKey, Protocol, Registry, RepoHealth, default_groups_path,
+    default_registry_path, is_outline_kind, operations_matching, outline_symbol,
 };
 use glyphtrail_store::{
     ChangeSpec, FederationScope, GraphStore, LadybugStore, SeedSpec, changed_files,
@@ -110,6 +110,17 @@ pub fn definitions() -> Vec<Value> {
             "Index statistics for the repository.",
             json!({}),
             &[],
+        ),
+        tool(
+            "outline",
+            "Symbol outline of a file or directory: each definition (functions, \
+             types, etc.) with its signature, at adjustable detail. The compact \
+             'shape of the code' for getting oriented before deeper queries.",
+            json!({
+                "path": { "type": "string", "description": "File or directory (repo-relative); '.' for the whole repo." },
+                "detail": { "type": "string", "enum": ["minimal", "standard", "full"], "description": "minimal=names, standard=signatures, full=+doc (default standard)." }
+            }),
+            &["path"],
         ),
         tool(
             "list_repos",
@@ -222,6 +233,7 @@ fn dispatch(db: &Path, name: &str, args: &Value) -> Result<Value, String> {
             Ok(Value::Array(report))
         }
         "impact" => impact_tool(&db, &*store, args),
+        "outline" => outline_tool(&db, &*store, args),
         "status" => {
             let s = store.stats().map_err(err)?;
             let languages: serde_json::Map<String, Value> = s
@@ -358,6 +370,55 @@ fn operations_list(
 /// Impact-analysis tool: resolve seeds (symbol / file / change set), run the
 /// shared engine via `store.classify_impact`, and return the `ImpactReport`
 /// JSON — the same report the `glyphtrail impact` CLI emits.
+/// Symbol outline of a file or directory (#293-adjacent): each definition with
+/// its signature, sliced from source on demand. Returns per-file symbol arrays.
+fn outline_tool(db: &Path, store: &dyn GraphStore, args: &Value) -> Result<Value, String> {
+    // The DB lives at <repo>/.glyphtrail/graph.db; signatures are read from source.
+    let root = db
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or_else(|| Path::new("."));
+    let detail = opt_str(args, "detail")
+        .map(Detail::parse)
+        .unwrap_or(Detail::Standard);
+    let prefix = opt_str(args, "path")
+        .unwrap_or(".")
+        .trim_start_matches("./")
+        .trim_end_matches('/')
+        .replace('\\', "/");
+    let whole_repo = prefix.is_empty() || prefix == ".";
+
+    let mut files: Vec<String> = store
+        .all_files()
+        .map_err(err)?
+        .into_iter()
+        .filter(|f| whole_repo || *f == prefix || f.starts_with(&format!("{prefix}/")))
+        .collect();
+    files.sort();
+
+    let mut out = Vec::new();
+    for file in files {
+        let mut nodes: Vec<Node> = store
+            .nodes_in_file(&file)
+            .map_err(err)?
+            .into_iter()
+            .filter(|n| is_outline_kind(n.kind))
+            .collect();
+        nodes.sort_by_key(|n| n.span.map(|s| s.start_line).unwrap_or(0));
+        let source = (detail != Detail::Minimal)
+            .then(|| std::fs::read_to_string(root.join(&file)).ok())
+            .flatten();
+        let symbols: Vec<_> = nodes
+            .iter()
+            .map(|n| outline_symbol(n, source.as_deref(), detail))
+            .collect();
+        if !symbols.is_empty() {
+            out.push(json!({ "file": file, "symbols": symbols }));
+        }
+    }
+    Ok(Value::Array(out))
+}
+
 fn impact_tool(db: &Path, store: &dyn GraphStore, args: &Value) -> Result<Value, String> {
     // The DB lives at <repo>/.glyphtrail/graph.db; git seed modes need the repo root.
     let repo = db

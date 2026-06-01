@@ -8,6 +8,7 @@ pub mod drift;
 pub mod group;
 pub mod impact;
 pub mod llm;
+pub mod outline;
 pub mod query;
 pub mod repo;
 pub mod serve;

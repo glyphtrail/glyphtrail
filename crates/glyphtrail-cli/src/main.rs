@@ -78,6 +78,24 @@ enum Command {
         #[arg(long, default_value_t = 7700)]
         port: u16,
     },
+    /// Outline a file or directory: its symbols and signatures (the code shape).
+    Outline {
+        /// File or directory to outline (defaults to the repo root).
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Repository root.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Detail: minimal (names), standard (signatures), full (+ doc lines).
+        #[arg(long, default_value = "standard")]
+        detail: String,
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
+        /// Emit YAML instead of text (compact structured output for agents).
+        #[arg(long)]
+        yaml: bool,
+    },
     /// Compute the blast radius of a change (symbol, file, or git change set).
     Impact(commands::impact::ImpactArgs),
     /// Report API contract drift: code endpoints vs blessed schema operations.
@@ -254,6 +272,18 @@ fn main() -> anyhow::Result<()> {
             depth,
         ),
         Command::Serve { repo, port } => commands::serve::run(&repo, port),
+        Command::Outline {
+            path,
+            repo,
+            detail,
+            json,
+            yaml,
+        } => commands::outline::run(
+            &repo,
+            &path.to_string_lossy(),
+            glyphtrail_core::Detail::parse(&detail),
+            commands::query::Emit::from_flags(json, yaml),
+        ),
         Command::Impact(args) => commands::impact::run(args),
         Command::Drift(args) => commands::drift::run(args),
         Command::Cypher { query, repo } => commands::cypher::run(&repo, &query),

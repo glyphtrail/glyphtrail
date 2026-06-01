@@ -14,6 +14,7 @@ pub mod links;
 pub mod manifest;
 pub mod matcher;
 pub mod model;
+pub mod outline;
 pub mod registry;
 pub mod rewrite;
 pub mod scrub;
@@ -46,6 +47,7 @@ pub use manifest::{
 };
 pub use matcher::{ClientCall, Endpoint, Match, Matcher};
 pub use model::{CodeGraph, Confidence, Edge, EdgeKind, Node, NodeId, NodeKind, PendingLink, Span};
+pub use outline::{Detail, OutlineSymbol, is_outline_kind, outline_symbol, slice_signature};
 pub use registry::{
     Contributor, RecordOutcome, Registry, RegistryEntry, RepoHealth, Resolution,
     default_registry_path, lock_path,
