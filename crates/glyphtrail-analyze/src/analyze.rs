@@ -1325,12 +1325,55 @@ mod staleness_tests {
         let s = decide_staleness(Some("r"), "r", Some("aaa"), || None, || true);
         check!(s == Staleness::Unknown);
     }
+
+    // #364: analyze from a subdir resolves to the enclosing git root, and a stray
+    // index left in the subdir must not win over it.
+    #[test]
+    fn repo_root_for_walks_up_to_the_git_checkout() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("gt-root-{nanos}"));
+        let sub = root.join("a/b");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(sub.join(INDEX_DIR).join("ladybug")).unwrap();
+        let got = repo_root_for(&sub.canonicalize().unwrap());
+        check!(got == root.canonicalize().unwrap());
+        std::fs::remove_dir_all(&root).ok();
+    }
+}
+
+/// The repository root to index for a target inside it: the nearest enclosing
+/// git checkout (`.git` — the canonical repo boundary), else an ancestor that
+/// already holds an index, else the target itself. Git wins over a stray subdir
+/// index so `analyze` from a subdir targets the real repo root (#364).
+fn repo_root_for(path: &Path) -> PathBuf {
+    if let Some(git) = path.ancestors().find(|p| p.join(".git").exists()) {
+        return git.to_path_buf();
+    }
+    if let Some(indexed) = path
+        .ancestors()
+        .find(|p| p.join(INDEX_DIR).join("ladybug").exists())
+    {
+        return indexed.to_path_buf();
+    }
+    path.to_path_buf()
 }
 
 pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
-    let root = path
+    let target = path
         .canonicalize()
         .with_context(|| format!("cannot resolve path {}", path.display()))?;
+    // Run from a subdirectory? Index the whole repository, not a second index in
+    // the subdir (#364). Walk up to the enclosing git checkout (its `.git` is the
+    // repo boundary; a submodule's own `.git` stops the walk), else an ancestor
+    // that already holds an index.
+    let root = repo_root_for(&target);
+    if root != target {
+        tracing::info!("indexing repository root {}", root.display());
+    }
 
     // User-wide exclusions (#269): skip a repo (or any path under it) listed in
     // ~/.glyphtrailignore before touching it — so analyzing a subfolder of an
