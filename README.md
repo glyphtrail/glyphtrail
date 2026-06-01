@@ -91,6 +91,12 @@ glyphtrail status
 #   read commands (query, impact, outline, drift, cypher) print a stderr note
 #   when the index looks stale (HEAD moved, uncommitted changes, or analyzer
 #   upgraded) so you know to re-run `glyphtrail analyze`
+
+# Inspect/edit the per-repo config (.glyphtrail/config.toml) without hand-editing
+glyphtrail config show
+glyphtrail config set security.record_sensitive_files true   # validated before write
+glyphtrail config get impact.test_globs
+glyphtrail config unset impact.test_globs
 ```
 
 ### Registering glyphtrail as an MCP server
