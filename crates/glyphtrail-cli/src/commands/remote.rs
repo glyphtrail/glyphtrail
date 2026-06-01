@@ -11,7 +11,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
-use glyphtrail_core::{canonicalize_remote, default_registry_path};
+use clap::Subcommand;
+use glyphtrail_core::{Registry, RepoHealth, canonicalize_remote, default_registry_path};
+
+use crate::commands::repo::registry_path;
 
 /// Whether `arg` is a git remote URL rather than a local path. A path that
 /// exists on disk always wins, so a local checkout is never mistaken for a URL.
@@ -23,7 +26,7 @@ pub fn is_remote_arg(arg: &str) -> bool {
 }
 
 /// `~/.glyphtrail/remote` — where managed clones of remote repos live.
-fn remote_dir() -> Result<PathBuf> {
+pub(crate) fn remote_dir() -> Result<PathBuf> {
     let registry =
         default_registry_path().ok_or_else(|| anyhow!("cannot locate home directory"))?;
     // registry is `~/.glyphtrail/registry.json`; its sibling `remote/` holds clones.
@@ -97,6 +100,121 @@ fn run_git(mut cmd: Command, what: &str) -> Result<()> {
     if !status.success() {
         bail!("`git {what}` failed");
     }
+    Ok(())
+}
+
+/// Manage repositories cloned by `analyze <url>` (#291 follow-up).
+#[derive(Subcommand)]
+pub enum RemoteCmd {
+    /// List remote-analyzed repositories and their local clone paths.
+    List,
+    /// Delete a cloned remote repo (its files and index) and unregister it.
+    #[command(alias = "rm")]
+    Remove {
+        /// Registry name of the remote repo (omit with --all).
+        name: Option<String>,
+        /// Remove every remote-analyzed repository.
+        #[arg(long)]
+        all: bool,
+    },
+}
+
+pub fn run(cmd: RemoteCmd) -> Result<()> {
+    match cmd {
+        RemoteCmd::List => list(),
+        RemoteCmd::Remove { name, all } => remove(name, all),
+    }
+}
+
+/// Whether a registered repo's root lives under the managed remote clone dir,
+/// i.e. it was created by `analyze <url>` rather than `repo add`.
+fn is_clone(root: &Path, dir: &Path) -> bool {
+    root.starts_with(dir)
+}
+
+fn health_label(h: RepoHealth) -> &'static str {
+    match h {
+        RepoHealth::Indexed => "indexed",
+        RepoHealth::Unindexed => "unindexed",
+        RepoHealth::Missing => "missing",
+    }
+}
+
+fn list() -> Result<()> {
+    let registry = Registry::load(&registry_path()?)?;
+    let dir = remote_dir()?;
+    let clones: Vec<_> = registry
+        .repos
+        .iter()
+        .filter(|e| is_clone(&e.root, &dir))
+        .collect();
+    if clones.is_empty() {
+        println!("no remote-analyzed repositories (use `glyphtrail analyze <git-url>`)");
+        return Ok(());
+    }
+    for e in clones {
+        println!(
+            "{}  {}  [{}]",
+            e.name,
+            e.root.display(),
+            health_label(e.health())
+        );
+        for id in &e.ids {
+            println!("  id {} ({})", id.id, id.source);
+        }
+    }
+    Ok(())
+}
+
+fn remove(name: Option<String>, all: bool) -> Result<()> {
+    let path = registry_path()?;
+    let registry = Registry::load(&path)?;
+    let dir = remote_dir()?;
+
+    // Resolve the clone(s) to drop: all of them, or one by name (which must be a
+    // managed clone — refuse to touch a `repo add`ed local working copy).
+    let targets: Vec<(String, PathBuf)> = match (all, name) {
+        (true, _) => registry
+            .repos
+            .iter()
+            .filter(|e| is_clone(&e.root, &dir))
+            .map(|e| (e.name.clone(), e.root.clone()))
+            .collect(),
+        (false, Some(name)) => {
+            let entry = registry
+                .repos
+                .iter()
+                .find(|e| e.name == name)
+                .ok_or_else(|| anyhow!("no repository named '{name}' in the registry"))?;
+            if !is_clone(&entry.root, &dir) {
+                bail!(
+                    "'{name}' is not a remote-analyzed repo (root {}); use `glyphtrail repo remove`",
+                    entry.root.display()
+                );
+            }
+            vec![(entry.name.clone(), entry.root.clone())]
+        }
+        (false, None) => bail!("provide a repository name, or --all to remove every remote clone"),
+    };
+    if targets.is_empty() {
+        println!("no remote-analyzed repositories to remove");
+        return Ok(());
+    }
+
+    for (name, root) in &targets {
+        // Safety: only ever delete inside the managed remote dir.
+        if root.starts_with(&dir) && root.exists() {
+            std::fs::remove_dir_all(root)
+                .with_context(|| format!("removing clone {}", root.display()))?;
+        }
+        println!("removed clone {} ({name})", root.display());
+    }
+    let names: Vec<String> = targets.into_iter().map(|(n, _)| n).collect();
+    Registry::mutate(&path, |reg| {
+        for n in &names {
+            reg.remove(n);
+        }
+    })?;
     Ok(())
 }
 

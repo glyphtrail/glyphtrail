@@ -158,6 +158,13 @@ tasks:
     cmds:
       - cargo run -p glyphtrail-cli {{.PROFILE_FLAG}} -- group {{.CLI_ARGS}}
 
+  # Lists or deletes repos cloned by `analyze <git-url>` (~/.glyphtrail/remote).
+  # Example: `task remote -- list` or `task remote -- remove <name>`
+  remote:
+    desc: 'List/delete remote-analyzed repos (pass args after --, e.g. task remote -- list)'
+    cmds:
+      - cargo run -p glyphtrail-cli {{.PROFILE_FLAG}} -- remote {{.CLI_ARGS}}
+
   # Emits a shell completion script to stdout.
   # Override shell: `task completions SHELL_KIND=zsh`
   completions:
