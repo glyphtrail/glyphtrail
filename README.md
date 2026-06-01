@@ -111,8 +111,8 @@ else to install. To wire it up by hand instead, add to
 }
 ```
 
-**Cursor / Windsurf / VS Code / other MCP clients** — point the client at the same
-stdio command. For example, a project-scoped Cursor `.cursor/mcp.json`:
+**Cursor / Windsurf / VS Code** — point the client at the same stdio command. For
+example, a project-scoped Cursor `.cursor/mcp.json`:
 
 ```json
 {
@@ -125,9 +125,27 @@ stdio command. For example, a project-scoped Cursor `.cursor/mcp.json`:
 }
 ```
 
-Any MCP client works the same way: command `glyphtrail`, args `mcp --repo <path>`,
-transport stdio. (`glyphtrail serve` additionally exposes the same tools over HTTP
-at `POST /mcp`, for clients that prefer a URL.)
+**OpenCode / Kilo Code** — these use a different shape and location: a single
+`command` array (program + args together) under a `type: "local"` server, in
+`~/.config/opencode/opencode.json` or `~/.config/kilo/kilo.jsonc` respectively:
+
+```jsonc
+{
+  "mcp": {
+    "glyphtrail": {
+      "type": "local",
+      "enabled": true,
+      "command": ["glyphtrail", "mcp", "--repo", "."]
+    }
+  }
+}
+```
+
+The exact key, format, and config location vary by client (some split
+`command`/`args`, some take one array; some are project-scoped, some global) —
+but the server is always the same: run `glyphtrail mcp --repo <path>` over stdio.
+(`glyphtrail serve` additionally exposes the same tools over HTTP at `POST /mcp`,
+for clients that prefer a URL.)
 
 Prefer it managed? `glyphtrail setup` writes an agent skill plus a
 `CLAUDE.md`/`AGENTS.md` section that points coding agents at these tools.
