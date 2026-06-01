@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use glyphtrail_core::config::RepoPaths;
+use glyphtrail_core::config::{INDEX_DIR, RepoPaths};
 use glyphtrail_core::{
     Confidence, Detail, EdgeKind, Groups, HttpMethod, ImpactPolicy, ImpactReport, Node, NodeId,
     NodeKind, OperationKey, Protocol, Registry, RepoHealth, default_groups_path,
@@ -135,9 +135,11 @@ pub fn definitions() -> Vec<Value> {
             "analyze",
             "(Re)index a repository: walk it, parse sources, resolve links, and \
              persist the graph. Targets the `repo` (registered name or path) or \
-             the server's launch repo. Run this after code changes, or to index \
-             a repo the server has never seen, so queries reflect the latest \
-             state — no shell required.",
+             the server's launch repo. The target must be a git repository (the \
+             repo root is used) or an already-indexed or registered directory; a \
+             bare path that is neither is refused, so pass `repo` explicitly when \
+             unsure. Run this after code changes, or to index a repo the server \
+             has never seen, so queries reflect the latest state — no shell required.",
             json!({
                 "update": { "type": "boolean", "description": "Only reparse files changed since the last index (incremental)." }
             }),
@@ -492,18 +494,77 @@ fn policy_from_args(args: &Value) -> Result<ImpactPolicy, String> {
     Ok(policy)
 }
 
-/// Analyze (index) a repository on demand (#240): resolve the repo root from
-/// the (already repo-resolved) index anchor and run the analysis pipeline, so an
-/// agent can point the server at any repo and build/refresh its index without a
-/// shell. Returns the `AnalyzeOutcome` JSON.
+/// Analyze (index) a repository on demand (#240): resolve and vet the repo root
+/// from the (already repo-resolved) index anchor and run the analysis pipeline,
+/// so an agent can point the server at any repo and build/refresh its index
+/// without a shell. Returns the `AnalyzeOutcome` JSON.
 fn analyze_tool(db: &Path, args: &Value) -> Result<Value, String> {
-    let root = db
+    let root = resolve_analyze_root(db)?;
+    let update = args.get("update").and_then(Value::as_bool).unwrap_or(false);
+    let outcome = glyphtrail_analyze::run(&root, update).map_err(err)?;
+    serde_json::to_value(&outcome).map_err(err)
+}
+
+/// Resolve and vet the repository root an `analyze` call will index.
+///
+/// `analyze` is the only MCP tool that writes to disk — it creates (and walks
+/// to build) `<root>/.glyphtrail/ladybug`. Left unconstrained, a call against
+/// the server's ambient default repo (`--repo .`, i.e. whatever directory the
+/// host launched the server in, which for a globally-registered server is
+/// undefined and may be `$HOME` or `/`) would drop an index in, and crawl, an
+/// arbitrary tree. So vet the target:
+///
+/// - a repo already in the global registry is allowed as-is (vetted, and may be
+///   a deliberately-indexed non-git directory);
+/// - otherwise, if the target sits inside a git repository, index that repo's
+///   root — so a subdirectory target (or an ambient CWD deep in a tree) still
+///   indexes the right thing;
+/// - otherwise, if the target already holds a `.glyphtrail` index, keep using it;
+/// - otherwise refuse, and tell the agent to name a target explicitly.
+fn resolve_analyze_root(target_db: &Path) -> Result<PathBuf, String> {
+    let root = target_db
         .parent()
         .and_then(Path::parent)
-        .ok_or_else(|| format!("invalid repo path {}", db.display()))?;
-    let update = args.get("update").and_then(Value::as_bool).unwrap_or(false);
-    let outcome = glyphtrail_analyze::run(root, update).map_err(err)?;
-    serde_json::to_value(&outcome).map_err(err)
+        .ok_or_else(|| format!("invalid repo path {}", target_db.display()))?;
+    let canonical = root
+        .canonicalize()
+        .map_err(|e| format!("repo path {} is not accessible: {e}", root.display()))?;
+
+    if is_registered_root(&canonical) {
+        return Ok(canonical);
+    }
+    if let Some(git_root) = enclosing_git_root(&canonical) {
+        return Ok(git_root);
+    }
+    if canonical.join(INDEX_DIR).join("ladybug").exists() {
+        return Ok(canonical);
+    }
+    Err(format!(
+        "refusing to index {} — it is not inside a git repository and has no \
+         existing index, so it is probably not a repository root. Pass `repo` \
+         with a registered name (see the `list_repos` tool) or an explicit \
+         repository path.",
+        canonical.display()
+    ))
+}
+
+/// Whether `canonical` is the active root of a repo in the global registry.
+fn is_registered_root(canonical: &Path) -> bool {
+    default_registry_path()
+        .and_then(|p| Registry::load(&p).ok())
+        .is_some_and(|reg| {
+            reg.repos
+                .iter()
+                .any(|e| e.active_root().canonicalize().is_ok_and(|r| r == canonical))
+        })
+}
+
+/// The nearest ancestor of `path` (inclusive) that contains a `.git` entry — a
+/// directory for a normal checkout, a file for a worktree/submodule.
+fn enclosing_git_root(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .find(|p| p.join(".git").exists())
+        .map(Path::to_path_buf)
 }
 
 /// Cross-repo impact (#222/#223): seed in the current repo and traverse into
@@ -862,15 +923,18 @@ mod tests {
     }
 
     // #240: the analyze tool indexes a repo at an arbitrary path on demand,
-    // returning the outcome — no shell, no server restart.
+    // returning the outcome — no shell, no server restart. The target is a git
+    // checkout, so the write-path guard lets it through (and a subdirectory
+    // target resolves up to this root).
     #[test]
-    fn analyze_tool_indexes_a_path() {
+    fn analyze_tool_indexes_a_repo() {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let root = std::env::temp_dir().join(format!("glyphtrail-mcp-analyze-{nanos}"));
         std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap(); // make it a repo
         std::fs::write(
             root.join("Cargo.toml"),
             "[package]\nname = \"t\"\nversion = \"0.1.0\"\n",
@@ -888,6 +952,31 @@ mod tests {
         let parsed: Value = serde_json::from_str(text).unwrap();
         check!(parsed["files"].as_u64().unwrap() >= 1);
         check!(parsed["nodes"].as_u64().unwrap() >= 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // The write-path guard refuses to index a directory that is neither a git
+    // repository nor already indexed — so a globally-launched server with an
+    // ambient default repo can't crawl and litter `$HOME` or `/`.
+    #[test]
+    fn analyze_tool_refuses_non_repo_location() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("glyphtrail-mcp-norepo-{nanos}"));
+        std::fs::create_dir_all(&root).unwrap(); // no .git, no .glyphtrail index
+
+        let res = call(
+            Path::new("/nonexistent/graph.db"),
+            "analyze",
+            &json!({ "repo": root.to_str().unwrap() }),
+        );
+        check!(res["isError"] == json!(true));
+        let text = res["content"][0]["text"].as_str().unwrap();
+        check!(text.contains("refusing to index"));
+        // Nothing was written into the unvetted directory.
+        check!(!root.join(".glyphtrail").exists());
         std::fs::remove_dir_all(&root).ok();
     }
 
