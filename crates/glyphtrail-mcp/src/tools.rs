@@ -126,7 +126,7 @@ pub fn definitions(has_default_repo: bool) -> Vec<Value> {
              still reflects the working tree. If stale, call `analyze` before \
              trusting query/impact results. `links` lists OTHER repos this one \
              declares cross-repo links to (e.g. a vendored/submodule repo) — \
-             target them by path/name in your searches.",
+             pass one as the `repo` argument to search it.",
             json!({}),
             &[],
         ),
@@ -978,7 +978,7 @@ fn declared_links(root: Option<&Path>) -> Vec<String> {
                 .iter()
                 .flat_map(|l| [l.from.repo.clone(), l.to.repo.clone()])
                 .flatten()
-                .filter(|r| r != ".")
+                .filter(|r| r != "." && !r.trim().is_empty())
                 .collect()
         })
         .unwrap_or_default();
