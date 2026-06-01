@@ -262,6 +262,16 @@ from = { symbol = "fetchUser" }            # repo "." = here
 to   = { repo = "user-svc", symbol = "get_user" }
 ```
 
+Edit hints without hand-writing TOML with `glyphtrail link`:
+
+```sh
+glyphtrail link add user-svc --to-symbol get_user --from-symbol fetchUser
+glyphtrail link add user-svc                 # coarse whole-repo link
+glyphtrail link add user-svc --local         # write the gitignored personal override
+glyphtrail link list                         # show hints (shared + local) with indices
+glyphtrail link remove 1                      # drop a hint by index
+```
+
 #### How it works (many local databases, one registry)
 
 There is no central database. Each repo owns its index at

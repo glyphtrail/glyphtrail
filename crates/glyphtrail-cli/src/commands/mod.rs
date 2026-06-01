@@ -19,6 +19,7 @@ pub mod cypher;
 pub mod drift;
 pub mod group;
 pub mod impact;
+pub mod link;
 pub mod llm;
 pub mod outline;
 pub mod query;

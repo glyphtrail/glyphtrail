@@ -165,6 +165,13 @@ tasks:
     cmds:
       - cargo run -p glyphtrail-cli {{.PROFILE_FLAG}} -- remote {{.CLI_ARGS}}
 
+  # Edit manual cross-repo link hints (glyphtrail.links.toml).
+  # Example: `task link -- add user-svc --to-symbol get_user` or `task link -- list`
+  link:
+    desc: 'Edit cross-repo link hints (pass args after --, e.g. task link -- list)'
+    cmds:
+      - cargo run -p glyphtrail-cli {{.PROFILE_FLAG}} -- link {{.CLI_ARGS}}
+
   # Emits a shell completion script to stdout.
   # Override shell: `task completions SHELL_KIND=zsh`
   completions:

@@ -27,7 +27,7 @@
 
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Committed, team-shared hints file at the repo root.
 pub const HINTS_FILE: &str = "glyphtrail.links.toml";
@@ -36,12 +36,12 @@ pub const LOCAL_HINTS_FILE: &str = "links.toml";
 
 /// One end of a hinted link. `repo` defaults to `.` (the declaring repo); a
 /// missing `symbol` means the whole repo (a coarse link).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LinkEnd {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub symbol: Option<String>,
 }
 
@@ -54,21 +54,27 @@ impl LinkEnd {
             Some(r) => r.to_string(),
         }
     }
+
+    /// Whether this end carries nothing (the default "here, whole repo"), so it
+    /// can be omitted when serializing a hint.
+    pub fn is_empty(&self) -> bool {
+        self.repo.is_none() && self.symbol.is_none()
+    }
 }
 
 /// A declared cross-repo edge: `from` (consumer) depends on `to` (producer), so
 /// a change to `to` impacts `from`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LinkHint {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "LinkEnd::is_empty")]
     pub from: LinkEnd,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "LinkEnd::is_empty")]
     pub to: LinkEnd,
 }
 
 /// The parsed hints file(s) for one repo.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct LinkHints {
     #[serde(default)]
     pub links: Vec<LinkHint>,
@@ -81,13 +87,27 @@ impl LinkHints {
     pub fn load(repo_root: &Path, index_dir: &Path) -> Self {
         let mut links = Vec::new();
         for path in [repo_root.join(HINTS_FILE), index_dir.join(LOCAL_HINTS_FILE)] {
-            if let Ok(text) = std::fs::read_to_string(&path)
-                && let Ok(parsed) = toml::from_str::<LinkHints>(&text)
-            {
-                links.extend(parsed.links);
-            }
+            links.extend(Self::load_file(&path).links);
         }
         LinkHints { links }
+    }
+
+    /// Load a single hints file, returning empty when it's absent or malformed.
+    /// Used by the `link` editing commands, which operate on one overlay at a time.
+    pub fn load_file(path: &Path) -> Self {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| toml::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    /// Write this set back to `path` (creating parent dirs), as TOML.
+    pub fn save_file(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let toml = toml::to_string_pretty(self).unwrap_or_else(|_| "links = []\n".to_string());
+        std::fs::write(path, toml)
     }
 }
 
