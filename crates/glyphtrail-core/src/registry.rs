@@ -222,6 +222,10 @@ impl Registry {
             let mut reg = Registry::load(path)?;
             ingest_spillovers(path, &mut reg); // string in any deferred adds first
             let value = f(&mut reg);
+            // Self-heal same-root rename duplicates on every write, not just via
+            // `record` — `analyze`'s identity pingback reaches the registry through
+            // here, so this is where its duplicates would otherwise persist (#350).
+            reg.dedup_by_root();
             reg.save(path)?;
             Ok(value)
         })
@@ -877,6 +881,22 @@ mod tests {
         check!(reg.repos.len() == 1);
         check!(reg.repos[0].ids.iter().any(|r| r.id == "x"));
         check!(reg.repos[0].ids.iter().any(|r| r.id == "y"));
+    }
+
+    // `mutate` (the path `analyze`'s identity pingback uses) self-heals same-root
+    // duplicates, so a rename leftover doesn't survive the next analyze (#350).
+    #[test]
+    fn mutate_dedups_same_root_entries() {
+        let dir = reg_dir("mutate-dedup");
+        let path = dir.join("registry.json");
+        let mut reg = Registry::default();
+        reg.repos.push(entry("oldname", "/work/proj"));
+        reg.repos.push(entry("newname", "/work/proj"));
+        reg.save(&path).unwrap();
+        Registry::mutate(&path, |_| {}).unwrap();
+        let reloaded = Registry::load(&path).unwrap();
+        check!(reloaded.repos.len() == 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // A later entry whose roots bridge two previously-distinct entries collapses
