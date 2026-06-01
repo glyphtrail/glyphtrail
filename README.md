@@ -96,9 +96,12 @@ claude mcp add glyphtrail -- glyphtrail mcp --repo .
 **Claude Desktop** — download the `glyphtrail-<version>-<target>.mcpb` bundle for
 your platform from a [release](https://github.com/glyphtrail/glyphtrail/releases)
 and open it (Settings → Extensions, or double-click). The bundle ships the
-`glyphtrail` binary and prompts for the repository to query, so there's nothing
-else to install. To wire it up by hand instead, add to
-`claude_desktop_config.json`:
+`glyphtrail` binary; nothing else to install. Because a Desktop extension is
+global, it starts **without** a pinned repository: the agent names the target
+`repo` (a registered name or path) on each tool call, and the `list_repos` tool
+discovers what is indexed. To wire it up by hand instead, add to
+`claude_desktop_config.json` (pass `--repo` to pin one repo, or omit it for the
+same repo-per-call behavior as the bundle):
 
 ```json
 {
@@ -144,6 +147,8 @@ example, a project-scoped Cursor `.cursor/mcp.json`:
 The exact key, format, and config location vary by client (some split
 `command`/`args`, some take one array; some are project-scoped, some global) —
 but the server is always the same: run `glyphtrail mcp --repo <path>` over stdio.
+Omit `--repo` (as the Desktop bundle does) and the server pins no repository:
+every tool call must then name a `repo`, and `list_repos` lists the indexed ones.
 (`glyphtrail serve` additionally exposes the same tools over HTTP at `POST /mcp`,
 for clients that prefer a URL.)
 

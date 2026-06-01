@@ -114,8 +114,12 @@ enum Command {
     Story(commands::story::StoryArgs),
     /// Run a Model Context Protocol server over stdio (for agents/editors).
     Mcp {
-        #[arg(long, default_value = ".")]
-        repo: PathBuf,
+        /// Launch repository. If omitted, the server has no default repo and
+        /// every tool call must name a `repo` (a registered name or path);
+        /// calls that don't are rejected. This is the mode the global Claude
+        /// Desktop bundle runs in.
+        #[arg(long)]
+        repo: Option<PathBuf>,
     },
     /// Onboard coding agents: write skill + CLAUDE.md/AGENTS.md section + gitignore.
     Setup {

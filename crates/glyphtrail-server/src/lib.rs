@@ -140,7 +140,7 @@ async fn api_search(
 /// Notifications (no `id`) yield `204 No Content`. Each call queries the graph
 /// through the shared MCP dispatch, so the tool surface matches `glyphtrail mcp`.
 async fn mcp(State(state): State<AppState>, Json(msg): Json<Value>) -> Response {
-    match glyphtrail_mcp::handle_request(&state.mcp_db, &msg) {
+    match glyphtrail_mcp::handle_request(Some(&state.mcp_db), &msg) {
         Some(resp) => Json(resp).into_response(),
         None => StatusCode::NO_CONTENT.into_response(),
     }
