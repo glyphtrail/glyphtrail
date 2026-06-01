@@ -39,6 +39,10 @@ pub struct RawComment {
 pub struct ParsedFile {
     pub defs: Vec<RawDef>,
     pub calls: Vec<RawRef>,
+    /// Type usages that are not calls (`@ref`): a type named in a signature,
+    /// field, or generic, and the path prefix of a scoped value (`Protocol::Rest`).
+    /// Resolved to `References` edges (#310).
+    pub refs: Vec<RawRef>,
     pub imports: Vec<String>,
     pub bases: Vec<RawBase>,
     pub comments: Vec<RawComment>,
@@ -141,7 +145,7 @@ pub fn parse_source(lang: &Language, source: &str) -> anyhow::Result<ParsedFile>
 
 /// Parse `source` with an explicit tree-sitter `grammar` and extraction
 /// `query`, mapping the shared capture convention (`@def.<kind>` + `@name`,
-/// `@call`, `@import`, `@extends`/`@implements`, `@comment`) into a
+/// `@call`, `@ref`, `@import`, `@extends`/`@implements`, `@comment`) into a
 /// [`ParsedFile`]. Decoupled from the built-in [`Language`] enum so the same
 /// extraction works for dynamically-loaded grammars.
 pub fn parse_with(
@@ -187,6 +191,16 @@ pub fn parse_with(
                     byte: node.start_byte(),
                     scope: call_qualifier(node, src),
                 }),
+                // A type usage (`@ref`) that is actually a definition's own name
+                // (e.g. the `Protocol` in `enum Protocol`) is skipped — the same
+                // keyword heuristic used for `@call` — so a type does not
+                // reference itself.
+                "ref" if is_definition_name(node, src) => {}
+                "ref" => out.refs.push(RawRef {
+                    name: text,
+                    byte: node.start_byte(),
+                    scope: call_qualifier(node, src),
+                }),
                 "import" => out.imports.push(clean_import(&text)),
                 "extends" => out.bases.push(RawBase {
                     kind: EdgeKind::Extends,
@@ -226,4 +240,31 @@ pub fn parse_with(
     }
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use assert2::check;
+
+    // #310: a type used in a signature, a return position, or as a scoped path
+    // prefix is captured as a reference, so it can become a References edge.
+    #[test]
+    fn captures_type_usages_as_references() {
+        let src = "enum Protocol { Rest }\nfn handle(p: Protocol) -> Protocol { Protocol::Rest }\n";
+        let parsed = parse_source(&Language::Rust, src).unwrap();
+        let protocol_refs = parsed.refs.iter().filter(|r| r.name == "Protocol").count();
+        // The param type, the return type, and the `Protocol::` path prefix.
+        check!(protocol_refs == 3);
+        // The enum is still recorded once as a definition.
+        check!(parsed.defs.iter().filter(|d| d.name == "Protocol").count() == 1);
+    }
+
+    // A definition's own name must not be captured as a self-reference.
+    #[test]
+    fn definition_name_is_not_a_self_reference() {
+        let parsed = parse_source(&Language::Rust, "struct Foo {}\n").unwrap();
+        check!(parsed.defs.iter().any(|d| d.name == "Foo"));
+        check!(parsed.refs.iter().all(|r| r.name != "Foo"));
+    }
 }

@@ -58,7 +58,7 @@ pub struct ImpactArgs {
     #[arg(long, value_delimiter = ',')]
     pub files: Option<Vec<String>>,
 
-    /// Edge kinds to traverse: any of calls,imports,impl,api (default: all).
+    /// Edge kinds to traverse: any of calls,refs,imports,impl,api (default: all).
     #[arg(long, value_delimiter = ',')]
     pub edges: Option<Vec<String>>,
     /// Max hops from a seed.

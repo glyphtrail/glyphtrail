@@ -735,6 +735,48 @@ pub fn build_file_graph(
         }
     }
 
+    // References: a type used (not called) — `proto: Protocol`, `-> Protocol`,
+    // `Protocol::Rest` — links the enclosing definition to the type, as a
+    // References edge. Resolved exactly like calls (unique local def, else a
+    // global pending link), so impact and neighbour queries reach a type's
+    // users, not just its callers (#310).
+    for r in &parsed.refs {
+        let referrer = enclosing_def(&defs, r.byte)
+            .map(|i| defs[i].id.clone())
+            .unwrap_or_else(|| file_id.clone());
+        if let Some(q) = &r.scope {
+            let scoped: Vec<&DefInfo> = defs
+                .iter()
+                .filter(|d| d.name == r.name && enclosing_scope(&d.qualified) == q.as_str())
+                .collect();
+            if scoped.len() == 1 {
+                fg.graph.add_edge(
+                    referrer,
+                    scoped[0].id.clone(),
+                    EdgeKind::References,
+                    Confidence::Extracted,
+                );
+                continue;
+            }
+        }
+        let local: Vec<&DefInfo> = defs.iter().filter(|d| d.name == r.name).collect();
+        if local.len() == 1 {
+            fg.graph.add_edge(
+                referrer,
+                local[0].id.clone(),
+                EdgeKind::References,
+                Confidence::Extracted,
+            );
+        } else {
+            fg.pending.push(PendingEdge {
+                src: referrer,
+                name: r.name.clone(),
+                kind: EdgeKind::References,
+                scope: r.scope.clone(),
+            });
+        }
+    }
+
     // Inheritance: attach to the enclosing type definition.
     for b in &parsed.bases {
         let Some(src_idx) = enclosing_def(&defs, b.byte) else {
