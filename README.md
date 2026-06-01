@@ -174,6 +174,35 @@ for clients that prefer a URL.)
 Prefer it managed? `glyphtrail setup` writes an agent skill plus a
 `CLAUDE.md`/`AGENTS.md` section that points coding agents at these tools.
 
+### Configuration
+
+Per-repo settings live in an optional `.glyphtrail/config.toml` — every field has
+a default, so the file is only needed to override one. It holds:
+
+- `[[api.schemas]]` — blessed API schemas (OpenAPI / GraphQL SDL / protobuf /
+  Hasura) to link code endpoints against and reconcile with `glyphtrail drift`.
+- `[[languages]]` — extra tree-sitter grammars to load at runtime.
+- `[impact] test_globs` — globs that mark a file as a test in impact reports.
+- `[security] record_sensitive_files` — record sensitive files as content-less
+  nodes (see below) instead of skipping them.
+
+Edit it without hand-writing TOML; every change is validated against the schema
+before it is written, so a wrong key or type is rejected and the file untouched:
+
+```sh
+glyphtrail config show                       # current settings (or "defaults in effect")
+glyphtrail config set security.record_sensitive_files true
+glyphtrail config set impact.test_globs '["**/*_test.rs","tests/**"]'
+glyphtrail config get impact.test_globs
+glyphtrail config unset impact.test_globs
+glyphtrail config path                       # the file's location
+```
+
+Values are parsed as TOML, so `true`, `42`, and `["a","b"]` keep their types.
+Manual cross-repo link hints are a separate file (`glyphtrail.links.toml`, plus a
+gitignored `.glyphtrail/links.toml` override) edited with `glyphtrail link` — see
+[Cross-repo blast radius](#cross-repo-blast-radius).
+
 ### Excluding sensitive files
 
 `analyze` honors `.gitignore`/`.git/info/exclude`, skips dotfiles, and reads
