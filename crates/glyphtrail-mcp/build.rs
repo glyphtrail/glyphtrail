@@ -4,6 +4,7 @@
 //! tool, since `CARGO_PKG_VERSION` alone (a static `0.1.0`) can't tell two
 //! builds apart.
 
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -13,8 +14,31 @@ fn main() {
         "cargo:rustc-env=GLYPHTRAIL_BUILD_TIMESTAMP={}",
         build_timestamp()
     );
-    // Re-bake when HEAD moves so the embedded commit doesn't go stale.
-    println!("cargo:rerun-if-changed=../../.git/HEAD");
+    emit_rerun_triggers();
+}
+
+/// Re-bake when the checked-out commit changes. Watching only `.git/HEAD` is not
+/// enough: on a branch, HEAD stays `ref: refs/heads/<branch>` while it is the ref
+/// file (or `packed-refs`) that moves on a new commit. Resolve the real git dir
+/// (handles worktrees) and watch HEAD, the ref it points at, and `packed-refs`.
+fn emit_rerun_triggers() {
+    let Some(git_dir) = git(&["rev-parse", "--absolute-git-dir"]).map(PathBuf::from) else {
+        return; // No git: the commit is reported as "unknown"; nothing to watch.
+    };
+    let head = git_dir.join("HEAD");
+    println!("cargo:rerun-if-changed={}", head.display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        git_dir.join("packed-refs").display()
+    );
+    if let Ok(content) = std::fs::read_to_string(&head)
+        && let Some(reference) = content.strip_prefix("ref:").map(str::trim)
+    {
+        println!(
+            "cargo:rerun-if-changed={}",
+            git_dir.join(reference).display()
+        );
+    }
 }
 
 /// `git output`, trimmed, or `None` if git is unavailable, errors, or is empty.
