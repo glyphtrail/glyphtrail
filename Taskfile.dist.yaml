@@ -57,6 +57,27 @@ tasks:
     cmds:
       - cargo run -p glyphtrail-cli {{.PROFILE_FLAG}} -- query {{.CLI_ARGS}}
 
+  # Outlines the symbols + signatures of a file or directory.
+  # Example: `task outline -- src --detail full`
+  outline:
+    desc: 'Outline a file/dir''s symbols (pass args after --, e.g. task outline -- src)'
+    cmds:
+      - cargo run -p glyphtrail-cli {{.PROFILE_FLAG}} -- outline {{.CLI_ARGS}}
+
+  # Computes the blast radius of a change. Requires a prior `task analyze`.
+  # Example: `task impact -- Protocol` or `task impact -- --since main..HEAD`
+  impact:
+    desc: 'Blast radius of a change (pass args after --, e.g. task impact -- <name>)'
+    cmds:
+      - cargo run -p glyphtrail-cli {{.PROFILE_FLAG}} -- impact {{.CLI_ARGS}}
+
+  # Runs a raw Cypher query against the graph.
+  # Example: `task cypher -- 'MATCH (n) RETURN n.name LIMIT 5'`
+  cypher:
+    desc: 'Run a raw Cypher query (pass the query after --)'
+    cmds:
+      - cargo run -p glyphtrail-cli {{.PROFILE_FLAG}} -- cypher {{.CLI_ARGS}}
+
   # Starts the HTTP graph explorer. Override port: `task serve PORT=8080`
   serve:
     desc: Start the interactive graph explorer on PORT (default 7700)
@@ -94,6 +115,48 @@ tasks:
     desc: Fail if API contract drift is found (CI gate)
     cmds:
       - cargo run -p glyphtrail-cli {{.PROFILE_FLAG}} -- drift --gate {{.CLI_ARGS}}
+
+  # Generates a documentation wiki from the graph via an LLM.
+  # Example: `task wiki -- --provider claude` or `task wiki -- --dry-run`
+  wiki:
+    desc: 'Generate a docs wiki via an LLM (pass args after --)'
+    cmds:
+      - cargo run -p glyphtrail-cli {{.PROFILE_FLAG}} -- wiki {{.CLI_ARGS}}
+
+  # Narrates the repository's history from its git log via an LLM.
+  # Example: `task story -- --provider claude`
+  story:
+    desc: 'Narrate repo history via an LLM (pass args after --)'
+    cmds:
+      - cargo run -p glyphtrail-cli {{.PROFILE_FLAG}} -- story {{.CLI_ARGS}}
+
+  # Runs the Model Context Protocol server over stdio (for agents/editors).
+  # Example: `task mcp -- --repo .`
+  mcp:
+    desc: 'Run the MCP server over stdio (pass args after --)'
+    cmds:
+      - cargo run -p glyphtrail-cli {{.PROFILE_FLAG}} -- mcp {{.CLI_ARGS}}
+
+  # Onboards coding agents: writes skill + CLAUDE.md/AGENTS.md section + gitignore.
+  # Example: `task setup -- .` or `task setup -- --home`
+  setup:
+    desc: 'Onboard coding agents (pass args after --)'
+    cmds:
+      - cargo run -p glyphtrail-cli {{.PROFILE_FLAG}} -- setup {{.CLI_ARGS}}
+
+  # Manages the global repository registry (~/.glyphtrail/registry.json).
+  # Example: `task repo -- list` or `task repo -- add .`
+  repo:
+    desc: 'Manage the repo registry (pass args after --, e.g. task repo -- list)'
+    cmds:
+      - cargo run -p glyphtrail-cli {{.PROFILE_FLAG}} -- repo {{.CLI_ARGS}}
+
+  # Manages named groups of repositories (~/.glyphtrail/groups.json).
+  # Example: `task group -- list`
+  group:
+    desc: 'Manage repo groups (pass args after --, e.g. task group -- list)'
+    cmds:
+      - cargo run -p glyphtrail-cli {{.PROFILE_FLAG}} -- group {{.CLI_ARGS}}
 
   # Emits a shell completion script to stdout.
   # Override shell: `task completions SHELL_KIND=zsh`
