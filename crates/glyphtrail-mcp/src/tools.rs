@@ -1,5 +1,6 @@
 //! MCP tool definitions and handlers over the Glyphtrail graph store.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use glyphtrail_core::config::{INDEX_DIR, RepoPaths};
@@ -138,9 +139,19 @@ pub fn definitions(has_default_repo: bool) -> Vec<Value> {
             "List OTHER repositories in the global registry (on-disk health, \
              groups, stable forge ids) for cross-repo work. You do NOT need this \
              for the repo you are already in — target that directly by its path. \
-             The registry may be large, so prefer narrowing the result — no shell \
-             required.",
-            json!({}),
+             The registry may be large, so narrow the result: `summary` for \
+             counts, `path_hint` for the repo(s) at a path, or \
+             `detail`/`limit`/filters — no shell required.",
+            json!({
+                "summary": { "type": "boolean", "description": "Return only counts {total, by_health, by_group} instead of the repo list. Cheapest way to see what is indexed." },
+                "detail": { "type": "string", "enum": ["minimal", "standard", "full"], "description": "Per-repo fields: minimal=name+health, standard=+root+groups, full=+alt_roots+ids (default full)." },
+                "path_hint": { "type": "string", "description": "Absolute path: return only the repo(s) at or containing it (e.g. the directory you are working in)." },
+                "health": { "type": "string", "enum": ["indexed", "unindexed", "missing"], "description": "Filter by on-disk health." },
+                "group": { "type": "string", "description": "Filter to repos in this named group." },
+                "name": { "type": "string", "description": "Filter to repos whose name contains this (case-insensitive)." },
+                "limit": { "type": "integer", "description": "Max repos to return." },
+                "offset": { "type": "integer", "description": "Skip this many repos before returning (pagination)." }
+            }),
             &[],
         ),
         tool(
@@ -200,7 +211,7 @@ pub fn call(default_db: Option<&Path>, name: &str, args: &Value) -> Value {
 fn dispatch(default_db: Option<&Path>, name: &str, args: &Value) -> Result<Value, String> {
     // Registry-level tools span repos and need no per-repo store.
     if name == "list_repos" {
-        return list_repos();
+        return list_repos(args);
     }
     // Resolve the per-call repo selector (#240): a registered name or a path
     // overrides the server's launch repo; absent, the launch repo is used — and
@@ -313,7 +324,7 @@ fn dispatch(default_db: Option<&Path>, name: &str, args: &Value) -> Result<Value
 /// Enumerate the global registry: every indexed repo with its on-disk health
 /// and group membership. Reads the registry and groups files directly (no
 /// per-repo store), so an agent can discover what is indexed without a shell.
-fn list_repos() -> Result<Value, String> {
+fn list_repos(args: &Value) -> Result<Value, String> {
     let registry = match default_registry_path() {
         Some(p) => Registry::load(&p).map_err(err)?,
         None => Registry::default(),
@@ -322,31 +333,104 @@ fn list_repos() -> Result<Value, String> {
         Some(p) => Groups::load(&p).map_err(err)?,
         None => Groups::default(),
     };
-    let repos: Vec<Value> = registry
+
+    // Filters. `path_hint` is the headway against "list the whole registry just
+    // to find the repo I'm already in" (#347): pass an absolute path, get back
+    // only the repo(s) at or containing it.
+    let path_hint = opt_str(args, "path_hint").and_then(|p| Path::new(p).canonicalize().ok());
+    let want_health = opt_str(args, "health");
+    let want_group = opt_str(args, "group");
+    let want_name = opt_str(args, "name").map(str::to_ascii_lowercase);
+
+    // (entry, health, groups) for every repo passing the filters.
+    let rows: Vec<(&_, &'static str, Vec<&str>)> = registry
         .repos
         .iter()
-        .map(|e| {
+        .filter_map(|e| {
             let health = match e.health() {
                 RepoHealth::Indexed => "indexed",
                 RepoHealth::Unindexed => "unindexed",
                 RepoHealth::Missing => "missing",
             };
+            if let Some(h) = want_health
+                && !h.eq_ignore_ascii_case(health)
+            {
+                return None;
+            }
+            if let Some(n) = &want_name
+                && !e.name.to_ascii_lowercase().contains(n)
+            {
+                return None;
+            }
             let member_of: Vec<&str> = groups
                 .groups
                 .iter()
                 .filter(|g| g.repos.iter().any(|r| r == &e.name))
                 .map(|g| g.name.as_str())
                 .collect();
-            json!({
+            if let Some(g) = want_group
+                && !member_of.contains(&g)
+            {
+                return None;
+            }
+            if let Some(p) = &path_hint
+                && !std::iter::once(&e.root)
+                    .chain(e.alt_roots.iter())
+                    .filter_map(|r| r.canonicalize().ok())
+                    .any(|root| p.starts_with(&root) || root.starts_with(p))
+            {
+                return None;
+            }
+            Some((e, health, member_of))
+        })
+        .collect();
+
+    // Summary: counts only — the cheapest "what's indexed?" answer (#343).
+    if args
+        .get("summary")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        let mut by_health: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut by_group: BTreeMap<&str, usize> = BTreeMap::new();
+        for (_, health, member_of) in &rows {
+            *by_health.entry(*health).or_default() += 1;
+            for g in member_of {
+                *by_group.entry(*g).or_default() += 1;
+            }
+        }
+        return Ok(json!({
+            "total": rows.len(),
+            "by_health": serde_json::to_value(&by_health).unwrap_or_default(),
+            "by_group": serde_json::to_value(&by_group).unwrap_or_default(),
+        }));
+    }
+
+    // Projection + pagination. Default `full` preserves the historical shape.
+    let detail = opt_str(args, "detail").unwrap_or("full");
+    let offset = opt_usize(args, "offset").unwrap_or(0);
+    let limit = opt_usize(args, "limit").unwrap_or(usize::MAX);
+    let repos: Vec<Value> = rows
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .map(|&(e, health, ref member_of)| match detail {
+            "minimal" => json!({ "name": e.name, "health": health }),
+            "standard" => json!({
                 "name": e.name,
                 "root": e.root,
-                // Additional known locations of the same repo (#272), if any.
+                "health": health,
+                "groups": member_of.clone(),
+            }),
+            // "full" (default): every field, including #272 alt_roots and #233 ids.
+            _ => json!({
+                "name": e.name,
+                "root": e.root,
                 "alt_roots": e.alt_roots,
                 "health": health,
-                "groups": member_of,
-                // Stable forge identities (#233): slug + optional numeric ids.
+                "groups": member_of.clone(),
                 "ids": serde_json::to_value(&e.ids).unwrap_or_default(),
-            })
+            }),
         })
         .collect();
     Ok(Value::Array(repos))
@@ -975,6 +1059,54 @@ mod tests {
         let text = res["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_norway::from_str(text).unwrap();
         check!(parsed.is_array());
+    }
+
+    // `summary` collapses the (potentially huge) registry to counts (#343).
+    #[test]
+    fn list_repos_summary_returns_counts_not_a_list() {
+        let res = call(None, "list_repos", &json!({ "summary": true }));
+        check!(res["isError"] == json!(false));
+        let text = res["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_norway::from_str(text).unwrap();
+        check!(parsed["total"].is_number());
+        check!(parsed["by_health"].is_object());
+    }
+
+    // `detail: minimal` drops everything but name + health, whatever is indexed.
+    #[test]
+    fn list_repos_detail_minimal_omits_root() {
+        let res = call(None, "list_repos", &json!({ "detail": "minimal" }));
+        let text = res["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_norway::from_str(text).unwrap();
+        check!(parsed.is_array());
+        check!(
+            parsed
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r.get("root").is_none() && r["name"].is_string())
+        );
+    }
+
+    // `path_hint` at a directory that is no registered repo lists nothing —
+    // the basis for resolving "the repo I'm in" without dumping the registry.
+    #[test]
+    fn list_repos_path_hint_unrelated_dir_is_empty() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tmp = std::env::temp_dir().join(format!("gt-listrepos-{nanos}"));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let res = call(
+            None,
+            "list_repos",
+            &json!({ "path_hint": tmp.to_str().unwrap() }),
+        );
+        let text = res["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_norway::from_str(text).unwrap();
+        check!(parsed.as_array().unwrap().is_empty());
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     // #240: a `repo` argument redirects a call to another repository by path,
