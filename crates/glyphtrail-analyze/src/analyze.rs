@@ -6,8 +6,8 @@ use glyphtrail_core::config::{IGNORE_FILE, INDEX_DIR, LEGACY_IGNORE_FILE, RepoPa
 use glyphtrail_core::{
     ClientCall, CodeGraph, Confidence, Config, DynamicLanguage, Ecosystem, Edge, EdgeKind,
     Endpoint, ExternalUse, IndexedPackage, Language, META_EXTERNAL_USES, META_PACKAGES, Matcher,
-    Node, NodeId, NodeKind, OperationKey, PackageExport, PendingLink, Protocol, RewriteEngine,
-    SchemaFormat, parse_cargo_manifest, parse_csproj, workspace_members,
+    Node, NodeId, NodeKind, OperationKey, PackageExport, PackageIdentity, PendingLink, Protocol,
+    Registry, RewriteEngine, SchemaFormat, parse_cargo_manifest, parse_csproj, workspace_members,
 };
 use glyphtrail_parse::{
     DynamicGrammar, PendingEdge, build_client_graph, build_file_graph, build_graphql_client_graph,
@@ -1877,11 +1877,24 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
     let packages_json = serde_json::to_string(&indexed).unwrap_or_else(|_| "[]".to_string());
     // Consumer side of cross-repo links (#220): imports referencing a declared
     // dependency. Resolved from the same identity, persisted for #221.
-    let uses_json = serde_json::to_string(&external_uses(&*store, &discovered, &root)?)
-        .unwrap_or_else(|_| "[]".to_string());
+    let uses = external_uses(&*store, &discovered, &root)?;
+    let uses_json = serde_json::to_string(&uses).unwrap_or_else(|_| "[]".to_string());
     store.set_meta(META_PACKAGES, &packages_json)?;
     store.set_meta(META_EXTERNAL_USES, &uses_json)?;
     store.set_meta("packages_fingerprint", &packages_fingerprint)?;
+
+    // Pingback (#292): cache this repo's cross-repo identity on its registry
+    // entry so federated impact resolves links from the loaded registry and opens
+    // only link-connected member stores, instead of opening every member just to
+    // read its identity. Best-effort: a busy registry lock or an unregistered
+    // repo must never fail an analyze — federation backfills anything missed.
+    if let Some(reg_path) = glyphtrail_core::default_registry_path() {
+        let identity = PackageIdentity {
+            packages: indexed,
+            external_uses: uses,
+        };
+        let _ = Registry::mutate(&reg_path, |r| r.set_identity_by_root(&root, identity));
+    }
     resolve_progress.finish_and_clear();
 
     let stats = store.stats()?;

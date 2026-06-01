@@ -379,6 +379,7 @@ fn entry_for(registry_path: &Path, root: &Path, name: Option<String>) -> Registr
         missing_since: None,
         ids,
         contributors: git_contributors(root),
+        identity: None,
     }
 }
 

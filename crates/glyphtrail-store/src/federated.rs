@@ -3,11 +3,12 @@
 //! Ties the registry, the persisted package identity, cross-repo link
 //! resolution and the [`FederatedAdjacency`] together into one entry point,
 //! [`federated_impact`], shared by the `glyphtrail impact --downstream` CLI and
-//! the `impact` MCP tool. It opens every member repo's store, seeds in the
-//! current repo, traverses across the package boundary, and returns a
+//! the `impact` MCP tool. It resolves cross-repo links from the identities cached
+//! on the registry (#292), seeds in the current repo, opens only the member
+//! stores reachable across the package boundary, traverses, and returns a
 //! [`FederatedReport`] (origin repo first, then downstream).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -103,9 +104,94 @@ pub fn federated_impact(
         names.push(current.clone());
     }
 
-    // Open every indexed member, keyed by registry name.
-    let mut stores: HashMap<String, Box<dyn GraphStore>> = HashMap::new();
+    // Cross-repo identities come from the registry (#292), so we don't open a
+    // store just to read identity. An entry indexed before this cache existed
+    // has `identity: None`; for those we open the store once to read its meta and
+    // best-effort backfill the registry, keeping the opened store to reuse below.
+    let mut prefetched: HashMap<String, Box<dyn GraphStore>> = HashMap::new();
+    let mut backfills: Vec<(std::path::PathBuf, PackageIdentity)> = Vec::new();
+    let mut identities: Vec<RepoIdentity> = Vec::new();
     for name in &names {
+        let Some(entry) = registry.get(name) else {
+            continue;
+        };
+        if entry.health() != RepoHealth::Indexed {
+            continue;
+        }
+        let identity = match &entry.identity {
+            Some(id) => id.clone(),
+            None => {
+                let ladybug = RepoPaths::new(entry.active_root())
+                    .index_dir
+                    .join("ladybug");
+                match LadybugStore::open(&ladybug) {
+                    Ok(store) => {
+                        let id = PackageIdentity::from_meta(
+                            store.get_meta(META_PACKAGES).ok().flatten().as_deref(),
+                            store.get_meta(META_EXTERNAL_USES).ok().flatten().as_deref(),
+                        );
+                        backfills.push((entry.active_root().clone(), id.clone()));
+                        prefetched.insert(name.clone(), Box::new(store));
+                        id
+                    }
+                    // One unreadable member shouldn't sink the run.
+                    Err(e) => {
+                        eprintln!("note: skipping repo '{name}': cannot open its index ({e})");
+                        continue;
+                    }
+                }
+            }
+        };
+        identities.push(RepoIdentity {
+            repo: name.clone(),
+            identity,
+        });
+    }
+    // Best-effort: cache backfilled identities so the next query is cheap (#292).
+    // Lock-tolerant — never fail the query because the registry is busy.
+    if !backfills.is_empty()
+        && let Some(reg_path) = default_registry_path()
+    {
+        let _ = Registry::mutate(&reg_path, |r| {
+            for (root, id) in &backfills {
+                r.set_identity_by_root(root, id.clone());
+            }
+        });
+    }
+
+    let links = resolve_links(&identities);
+
+    // Only repos reachable from the current repo along producer -> consumer edges
+    // (a consumer's external use of a producer is a link `to_repo -> from_repo`)
+    // can receive impact from its seeds, so only those need their store opened —
+    // not the whole registry. BFS the repo-level link graph from the current repo.
+    let mut consumers_of: HashMap<&str, Vec<&str>> = HashMap::new();
+    for l in &links {
+        consumers_of
+            .entry(l.to_repo.as_str())
+            .or_default()
+            .push(l.from_repo.as_str());
+    }
+    let mut reachable: HashSet<String> = HashSet::from([current.clone()]);
+    let mut queue = vec![current.clone()];
+    while let Some(r) = queue.pop() {
+        if let Some(consumers) = consumers_of.get(r.as_str()) {
+            for &c in consumers {
+                if reachable.insert(c.to_string()) {
+                    queue.push(c.to_string());
+                }
+            }
+        }
+    }
+
+    // Open the stores for just the reachable repos, reusing any opened during
+    // backfill. A connected member whose index won't open is skipped, as before.
+    let mut stores: HashMap<String, Box<dyn GraphStore>> = HashMap::new();
+    for name in &reachable {
+        if let Some(store) = prefetched.remove(name) {
+            stores.insert(name.clone(), store);
+            continue;
+        }
         let Some(entry) = registry.get(name) else {
             continue;
         };
@@ -115,10 +201,6 @@ pub fn federated_impact(
         let ladybug = RepoPaths::new(entry.active_root())
             .index_dir
             .join("ladybug");
-        // Skip a member whose index won't open (corrupt or incompatible file)
-        // rather than aborting the whole federated query — one bad index among
-        // many registered repos shouldn't sink the run. The current repo's index
-        // is checked separately below, so a real failure there still errors.
         match LadybugStore::open(&ladybug) {
             Ok(store) => {
                 stores.insert(name.clone(), Box::new(store));
@@ -147,20 +229,6 @@ pub fn federated_impact(
         }
     };
 
-    // Build the qualified cross-edge table from symbol-level links: each
-    // producer export -> the consumer's symbols in the importing file.
-    let identities = stores
-        .iter()
-        .map(|(name, s)| {
-            Ok(RepoIdentity {
-                repo: name.clone(),
-                identity: PackageIdentity::from_meta(
-                    s.get_meta(META_PACKAGES)?.as_deref(),
-                    s.get_meta(META_EXTERNAL_USES)?.as_deref(),
-                ),
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
     // Origin packages each seed belongs to, for crate-level propagation (#237):
     // a crate-level consumer of one of these packages is flagged as potentially
     // affected even though no specific symbol resolved.
@@ -169,7 +237,7 @@ pub fn federated_impact(
         .find(|r| r.repo == current)
         .map(|r| r.identity.packages.as_slice())
         .unwrap_or(&[]);
-    let mut seed_packages: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seed_packages: HashSet<String> = HashSet::new();
     for seed in &local_seeds {
         if let Some(node) = current_store.get_node(&seed.0)?
             && let Some(pkg) = owning_package(origin_packages, &node.file)
@@ -178,9 +246,11 @@ pub fn federated_impact(
         }
     }
 
+    // Build the qualified cross-edge table from symbol-level links: each
+    // producer export -> the consumer's symbols in the importing file.
     let mut cross: HashMap<NodeId, Vec<(NodeId, Confidence)>> = HashMap::new();
     let mut crate_level: Vec<CrateLevelHit> = Vec::new();
-    for link in resolve_links(&identities) {
+    for link in &links {
         match &link.to_node {
             // Symbol-level link: add a cross-edge from the producer export to the
             // consumer use-sites. Precise use-sites (#236) land on exactly the
