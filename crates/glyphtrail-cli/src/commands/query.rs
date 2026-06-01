@@ -23,7 +23,7 @@ pub enum QueryCmd {
     Callees { name: String },
     /// Direct neighbours in any direction.
     Neighbors { name: String },
-    /// Full-text search over names and doc comments.
+    /// Substring search over names, qualified names, and doc comments.
     Search {
         text: String,
         /// Match case exactly (default: case-insensitive).

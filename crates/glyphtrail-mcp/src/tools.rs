@@ -33,8 +33,8 @@ pub fn definitions(has_default_repo: bool) -> Vec<Value> {
     let mut defs = vec![
         tool(
             "search",
-            "Substring search over symbol names and doc comments. Case-insensitive \
-             by default.",
+            "Substring search over symbol names, qualified names, and doc \
+             comments. Case-insensitive by default.",
             json!({
                 "query": { "type": "string" },
                 "limit": { "type": "integer" },
@@ -1119,6 +1119,28 @@ mod tests {
         let parsed: Value = serde_norway::from_str(text).unwrap();
         check!(parsed[0]["node"]["name"] == json!("caller"));
         check!(parsed[0]["edge"] == json!("calls"));
+        std::fs::remove_dir_all(db.parent().unwrap()).ok();
+    }
+
+    // search is case-insensitive by default; `case_sensitive: true` is exact (#367).
+    #[test]
+    fn search_tool_is_case_insensitive_by_default() {
+        let db = build_db("search-case");
+        let hits = |query: &str, case_sensitive: bool| -> usize {
+            let res = call(
+                Some(&db),
+                "search",
+                &json!({ "query": query, "case_sensitive": case_sensitive }),
+            );
+            let text = res["content"][0]["text"].as_str().unwrap();
+            serde_norway::from_str::<Value>(text)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len()
+        };
+        check!(hits("CALLER", false) >= 1);
+        check!(hits("CALLER", true) == 0);
         std::fs::remove_dir_all(db.parent().unwrap()).ok();
     }
 
