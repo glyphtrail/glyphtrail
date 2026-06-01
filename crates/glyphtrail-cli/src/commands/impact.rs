@@ -238,12 +238,20 @@ fn emit_federated(report: &FederatedReport, format: Format) -> Result<()> {
 
 fn print_federated_text(report: &FederatedReport) {
     let s = &report.summary;
+    // Crate-level consumers (known to depend on the change but with no symbol
+    // resolved) count toward downstream breadth — surface them so the level isn't
+    // a mystery when there are no symbol-level hits (#292 follow-up).
+    let crate_note = if report.crate_level.is_empty() {
+        String::new()
+    } else {
+        format!(", {} crate-level", report.crate_level.len())
+    };
     println!(
-        "impact: {} — {} symbols across {} repo(s) ({} downstream); {} tests, {} API, {} cross-boundary",
+        "impact: {} — {} symbols · {} downstream repo(s){} · {} tests · {} API · {} cross-boundary",
         s.level.label(),
         s.total,
-        report.repos.len(),
-        report.downstream_repos(),
+        report.downstream_breadth(),
+        crate_note,
         s.tests,
         s.api,
         s.cross_boundary

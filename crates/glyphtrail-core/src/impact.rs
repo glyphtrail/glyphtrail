@@ -348,7 +348,9 @@ pub struct ClassifiedItem {
 /// cross-boundary consumer is "contract" risk and forces at least [`High`].
 ///
 /// [`High`]: ImpactLevel::High
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+// Declaration order is the severity order; `derive(Ord)` relies on it so levels
+// from different signals can be combined with `.max()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImpactLevel {
     /// Nothing impacted.
@@ -374,6 +376,20 @@ impl ImpactLevel {
             _ if big || contract => ImpactLevel::High,
             _ if total >= 10 => ImpactLevel::Medium,
             _ => ImpactLevel::Low,
+        }
+    }
+
+    /// Risk implied purely by *how many downstream repos* depend on the change
+    /// (#292 follow-up). Crossing a repo boundary is more serious than an
+    /// internal-only change, so even one known downstream consumer is at least
+    /// `Medium` — this rescues a change with crate-level-only or thinly-traversed
+    /// downstream consumers from reading `None`/`Low`. Combined with the
+    /// symbol-level [`assess`](Self::assess) via `max`.
+    pub fn from_downstream_breadth(downstream_repos: usize) -> Self {
+        match downstream_repos {
+            0 => ImpactLevel::None,
+            1..=4 => ImpactLevel::Medium,
+            _ => ImpactLevel::High,
         }
     }
 
@@ -596,7 +612,21 @@ impl FederatedReport {
             }
             summary.max_distance = summary.max_distance.max(i.distance);
         }
-        summary.level = ImpactLevel::assess(summary.total, summary.api, summary.cross_boundary);
+        // Fold downstream breadth into the level (#292 follow-up): distinct
+        // downstream repos that depend on the change — reached at symbol level
+        // *or* linked only at crate level. Knowing N other repos need this symbol
+        // raises the risk even when no specific downstream symbol resolved, so the
+        // level is the stronger of the symbol-based and breadth-based assessments.
+        let mut downstream: std::collections::HashSet<&str> = repos
+            .iter()
+            .filter(|r| !r.origin && !r.items.is_empty())
+            .map(|r| r.repo.as_str())
+            .collect();
+        for hit in &crate_level {
+            downstream.insert(hit.repo.as_str());
+        }
+        let symbol_level = ImpactLevel::assess(summary.total, summary.api, summary.cross_boundary);
+        summary.level = symbol_level.max(ImpactLevel::from_downstream_breadth(downstream.len()));
         FederatedReport {
             summary,
             repos,
@@ -607,6 +637,22 @@ impl FederatedReport {
     /// Count of downstream (non-origin) repos with impacted nodes.
     pub fn downstream_repos(&self) -> usize {
         self.repos.iter().filter(|r| !r.origin).count()
+    }
+
+    /// Count of distinct downstream repos that depend on the change at all —
+    /// reached at symbol level or linked only at crate level. Drives the
+    /// breadth component of the risk level and the headline (#292 follow-up).
+    pub fn downstream_breadth(&self) -> usize {
+        let mut repos: std::collections::HashSet<&str> = self
+            .repos
+            .iter()
+            .filter(|r| !r.origin && !r.items.is_empty())
+            .map(|r| r.repo.as_str())
+            .collect();
+        for hit in &self.crate_level {
+            repos.insert(hit.repo.as_str());
+        }
+        repos.len()
     }
 }
 
@@ -708,6 +754,33 @@ mod tests {
         check!(ImpactLevel::assess(5, 1, 0) == High); // small but touches API
         check!(ImpactLevel::assess(5, 0, 3) == High); // small but cross-boundary
         check!(ImpactLevel::assess(60, 2, 0) == Critical); // big and contract
+    }
+
+    // #292 follow-up: knowing downstream repos depend on the change raises the
+    // level even when no downstream symbol resolved (crate-level only).
+    #[test]
+    fn federated_level_reflects_downstream_breadth() {
+        check!(ImpactLevel::from_downstream_breadth(0) == ImpactLevel::None);
+        check!(ImpactLevel::from_downstream_breadth(3) == ImpactLevel::Medium);
+        check!(ImpactLevel::from_downstream_breadth(9) == ImpactLevel::High);
+
+        let hit = |repo: &str| CrateLevelHit {
+            repo: repo.into(),
+            package: repo.into(),
+            file: format!("{repo}/lib.rs"),
+            via: "lib".into(),
+        };
+        let report = FederatedReport::new(
+            vec![RepoImpact {
+                repo: "origin".into(),
+                origin: true,
+                items: vec![],
+            }],
+            vec![hit("a"), hit("b")],
+        );
+        check!(report.summary.total == 0); // no symbol-level impact
+        check!(report.downstream_breadth() == 2);
+        check!(report.summary.level == ImpactLevel::Medium); // breadth lifts it off None
     }
 
     #[test]
