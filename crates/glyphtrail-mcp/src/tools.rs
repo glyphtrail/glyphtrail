@@ -674,12 +674,14 @@ fn analyze_tool(db: &Path, args: &Value) -> Result<Value, String> {
     let update = args.get("update").and_then(Value::as_bool).unwrap_or(false);
     let outcome = glyphtrail_analyze::run(&root, update).map_err(err)?;
     let mut value = serde_json::to_value(&outcome).map_err(err)?;
-    // Render `languages` as a {lang: count} map (descending order preserved),
-    // matching the `status` tool instead of a YAML-awkward array of pairs (#346).
+    // Render `languages` as a {lang: count} map, matching the `status` tool
+    // instead of a YAML-awkward array of pairs (#346). The descending-by-count
+    // order survives because serde_json's `preserve_order` is enabled in this
+    // workspace (it pulls indexmap), so the Map iterates in insertion order.
     let languages: serde_json::Map<String, Value> = outcome
         .languages
-        .iter()
-        .map(|(lang, n)| (lang.clone(), json!(*n)))
+        .into_iter()
+        .map(|(lang, n)| (lang, json!(n)))
         .collect();
     value["languages"] = Value::Object(languages);
     Ok(value)
