@@ -16,6 +16,7 @@ glyphtrail-analyze.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_norway.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

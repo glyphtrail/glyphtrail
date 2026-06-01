@@ -776,8 +776,20 @@ fn tool(name: &str, description: &str, mut properties: Value, required: &[&str])
     })
 }
 
+/// Render a tool result's text payload.
+///
+/// Agent-facing output defaults to YAML: lower-boilerplate than JSON, so it costs
+/// fewer tokens for the model to read. Set `GLYPHTRAIL_MCP_FORMAT=json` to restore
+/// pretty-JSON for clients that expect it. (See #109.)
 fn text_result(value: &Value, is_error: bool) -> Value {
-    let text = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
+    let as_json = std::env::var("GLYPHTRAIL_MCP_FORMAT")
+        .map(|f| f.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+    let text = if as_json {
+        serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+    } else {
+        serde_norway::to_string(value).unwrap_or_else(|_| value.to_string())
+    };
     json!({ "content": [ { "type": "text", "text": text } ], "isError": is_error })
 }
 
@@ -905,7 +917,7 @@ mod tests {
         );
         check!(res["isError"] == json!(false));
         let text = res["content"][0]["text"].as_str().unwrap();
-        let parsed: Value = serde_json::from_str(text).unwrap();
+        let parsed: Value = serde_norway::from_str(text).unwrap();
         check!(parsed[0]["name"] == json!("lonely"));
         std::fs::remove_dir_all(index_dir.parent().unwrap()).ok();
     }
@@ -916,7 +928,7 @@ mod tests {
         let res = call(Some(&db), "callers", &json!({ "name": "callee" }));
         check!(res["isError"] == json!(false));
         let text = res["content"][0]["text"].as_str().unwrap();
-        let parsed: Value = serde_json::from_str(text).unwrap();
+        let parsed: Value = serde_norway::from_str(text).unwrap();
         check!(parsed[0]["node"]["name"] == json!("caller"));
         check!(parsed[0]["edge"] == json!("calls"));
         std::fs::remove_dir_all(db.parent().unwrap()).ok();
@@ -927,7 +939,7 @@ mod tests {
         let db = build_db("status");
         let res = call(Some(&db), "status", &json!({}));
         let text = res["content"][0]["text"].as_str().unwrap();
-        let parsed: Value = serde_json::from_str(text).unwrap();
+        let parsed: Value = serde_norway::from_str(text).unwrap();
         check!(parsed["nodes"] == json!(2));
         check!(parsed["edges"] == json!(1));
         std::fs::remove_dir_all(db.parent().unwrap()).ok();
@@ -940,7 +952,7 @@ mod tests {
         let res = call(None, "list_repos", &json!({}));
         check!(res["isError"] == json!(false));
         let text = res["content"][0]["text"].as_str().unwrap();
-        let parsed: Value = serde_json::from_str(text).unwrap();
+        let parsed: Value = serde_norway::from_str(text).unwrap();
         check!(parsed.is_array());
     }
 
@@ -981,7 +993,7 @@ mod tests {
         );
         check!(res["isError"] == json!(false));
         let text = res["content"][0]["text"].as_str().unwrap();
-        let parsed: Value = serde_json::from_str(text).unwrap();
+        let parsed: Value = serde_norway::from_str(text).unwrap();
         check!(parsed[0]["name"] == json!("zonk"));
         std::fs::remove_dir_all(&root).ok();
     }
@@ -1013,7 +1025,7 @@ mod tests {
         );
         check!(res["isError"] == json!(false));
         let text = res["content"][0]["text"].as_str().unwrap();
-        let parsed: Value = serde_json::from_str(text).unwrap();
+        let parsed: Value = serde_norway::from_str(text).unwrap();
         check!(parsed["files"].as_u64().unwrap() >= 1);
         check!(parsed["nodes"].as_u64().unwrap() >= 1);
         std::fs::remove_dir_all(&root).ok();
