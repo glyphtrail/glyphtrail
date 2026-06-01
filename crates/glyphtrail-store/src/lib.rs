@@ -31,6 +31,7 @@ mod tests {
                 end_line: 2,
             }),
             doc: None,
+            signature: None,
         }
     }
 

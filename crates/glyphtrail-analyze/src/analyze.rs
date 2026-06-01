@@ -186,6 +186,7 @@ fn parse_file(
             language: None,
             span: None,
             doc: Some("sensitive: contents excluded from the index".into()),
+            signature: None,
         });
         out.graph.add_edge(
             repo_id.clone(),
@@ -206,6 +207,7 @@ fn parse_file(
         language: Some(language.name().to_string()),
         span: None,
         doc: None,
+        signature: None,
     });
     out.graph.add_edge(
         repo_id.clone(),
@@ -231,7 +233,7 @@ fn parse_file(
         }
     };
 
-    let fg = build_file_graph(&f.rel_path, language, &file_id, &parsed);
+    let fg = build_file_graph(&f.rel_path, language, &file_id, &parsed, &source);
     // REST server-route extraction runs for any language with a registered
     // extractor (registry decides; no-op otherwise).
     let rg = build_rest_graph(&f.rel_path, language, &fg.symbols, &source);
@@ -1491,6 +1493,7 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
         language: None,
         span: None,
         doc: None,
+        signature: None,
     });
 
     let mut pending: Vec<PendingEdge> = Vec::new();
@@ -1763,6 +1766,7 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
                     language: None,
                     span: None,
                     doc: None,
+                    signature: None,
                 });
                 import_edges.push(Edge {
                     src: importer_id,
@@ -2101,6 +2105,7 @@ fn ingest_schemas(
                 language: None,
                 span: None,
                 doc: None,
+                signature: None,
             });
             operations.push((id, key));
         }

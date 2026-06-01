@@ -2,16 +2,18 @@
 //! detail — the compact "shape of the code" view an agent (or human) reads to
 //! get oriented before diving into impact or queries.
 //!
-//! Signatures are sliced from source **on demand**: a definition node's span
-//! starts at the `fn`/`struct`/`def` keyword, so the header is
-//! `source[span.start_byte .. body_opener]`. This needs no stored signature and
-//! no reindex; a missing/edited source simply drops back to name + kind.
+//! Signatures are captured at parse time and stored on the node, so `outline`
+//! reads them from the graph without touching the file (#344) — a stale or
+//! edited working tree can't garble them, and there is no query-time I/O.
 //!
-//! The slicer is a small best-effort lexer, not a parser: it tracks `()`/`[]`
-//! depth and string literals so a `{` inside an argument or a string doesn't
-//! end the header early, and it is bounded so a pathological span can't run
-//! away. It does not track block comments — a `{` inside a comment in a header
-//! is rare enough to accept.
+//! The slicer below is what captures the header at analyze time (a definition
+//! node's span starts at the `fn`/`struct`/`def` keyword, so the header is
+//! `source[span.start_byte .. body_opener]`), and it is also the fallback for
+//! legacy indexes that predate the stored field. It is a small best-effort
+//! lexer, not a parser: it tracks `()`/`[]` depth and string literals so a `{`
+//! inside an argument or a string doesn't end the header early, and it is
+//! bounded so a pathological span can't run away. It does not track block
+//! comments — a `{` inside a comment in a header is rare enough to accept.
 
 use serde::Serialize;
 
@@ -76,9 +78,13 @@ pub fn outline_symbol(node: &Node, source: Option<&str>, detail: Detail) -> Outl
     let line = node.span.map(|s| s.start_line).unwrap_or(0);
     let signature = match detail {
         Detail::Minimal => None,
-        Detail::Standard | Detail::Full => source
-            .zip(node.span)
-            .and_then(|(src, span)| slice_signature(src, span, node.language.as_deref())),
+        // Prefer the signature captured at parse time (#344); fall back to slicing
+        // the source for legacy indexes built before that field existed.
+        Detail::Standard | Detail::Full => node.signature.clone().or_else(|| {
+            source
+                .zip(node.span)
+                .and_then(|(src, span)| slice_signature(src, span, node.language.as_deref()))
+        }),
     };
     let doc = match detail {
         Detail::Full => node
@@ -133,7 +139,7 @@ fn is_brace_family(language: Option<&str>) -> bool {
 pub fn slice_signature(source: &str, span: Span, language: Option<&str>) -> Option<String> {
     let rest = source.get(span.start_byte..)?; // node start is a char boundary
     let header = if is_brace_family(language) {
-        brace_header(rest).unwrap_or_else(|| first_line(rest))
+        brace_header(rest, language == Some("rust")).unwrap_or_else(|| first_line(rest))
     } else {
         first_line(rest)
     };
@@ -143,7 +149,12 @@ pub fn slice_signature(source: &str, span: Span, language: Option<&str>) -> Opti
 
 /// The slice up to the body's opening `{` at top level (not inside `()`/`[]` or
 /// a string). `None` if no such `{` within the bounds → caller uses first line.
-fn brace_header(rest: &str) -> Option<&str> {
+///
+/// `is_rust` flips how a `'` is read: in Rust it is usually a lifetime (`'a`,
+/// `&'a`, `'static`) — code, not a string — and only a char literal (`'x'`,
+/// `'\n'`, `'{'`) is a span to skip. In every other brace language a single
+/// quote opens a string, so it is consumed wholesale as before.
+fn brace_header(rest: &str, is_rust: bool) -> Option<&str> {
     let mut depth: i32 = 0;
     let mut string: Option<char> = None;
     let mut escaped = false;
@@ -163,7 +174,18 @@ fn brace_header(rest: &str) -> Option<&str> {
             continue;
         }
         match c {
-            '"' | '\'' | '`' => string = Some(c),
+            '"' | '`' => string = Some(c),
+            // In Rust a `'` is treated as a string only for a char literal
+            // (`'x'`, `'\n'`, `'{'`); a lifetime (`'a`, `&'a`) is code, so it
+            // must not swallow the header looking for a close (#344). Every other
+            // brace language single-quotes strings, so a `'` opens one there.
+            '\'' => {
+                let b = rest.as_bytes();
+                let char_lit = b.get(i + 1) == Some(&b'\\') || b.get(i + 2) == Some(&b'\'');
+                if !is_rust || char_lit {
+                    string = Some('\'');
+                }
+            }
             '(' | '[' => depth += 1,
             ')' | ']' => depth -= 1,
             '{' if depth <= 0 => return Some(&rest[..i]),
@@ -240,6 +262,24 @@ mod tests {
     }
 
     #[test]
+    fn rust_lifetimes_do_not_swallow_the_body() {
+        // `'a` is a lifetime, not a char literal: the scanner must still find the
+        // body `{` rather than treating `'...'` as a string and bleeding the
+        // header into the body (#344).
+        check!(
+            sig("fn f<'a>(x: &'a str) -> &'a str {\n  x\n}", "rust")
+                == Some("fn f<'a>(x: &'a str) -> &'a str".into())
+        );
+    }
+
+    #[test]
+    fn non_rust_single_quoted_string_brace_is_not_the_body() {
+        // JS/TS/PHP single-quote strings: a `{` inside one must not be mistaken
+        // for the body brace (the Rust lifetime handling must not regress this).
+        check!(sig("const f = () => 'x{y'", "javascript") == Some("const f = () => 'x{y'".into()));
+    }
+
+    #[test]
     fn python_uses_first_line() {
         check!(
             sig("def run(self, x: int) -> str:\n    pass", "python")
@@ -281,6 +321,30 @@ mod tests {
     }
 
     #[test]
+    fn outline_prefers_the_stored_signature_over_slicing() {
+        let node = Node {
+            id: crate::model::NodeId("n".into()),
+            kind: NodeKind::Function,
+            name: "go".into(),
+            qualified_name: "go".into(),
+            file: "a.rs".into(),
+            language: Some("rust".into()),
+            span: Some(Span {
+                start_byte: 0,
+                end_byte: 5,
+                start_line: 1,
+                end_line: 1,
+            }),
+            doc: None,
+            signature: Some("fn go(stored: bool) -> Stored".into()),
+        };
+        // Even with (deliberately wrong) source, the parse-time signature wins —
+        // so a stale working tree can't garble outline (#344).
+        let sym = outline_symbol(&node, Some("fn WRONG() {}"), Detail::Standard);
+        check!(sym.signature.as_deref() == Some("fn go(stored: bool) -> Stored"));
+    }
+
+    #[test]
     fn outline_symbol_respects_detail() {
         let node = Node {
             id: crate::model::NodeId("n".into()),
@@ -296,6 +360,7 @@ mod tests {
                 end_line: 7,
             }),
             doc: Some("Does the thing.\nMore.".into()),
+            signature: None,
         };
         let src = "fn go() -> u8 {\n  1\n}";
         let min = outline_symbol(&node, Some(src), Detail::Minimal);

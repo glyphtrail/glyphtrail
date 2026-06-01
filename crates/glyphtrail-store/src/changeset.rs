@@ -254,6 +254,7 @@ index 333..000
                 end_line: el,
             }),
             doc: None,
+            signature: None,
         };
         store
             .insert_graph(&[mk("f1", 1, 10), mk("f2", 20, 30)], &[])
