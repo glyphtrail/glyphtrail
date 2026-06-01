@@ -246,6 +246,8 @@ impl Registry {
             ingest_spillovers(path, &mut reg);
             let resolutions: Vec<Resolution> =
                 entries.iter().map(|e| reg.upsert_repo(e.clone())).collect();
+            // Self-heal any same-root duplicate left by an earlier rename (#350).
+            reg.dedup_by_root();
             reg.save(path)?;
             Ok(resolutions)
         });
@@ -335,6 +337,62 @@ impl Registry {
         // 3. New repo.
         self.repos.push(entry);
         Resolution::Added
+    }
+
+    /// Collapse entries that point at the same physical repository — they share a
+    /// root, compared canonically when it resolves on disk and by the path as
+    /// written otherwise — into a single entry. The most recently registered name
+    /// wins (a rename's new name), and ids, alternate locations, and contributors
+    /// are unioned. This repairs duplicates left when a repo is re-registered
+    /// under a new name before its forge ids line up — which `upsert_repo`'s
+    /// id/name matching alone does not catch (#350). Returns whether it merged.
+    pub fn dedup_by_root(&mut self) -> bool {
+        fn key(p: &Path) -> PathBuf {
+            p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
+        }
+        // Carry each kept entry's root keys so the O(n^2) overlap scan never
+        // re-canonicalizes (one stat pass per entry, not per comparison).
+        let mut kept: Vec<(RegistryEntry, Vec<PathBuf>)> = Vec::with_capacity(self.repos.len());
+        let mut merged = false;
+        for entry in std::mem::take(&mut self.repos) {
+            let entry_roots: Vec<PathBuf> = entry.roots().cloned().collect();
+            let entry_keys: Vec<PathBuf> = entry_roots.iter().map(|r| key(r)).collect();
+            match kept
+                .iter()
+                .position(|(_, keys)| keys.iter().any(|k| entry_keys.contains(k)))
+            {
+                Some(i) => {
+                    merged = true;
+                    let (target, keys) = &mut kept[i];
+                    // `entry` was registered later, so its name is the current one.
+                    target.name = entry.name;
+                    for r in entry_roots {
+                        target.add_path(r);
+                    }
+                    for id in entry.ids {
+                        if !target.ids.iter().any(|e| e.id == id.id) {
+                            target.ids.push(id);
+                        }
+                    }
+                    if !entry.contributors.is_empty() {
+                        target.contributors = entry.contributors;
+                    }
+                    if target.identity.is_none() {
+                        target.identity = entry.identity;
+                    }
+                    // Missing only if every merged location was missing.
+                    target.missing_since = target.missing_since.and(entry.missing_since);
+                    for k in entry_keys {
+                        if !keys.contains(&k) {
+                            keys.push(k);
+                        }
+                    }
+                }
+                None => kept.push((entry, entry_keys)),
+            }
+        }
+        self.repos = kept.into_iter().map(|(e, _)| e).collect();
+        merged
     }
 
     /// Set the stable forge identities for a named entry (#233), replacing any
@@ -766,6 +824,40 @@ mod tests {
         check!(reg.upsert_repo(entry("a", "/a2")) == Resolution::Updated);
         check!(reg.repos.len() == 1);
         check!(reg.repos[0].root == PathBuf::from("/a2"));
+    }
+
+    // #350: a rename re-registers the same root under a new name. Even without an
+    // id match, the same-root entries collapse into one and the new name wins.
+    #[test]
+    fn dedup_by_root_folds_a_renamed_duplicate() {
+        let mut reg = Registry::default();
+        reg.repos.push(entry("oldname", "/work/proj"));
+        reg.repos.push(entry("newname", "/work/proj"));
+        check!(reg.dedup_by_root());
+        check!(reg.repos.len() == 1);
+        check!(reg.repos[0].name == "newname"); // most recently registered wins
+    }
+
+    // Distinct repos at distinct roots are left untouched.
+    #[test]
+    fn dedup_by_root_keeps_distinct_repos() {
+        let mut reg = Registry::default();
+        reg.repos.push(entry("a", "/work/a"));
+        reg.repos.push(entry("b", "/work/b"));
+        check!(!reg.dedup_by_root());
+        check!(reg.repos.len() == 2);
+    }
+
+    // Folding a same-root duplicate unions forge ids so neither identity is lost.
+    #[test]
+    fn dedup_by_root_unions_ids() {
+        let mut reg = Registry::default();
+        reg.repos.push(entry_with_id("old", "/work/proj", "x"));
+        reg.repos.push(entry_with_id("new", "/work/proj", "y"));
+        check!(reg.dedup_by_root());
+        check!(reg.repos.len() == 1);
+        check!(reg.repos[0].ids.iter().any(|r| r.id == "x"));
+        check!(reg.repos[0].ids.iter().any(|r| r.id == "y"));
     }
 
     // `record` applies under the lock and reports it.
