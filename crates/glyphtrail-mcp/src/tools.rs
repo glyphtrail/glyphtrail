@@ -1332,18 +1332,16 @@ mod tests {
     // (but never on list_repos, the discovery escape hatch).
     #[test]
     fn analyze_is_the_only_writing_tool() {
-        let read_only = |name: &str| -> Value {
-            definitions(true)
-                .into_iter()
-                .find(|d| d["name"] == json!(name))
-                .unwrap()["annotations"]["readOnlyHint"]
-                .clone()
-        };
-        // analyze rebuilds the index — a write; everything else is read-only (#362).
-        check!(read_only("analyze") == json!(false));
-        check!(read_only("search") == json!(true));
-        check!(read_only("impact") == json!(true));
-        check!(read_only("list_repos") == json!(true));
+        // Every tool is read-only except analyze, which rebuilds the index (#362).
+        // Iterate all of them so a stray write hint can't slip through.
+        for def in definitions(true) {
+            let name = def["name"].as_str().unwrap().to_string();
+            let read_only = def["annotations"]["readOnlyHint"] == json!(true);
+            check!(
+                read_only == (name != "analyze"),
+                "{name} has the wrong readOnlyHint"
+            );
+        }
     }
 
     #[test]
