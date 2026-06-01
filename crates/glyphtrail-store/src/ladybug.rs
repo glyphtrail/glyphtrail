@@ -1136,7 +1136,7 @@ mod tests {
         {
             let mut lb = LadybugStore::open(&dir).unwrap();
             lb.insert_graph(&[node("a", "stale")], &[]).unwrap();
-            lb.set_meta("schema_version", "0").unwrap(); // simulate an older index
+            lb.set_meta("schema_version", "1").unwrap(); // a pre-#344 ("1") index
         }
         // Reopen: the version mismatch drops + recreates, wiping stale data.
         let lb = LadybugStore::open(&dir).unwrap();
