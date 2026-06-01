@@ -90,6 +90,7 @@ pub fn build_rest_graph(
             language: Some(lang.name().to_string()),
             span: Some(ep.span),
             doc: None,
+            signature: None,
         });
         rg.operations.push((ep_id.clone(), key));
 
@@ -157,6 +158,7 @@ pub fn build_rest_graph(
                     language: Some(lang.name().to_string()),
                     span: Some(rm.span),
                     doc: None,
+                    signature: None,
                 });
             }
         }
@@ -199,6 +201,7 @@ pub fn build_grpc_graph(
             language: Some(lang.name().to_string()),
             span: Some(ep.span),
             doc: None,
+            signature: None,
         });
         rg.operations
             .push((ep_id.clone(), OperationKey::opaque(Protocol::Grpc, path)));
@@ -247,6 +250,7 @@ pub fn build_graphql_graph(
             language: Some(lang.name().to_string()),
             span: Some(f.span),
             doc: None,
+            signature: None,
         });
         rg.operations
             .push((ep_id.clone(), OperationKey::opaque(Protocol::GraphQl, path)));
@@ -333,6 +337,7 @@ pub fn build_grpc_client_graph(rel_path: &str, source: &str, lang: &Language) ->
             language: Some(lang.name().to_string()),
             span: Some(call.span),
             doc: None,
+            signature: None,
         });
         cg.operations
             .push((id, OperationKey::opaque(Protocol::Grpc, path)));
@@ -364,6 +369,7 @@ pub fn build_ws_client_graph(rel_path: &str, source: &str, lang: &Language) -> C
             language: Some(lang.name().to_string()),
             span: Some(conn.span),
             doc: None,
+            signature: None,
         });
         cg.operations.push((id, key));
     }
@@ -390,6 +396,7 @@ pub fn build_ws_client_graph(rel_path: &str, source: &str, lang: &Language) -> C
             language: Some(lang.name().to_string()),
             span: Some(ev.span),
             doc: None,
+            signature: None,
         });
         cg.operations.push((id, key));
     }
@@ -426,6 +433,7 @@ pub fn build_ws_server_graph(
             language: Some(lang.name().to_string()),
             span: Some(ev.span),
             doc: None,
+            signature: None,
         });
         rg.operations.push((ep_id.clone(), key));
         if ev.handler.is_empty() {
@@ -469,6 +477,7 @@ pub fn build_graphql_client_graph(rel_path: &str, source: &str, lang: &Language)
             language: Some(lang.name().to_string()),
             span: Some(op.span),
             doc: None,
+            signature: None,
         });
         cg.operations
             .push((id, OperationKey::opaque(Protocol::GraphQl, path)));
@@ -501,6 +510,7 @@ pub fn build_client_graph(rel_path: &str, source: &str, lang: &Language) -> Clie
             language: Some(lang.name().to_string()),
             span: Some(call.span),
             doc: None,
+            signature: None,
         });
         cg.operations.push((id, key));
     }
@@ -594,6 +604,7 @@ pub fn build_file_graph(
     lang: &Language,
     file_id: &NodeId,
     parsed: &ParsedFile,
+    source: &str,
 ) -> FileGraph {
     let mut fg = FileGraph::default();
 
@@ -674,6 +685,9 @@ pub fn build_file_graph(
             language: Some(lang.name().to_string()),
             span: Some(d.span),
             doc,
+            // Capture the declaration header now, while the source is the one
+            // that was parsed, so `outline` never re-slices a drifted file (#344).
+            signature: glyphtrail_core::slice_signature(source, d.span, Some(lang.name())),
         });
         fg.symbols.push(SymbolEntry {
             name: d.name.clone(),
@@ -823,6 +837,7 @@ pub fn build_file_graph(
             language: Some(lang.name().to_string()),
             span: Some(c.span),
             doc: Some(text.into_owned()),
+            signature: None,
         });
         fg.graph
             .add_edge(cid, scope, EdgeKind::Documents, Confidence::Extracted);
@@ -851,6 +866,7 @@ mod tests {
                 end_line: 0,
             }),
             doc: None,
+            signature: None,
         }
     }
 

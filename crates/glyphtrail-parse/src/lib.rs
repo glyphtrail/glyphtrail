@@ -97,7 +97,7 @@ mod tests {
             let parsed = parse_source(&lang, src)
                 .unwrap_or_else(|e| panic!("parse failed for {}: {e}", lang.name()));
             let file_id = NodeId::derive(&["file", "x"]);
-            let fg = build_file_graph("x", &lang, &file_id, &parsed);
+            let fg = build_file_graph("x", &lang, &file_id, &parsed, src);
             check!(
                 fg.graph.nodes.iter().any(|n| n.name == "f"),
                 "{} should extract a definition named `f`, got {:?}",
@@ -252,7 +252,7 @@ mod tests {
         let src = format!("// NOTE: rotate {token} soon\nfn f() {{}}\n");
         let parsed = parse_source(&Language::Rust, &src).unwrap();
         let file_id = NodeId::derive(&["file", "c.rs"]);
-        let fg = build_file_graph("c.rs", &Language::Rust, &file_id, &parsed);
+        let fg = build_file_graph("c.rs", &Language::Rust, &file_id, &parsed, &src);
         let comment = fg
             .graph
             .nodes
@@ -329,7 +329,7 @@ class Service:
 "#;
         let parsed = parse_source(&Language::Python, src).unwrap();
         let file_id = NodeId::derive(&["file", "svc.py"]);
-        let fg = build_file_graph("svc.py", &Language::Python, &file_id, &parsed);
+        let fg = build_file_graph("svc.py", &Language::Python, &file_id, &parsed, src);
 
         // Methods nested in a class are reclassified from function to method.
         let handle = fg
@@ -370,7 +370,7 @@ fn app() -> Router {
 "#;
         let parsed = parse_source(&Language::Rust, src).unwrap();
         let file_id = NodeId::derive(&["file", "r.rs"]);
-        let fg = build_file_graph("r.rs", &Language::Rust, &file_id, &parsed);
+        let fg = build_file_graph("r.rs", &Language::Rust, &file_id, &parsed, src);
         let rg = build_rest_graph("r.rs", &Language::Rust, &fg.symbols, src);
 
         let ep = rg
@@ -403,7 +403,7 @@ fn app() -> Router {
 "#;
         let parsed = parse_source(&Language::Rust, src).unwrap();
         let file_id = NodeId::derive(&["file", "r.rs"]);
-        let fg = build_file_graph("r.rs", &Language::Rust, &file_id, &parsed);
+        let fg = build_file_graph("r.rs", &Language::Rust, &file_id, &parsed, src);
         let rg = build_rest_graph("r.rs", &Language::Rust, &fg.symbols, src);
 
         let ep = rg
@@ -436,7 +436,7 @@ fn app() -> Router {
 "#;
         let parsed = parse_source(&Language::Rust, src).unwrap();
         let file_id = NodeId::derive(&["file", "r.rs"]);
-        let fg = build_file_graph("r.rs", &Language::Rust, &file_id, &parsed);
+        let fg = build_file_graph("r.rs", &Language::Rust, &file_id, &parsed, src);
         let rg = build_rest_graph("r.rs", &Language::Rust, &fg.symbols, src);
 
         let sym = |name: &str| {

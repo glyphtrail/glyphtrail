@@ -35,7 +35,7 @@ const MERGE_EDGES: &str = "UNWIND $rows AS r MATCH (a:Node {id:r.src}), (b:Node 
      ON MATCH SET e.confidence = CASE WHEN r.conf = 'extracted' THEN 'extracted' ELSE e.confidence END";
 
 const SCHEMA: &[&str] = &[
-    "CREATE NODE TABLE IF NOT EXISTS Node(id STRING, kind STRING, name STRING, qualified_name STRING, file STRING, language STRING, start_byte INT64, end_byte INT64, start_line INT64, end_line INT64, doc STRING, PRIMARY KEY(id))",
+    "CREATE NODE TABLE IF NOT EXISTS Node(id STRING, kind STRING, name STRING, qualified_name STRING, file STRING, language STRING, start_byte INT64, end_byte INT64, start_line INT64, end_line INT64, doc STRING, signature STRING, PRIMARY KEY(id))",
     "CREATE REL TABLE IF NOT EXISTS Edge(FROM Node TO Node, kind STRING, confidence STRING)",
     "CREATE NODE TABLE IF NOT EXISTS File(path STRING, language STRING, hash STRING, PRIMARY KEY(path))",
     "CREATE NODE TABLE IF NOT EXISTS ApiOp(node_id STRING, protocol STRING, method STRING, path STRING, signature STRING, PRIMARY KEY(node_id))",
@@ -45,7 +45,7 @@ const SCHEMA: &[&str] = &[
 ];
 
 /// Property list a `Node` row returns, in order, so `row_to_node` can decode it.
-const NODE_COLS: &str = "n.id, n.kind, n.name, n.qualified_name, n.file, n.language, n.start_byte, n.end_byte, n.start_line, n.end_line, n.doc";
+const NODE_COLS: &str = "n.id, n.kind, n.name, n.qualified_name, n.file, n.language, n.start_byte, n.end_byte, n.start_line, n.end_line, n.doc, n.signature";
 
 /// Bumped when the node/rel schema shape changes. A stored `schema_version`
 /// other than this triggers a drop + recreate on open (#135); `analyze` then
@@ -228,6 +228,8 @@ impl LadybugStore {
             csv.push_str(&csv_field(n.language.as_deref().unwrap_or("")));
             csv.push_str(&format!(",{sb},{eb},{sl},{el},"));
             csv.push_str(&csv_field(n.doc.as_deref().unwrap_or("")));
+            csv.push(',');
+            csv.push_str(&csv_field(n.signature.as_deref().unwrap_or("")));
             csv.push('\n');
         }
         self.copy_into("Node", csv)
@@ -318,6 +320,7 @@ fn row_to_node(row: &[Value]) -> Node {
         language: opt(get_str(row, 5)),
         span,
         doc: opt(get_str(row, 10)),
+        signature: opt(get_str(row, 11)),
     }
 }
 
@@ -529,6 +532,7 @@ impl GraphStore for LadybugStore {
                     ("sl", Value::Int64(sl)),
                     ("el", Value::Int64(el)),
                     ("doc", s(n.doc.as_deref().unwrap_or(""))),
+                    ("sig", s(n.signature.as_deref().unwrap_or(""))),
                 ]
             })
             .collect();
@@ -537,7 +541,7 @@ impl GraphStore for LadybugStore {
             "UNWIND $rows AS r MERGE (n:Node {id:r.id}) SET n.kind=r.kind, \
              n.name=r.name, n.qualified_name=r.qn, n.file=r.file, n.language=r.lang, \
              n.start_byte=r.sb, n.end_byte=r.eb, n.start_line=r.sl, n.end_line=r.el, \
-             n.doc=r.doc",
+             n.doc=r.doc, n.signature=r.sig",
             node_rows,
         )?;
         self.exec_unwind(&conn, MERGE_EDGES, edge_rows(edges))
@@ -841,8 +845,10 @@ impl GraphStore for LadybugStore {
             .map(|r| {
                 (
                     row_to_node(r),
-                    parse_edge_kind(&get_str(r, 11)),
-                    parse_conf(&get_str(r, 12)),
+                    // Edge columns follow the node's; NODE_COLS has 12 (incl.
+                    // signature, #344), so e.kind/e.confidence are at 12/13.
+                    parse_edge_kind(&get_str(r, 12)),
+                    parse_conf(&get_str(r, 13)),
                 )
             })
             .filter(|(_, k, _)| kind.is_none_or(|want| *k == want))
@@ -1046,6 +1052,7 @@ mod tests {
                 end_line: 4,
             }),
             doc: None,
+            signature: None,
         }
     }
 

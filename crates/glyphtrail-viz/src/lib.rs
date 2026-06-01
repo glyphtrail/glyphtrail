@@ -184,6 +184,7 @@ mod tests {
             language: Some("rust".into()),
             span: None,
             doc: None,
+            signature: None,
         }
     }
     fn edge(src: &str, dst: &str, kind: EdgeKind) -> Edge {

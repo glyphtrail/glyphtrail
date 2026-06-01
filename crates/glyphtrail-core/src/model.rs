@@ -180,6 +180,12 @@ pub struct Node {
     pub span: Option<Span>,
     /// Colocated design-rationale / doc comment text attached to this symbol.
     pub doc: Option<String>,
+    /// Declaration header (signature) captured at parse time, so `outline` reads
+    /// it from the graph instead of re-slicing the live file — which garbles when
+    /// the index is stale (#344). `None` for nodes without a declaration and for
+    /// legacy indexes built before this field existed.
+    #[serde(default)]
+    pub signature: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

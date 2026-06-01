@@ -276,6 +276,7 @@ mod tests {
                 end_line: 1,
             }),
             doc: None,
+            signature: None,
         };
         store.insert_graph(&[n], &[] as &[Edge]).unwrap();
         store.set_file("src/main.rs", Some("rust"), "h").unwrap();

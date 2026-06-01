@@ -76,9 +76,13 @@ pub fn outline_symbol(node: &Node, source: Option<&str>, detail: Detail) -> Outl
     let line = node.span.map(|s| s.start_line).unwrap_or(0);
     let signature = match detail {
         Detail::Minimal => None,
-        Detail::Standard | Detail::Full => source
-            .zip(node.span)
-            .and_then(|(src, span)| slice_signature(src, span, node.language.as_deref())),
+        // Prefer the signature captured at parse time (#344); fall back to slicing
+        // the source for legacy indexes built before that field existed.
+        Detail::Standard | Detail::Full => node.signature.clone().or_else(|| {
+            source
+                .zip(node.span)
+                .and_then(|(src, span)| slice_signature(src, span, node.language.as_deref()))
+        }),
     };
     let doc = match detail {
         Detail::Full => node
@@ -163,7 +167,17 @@ fn brace_header(rest: &str) -> Option<&str> {
             continue;
         }
         match c {
-            '"' | '\'' | '`' => string = Some(c),
+            '"' | '`' => string = Some(c),
+            // A `'` opens a string-like span to skip only for a char literal
+            // (`'x'`, `'\n'`). A Rust lifetime (`'a`, `&'a`, `'static`) is code:
+            // treating it as a string used to swallow the rest of the header and
+            // miss the body `{`, so signatures bled into the body (#344).
+            '\'' => {
+                let b = rest.as_bytes();
+                if b.get(i + 1) == Some(&b'\\') || b.get(i + 2) == Some(&b'\'') {
+                    string = Some('\'');
+                }
+            }
             '(' | '[' => depth += 1,
             ')' | ']' => depth -= 1,
             '{' if depth <= 0 => return Some(&rest[..i]),
@@ -240,6 +254,17 @@ mod tests {
     }
 
     #[test]
+    fn rust_lifetimes_do_not_swallow_the_body() {
+        // `'a` is a lifetime, not a char literal: the scanner must still find the
+        // body `{` rather than treating `'...'` as a string and bleeding the
+        // header into the body (#344).
+        check!(
+            sig("fn f<'a>(x: &'a str) -> &'a str {\n  x\n}", "rust")
+                == Some("fn f<'a>(x: &'a str) -> &'a str".into())
+        );
+    }
+
+    #[test]
     fn python_uses_first_line() {
         check!(
             sig("def run(self, x: int) -> str:\n    pass", "python")
@@ -281,6 +306,30 @@ mod tests {
     }
 
     #[test]
+    fn outline_prefers_the_stored_signature_over_slicing() {
+        let node = Node {
+            id: crate::model::NodeId("n".into()),
+            kind: NodeKind::Function,
+            name: "go".into(),
+            qualified_name: "go".into(),
+            file: "a.rs".into(),
+            language: Some("rust".into()),
+            span: Some(Span {
+                start_byte: 0,
+                end_byte: 5,
+                start_line: 1,
+                end_line: 1,
+            }),
+            doc: None,
+            signature: Some("fn go(stored: bool) -> Stored".into()),
+        };
+        // Even with (deliberately wrong) source, the parse-time signature wins —
+        // so a stale working tree can't garble outline (#344).
+        let sym = outline_symbol(&node, Some("fn WRONG() {}"), Detail::Standard);
+        check!(sym.signature.as_deref() == Some("fn go(stored: bool) -> Stored"));
+    }
+
+    #[test]
     fn outline_symbol_respects_detail() {
         let node = Node {
             id: crate::model::NodeId("n".into()),
@@ -296,6 +345,7 @@ mod tests {
                 end_line: 7,
             }),
             doc: Some("Does the thing.\nMore.".into()),
+            signature: None,
         };
         let src = "fn go() -> u8 {\n  1\n}";
         let min = outline_symbol(&node, Some(src), Detail::Minimal);

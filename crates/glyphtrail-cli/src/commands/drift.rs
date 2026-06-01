@@ -197,6 +197,7 @@ mod tests {
                 end_line: 1,
             }),
             doc: None,
+            signature: None,
         }
     }
 

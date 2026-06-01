@@ -1015,6 +1015,7 @@ mod tests {
                 end_line: 4,
             }),
             doc: None,
+            signature: None,
         };
         store
             .insert_graph(
@@ -1066,6 +1067,7 @@ mod tests {
                         language: Some("rust".into()),
                         span: None,
                         doc: None,
+                        signature: None,
                     }],
                     &[],
                 )
@@ -1203,6 +1205,7 @@ mod tests {
                         language: Some("rust".into()),
                         span: None,
                         doc: None,
+                        signature: None,
                     }],
                     &[],
                 )
