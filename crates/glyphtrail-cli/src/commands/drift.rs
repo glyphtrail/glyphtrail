@@ -72,6 +72,7 @@ impl Report {
 pub fn run(args: DriftArgs) -> Result<()> {
     let paths = RepoPaths::new(&args.repo);
     let store = backend::open_existing(&paths)?;
+    crate::commands::note_staleness(&args.repo, store.as_ref());
     let report = reconcile(store.as_ref())?;
 
     match args.format {

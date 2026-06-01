@@ -16,6 +16,7 @@ use crate::ui;
 pub fn run(repo: &Path, path: &str, detail: Detail, emit: Emit) -> Result<()> {
     let paths = RepoPaths::new(repo);
     let store = backend::open_existing(&paths)?;
+    crate::commands::note_staleness(repo, store.as_ref());
     let prefix = repo_relative(repo, path);
 
     // Indexed files under `path` (a single file matches itself).
