@@ -16,6 +16,7 @@ pub fn note_staleness(repo: &Path, store: &dyn GraphStore) {
 }
 
 pub mod config;
+pub mod config_file;
 pub mod cypher;
 pub mod drift;
 pub mod group;

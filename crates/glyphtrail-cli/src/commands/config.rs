@@ -1,28 +1,32 @@
-//! `glyphtrail config` — inspect and edit the per-repo config file
-//! (`.glyphtrail/config.toml`) without hand-editing TOML. Get/set work on dotted
-//! keys (`security.record_sensitive_files`, `impact.test_globs`); a `set` value
-//! is parsed as TOML, so `true`, `42`, and `["a","b"]` keep their types, and any
+//! `glyphtrail config` — inspect and edit the unified per-repo config file
+//! (`glyphtrail.toml`, committed; `.glyphtrail/glyphtrail.toml` with `--local`)
+//! without hand-editing TOML. Get/set work on dotted keys
+//! (`security.record_sensitive_files`, `impact.test_globs`); a `set` value is
+//! parsed as TOML, so `true`, `42`, and `["a","b"]` keep their types, and any
 //! edit is validated against the config schema before it is written.
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, bail};
 use clap::Subcommand;
-use glyphtrail_core::config::{Config, RepoPaths};
+
+use crate::commands::config_file;
 
 #[derive(Subcommand)]
 pub enum ConfigCmd {
-    /// Print the config file (or note that defaults are in effect).
+    /// Print the config file(s) (or note that defaults are in effect).
     Show {
         #[arg(long, default_value = ".")]
         repo: PathBuf,
     },
-    /// Print the config file path.
+    /// Print the config file path (committed, or the personal override with --local).
     Path {
+        #[arg(long)]
+        local: bool,
         #[arg(long, default_value = ".")]
         repo: PathBuf,
     },
-    /// Get a value by dotted key, e.g. `impact.test_globs`.
+    /// Get a value by dotted key (personal override wins over committed).
     Get {
         key: String,
         #[arg(long, default_value = ".")]
@@ -33,12 +37,17 @@ pub enum ConfigCmd {
     Set {
         key: String,
         value: String,
+        /// Write the personal override instead of the committed file.
+        #[arg(long)]
+        local: bool,
         #[arg(long, default_value = ".")]
         repo: PathBuf,
     },
     /// Remove a key by dotted path.
     Unset {
         key: String,
+        #[arg(long)]
+        local: bool,
         #[arg(long, default_value = ".")]
         repo: PathBuf,
     },
@@ -47,79 +56,73 @@ pub enum ConfigCmd {
 pub fn run(cmd: ConfigCmd) -> Result<()> {
     match cmd {
         ConfigCmd::Show { repo } => show(&repo),
-        ConfigCmd::Path { repo } => {
-            println!("{}", config_path(&repo).display());
+        ConfigCmd::Path { local, repo } => {
+            println!("{}", config_file::target(&repo, local).display());
             Ok(())
         }
         ConfigCmd::Get { key, repo } => get(&repo, &key),
-        ConfigCmd::Set { key, value, repo } => set(&repo, &key, &value),
-        ConfigCmd::Unset { key, repo } => unset(&repo, &key),
+        ConfigCmd::Set {
+            key,
+            value,
+            local,
+            repo,
+        } => set(&repo, local, &key, &value),
+        ConfigCmd::Unset { key, local, repo } => unset(&repo, local, &key),
     }
-}
-
-fn config_path(repo: &Path) -> PathBuf {
-    RepoPaths::new(repo).config_path()
-}
-
-/// Load the raw config document, or an empty table when the file is absent.
-fn load_table(path: &Path) -> Result<toml::Table> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => Ok(text.parse::<toml::Table>()?),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(toml::Table::new()),
-        Err(e) => Err(e.into()),
-    }
-}
-
-/// Serialize, validate against the config schema, then write — so an edit never
-/// leaves an invalid config behind.
-fn save_table(path: &Path, table: &toml::Table) -> Result<()> {
-    let text = toml::to_string_pretty(table)?;
-    Config::from_toml_str(&text)
-        .map_err(|e| anyhow!("that edit would make the config invalid: {e}"))?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, text)?;
-    Ok(())
 }
 
 fn show(repo: &Path) -> Result<()> {
-    let path = config_path(repo);
-    match std::fs::read_to_string(&path) {
-        Ok(text) => print!("{text}"),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            println!("no config at {} — defaults are in effect", path.display());
+    let mut any = false;
+    for (label, path) in [
+        ("committed", config_file::committed(repo)),
+        ("local", config_file::local(repo)),
+    ] {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            any = true;
+            println!("# {label}: {}", path.display());
+            print!("{text}");
+            if !text.ends_with('\n') {
+                println!();
+            }
         }
-        Err(e) => return Err(e.into()),
+    }
+    if !any {
+        println!("no config — defaults are in effect");
     }
     Ok(())
 }
 
 fn get(repo: &Path, key: &str) -> Result<()> {
-    let table = load_table(&config_path(repo))?;
-    match lookup(&table, key) {
-        Some(value) => println!("{value}"),
-        None => println!("{key} is not set (the default applies)"),
+    // Personal override wins over the committed file.
+    for path in [config_file::local(repo), config_file::committed(repo)] {
+        let table = config_file::load_table(&path)?;
+        if let Some(value) = lookup(&table, key) {
+            println!("{value}");
+            return Ok(());
+        }
     }
+    println!("{key} is not set (the default applies)");
     Ok(())
 }
 
-fn set(repo: &Path, key: &str, value: &str) -> Result<()> {
-    let path = config_path(repo);
-    let mut table = load_table(&path)?;
+fn set(repo: &Path, local: bool, key: &str, value: &str) -> Result<()> {
+    config_file::migrate_legacy(repo)?;
+    let path = config_file::target(repo, local);
+    let mut table = config_file::load_table(&path)?;
     set_key(&mut table, key, parse_value(value))?;
-    save_table(&path, &table)?;
+    config_file::save(&path, &table)?;
     println!("set {key} ({})", path.display());
     Ok(())
 }
 
-fn unset(repo: &Path, key: &str) -> Result<()> {
-    let path = config_path(repo);
-    let mut table = load_table(&path)?;
+fn unset(repo: &Path, local: bool, key: &str) -> Result<()> {
+    config_file::migrate_legacy(repo)?;
+    let path = config_file::target(repo, local);
+    let mut table = config_file::load_table(&path)?;
     if !unset_key(&mut table, key) {
         bail!("{key} is not set in {}", path.display());
     }
-    save_table(&path, &table)?;
+    config_file::save(&path, &table)?;
     println!("unset {key} ({})", path.display());
     Ok(())
 }
@@ -146,7 +149,9 @@ fn lookup<'a>(table: &'a toml::Table, key: &str) -> Option<&'a toml::Value> {
 
 fn set_key(table: &mut toml::Table, key: &str, value: toml::Value) -> Result<()> {
     let parts: Vec<&str> = key.split('.').collect();
-    let (leaf, parents) = parts.split_last().ok_or_else(|| anyhow!("empty key"))?;
+    let (leaf, parents) = parts
+        .split_last()
+        .ok_or_else(|| anyhow::anyhow!("empty key"))?;
     let mut cur = table;
     for p in parents {
         let entry = cur
@@ -154,7 +159,7 @@ fn set_key(table: &mut toml::Table, key: &str, value: toml::Value) -> Result<()>
             .or_insert_with(|| toml::Value::Table(toml::Table::new()));
         cur = entry
             .as_table_mut()
-            .ok_or_else(|| anyhow!("cannot set '{key}': '{p}' is not a table"))?;
+            .ok_or_else(|| anyhow::anyhow!("cannot set '{key}': '{p}' is not a table"))?;
     }
     cur.insert(leaf.to_string(), value);
     Ok(())
@@ -199,8 +204,14 @@ mod tests {
         check!(
             lookup(&table, "security.record_sensitive_files") == Some(&toml::Value::Boolean(true))
         );
-        let globs = lookup(&table, "impact.test_globs").unwrap();
-        check!(globs.as_array().unwrap().len() == 1);
+        check!(
+            lookup(&table, "impact.test_globs")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len()
+                == 1
+        );
 
         check!(unset_key(&mut table, "security.record_sensitive_files"));
         check!(lookup(&table, "security.record_sensitive_files").is_none());

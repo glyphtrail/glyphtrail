@@ -4,14 +4,22 @@ use serde::Deserialize;
 
 use crate::CoreError;
 use crate::api::Protocol;
+use crate::link_hints::{HINTS_FILE, LOCAL_HINTS_FILE, LinkHint};
 use crate::rewrite::PrefixRewrite;
 
 /// Per-repo layout. The index lives in `<repo>/.glyphtrail/`.
 pub const INDEX_DIR: &str = ".glyphtrail";
 pub const DB_FILE: &str = "graph.db";
 pub const IGNORE_FILE: &str = ".glyphtrailignore";
-/// Optional per-repo config file, read from `<repo>/.glyphtrail/config.toml`.
-pub const CONFIG_FILE: &str = "config.toml";
+/// The unified per-repo config file. Committed at the repo root
+/// (`<repo>/glyphtrail.toml`, team-shared); an optional same-named file inside
+/// `.glyphtrail/` is a gitignored personal override merged on top. Holds the
+/// analysis settings *and* the cross-repo `[[links]]` hints.
+pub const CONFIG_FILE: &str = "glyphtrail.toml";
+/// Pre-unification config file (analysis only), still read for back-compat from
+/// `<repo>/.glyphtrail/config.toml` and folded into the unified file on the next
+/// `config`/`link` edit.
+pub const LEGACY_CONFIG_FILE: &str = "config.toml";
 
 /// Pre-rename names, silently migrated to the current ones when found (#293,
 /// the project was `stratograph`). The per-repo ignore file is still *honored*
@@ -50,14 +58,27 @@ impl RepoPaths {
         std::fs::create_dir_all(&self.index_dir)
     }
 
-    /// Path to the optional per-repo config file.
-    pub fn config_path(&self) -> PathBuf {
+    /// The committed, team-shared config file at the repo root
+    /// (`<repo>/glyphtrail.toml`).
+    pub fn committed_config_path(&self) -> PathBuf {
+        self.root.join(CONFIG_FILE)
+    }
+
+    /// The gitignored personal config override (`.glyphtrail/glyphtrail.toml`).
+    pub fn local_config_path(&self) -> PathBuf {
         self.index_dir.join(CONFIG_FILE)
+    }
+
+    /// The pre-unification analysis config (`.glyphtrail/config.toml`), still read
+    /// for back-compat.
+    pub fn legacy_config_path(&self) -> PathBuf {
+        self.index_dir.join(LEGACY_CONFIG_FILE)
     }
 }
 
-/// Per-repo configuration, read from `.glyphtrail/config.toml`. Every field has a
-/// default, so a missing or partial file is always valid.
+/// Per-repo configuration, read from the unified `glyphtrail.toml` (committed)
+/// overlaid by `.glyphtrail/glyphtrail.toml` (personal); see [`Config::load`].
+/// Every field has a default, so a missing or partial file is always valid.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -74,6 +95,10 @@ pub struct Config {
     pub impact: ImpactConfig,
     /// Security / sensitive-data handling.
     pub security: SecurityConfig,
+    /// Manual cross-repo link hints (#281): relationships the auto-resolver can't
+    /// infer (a service called over HTTP with no shared package). Unioned across
+    /// the committed and personal config files.
+    pub links: Vec<LinkHint>,
 }
 
 /// Security configuration.
@@ -128,19 +153,90 @@ pub struct DynamicLanguage {
     pub query: PathBuf,
 }
 
-impl Config {
-    /// Load config for a repo, returning defaults when the file is absent.
-    pub fn load(repo_root: impl AsRef<Path>) -> crate::Result<Config> {
-        let path = RepoPaths::new(repo_root).config_path();
-        match std::fs::read_to_string(&path) {
-            Ok(text) => Config::parse(&text, &path),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
-            Err(source) => Err(CoreError::ConfigRead { path, source }),
+/// Read a TOML file into a table, or `None` when it's absent.
+fn read_table(path: &Path) -> crate::Result<Option<toml::Table>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let table = text
+                .parse::<toml::Table>()
+                .map_err(|source| CoreError::ConfigParse {
+                    path: path.to_path_buf(),
+                    source: Box::new(source),
+                })?;
+            Ok(Some(table))
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(CoreError::ConfigRead {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// Take the `[[links]]` array out of a config table, returning its entries (so
+/// links can be unioned across sources rather than overridden).
+fn take_links(table: &mut toml::Table) -> Vec<toml::Value> {
+    match table.remove("links") {
+        Some(toml::Value::Array(items)) => items,
+        _ => Vec::new(),
+    }
+}
+
+/// Overlay `over` onto `base`: nested tables merge recursively; every other
+/// value (scalar or array) is replaced by `over`'s.
+fn deep_merge(base: &mut toml::Table, over: toml::Table) {
+    for (key, value) in over {
+        match (base.get_mut(&key), value) {
+            (Some(toml::Value::Table(bt)), toml::Value::Table(ot)) => deep_merge(bt, ot),
+            (_, value) => {
+                base.insert(key, value);
+            }
+        }
+    }
+}
+
+impl Config {
+    /// Load the effective config for a repo: the committed `glyphtrail.toml`
+    /// overlaid by the personal `.glyphtrail/glyphtrail.toml`, plus — for
+    /// back-compat — the legacy `.glyphtrail/config.toml` and the standalone link
+    /// files. Analysis settings override low→high (legacy < committed < personal);
+    /// `[[links]]` from every source are unioned. Absent files are skipped, so a
+    /// repo with no config is the default.
+    pub fn load(repo_root: impl AsRef<Path>) -> crate::Result<Config> {
+        let paths = RepoPaths::new(repo_root);
+        let mut analysis = toml::Table::new();
+        let mut links: Vec<toml::Value> = Vec::new();
+
+        // Analysis config + any inline links, low→high precedence.
+        for path in [
+            paths.legacy_config_path(),    // legacy analysis (.glyphtrail/config.toml)
+            paths.committed_config_path(), // committed (<repo>/glyphtrail.toml)
+            paths.local_config_path(),     // personal (.glyphtrail/glyphtrail.toml)
+        ] {
+            if let Some(mut table) = read_table(&path)? {
+                links.append(&mut take_links(&mut table));
+                deep_merge(&mut analysis, table);
+            }
+        }
+        // Legacy standalone link files (committed root + gitignored personal).
+        for path in [
+            paths.root.join(HINTS_FILE),
+            paths.index_dir.join(LOCAL_HINTS_FILE),
+        ] {
+            if let Some(mut table) = read_table(&path)? {
+                links.append(&mut take_links(&mut table));
+            }
+        }
+        if !links.is_empty() {
+            analysis.insert("links".to_string(), toml::Value::Array(links));
+        }
+
+        let text = toml::to_string(&analysis).unwrap_or_default();
+        Config::parse(&text, &paths.committed_config_path())
     }
 
     pub fn from_toml_str(text: &str) -> crate::Result<Config> {
-        Config::parse(text, Path::new("config.toml"))
+        Config::parse(text, Path::new(CONFIG_FILE))
     }
 
     /// Parse and validate config, attaching `path` to any error for diagnostics.
