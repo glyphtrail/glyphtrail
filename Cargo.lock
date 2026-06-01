@@ -709,6 +709,7 @@ dependencies = [
  "serde_json",
  "serde_norway",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "ureq",

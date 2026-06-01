@@ -155,6 +155,11 @@ enum Command {
         #[command(subcommand)]
         cmd: commands::link::LinkCmd,
     },
+    /// Inspect and edit the per-repo config (.glyphtrail/config.toml).
+    Config {
+        #[command(subcommand)]
+        cmd: commands::config::ConfigCmd,
+    },
     /// Manage named groups of repositories (~/.glyphtrail/groups.json).
     Group {
         #[command(subcommand)]
@@ -332,6 +337,7 @@ fn main() -> anyhow::Result<()> {
         Command::Repo { cmd } => commands::repo::run(cmd),
         Command::Remote { cmd } => commands::remote::run(cmd),
         Command::Link { cmd } => commands::link::run(cmd),
+        Command::Config { cmd } => commands::config::run(cmd),
         Command::Group { cmd } => commands::group::run(cmd),
         Command::Status {
             repo,

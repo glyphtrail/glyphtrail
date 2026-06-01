@@ -172,6 +172,13 @@ tasks:
     cmds:
       - cargo run -p glyphtrail-cli {{.PROFILE_FLAG}} -- link {{.CLI_ARGS}}
 
+  # Inspect/edit the per-repo config (.glyphtrail/config.toml).
+  # Example: `task config -- show` or `task config -- set security.record_sensitive_files true`
+  config:
+    desc: 'Inspect/edit the per-repo config (pass args after --, e.g. task config -- show)'
+    cmds:
+      - cargo run -p glyphtrail-cli {{.PROFILE_FLAG}} -- config {{.CLI_ARGS}}
+
   # Emits a shell completion script to stdout.
   # Override shell: `task completions SHELL_KIND=zsh`
   completions:
