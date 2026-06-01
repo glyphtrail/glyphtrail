@@ -37,6 +37,10 @@ pub enum NodeKind {
     Interface,
     Enum,
     Trait,
+    /// A value symbol with no executable body: a constant/equate or a data
+    /// definition (assembly `=` / `ds` / `hex` / `dfb` / …), as opposed to a
+    /// callable routine (#369).
+    Constant,
     Comment,
     /// A server-side API operation (REST route, gRPC method, GraphQL field).
     Endpoint,
@@ -64,6 +68,7 @@ impl NodeKind {
             NodeKind::Interface => "interface",
             NodeKind::Enum => "enum",
             NodeKind::Trait => "trait",
+            NodeKind::Constant => "constant",
             NodeKind::Comment => "comment",
             NodeKind::Endpoint => "endpoint",
             NodeKind::ClientCall => "client_call",

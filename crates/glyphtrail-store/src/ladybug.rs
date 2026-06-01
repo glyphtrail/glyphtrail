@@ -340,6 +340,7 @@ fn parse_kind(s: &str) -> NodeKind {
         "interface" => NodeKind::Interface,
         "enum" => NodeKind::Enum,
         "trait" => NodeKind::Trait,
+        "constant" => NodeKind::Constant,
         "comment" => NodeKind::Comment,
         "endpoint" => NodeKind::Endpoint,
         "client_call" => NodeKind::ClientCall,

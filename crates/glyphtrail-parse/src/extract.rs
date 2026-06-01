@@ -58,6 +58,7 @@ fn kind_from_suffix(suffix: &str) -> Option<NodeKind> {
         "trait" => NodeKind::Trait,
         "interface" => NodeKind::Interface,
         "module" => NodeKind::Module,
+        "constant" => NodeKind::Constant,
         _ => return None,
     })
 }

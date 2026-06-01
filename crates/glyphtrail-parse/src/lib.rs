@@ -216,6 +216,19 @@ mod tests {
         );
     }
 
+    // #369: a code label is a callable Function; a label on an assembler
+    // directive (equate `=`, storage `ds`) is a Constant value, not a routine.
+    #[test]
+    fn merlin_splits_code_routines_from_data_constants() {
+        use glyphtrail_core::NodeKind;
+        let parsed =
+            parse_source(&Language::Merlin6502, "routine rts\nwidth = 5\nbuf ds 30\n").unwrap();
+        let kind = |name: &str| parsed.defs.iter().find(|d| d.name == name).map(|d| d.kind);
+        check!(kind("routine") == Some(NodeKind::Function));
+        check!(kind("width") == Some(NodeKind::Constant));
+        check!(kind("buf") == Some(NodeKind::Constant));
+    }
+
     // #5: `new Foo()` constructor instantiation is a reference to the class, so
     // it is captured as a call in JS/TS/TSX and Java (Python `Foo()` already is).
     #[test]
