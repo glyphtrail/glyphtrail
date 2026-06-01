@@ -47,6 +47,9 @@ pub fn resolve_import(importer_rel: &str, raw: &str, lang: &Language) -> Vec<Str
         | Language::Zig
         | Language::R
         | Language::Dart
+        // Merlin PUT/USE includes are recorded raw; file-node resolution (append
+        // `.S`, resolve against the source dir) is a follow-up (#359).
+        | Language::Merlin6502
         | Language::Other(_) => Vec::new(),
     }
 }

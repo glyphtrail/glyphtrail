@@ -29,6 +29,7 @@ pub fn grammar(lang: &Language) -> Option<TsLanguage> {
         Language::Zig => tree_sitter_zig::LANGUAGE.into(),
         Language::R => tree_sitter_r::LANGUAGE.into(),
         Language::Dart => tree_sitter_dart::LANGUAGE.into(),
+        Language::Merlin6502 => tree_sitter_merlin6502::LANGUAGE.into(),
         Language::Other(_) => return None,
     })
 }
@@ -65,6 +66,7 @@ pub fn query_source(lang: &Language) -> Option<&'static str> {
         Language::Zig => include_str!("../queries/zig.scm"),
         Language::R => include_str!("../queries/r.scm"),
         Language::Dart => include_str!("../queries/dart.scm"),
+        Language::Merlin6502 => include_str!("../queries/merlin6502.scm"),
         Language::Other(_) => return None,
     })
 }

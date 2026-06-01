@@ -31,6 +31,8 @@ pub enum Language {
     Zig,
     R,
     Dart,
+    /// Merlin 6502 assembly (#359).
+    Merlin6502,
     /// A language identified by name but not built in (dynamically loaded).
     Other(String),
 }
@@ -61,13 +63,15 @@ impl Language {
             Language::Zig => "zig",
             Language::R => "r",
             Language::Dart => "dart",
+            Language::Merlin6502 => "merlin6502",
             Language::Other(name) => name,
         }
     }
 
     /// Best-effort detection from a file extension.
     pub fn from_path(path: &Path) -> Option<Language> {
-        let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+        let raw = path.extension()?.to_str()?;
+        let ext = raw.to_ascii_lowercase();
         Some(match ext.as_str() {
             "rs" => Language::Rust,
             "py" | "pyi" => Language::Python,
@@ -92,6 +96,10 @@ impl Language {
             "zig" => Language::Zig,
             "r" => Language::R,
             "dart" => Language::Dart,
+            // Uppercase `.S` is the Merlin / Apple II convention; lowercase `.s`
+            // is left to generic assemblers (GNU as). A non-6502 `.S` repo can
+            // override via a per-repo dynamic `[[languages]]` entry (#359).
+            "s" if raw == "S" => Language::Merlin6502,
             _ => return None,
         })
     }
@@ -121,11 +129,12 @@ impl Language {
             "zig" => Language::Zig,
             "r" => Language::R,
             "dart" => Language::Dart,
+            "merlin6502" | "merlin" => Language::Merlin6502,
             _ => return None,
         })
     }
 
-    pub const ALL: [Language; 23] = [
+    pub const ALL: [Language; 24] = [
         Language::Rust,
         Language::Python,
         Language::JavaScript,
@@ -149,5 +158,21 @@ impl Language {
         Language::Zig,
         Language::R,
         Language::Dart,
+        Language::Merlin6502,
     ];
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use assert2::check;
+
+    // #359: Merlin claims uppercase `.S` (Apple II convention); lowercase `.s`
+    // stays with generic assemblers.
+    #[test]
+    fn merlin_claims_uppercase_s_only() {
+        check!(Language::from_path(Path::new("CUBE.S")) == Some(Language::Merlin6502));
+        check!(Language::from_path(Path::new("boot.s")).is_none());
+        check!(Language::from_name("merlin6502") == Some(Language::Merlin6502));
+    }
 }
