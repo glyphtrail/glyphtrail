@@ -2,16 +2,18 @@
 //! detail — the compact "shape of the code" view an agent (or human) reads to
 //! get oriented before diving into impact or queries.
 //!
-//! Signatures are sliced from source **on demand**: a definition node's span
-//! starts at the `fn`/`struct`/`def` keyword, so the header is
-//! `source[span.start_byte .. body_opener]`. This needs no stored signature and
-//! no reindex; a missing/edited source simply drops back to name + kind.
+//! Signatures are captured at parse time and stored on the node, so `outline`
+//! reads them from the graph without touching the file (#344) — a stale or
+//! edited working tree can't garble them, and there is no query-time I/O.
 //!
-//! The slicer is a small best-effort lexer, not a parser: it tracks `()`/`[]`
-//! depth and string literals so a `{` inside an argument or a string doesn't
-//! end the header early, and it is bounded so a pathological span can't run
-//! away. It does not track block comments — a `{` inside a comment in a header
-//! is rare enough to accept.
+//! The slicer below is what captures the header at analyze time (a definition
+//! node's span starts at the `fn`/`struct`/`def` keyword, so the header is
+//! `source[span.start_byte .. body_opener]`), and it is also the fallback for
+//! legacy indexes that predate the stored field. It is a small best-effort
+//! lexer, not a parser: it tracks `()`/`[]` depth and string literals so a `{`
+//! inside an argument or a string doesn't end the header early, and it is
+//! bounded so a pathological span can't run away. It does not track block
+//! comments — a `{` inside a comment in a header is rare enough to accept.
 
 use serde::Serialize;
 
@@ -137,7 +139,7 @@ fn is_brace_family(language: Option<&str>) -> bool {
 pub fn slice_signature(source: &str, span: Span, language: Option<&str>) -> Option<String> {
     let rest = source.get(span.start_byte..)?; // node start is a char boundary
     let header = if is_brace_family(language) {
-        brace_header(rest).unwrap_or_else(|| first_line(rest))
+        brace_header(rest, language == Some("rust")).unwrap_or_else(|| first_line(rest))
     } else {
         first_line(rest)
     };
@@ -147,7 +149,12 @@ pub fn slice_signature(source: &str, span: Span, language: Option<&str>) -> Opti
 
 /// The slice up to the body's opening `{` at top level (not inside `()`/`[]` or
 /// a string). `None` if no such `{` within the bounds → caller uses first line.
-fn brace_header(rest: &str) -> Option<&str> {
+///
+/// `is_rust` flips how a `'` is read: in Rust it is usually a lifetime (`'a`,
+/// `&'a`, `'static`) — code, not a string — and only a char literal (`'x'`,
+/// `'\n'`, `'{'`) is a span to skip. In every other brace language a single
+/// quote opens a string, so it is consumed wholesale as before.
+fn brace_header(rest: &str, is_rust: bool) -> Option<&str> {
     let mut depth: i32 = 0;
     let mut string: Option<char> = None;
     let mut escaped = false;
@@ -168,13 +175,14 @@ fn brace_header(rest: &str) -> Option<&str> {
         }
         match c {
             '"' | '`' => string = Some(c),
-            // A `'` opens a string-like span to skip only for a char literal
-            // (`'x'`, `'\n'`). A Rust lifetime (`'a`, `&'a`, `'static`) is code:
-            // treating it as a string used to swallow the rest of the header and
-            // miss the body `{`, so signatures bled into the body (#344).
+            // In Rust a `'` is treated as a string only for a char literal
+            // (`'x'`, `'\n'`, `'{'`); a lifetime (`'a`, `&'a`) is code, so it
+            // must not swallow the header looking for a close (#344). Every other
+            // brace language single-quotes strings, so a `'` opens one there.
             '\'' => {
                 let b = rest.as_bytes();
-                if b.get(i + 1) == Some(&b'\\') || b.get(i + 2) == Some(&b'\'') {
+                let char_lit = b.get(i + 1) == Some(&b'\\') || b.get(i + 2) == Some(&b'\'');
+                if !is_rust || char_lit {
                     string = Some('\'');
                 }
             }
@@ -262,6 +270,13 @@ mod tests {
             sig("fn f<'a>(x: &'a str) -> &'a str {\n  x\n}", "rust")
                 == Some("fn f<'a>(x: &'a str) -> &'a str".into())
         );
+    }
+
+    #[test]
+    fn non_rust_single_quoted_string_brace_is_not_the_body() {
+        // JS/TS/PHP single-quote strings: a `{` inside one must not be mistaken
+        // for the body brace (the Rust lifetime handling must not regress this).
+        check!(sig("const f = () => 'x{y'", "javascript") == Some("const f = () => 'x{y'".into()));
     }
 
     #[test]
