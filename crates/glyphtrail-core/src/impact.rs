@@ -343,9 +343,57 @@ pub struct ClassifiedItem {
     pub path: Vec<String>,
 }
 
+/// Coarse risk level for a blast radius, so the headline conveys severity before
+/// any item list (#310 follow-up). Reaching the public API surface or a
+/// cross-boundary consumer is "contract" risk and forces at least [`High`].
+///
+/// [`High`]: ImpactLevel::High
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImpactLevel {
+    /// Nothing impacted.
+    None,
+    /// 1–9 internal dependents.
+    Low,
+    /// 10–49 internal dependents.
+    Medium,
+    /// 50+ dependents, or the change reaches API/cross-boundary surface.
+    High,
+    /// 50+ dependents *and* the change reaches API/cross-boundary surface.
+    Critical,
+}
+
+impl ImpactLevel {
+    /// Derive the level from the headline counts.
+    pub fn assess(total: usize, api: usize, cross_boundary: usize) -> Self {
+        let contract = api > 0 || cross_boundary > 0;
+        let big = total >= 50;
+        match total {
+            0 => ImpactLevel::None,
+            _ if big && contract => ImpactLevel::Critical,
+            _ if big || contract => ImpactLevel::High,
+            _ if total >= 10 => ImpactLevel::Medium,
+            _ => ImpactLevel::Low,
+        }
+    }
+
+    /// Uppercase label for the headline (`HIGH`).
+    pub fn label(self) -> &'static str {
+        match self {
+            ImpactLevel::None => "NONE",
+            ImpactLevel::Low => "LOW",
+            ImpactLevel::Medium => "MEDIUM",
+            ImpactLevel::High => "HIGH",
+            ImpactLevel::Critical => "CRITICAL",
+        }
+    }
+}
+
 /// Blast-radius counts.
 #[derive(Debug, Clone, Serialize)]
 pub struct ImpactSummary {
+    /// Coarse risk level derived from the counts below.
+    pub level: ImpactLevel,
     pub total: usize,
     pub tests: usize,
     pub api: usize,
@@ -375,13 +423,17 @@ impl ImpactReport {
         unresolved_files: Vec<String>,
     ) -> Self {
         let count = |c: ImpactClass| items.iter().filter(|i| i.class == c).count();
+        let total = items.len();
+        let api = count(ImpactClass::Api);
+        let cross_boundary = items.iter().filter(|i| i.cross_boundary).count();
         let summary = ImpactSummary {
-            total: items.len(),
+            level: ImpactLevel::assess(total, api, cross_boundary),
+            total,
             tests: count(ImpactClass::Test),
-            api: count(ImpactClass::Api),
+            api,
             entrypoints: count(ImpactClass::Entrypoint),
             internal: count(ImpactClass::Internal),
-            cross_boundary: items.iter().filter(|i| i.cross_boundary).count(),
+            cross_boundary,
             max_distance: items.iter().map(|i| i.distance).max().unwrap_or(0),
         };
         ImpactReport {
@@ -392,12 +444,17 @@ impl ImpactReport {
         }
     }
 
-    /// One-line blast-radius headline.
+    /// One-line blast-radius headline, led by the risk level.
     pub fn headline(&self) -> String {
         let s = &self.summary;
         format!(
-            "blast radius: {} symbols, {} tests, {} API, {} cross-boundary consumers",
-            s.total, s.tests, s.api, s.cross_boundary
+            "impact: {} — {} symbols · {} tests · {} API · {} cross-boundary · max depth {}",
+            s.level.label(),
+            s.total,
+            s.tests,
+            s.api,
+            s.cross_boundary,
+            s.max_distance
         )
     }
 
@@ -413,8 +470,8 @@ impl ImpactReport {
         let mut md = String::new();
         md.push_str("## Impact analysis\n\n");
         md.push_str(&format!(
-            "**Blast radius:** {} symbols · {} tests · {} API surface · {} cross-boundary consumers · max distance {}\n",
-            s.total, s.tests, s.api, s.cross_boundary, s.max_distance
+            "**Impact: {}** — {} symbols · {} tests · {} API surface · {} cross-boundary consumers · max distance {}\n",
+            s.level.label(), s.total, s.tests, s.api, s.cross_boundary, s.max_distance
         ));
 
         let section = |md: &mut String, title: &str, rows: Vec<&ClassifiedItem>| {
@@ -517,6 +574,7 @@ impl FederatedReport {
         crate_level.sort_by(|a, b| (&a.repo, &a.file, &a.via).cmp(&(&b.repo, &b.file, &b.via)));
         crate_level.dedup();
         let mut summary = ImpactSummary {
+            level: ImpactLevel::None,
             total: 0,
             tests: 0,
             api: 0,
@@ -538,6 +596,7 @@ impl FederatedReport {
             }
             summary.max_distance = summary.max_distance.max(i.distance);
         }
+        summary.level = ImpactLevel::assess(summary.total, summary.api, summary.cross_boundary);
         FederatedReport {
             summary,
             repos,
@@ -637,6 +696,18 @@ mod tests {
     fn refs_edge_set_traverses_references_incoming() {
         let rules = edge_rules(&["refs"]).unwrap();
         check!(rules == vec![EdgeRule::incoming(EdgeKind::References)]);
+    }
+
+    #[test]
+    fn risk_level_is_size_and_contract_aware() {
+        use ImpactLevel::*;
+        check!(ImpactLevel::assess(0, 0, 0) == None);
+        check!(ImpactLevel::assess(5, 0, 0) == Low);
+        check!(ImpactLevel::assess(20, 0, 0) == Medium);
+        check!(ImpactLevel::assess(60, 0, 0) == High); // big internal
+        check!(ImpactLevel::assess(5, 1, 0) == High); // small but touches API
+        check!(ImpactLevel::assess(5, 0, 3) == High); // small but cross-boundary
+        check!(ImpactLevel::assess(60, 2, 0) == Critical); // big and contract
     }
 
     #[test]

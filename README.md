@@ -56,6 +56,8 @@ glyphtrail impact <name>                       # seed: a symbol
 glyphtrail impact --file src/api.rs            # seed: every symbol in a file
 glyphtrail impact --since main..HEAD           # seed: changed symbols vs a git range
 glyphtrail impact --staged | --diff            # seed: staged / working-tree changes
+#   reports a risk level (LOW/MEDIUM/HIGH/CRITICAL) and, for a large blast radius,
+#   a capped summary — add --details (full list) or --limit N
 #   [--cross-boundary] reach API consumers (HANDLES/INVOKES/EXPOSES/MOUNTS)
 #   [--edges calls,refs,imports,impl,api] [--depth N] [--min-confidence extracted|inferred]
 #   [--format text|json|md]   [--gate]  exit 2 when the change touches the API surface

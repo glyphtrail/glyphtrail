@@ -37,8 +37,8 @@ pub use identity::{
 };
 pub use impact::{
     Adjacency, ClassifiedItem, CrateLevelHit, Direction, EdgeRule, FederatedReport, ImpactClass,
-    ImpactItem, ImpactPolicy, ImpactReport, ImpactSummary, RepoImpact, classify, compute_impact,
-    edge_rules, is_cross_boundary_path, parse_confidence,
+    ImpactItem, ImpactLevel, ImpactPolicy, ImpactReport, ImpactSummary, RepoImpact, classify,
+    compute_impact, edge_rules, is_cross_boundary_path, parse_confidence,
 };
 pub use lang::Language;
 pub use links::{CrossRepoLink, LinkKind, RepoIdentity, imported_symbols, resolve_links};

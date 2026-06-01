@@ -94,7 +94,8 @@ pub fn definitions(has_default_repo: bool) -> Vec<Value> {
             "impact",
             "Blast radius of a change: seed from a symbol, a file, or a git \
              change set, and report classified, confidence-aware impacted nodes \
-             (tests, API surface, cross-boundary consumers, internal).",
+             (tests, API surface, cross-boundary consumers, internal). The \
+             summary carries a risk level (none/low/medium/high/critical).",
             json!({
                 "name": { "type": "string", "description": "Seed symbol name." },
                 "file": { "type": "string", "description": "Seed every symbol in this repo-relative file." },
