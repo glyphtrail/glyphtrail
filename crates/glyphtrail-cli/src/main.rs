@@ -145,6 +145,11 @@ enum Command {
         #[command(subcommand)]
         cmd: commands::repo::RepoCmd,
     },
+    /// List or delete repositories cloned by `analyze <git-url>` (~/.glyphtrail/remote).
+    Remote {
+        #[command(subcommand)]
+        cmd: commands::remote::RemoteCmd,
+    },
     /// Manage named groups of repositories (~/.glyphtrail/groups.json).
     Group {
         #[command(subcommand)]
@@ -320,6 +325,7 @@ fn main() -> anyhow::Result<()> {
         Command::Mcp { repo } => glyphtrail_mcp::serve_stdio(repo),
         Command::Setup { path, force, home } => commands::setup::run(&path, force, home),
         Command::Repo { cmd } => commands::repo::run(cmd),
+        Command::Remote { cmd } => commands::remote::run(cmd),
         Command::Group { cmd } => commands::group::run(cmd),
         Command::Status {
             repo,
