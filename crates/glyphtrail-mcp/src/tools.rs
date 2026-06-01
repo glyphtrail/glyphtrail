@@ -169,6 +169,12 @@ pub fn definitions(has_default_repo: bool) -> Vec<Value> {
             &[],
         ),
     ];
+    // analyze is the only tool that writes (it rebuilds the index). Mark it so
+    // the agent leaves the re-index decision to the caller rather than the model
+    // assuming every tool is side-effect-free (#362).
+    if let Some(analyze) = defs.iter_mut().find(|d| d["name"] == json!("analyze")) {
+        analyze["annotations"]["readOnlyHint"] = json!(false);
+    }
     if !has_default_repo {
         require_repo_argument(&mut defs);
     }
@@ -914,6 +920,13 @@ fn tool(name: &str, description: &str, mut properties: Value, required: &[&str])
             "properties": properties,
             "required": required,
         },
+        // Default to read-only; `definitions` flips the one writer (analyze) so an
+        // agent can tell a mutating tool from a query without running it (#362).
+        "annotations": {
+            "readOnlyHint": true,
+            "idempotentHint": true,
+            "destructiveHint": false,
+        },
     })
 }
 
@@ -1317,6 +1330,22 @@ mod tests {
     // The advertised schema adapts to the launch mode: with a default repo,
     // `repo` is optional; without one, it is required on every repo-scoped tool
     // (but never on list_repos, the discovery escape hatch).
+    #[test]
+    fn analyze_is_the_only_writing_tool() {
+        let read_only = |name: &str| -> Value {
+            definitions(true)
+                .into_iter()
+                .find(|d| d["name"] == json!(name))
+                .unwrap()["annotations"]["readOnlyHint"]
+                .clone()
+        };
+        // analyze rebuilds the index — a write; everything else is read-only (#362).
+        check!(read_only("analyze") == json!(false));
+        check!(read_only("search") == json!(true));
+        check!(read_only("impact") == json!(true));
+        check!(read_only("list_repos") == json!(true));
+    }
+
     #[test]
     fn schema_marks_repo_required_only_without_a_default_repo() {
         let required_of = |defs: &[Value], name: &str| -> Vec<String> {
