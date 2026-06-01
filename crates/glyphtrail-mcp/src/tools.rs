@@ -335,6 +335,11 @@ fn dispatch(
                 "freshness": freshness,
                 "stale": staleness.is_stale(),
                 "stale_reason": reason,
+                // Which build is answering (#351): the semver alone (a static
+                // 0.1.0) can't distinguish builds, so carry the commit + build time.
+                "version": env!("CARGO_PKG_VERSION"),
+                "commit": env!("GLYPHTRAIL_GIT_COMMIT"),
+                "built": env!("GLYPHTRAIL_BUILD_TIMESTAMP"),
             }))
         }
         other => Err(format!("unknown tool: {other}")),
@@ -1099,6 +1104,19 @@ mod tests {
         let parsed: Value = serde_norway::from_str(text).unwrap();
         check!(parsed["nodes"] == json!(2));
         check!(parsed["edges"] == json!(1));
+        std::fs::remove_dir_all(db.parent().unwrap()).ok();
+    }
+
+    // status reports which build is answering (#351): version + commit + built.
+    #[test]
+    fn status_reports_build_provenance() {
+        let db = build_db("provenance");
+        let res = call(Some(&db), "status", &json!({}));
+        let text = res["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_norway::from_str(text).unwrap();
+        check!(parsed["version"] == json!(env!("CARGO_PKG_VERSION")));
+        check!(!parsed["commit"].as_str().unwrap().is_empty());
+        check!(parsed["built"].as_str().unwrap().contains('T'));
         std::fs::remove_dir_all(db.parent().unwrap()).ok();
     }
 
