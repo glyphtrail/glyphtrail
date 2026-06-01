@@ -15,7 +15,13 @@ use glyphtrail_store::{
 use serde_json::{Value, json};
 
 /// The advertised tool set (`tools/list`).
-pub fn definitions() -> Vec<Value> {
+///
+/// `has_default_repo` reflects whether the server was launched with a `--repo`.
+/// When it was not (the global Claude Desktop bundle, say), the `repo` argument
+/// is promoted to *required* on every repo-scoped tool — both in the JSON schema
+/// (`required`) and in its description — so the agent is steered to name a target
+/// up front rather than relying on a default the server does not have.
+pub fn definitions(has_default_repo: bool) -> Vec<Value> {
     let name_arg = json!({ "name": { "type": "string", "description": "Symbol name." } });
     let proto_arg =
         json!({ "protocol": { "type": "string", "enum": ["rest", "grpc", "graphql"] } });
@@ -23,7 +29,7 @@ pub fn definitions() -> Vec<Value> {
         "path": { "type": "string", "description": "Request path, e.g. /users/{id} or /users/123." },
         "method": { "type": "string", "description": "Optional HTTP method (GET, POST, …)." }
     });
-    vec![
+    let mut defs = vec![
         tool(
             "search",
             "Full-text search over symbol names and doc comments.",
@@ -145,27 +151,54 @@ pub fn definitions() -> Vec<Value> {
             }),
             &[],
         ),
-    ]
+    ];
+    if !has_default_repo {
+        require_repo_argument(&mut defs);
+    }
+    defs
+}
+
+/// Promote `repo` to a required argument on every repo-scoped tool, for a server
+/// with no launch repo. Adds `repo` to each tool's `required` list and rewrites
+/// its description to say so. `list_repos` is skipped — it spans repos and takes
+/// no `repo` — so the agent always has a way to discover a target.
+fn require_repo_argument(defs: &mut [Value]) {
+    const REQUIRED_DESC: &str = "REQUIRED — this server was started without a \
+        launch repo. Target a repository by registered name or filesystem path. \
+        Call list_repos to discover indexed repositories.";
+    for def in defs {
+        if def["name"] == json!("list_repos") {
+            continue;
+        }
+        if let Some(req) = def["inputSchema"]["required"].as_array_mut()
+            && !req.iter().any(|v| v == "repo")
+        {
+            req.push(json!("repo"));
+        }
+        def["inputSchema"]["properties"]["repo"]["description"] = json!(REQUIRED_DESC);
+    }
 }
 
 /// Execute a tool call, returning a `tools/call` result object. Tool-level
 /// failures are reported as `isError` results rather than protocol errors, per
 /// the MCP convention.
-pub fn call(db: &Path, name: &str, args: &Value) -> Value {
-    match dispatch(db, name, args) {
+pub fn call(default_db: Option<&Path>, name: &str, args: &Value) -> Value {
+    match dispatch(default_db, name, args) {
         Ok(value) => text_result(&value, false),
         Err(message) => text_result(&json!({ "error": message }), true),
     }
 }
 
-fn dispatch(db: &Path, name: &str, args: &Value) -> Result<Value, String> {
+fn dispatch(default_db: Option<&Path>, name: &str, args: &Value) -> Result<Value, String> {
     // Registry-level tools span repos and need no per-repo store.
     if name == "list_repos" {
         return list_repos();
     }
     // Resolve the per-call repo selector (#240): a registered name or a path
-    // overrides the server's launch repo; absent, the launch repo is used.
-    let db = target_db(db, args)?;
+    // overrides the server's launch repo; absent, the launch repo is used — and
+    // if the server has no launch repo, the call is rejected (the agent must
+    // name a repo). See `target_db`.
+    let db = target_db(default_db, args)?;
     // analyze writes a fresh index for the target repo; it opens its own store,
     // so it runs before (and instead of) the read-path store open.
     if name == "analyze" {
@@ -293,23 +326,30 @@ fn list_repos() -> Result<Value, String> {
     Ok(Value::Array(repos))
 }
 
-/// Resolve the index anchor path a call targets (#240). With no `repo`
-/// argument, the server's launch `default_db` is used. A `repo` value is first
-/// matched against the global registry by name; if no registered repo matches,
-/// it is treated as a filesystem path to a repository root. Either way the
-/// returned path is the `.glyphtrail/graph.db` anchor beside which the index
-/// lives.
-fn target_db(default_db: &Path, args: &Value) -> Result<PathBuf, String> {
-    let Some(selector) = opt_str(args, "repo") else {
-        return Ok(default_db.to_path_buf());
-    };
-    if let Some(path) = default_registry_path()
-        && let Ok(registry) = Registry::load(&path)
-        && let Some(entry) = registry.get(selector)
-    {
-        return Ok(RepoPaths::new(entry.active_root()).db_path);
+/// Resolve the index anchor path a call targets (#240). A `repo` argument is
+/// first matched against the global registry by name; if no registered repo
+/// matches, it is treated as a filesystem path to a repository root. With no
+/// `repo` argument, the server's launch `default_db` is used — but a server
+/// started without a launch repo (e.g. the globally-installed Claude Desktop
+/// bundle, whose working directory is undefined) has no default, so the call is
+/// rejected and the agent is told to name a repo. Either way the returned path
+/// is the `.glyphtrail/graph.db` anchor beside which the index lives.
+fn target_db(default_db: Option<&Path>, args: &Value) -> Result<PathBuf, String> {
+    if let Some(selector) = opt_str(args, "repo") {
+        if let Some(path) = default_registry_path()
+            && let Ok(registry) = Registry::load(&path)
+            && let Some(entry) = registry.get(selector)
+        {
+            return Ok(RepoPaths::new(entry.active_root()).db_path);
+        }
+        return Ok(RepoPaths::new(Path::new(selector)).db_path);
     }
-    Ok(RepoPaths::new(Path::new(selector)).db_path)
+    default_db.map(Path::to_path_buf).ok_or_else(|| {
+        "no repository selected: this MCP server was started without a default \
+         repo, so pass `repo` (a registered name or a filesystem path) on the \
+         call. Use the `list_repos` tool to see indexed repositories."
+            .to_string()
+    })
 }
 
 /// Open the repo's LadybugDB graph store. `db` is the index anchor path
@@ -697,7 +737,7 @@ fn tool(name: &str, description: &str, mut properties: Value, required: &[&str])
             "repo".to_string(),
             json!({
                 "type": "string",
-                "description": "Target a repository by registered name or filesystem path. Defaults to the server's launch repo."
+                "description": "Target a repository by registered name or filesystem path. Defaults to the server's launch repo; REQUIRED when the server was started without one (e.g. the Claude Desktop bundle) — call list_repos to discover indexed repositories."
             }),
         );
     }
@@ -798,7 +838,7 @@ mod tests {
     #[test]
     fn missing_index_is_a_tool_error() {
         let res = call(
-            Path::new("/nonexistent/glyphtrail.db"),
+            Some(Path::new("/nonexistent/glyphtrail.db")),
             "status",
             &json!({}),
         );
@@ -835,7 +875,7 @@ mod tests {
         }
         // graph.db itself does not exist; open() must fall through to ladybug.
         let res = call(
-            &index_dir.join("graph.db"),
+            Some(index_dir.join("graph.db").as_path()),
             "definition",
             &json!({ "name": "lonely" }),
         );
@@ -849,7 +889,7 @@ mod tests {
     #[test]
     fn callers_tool_returns_the_caller() {
         let db = build_db("callers");
-        let res = call(&db, "callers", &json!({ "name": "callee" }));
+        let res = call(Some(&db), "callers", &json!({ "name": "callee" }));
         check!(res["isError"] == json!(false));
         let text = res["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
@@ -861,7 +901,7 @@ mod tests {
     #[test]
     fn status_tool_reports_counts() {
         let db = build_db("status");
-        let res = call(&db, "status", &json!({}));
+        let res = call(Some(&db), "status", &json!({}));
         let text = res["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
         check!(parsed["nodes"] == json!(2));
@@ -873,7 +913,7 @@ mod tests {
     // registry (empty in CI) and returns an array, even with a bogus db path.
     #[test]
     fn list_repos_needs_no_store_and_returns_an_array() {
-        let res = call(Path::new("/nonexistent/graph.db"), "list_repos", &json!({}));
+        let res = call(None, "list_repos", &json!({}));
         check!(res["isError"] == json!(false));
         let text = res["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
@@ -911,7 +951,7 @@ mod tests {
         }
         // The launch db points nowhere; the `repo` arg redirects to `root`.
         let res = call(
-            Path::new("/nonexistent/graph.db"),
+            Some(Path::new("/nonexistent/graph.db")),
             "definition",
             &json!({ "name": "zonk", "repo": root.to_str().unwrap() }),
         );
@@ -943,7 +983,7 @@ mod tests {
         std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
 
         let res = call(
-            Path::new("/nonexistent/graph.db"),
+            Some(Path::new("/nonexistent/graph.db")),
             "analyze",
             &json!({ "repo": root.to_str().unwrap() }),
         );
@@ -968,7 +1008,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap(); // no .git, no .glyphtrail index
 
         let res = call(
-            Path::new("/nonexistent/graph.db"),
+            Some(Path::new("/nonexistent/graph.db")),
             "analyze",
             &json!({ "repo": root.to_str().unwrap() }),
         );
@@ -983,8 +1023,62 @@ mod tests {
     #[test]
     fn unknown_tool_errors() {
         let db = build_db("unknown");
-        let res = call(&db, "nope", &json!({}));
+        let res = call(Some(&db), "nope", &json!({}));
         check!(res["isError"] == json!(true));
         std::fs::remove_dir_all(db.parent().unwrap()).ok();
+    }
+
+    // The advertised schema adapts to the launch mode: with a default repo,
+    // `repo` is optional; without one, it is required on every repo-scoped tool
+    // (but never on list_repos, the discovery escape hatch).
+    #[test]
+    fn schema_marks_repo_required_only_without_a_default_repo() {
+        let required_of = |defs: &[Value], name: &str| -> Vec<String> {
+            let tool = defs.iter().find(|d| d["name"] == json!(name)).unwrap();
+            tool["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let with_default = definitions(true);
+        check!(!required_of(&with_default, "search").contains(&"repo".to_string()));
+        check!(!required_of(&with_default, "status").contains(&"repo".to_string()));
+
+        let no_default = definitions(false);
+        check!(required_of(&no_default, "search").contains(&"repo".to_string()));
+        check!(required_of(&no_default, "status").contains(&"repo".to_string()));
+        // The seed arg stays required alongside the promoted repo arg.
+        check!(required_of(&no_default, "search").contains(&"query".to_string()));
+        // Discovery tool never requires a repo.
+        check!(!required_of(&no_default, "list_repos").contains(&"repo".to_string()));
+        // The repo description is tightened to flag the requirement.
+        let search = no_default
+            .iter()
+            .find(|d| d["name"] == json!("search"))
+            .unwrap();
+        check!(
+            search["inputSchema"]["properties"]["repo"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("REQUIRED")
+        );
+    }
+
+    // A server started without a launch repo (no `--repo`, as the Claude Desktop
+    // bundle runs) has no default: a tool call that names no `repo` is rejected,
+    // steering the agent to provide one rather than guessing a directory.
+    #[test]
+    fn no_launch_repo_requires_repo_on_the_call() {
+        let res = call(None, "status", &json!({}));
+        check!(res["isError"] == json!(true));
+        let text = res["content"][0]["text"].as_str().unwrap();
+        check!(text.contains("no repository selected"));
+
+        // list_repos still works with no repo, so the agent can discover one.
+        let repos = call(None, "list_repos", &json!({}));
+        check!(repos["isError"] == json!(false));
     }
 }
