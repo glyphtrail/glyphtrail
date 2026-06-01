@@ -169,6 +169,12 @@ pub fn definitions(has_default_repo: bool) -> Vec<Value> {
             &[],
         ),
     ];
+    // analyze is the only tool that writes (it rebuilds the index). Mark it so
+    // the agent leaves the re-index decision to the caller rather than the model
+    // assuming every tool is side-effect-free (#362).
+    if let Some(analyze) = defs.iter_mut().find(|d| d["name"] == json!("analyze")) {
+        analyze["annotations"]["readOnlyHint"] = json!(false);
+    }
     if !has_default_repo {
         require_repo_argument(&mut defs);
     }
@@ -914,6 +920,13 @@ fn tool(name: &str, description: &str, mut properties: Value, required: &[&str])
             "properties": properties,
             "required": required,
         },
+        // Default to read-only; `definitions` flips the one writer (analyze) so an
+        // agent can tell a mutating tool from a query without running it (#362).
+        "annotations": {
+            "readOnlyHint": true,
+            "idempotentHint": true,
+            "destructiveHint": false,
+        },
     })
 }
 
@@ -1317,6 +1330,20 @@ mod tests {
     // The advertised schema adapts to the launch mode: with a default repo,
     // `repo` is optional; without one, it is required on every repo-scoped tool
     // (but never on list_repos, the discovery escape hatch).
+    #[test]
+    fn analyze_is_the_only_writing_tool() {
+        // Every tool is read-only except analyze, which rebuilds the index (#362).
+        // Iterate all of them so a stray write hint can't slip through.
+        for def in definitions(true) {
+            let name = def["name"].as_str().unwrap().to_string();
+            let read_only = def["annotations"]["readOnlyHint"] == json!(true);
+            check!(
+                read_only == (name != "analyze"),
+                "{name} has the wrong readOnlyHint"
+            );
+        }
+    }
+
     #[test]
     fn schema_marks_repo_required_only_without_a_default_repo() {
         let required_of = |defs: &[Value], name: &str| -> Vec<String> {
