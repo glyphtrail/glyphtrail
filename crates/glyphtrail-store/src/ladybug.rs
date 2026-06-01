@@ -818,13 +818,23 @@ impl GraphStore for LadybugStore {
         )
     }
 
-    fn search(&self, query: &str, limit: usize) -> Result<Vec<Node>> {
+    fn search(&self, query: &str, limit: usize, case_sensitive: bool) -> Result<Vec<Node>> {
         // No native FTS; approximate with substring CONTAINS over name/qname/doc.
+        // Case-insensitive by default (#367): lower() both the columns and the
+        // query; `case_sensitive` keeps an exact-case CONTAINS.
+        let where_clause = if case_sensitive {
+            "n.name CONTAINS $q OR n.qualified_name CONTAINS $q OR n.doc CONTAINS $q"
+        } else {
+            "lower(n.name) CONTAINS $q OR lower(n.qualified_name) CONTAINS $q OR lower(n.doc) CONTAINS $q"
+        };
+        let q = if case_sensitive {
+            query.to_string()
+        } else {
+            query.to_lowercase()
+        };
         self.run_nodes(
-            &format!(
-                "MATCH (n:Node) WHERE n.name CONTAINS $q OR n.qualified_name CONTAINS $q OR n.doc CONTAINS $q RETURN {NODE_COLS} LIMIT {limit}"
-            ),
-            vec![("q", s(query))],
+            &format!("MATCH (n:Node) WHERE {where_clause} RETURN {NODE_COLS} LIMIT {limit}"),
+            vec![("q", s(&q))],
         )
     }
 

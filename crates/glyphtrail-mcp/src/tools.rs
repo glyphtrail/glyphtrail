@@ -33,8 +33,13 @@ pub fn definitions(has_default_repo: bool) -> Vec<Value> {
     let mut defs = vec![
         tool(
             "search",
-            "Full-text search over symbol names and doc comments.",
-            json!({ "query": { "type": "string" }, "limit": { "type": "integer" } }),
+            "Substring search over symbol names and doc comments. Case-insensitive \
+             by default.",
+            json!({
+                "query": { "type": "string" },
+                "limit": { "type": "integer" },
+                "case_sensitive": { "type": "boolean", "description": "Match case exactly (default: case-insensitive)." }
+            }),
             &["query"],
         ),
         tool(
@@ -258,7 +263,13 @@ fn dispatch(
     match name {
         "search" => {
             let limit = opt_usize(args, "limit").unwrap_or(30);
-            let nodes = store.search(req_str(args, "query")?, limit).map_err(err)?;
+            let case_sensitive = args
+                .get("case_sensitive")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let nodes = store
+                .search(req_str(args, "query")?, limit, case_sensitive)
+                .map_err(err)?;
             Ok(nodes_json(&nodes))
         }
         "definition" => {

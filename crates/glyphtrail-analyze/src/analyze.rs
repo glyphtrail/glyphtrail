@@ -2825,7 +2825,7 @@ mod tests {
         check!(env.kind == NodeKind::File);
         check!(env.doc.as_deref() == Some("sensitive: contents excluded from the index"));
         // The secret value never entered the index (no node mentions it).
-        check!(store.search("supersecret", 50).unwrap().is_empty());
+        check!(store.search("supersecret", 50, false).unwrap().is_empty());
 
         std::fs::remove_dir_all(&dir).ok();
     }
