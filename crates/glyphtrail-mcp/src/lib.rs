@@ -24,11 +24,14 @@ const PROTOCOL_VERSION: &str = "2024-11-05";
 /// opens the repo's graph fresh, so results track re-indexing without restarting
 /// the server.
 ///
-/// `repo` is the optional launch repository. When `None` (the server was started
-/// without `--repo`, as the globally-installed Claude Desktop bundle is), there
-/// is no default repo: every tool call must name a `repo`, and calls that don't
-/// are rejected rather than silently operating on an undefined working directory.
+/// `repo` is the optional launch repository. When `None`, the server infers the
+/// repo it was launched in from its working directory (#347), so an agent already
+/// inside a repo needs neither to name it nor to call `list_repos`. Only when that
+/// also fails (the Claude Desktop bundle's undefined CWD) is there no default
+/// repo: each tool call must then name one, and calls that don't are rejected
+/// rather than silently operating on an undefined working directory.
 pub fn serve_stdio(repo: Option<PathBuf>) -> Result<()> {
+    let repo = repo.or_else(tools::infer_cwd_repo);
     let default_db = repo.map(|r| RepoPaths::new(&r).db_path);
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();

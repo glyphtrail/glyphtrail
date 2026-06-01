@@ -135,10 +135,11 @@ pub fn definitions(has_default_repo: bool) -> Vec<Value> {
         ),
         tool(
             "list_repos",
-            "List repositories indexed in the global registry, each with its \
-             on-disk health (indexed/unindexed/missing), the groups it belongs \
-             to, and its stable forge ids (slug + optional numeric). Use this to \
-             discover what is indexed before a cross-repo query — no shell required.",
+            "List OTHER repositories in the global registry (on-disk health, \
+             groups, stable forge ids) for cross-repo work. You do NOT need this \
+             for the repo you are already in — target that directly by its path. \
+             The registry may be large, so prefer narrowing the result — no shell \
+             required.",
             json!({}),
             &[],
         ),
@@ -168,9 +169,11 @@ pub fn definitions(has_default_repo: bool) -> Vec<Value> {
 /// its description to say so. `list_repos` is skipped — it spans repos and takes
 /// no `repo` — so the agent always has a way to discover a target.
 fn require_repo_argument(defs: &mut [Value]) {
-    const REQUIRED_DESC: &str = "REQUIRED — this server was started without a \
-        launch repo. Target a repository by registered name or filesystem path. \
-        Call list_repos to discover indexed repositories.";
+    const REQUIRED_DESC: &str = "REQUIRED — the server has no default repo and \
+        could not detect one from its working directory. Pass the absolute path \
+        of the directory you are working in, or a registered repo name (you \
+        already know your path — no lookup needed). `list_repos` is only for \
+        discovering OTHER repos.";
     for def in defs {
         if def["name"] == json!("list_repos") {
             continue;
@@ -368,9 +371,10 @@ fn target_db(default_db: Option<&Path>, args: &Value) -> Result<PathBuf, String>
         return Ok(RepoPaths::new(Path::new(selector)).db_path);
     }
     default_db.map(Path::to_path_buf).ok_or_else(|| {
-        "no repository selected: this MCP server was started without a default \
-         repo, so pass `repo` (a registered name or a filesystem path) on the \
-         call. Use the `list_repos` tool to see indexed repositories."
+        "no repository selected: this server has no default repo and could not \
+         detect one from its working directory. Pass `repo` as the absolute path \
+         of the directory you are working in, or a registered repo name; use \
+         `list_repos` only to discover other repos."
             .to_string()
     })
 }
@@ -630,6 +634,23 @@ fn enclosing_git_root(path: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
+/// Best-effort: the glyphtrail repo the server is *running in*, used as the
+/// launch default when started without an explicit `--repo` (#347). Resolves the
+/// process working directory (or its enclosing git root) to a registered or
+/// already-indexed repo, so an agent working inside a repo never has to discover
+/// or name the path it is already in. `None` when the working directory is not a
+/// glyphtrail repo (e.g. the Claude Desktop bundle's undefined CWD), so callers
+/// fall back to requiring an explicit `repo`.
+pub(crate) fn infer_cwd_repo() -> Option<PathBuf> {
+    let usable = |p: &Path| is_registered_root(p) || p.join(INDEX_DIR).join("ladybug").exists();
+    let cwd = std::env::current_dir().ok()?.canonicalize().ok()?;
+    if usable(&cwd) {
+        return Some(cwd);
+    }
+    let root = enclosing_git_root(&cwd)?;
+    usable(&root).then_some(root)
+}
+
 /// Cross-repo impact (#222/#223): seed in the current repo and traverse into
 /// downstream repos across the package boundary, returning the per-repo
 /// `FederatedReport`. Opens its own member stores via the registry.
@@ -761,7 +782,7 @@ fn tool(name: &str, description: &str, mut properties: Value, required: &[&str])
             "repo".to_string(),
             json!({
                 "type": "string",
-                "description": "Target a repository by registered name or filesystem path. Defaults to the server's launch repo; REQUIRED when the server was started without one (e.g. the Claude Desktop bundle) — call list_repos to discover indexed repositories."
+                "description": "Repository to target: the absolute path of the directory you are working in, or a registered repo name. Defaults to the repo the server was launched in (or inferred from its working directory), so you usually omit it. `list_repos` is only for discovering OTHER repos — you do not need it for the repo you are already in."
             }),
         );
     }
