@@ -189,7 +189,7 @@ holds:
 - `[security] record_sensitive_files` — record sensitive files as content-less
   nodes (see below) instead of skipping them.
 - `[[links]]` — manual cross-repo link hints (see
-  [Cross-repo blast radius](#cross-repo-blast-radius)), edited with `glyphtrail link`.
+  [Cross-repo blast radius](#cross-repo-blast-radius)), edited with `glyphtrail repo link`.
 
 Edit it without hand-writing TOML; every change is validated against the schema
 before it is written, so a wrong key or type is rejected and the file untouched:
@@ -293,7 +293,7 @@ as `[[links]]` in `glyphtrail.toml` (committed) and/or `.glyphtrail/glyphtrail.t
 auto-resolved links. `from` is the consumer, `to` the producer (changing `to`
 impacts `from`); each side's `repo` defaults to `.` (this repo), so you only name
 the other one. Omit a `symbol` for a coarse whole-repo link. Edit them with
-`glyphtrail link add/list/remove` (a thin wrapper over the same file).
+`glyphtrail repo link add/list/remove` (a thin wrapper over the same file).
 
 ```toml
 # in web-client's glyphtrail.toml: we call user-svc's endpoint (no shared package)
@@ -302,14 +302,14 @@ from = { symbol = "fetchUser" }            # repo "." = here
 to   = { repo = "user-svc", symbol = "get_user" }
 ```
 
-Edit hints without hand-writing TOML with `glyphtrail link`:
+Edit hints without hand-writing TOML with `glyphtrail repo link`:
 
 ```sh
-glyphtrail link add user-svc --to-symbol get_user --from-symbol fetchUser
-glyphtrail link add user-svc                 # coarse whole-repo link
-glyphtrail link add user-svc --local         # write the gitignored personal override
-glyphtrail link list                         # show hints (shared + local) with indices
-glyphtrail link remove 1                      # drop a hint by index
+glyphtrail repo link add user-svc --to-symbol get_user --from-symbol fetchUser
+glyphtrail repo link add user-svc                 # coarse whole-repo link
+glyphtrail repo link add user-svc --local         # write the gitignored personal override
+glyphtrail repo link list                         # show hints (shared + local) with indices
+glyphtrail repo link remove 1                      # drop a hint by index
 ```
 
 #### How it works (many local databases, one registry)

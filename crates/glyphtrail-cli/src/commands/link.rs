@@ -105,7 +105,7 @@ fn list(repo: &Path) -> Result<()> {
         }
     }
     if !any {
-        println!("no link hints (use `glyphtrail link add <repo> [--to-symbol ..]`)");
+        println!("no link hints (use `glyphtrail repo link add <repo> [--to-symbol ..]`)");
     }
     Ok(())
 }
@@ -156,7 +156,7 @@ fn remove(repo: &Path, local: bool, index: usize) -> Result<()> {
     };
     if index == 0 || index > arr.len() {
         bail!(
-            "no hint at index {index} in {} ({} hint(s); see `glyphtrail link list`)",
+            "no hint at index {index} in {} ({} hint(s); see `glyphtrail repo link list`)",
             path.display(),
             arr.len()
         );
