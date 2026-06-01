@@ -79,6 +79,15 @@ pub struct ImpactArgs {
     #[arg(long)]
     pub group: Option<String>,
 
+    /// List every affected symbol. Default text output is a capped summary for
+    /// large blast radii; this prints the full grouped list.
+    #[arg(long)]
+    pub details: bool,
+    /// Max items per section in the summary view, and the size below which the
+    /// full list is shown anyway. Ignored with --details or non-text formats.
+    #[arg(long, default_value_t = 10)]
+    pub limit: usize,
+
     /// Output format: text, json, or md (Markdown for CI / PR comments).
     #[arg(long, value_enum, default_value_t = Format::Text)]
     pub format: Format,
@@ -140,7 +149,7 @@ pub fn run(args: ImpactArgs) -> Result<()> {
         )
     };
 
-    emit(&report, format)?;
+    emit(&report, format, args.details, args.limit)?;
 
     // Drift gate: a PR touching the API/contract surface exits non-zero so CI
     // can flag it loudly. Default is report-only.
@@ -229,7 +238,8 @@ fn emit_federated(report: &FederatedReport, format: Format) -> Result<()> {
 fn print_federated_text(report: &FederatedReport) {
     let s = &report.summary;
     println!(
-        "blast radius: {} symbols across {} repo(s) ({} downstream); {} tests, {} API, {} cross-boundary",
+        "impact: {} — {} symbols across {} repo(s) ({} downstream); {} tests, {} API, {} cross-boundary",
+        s.level.label(),
         s.total,
         report.repos.len(),
         report.downstream_repos(),
@@ -259,7 +269,8 @@ fn federated_markdown(report: &FederatedReport) -> String {
     let s = &report.summary;
     let mut md = String::from("## Cross-repo impact analysis\n\n");
     md.push_str(&format!(
-        "**Blast radius:** {} symbols across {} repo(s) · {} tests · {} API · {} cross-boundary · max distance {}\n",
+        "**Impact: {}** — {} symbols across {} repo(s) · {} tests · {} API · {} cross-boundary · max distance {}\n",
+        s.level.label(),
         s.total,
         report.repos.len(),
         s.tests,
@@ -347,25 +358,99 @@ fn resolve_seeds(store: &dyn GraphStore, args: &ImpactArgs) -> Result<SeedSet> {
     seed_nodes(store, &files)
 }
 
-fn emit(report: &ImpactReport, format: Format) -> Result<()> {
+fn emit(report: &ImpactReport, format: Format, details: bool, limit: usize) -> Result<()> {
     match format {
         Format::Json => println!("{}", serde_json::to_string_pretty(report)?),
         Format::Yaml => print!("{}", serde_norway::to_string(report)?),
         Format::Md => print!("{}", report.to_markdown()),
-        Format::Text => print_text(report),
+        Format::Text => print_text(report, details, limit),
     }
     Ok(())
 }
 
-fn print_text(report: &ImpactReport) {
+fn print_text(report: &ImpactReport, details: bool, limit: usize) {
+    let s = &report.summary;
     println!("{}", report.headline());
-    if report.summary.max_distance > 0 {
-        println!("max distance: {}", report.summary.max_distance);
+
+    // A small blast radius is shown in full; a large one defaults to a capped
+    // summary so the headline + the items that "will break" are not buried.
+    if details || s.total <= limit {
+        print_sections_full(report);
+    } else {
+        print_summary(report, limit);
     }
 
-    // Cross-boundary consumers (reached across the wire) are listed once, here;
-    // every other item is grouped by class below. Partitioning keeps each item
-    // in exactly one section.
+    print_change_notes(report);
+}
+
+/// Capped summary view: cross-boundary and API items (the contract surface), the
+/// direct depth-1 dependents that will break, a one-line tests digest, and a
+/// footer pointing at `--details` for the rest.
+fn print_summary(report: &ImpactReport, limit: usize) {
+    let is = |i: &&ClassifiedItem, c: ImpactClass| i.class == c;
+    let cross: Vec<&ClassifiedItem> = report.items.iter().filter(|i| i.cross_boundary).collect();
+    let api: Vec<&ClassifiedItem> = report
+        .items
+        .iter()
+        .filter(|i| !i.cross_boundary && is(i, ImpactClass::Api))
+        .collect();
+    // Direct (depth-1) breakers, excluding tests and the contract buckets above.
+    let direct: Vec<&ClassifiedItem> = report
+        .items
+        .iter()
+        .filter(|i| {
+            !i.cross_boundary
+                && !is(i, ImpactClass::Api)
+                && !is(i, ImpactClass::Test)
+                && i.distance == 1
+        })
+        .collect();
+    let tests_direct = report
+        .items
+        .iter()
+        .filter(|i| !i.cross_boundary && is(i, ImpactClass::Test) && i.distance == 1)
+        .count();
+    let tests_deeper = report
+        .items
+        .iter()
+        .filter(|i| !i.cross_boundary && is(i, ImpactClass::Test) && i.distance > 1)
+        .count();
+
+    let mut shown = 0;
+    shown += print_capped("cross-boundary consumers", &cross, limit);
+    shown += print_capped("API surface (contract)", &api, limit);
+    shown += print_capped("direct (depth 1) — will break", &direct, limit);
+    if tests_direct + tests_deeper > 0 {
+        println!("\ntests: {tests_direct} direct, {tests_deeper} deeper");
+    }
+
+    let hidden = report.summary.total - shown;
+    if hidden > 0 {
+        println!(
+            "\n+ {hidden} more affected symbol(s) not listed. Re-run with --details for the full list (or raise --limit)."
+        );
+    }
+}
+
+/// Print up to `limit` items under `label`, with a "… N more" line when capped.
+/// Returns the number of items actually printed.
+fn print_capped(label: &str, items: &[&ClassifiedItem], limit: usize) -> usize {
+    if items.is_empty() {
+        return 0;
+    }
+    println!("\n{label}:");
+    let n = items.len().min(limit);
+    for i in &items[..n] {
+        print_item(i);
+    }
+    if items.len() > n {
+        println!("  … {} more", items.len() - n);
+    }
+    n
+}
+
+/// Full grouped view: every item, partitioned into exactly one section.
+fn print_sections_full(report: &ImpactReport) {
     let cb: Vec<&ClassifiedItem> = report.items.iter().filter(|i| i.cross_boundary).collect();
     if !cb.is_empty() {
         println!("\ncross-boundary consumers:");
@@ -392,6 +477,9 @@ fn print_text(report: &ImpactReport) {
             print_item(i);
         }
     }
+}
+
+fn print_change_notes(report: &ImpactReport) {
     if !report.removed_files.is_empty() {
         println!("\nremoved files (former dependents may be affected):");
         for f in &report.removed_files {
