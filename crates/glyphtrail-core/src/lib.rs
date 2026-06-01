@@ -10,6 +10,7 @@ pub mod groups;
 pub mod identity;
 pub mod impact;
 pub mod lang;
+pub mod link_hints;
 pub mod links;
 pub mod manifest;
 pub mod matcher;
@@ -41,6 +42,7 @@ pub use impact::{
     compute_impact, edge_rules, is_cross_boundary_path, parse_confidence,
 };
 pub use lang::Language;
+pub use link_hints::{LinkEnd, LinkHint, LinkHints};
 pub use links::{CrossRepoLink, LinkKind, RepoIdentity, imported_symbols, resolve_links};
 pub use manifest::{
     CargoDependency, CargoPackage, DepKind, DepSource, parse_cargo_manifest, workspace_members,

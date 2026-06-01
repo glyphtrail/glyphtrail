@@ -240,11 +240,27 @@ glyphtrail impact MySymbol --downstream --deep     # re-read identities from eac
 #   one that were never `repo add`ed — for when the cache may be stale/incomplete
 ```
 
-Cross-repo links are matched by package name (Cargo today): a consumer's
-dependency is tied to the producer repo whose crate publishes it. The MCP
-`impact` tool takes the same `downstream`/`group` arguments, and `list_repos`
-enumerates the registry, so an agent gets the cross-repo blast radius in one
-call.
+Cross-repo links are matched by package name (Cargo, npm, Go, Python, .NET): a
+consumer's dependency is tied to the producer repo whose package publishes it.
+The MCP `impact` tool takes the same `downstream`/`group` arguments, and
+`list_repos` enumerates the registry, so an agent gets the cross-repo blast
+radius in one call.
+
+**Manual link hints.** Some real relationships can't be matched by package name —
+a service called over HTTP from another repo with no shared package. Declare those
+in `glyphtrail.links.toml` at the repo root (committed, team-shared) and/or
+`.glyphtrail/links.toml` (gitignored, personal); both are unioned and fed into the
+federated impact alongside the auto-resolved links. `from` is the consumer, `to`
+the producer (changing `to` impacts `from`); each side's `repo` defaults to `.`
+(this repo), so you only name the other one. Omit a `symbol` for a coarse
+whole-repo link.
+
+```toml
+# in web-client: we call user-svc's endpoint (no shared package)
+[[links]]
+from = { symbol = "fetchUser" }            # repo "." = here
+to   = { repo = "user-svc", symbol = "get_user" }
+```
 
 #### How it works (many local databases, one registry)
 
