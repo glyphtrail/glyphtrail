@@ -69,6 +69,7 @@ pub fn is_outline_kind(kind: NodeKind) -> bool {
             | NodeKind::Enum
             | NodeKind::Trait
             | NodeKind::Module
+            | NodeKind::Constant
     )
 }
 
