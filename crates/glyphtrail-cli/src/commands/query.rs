@@ -23,8 +23,13 @@ pub enum QueryCmd {
     Callees { name: String },
     /// Direct neighbours in any direction.
     Neighbors { name: String },
-    /// Full-text search over names and doc comments.
-    Search { text: String },
+    /// Substring search over names, qualified names, and doc comments.
+    Search {
+        text: String,
+        /// Match case exactly (default: case-insensitive).
+        #[arg(long)]
+        case_sensitive: bool,
+    },
     /// Transitive set of symbols affected if this one changes.
     Impact {
         name: String,
@@ -308,7 +313,10 @@ fn execute(store: &dyn GraphStore, cmd: &QueryCmd) -> Result<QueryResult> {
             items.extend(store.neighbors(&n.id.0, None, false)?);
             QueryResult::Neighbors(neighbor_out(items))
         }
-        QueryCmd::Search { text } => QueryResult::Nodes(store.search(text, 50)?),
+        QueryCmd::Search {
+            text,
+            case_sensitive,
+        } => QueryResult::Nodes(store.search(text, 50, *case_sensitive)?),
         QueryCmd::Impact { name, depth } => {
             let n = resolve_one(store, name)?;
             // Callers (transitively) are what breaks if this symbol changes.

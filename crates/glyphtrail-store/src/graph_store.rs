@@ -79,7 +79,9 @@ pub trait GraphStore: Adjacency {
     fn get_node(&self, id: &str) -> Result<Option<Node>>;
     fn nodes_in_file(&self, file: &str) -> Result<Vec<Node>>;
     fn find_by_name(&self, name: &str) -> Result<Vec<Node>>;
-    fn search(&self, query: &str, limit: usize) -> Result<Vec<Node>>;
+    /// Substring search over name/qualified-name/doc. Case-insensitive unless
+    /// `case_sensitive` (#367).
+    fn search(&self, query: &str, limit: usize, case_sensitive: bool) -> Result<Vec<Node>>;
     fn neighbors(
         &self,
         id: &str,

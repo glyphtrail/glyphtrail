@@ -132,7 +132,9 @@ async fn api_search(
     Query(params): Query<SearchParams>,
 ) -> Json<Value> {
     let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
-    let nodes = store.search(&params.q, params.limit).unwrap_or_default();
+    let nodes = store
+        .search(&params.q, params.limit, false)
+        .unwrap_or_default();
     Json(json!(nodes))
 }
 

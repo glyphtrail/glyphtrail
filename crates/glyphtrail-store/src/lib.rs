@@ -59,8 +59,11 @@ mod tests {
         check!(callers.len() == 1);
         check!(callers[0].0.name == "caller");
 
-        // FTS finds by name.
-        check!(store.search("callee", 10).unwrap().len() == 1);
+        // Substring search finds by name.
+        check!(store.search("callee", 10, false).unwrap().len() == 1);
+        // Case-insensitive by default; case_sensitive requires an exact-case match (#367).
+        check!(store.search("CALLEE", 10, false).unwrap().len() == 1);
+        check!(store.search("CALLEE", 10, true).unwrap().is_empty());
 
         // Reachability: who is impacted if b changes -> a.
         let impacted = store.reachable("b", EdgeKind::Calls, false, 5).unwrap();
