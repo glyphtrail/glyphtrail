@@ -78,6 +78,12 @@ pub struct ImpactArgs {
     /// Like --downstream, but scope the federation to a named group.
     #[arg(long)]
     pub group: Option<String>,
+    /// Thorough federated scan: re-read each member's identity from its store
+    /// instead of the registry cache, and include indexed repos beside this one
+    /// that were never `repo add`ed. Slower; use when the registry shortcut may
+    /// be stale or incomplete (e.g. a dependent indexed after its dependency).
+    #[arg(long)]
+    pub deep: bool,
 
     /// List every affected symbol. Default text output is a capped summary for
     /// large blast radii; this prints the full grouped list.
@@ -209,7 +215,13 @@ fn run_federated(args: &ImpactArgs, format: Format) -> Result<()> {
         Some(g) => FederationScope::Group(g.clone()),
         None => FederationScope::Registry,
     };
-    let mut report = federated_impact(&args.repo, &scope, seed_spec(args)?, &build_policy(args)?)?;
+    let mut report = federated_impact(
+        &args.repo,
+        &scope,
+        seed_spec(args)?,
+        &build_policy(args)?,
+        args.deep,
+    )?;
 
     // Apply the origin repo's configured test globs (#131), then rebuild so the
     // summary counts the re-tagged tests.

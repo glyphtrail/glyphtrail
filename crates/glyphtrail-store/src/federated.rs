@@ -62,11 +62,19 @@ fn owning_package<'a>(packages: &'a [IndexedPackage], file: &str) -> Option<&'a 
 /// Compute the cross-repo blast radius: seed in the repo at `current_root` and
 /// traverse into downstream repos across the link table, scoped to the whole
 /// registry or a named group. The current repo must be registered and indexed.
+///
+/// `deep` trades speed for thoroughness when the registry shortcut may be
+/// incomplete (indexing the dependency before its dependents, or a cache write
+/// skipped under lock contention): instead of trusting the identities cached on
+/// the registry, it re-reads each member's identity from its store, and it
+/// discovers indexed repos sitting beside the current one that were never
+/// `repo add`ed and folds them in. The default (`deep = false`) is the fast path.
 pub fn federated_impact(
     current_root: &Path,
     scope: &FederationScope,
     seeds: SeedSpec,
     policy: &ImpactPolicy,
+    deep: bool,
 ) -> Result<FederatedReport> {
     let registry = Registry::load(
         &default_registry_path().ok_or_else(|| anyhow!("cannot locate home directory"))?,
@@ -106,8 +114,9 @@ pub fn federated_impact(
 
     // Cross-repo identities come from the registry (#292), so we don't open a
     // store just to read identity. An entry indexed before this cache existed
-    // has `identity: None`; for those we open the store once to read its meta and
-    // best-effort backfill the registry, keeping the opened store to reuse below.
+    // has `identity: None`; for those (and for every member under `deep`) we open
+    // the store, read its identity fresh, and best-effort backfill the registry,
+    // keeping the opened store to reuse below.
     let mut prefetched: HashMap<String, Box<dyn GraphStore>> = HashMap::new();
     let mut backfills: Vec<(std::path::PathBuf, PackageIdentity)> = Vec::new();
     let mut identities: Vec<RepoIdentity> = Vec::new();
@@ -118,27 +127,27 @@ pub fn federated_impact(
         if entry.health() != RepoHealth::Indexed {
             continue;
         }
-        let identity = match &entry.identity {
-            Some(id) => id.clone(),
-            None => {
-                let ladybug = RepoPaths::new(entry.active_root())
-                    .index_dir
-                    .join("ladybug");
-                match LadybugStore::open(&ladybug) {
-                    Ok(store) => {
-                        let id = PackageIdentity::from_meta(
-                            store.get_meta(META_PACKAGES).ok().flatten().as_deref(),
-                            store.get_meta(META_EXTERNAL_USES).ok().flatten().as_deref(),
-                        );
-                        backfills.push((entry.active_root().clone(), id.clone()));
-                        prefetched.insert(name.clone(), Box::new(store));
-                        id
-                    }
-                    // One unreadable member shouldn't sink the run.
-                    Err(e) => {
-                        eprintln!("note: skipping repo '{name}': cannot open its index ({e})");
-                        continue;
-                    }
+        let identity = if !deep && let Some(id) = &entry.identity {
+            id.clone()
+        } else {
+            // Deep mode, or no cached identity: read straight from the store.
+            let ladybug = RepoPaths::new(entry.active_root())
+                .index_dir
+                .join("ladybug");
+            match LadybugStore::open(&ladybug) {
+                Ok(store) => {
+                    let id = PackageIdentity::from_meta(
+                        store.get_meta(META_PACKAGES).ok().flatten().as_deref(),
+                        store.get_meta(META_EXTERNAL_USES).ok().flatten().as_deref(),
+                    );
+                    backfills.push((entry.active_root().clone(), id.clone()));
+                    prefetched.insert(name.clone(), Box::new(store));
+                    id
+                }
+                // One unreadable member shouldn't sink the run.
+                Err(e) => {
+                    eprintln!("note: skipping repo '{name}': cannot open its index ({e})");
+                    continue;
                 }
             }
         };
@@ -147,8 +156,56 @@ pub fn federated_impact(
             identity,
         });
     }
-    // Best-effort: cache backfilled identities so the next query is cheap (#292).
-    // Lock-tolerant — never fail the query because the registry is busy.
+
+    // Deep scan: discover indexed repos sitting beside the current one that were
+    // never registered, so a dependent indexed-but-not-`repo add`ed is still
+    // found (#292 follow-up). Bounded to the immediate siblings of the current
+    // repo; keyed by directory name and skipped on a name clash with a member.
+    if deep
+        && let Some(parent) = here.parent()
+        && let Ok(dir_entries) = std::fs::read_dir(parent)
+    {
+        let registered: HashSet<std::path::PathBuf> = registry
+            .repos
+            .iter()
+            .flat_map(|e| e.roots().filter_map(|r| r.canonicalize().ok()))
+            .collect();
+        for dir_entry in dir_entries.flatten() {
+            let dir = dir_entry.path();
+            let ladybug = RepoPaths::new(&dir).index_dir.join("ladybug");
+            if !dir.is_dir() || !ladybug.exists() {
+                continue;
+            }
+            if dir
+                .canonicalize()
+                .ok()
+                .is_some_and(|c| registered.contains(&c))
+            {
+                continue; // already a registry member
+            }
+            let Some(name) = dir.file_name().map(|s| s.to_string_lossy().to_string()) else {
+                continue;
+            };
+            if name.is_empty() || identities.iter().any(|i| i.repo == name) {
+                continue;
+            }
+            if let Ok(store) = LadybugStore::open(&ladybug) {
+                let id = PackageIdentity::from_meta(
+                    store.get_meta(META_PACKAGES).ok().flatten().as_deref(),
+                    store.get_meta(META_EXTERNAL_USES).ok().flatten().as_deref(),
+                );
+                prefetched.insert(name.clone(), Box::new(store));
+                identities.push(RepoIdentity {
+                    repo: name,
+                    identity: id,
+                });
+            }
+        }
+    }
+
+    // Best-effort: cache (re)read identities so the next query is cheap (#292),
+    // which also self-heals a stale cache on a deep run. Lock-tolerant — never
+    // fail the query because the registry is busy.
     if !backfills.is_empty()
         && let Some(reg_path) = default_registry_path()
     {

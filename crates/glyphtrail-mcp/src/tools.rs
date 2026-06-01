@@ -108,7 +108,8 @@ pub fn definitions(has_default_repo: bool) -> Vec<Value> {
                 "min_confidence": { "type": "string", "enum": ["extracted", "inferred"] },
                 "cross_boundary": { "type": "boolean", "description": "Include HANDLES/INVOKES/EXPOSES/MOUNTS consumers." },
                 "downstream": { "type": "boolean", "description": "Extend the blast radius into OTHER indexed repos that depend on this one (federate over the registry). Reports which repos break and where." },
-                "group": { "type": "string", "description": "Like downstream, but scope the federation to a named group." }
+                "group": { "type": "string", "description": "Like downstream, but scope the federation to a named group." },
+                "deep": { "type": "boolean", "description": "Thorough federated scan: re-read each member's identity from its store instead of the registry cache, and include indexed repos beside this one that were never registered. Slower; use when the registry shortcut may be stale or incomplete." }
             }),
             &[],
         ),
@@ -643,7 +644,8 @@ fn federated_impact_tool(db: &Path, args: &Value) -> Result<Value, String> {
     };
     let seeds = seed_spec_from_args(args)?;
     let policy = policy_from_args(args)?;
-    let report = federated_impact(repo, &scope, seeds, &policy).map_err(err)?;
+    let deep = args.get("deep").and_then(Value::as_bool).unwrap_or(false);
+    let report = federated_impact(repo, &scope, seeds, &policy, deep).map_err(err)?;
     serde_json::to_value(&report).map_err(err)
 }
 
