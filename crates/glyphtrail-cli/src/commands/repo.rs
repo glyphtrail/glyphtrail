@@ -86,6 +86,11 @@ pub enum RepoCmd {
     /// file; the registry self-heals stale locks automatically, so this is
     /// rarely needed.
     Unlock,
+    /// Edit manual cross-repo link hints (glyphtrail.links.toml).
+    Link {
+        #[command(subcommand)]
+        cmd: super::link::LinkCmd,
+    },
 }
 
 pub(crate) fn registry_path() -> Result<PathBuf> {
@@ -254,6 +259,7 @@ pub fn run(cmd: RepoCmd) -> Result<()> {
             Some(desc) => println!("released registry lock ({desc})"),
             None => println!("no registry lock held"),
         },
+        RepoCmd::Link { cmd } => super::link::run(cmd)?,
     }
     Ok(())
 }

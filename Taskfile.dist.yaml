@@ -170,7 +170,7 @@ tasks:
   link:
     desc: 'Edit cross-repo link hints (pass args after --, e.g. task link -- list)'
     cmds:
-      - cargo run -p glyphtrail-cli {{.PROFILE_FLAG}} -- link {{.CLI_ARGS}}
+      - cargo run -p glyphtrail-cli {{.PROFILE_FLAG}} -- repo link {{.CLI_ARGS}}
 
   # Inspect/edit the per-repo config (.glyphtrail/config.toml).
   # Example: `task config -- show` or `task config -- set security.record_sensitive_files true`

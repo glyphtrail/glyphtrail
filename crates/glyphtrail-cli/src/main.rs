@@ -150,11 +150,6 @@ enum Command {
         #[command(subcommand)]
         cmd: commands::remote::RemoteCmd,
     },
-    /// Edit manual cross-repo link hints (glyphtrail.links.toml).
-    Link {
-        #[command(subcommand)]
-        cmd: commands::link::LinkCmd,
-    },
     /// Inspect and edit the per-repo config (.glyphtrail/config.toml).
     Config {
         #[command(subcommand)]
@@ -336,7 +331,6 @@ fn main() -> anyhow::Result<()> {
         Command::Setup { path, force, home } => commands::setup::run(&path, force, home),
         Command::Repo { cmd } => commands::repo::run(cmd),
         Command::Remote { cmd } => commands::remote::run(cmd),
-        Command::Link { cmd } => commands::link::run(cmd),
         Command::Config { cmd } => commands::config::run(cmd),
         Command::Group { cmd } => commands::group::run(cmd),
         Command::Status {

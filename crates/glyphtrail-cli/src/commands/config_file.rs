@@ -1,5 +1,5 @@
 //! Shared editing of the unified per-repo config file. Both `glyphtrail config`
-//! and `glyphtrail link` write the same `glyphtrail.toml` (committed at the repo
+//! and `glyphtrail repo link` write the same `glyphtrail.toml` (committed at the repo
 //! root) or `.glyphtrail/glyphtrail.toml` (the gitignored personal override),
 //! and both run [`migrate_legacy`] first so the older split files
 //! (`.glyphtrail/config.toml`, `glyphtrail.links.toml`, `.glyphtrail/links.toml`)
