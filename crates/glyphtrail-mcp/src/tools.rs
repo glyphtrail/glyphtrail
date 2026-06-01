@@ -989,21 +989,27 @@ fn file_issue_enabled() -> bool {
 }
 
 /// The `file_issue` tool definition (#370): guidance for reporting a glyphtrail
-/// bug/idea, deliberately doing nothing itself.
+/// bug/idea, deliberately doing nothing itself. Built directly (not via `tool()`)
+/// because it is project-level, not repo-scoped, so it carries no `repo` arg.
 fn file_issue_tool() -> Value {
-    tool(
-        "file_issue",
-        "Guidance for reporting a glyphtrail bug or idea to its GitHub project. \
-         It does NOT file anything — it returns instructions and a provenance \
-         line; you act with your own tools. ALWAYS search existing OPEN and \
-         CLOSED issues first and prefer commenting on a match over opening a \
-         duplicate.",
-        json!({
-            "title": { "type": "string", "description": "Proposed issue title." },
-            "body": { "type": "string", "description": "Proposed issue body (Markdown)." }
-        }),
-        &["title"],
-    )
+    json!({
+        "name": "file_issue",
+        "description": "Guidance for reporting a glyphtrail bug or idea to its \
+             GitHub project. It does NOT file anything — it returns instructions \
+             and a provenance line; you act with your own tools. ALWAYS search \
+             existing OPEN and CLOSED issues first and prefer commenting on a \
+             match over opening a duplicate.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": { "type": "string", "description": "Proposed issue title." },
+                "body": { "type": "string", "description": "Proposed issue body (Markdown)." }
+            },
+            "required": ["title"],
+        },
+        // Returns text only; no mutation, no network.
+        "annotations": { "readOnlyHint": true, "idempotentHint": true, "destructiveHint": false },
+    })
 }
 
 /// Build the `file_issue` response: where and how to report, plus the proposed
@@ -1315,14 +1321,15 @@ mod tests {
         check!(steps.iter().any(|s| s.as_str().unwrap().contains("CLOSED")));
     }
 
-    // Off by default: without the env flag, file_issue is not advertised.
+    // file_issue is advertised exactly when enabled (off by default). Asserting
+    // the iff is deterministic regardless of the ambient env var, with no env
+    // mutation (the workspace forbids `unsafe`).
     #[test]
-    fn file_issue_tool_is_off_by_default() {
-        check!(
-            definitions(true)
-                .iter()
-                .all(|d| d["name"] != json!("file_issue"))
-        );
+    fn file_issue_tool_advertised_only_when_enabled() {
+        let advertised = definitions(true)
+            .iter()
+            .any(|d| d["name"] == json!("file_issue"));
+        check!(advertised == file_issue_enabled());
     }
 
     // #223: a registry-level tool needs no per-repo index. It reads the global
