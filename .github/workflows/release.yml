@@ -45,8 +45,15 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      - name: Build
-        run: cargo build --release --locked -p glyphtrail-cli --target ${{ matrix.target }}
+      # Embed an SBOM (the exact dependency tree) into the binary so it can be
+      # audited after the fact with `cargo audit bin <binary>` (#301). Installed
+      # from a prebuilt to avoid compiling it on every target.
+      - name: Install cargo-auditable
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-auditable
+      - name: Build (SBOM embedded)
+        run: cargo auditable build --release --locked -p glyphtrail-cli --target ${{ matrix.target }}
       - name: Package
         shell: bash
         run: |
