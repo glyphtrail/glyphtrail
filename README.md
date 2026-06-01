@@ -38,6 +38,11 @@ glyphtrail analyze .
 # Re-index only files that changed
 glyphtrail analyze . --update
 
+# Index a remote repository: clone into ~/.glyphtrail/remote/<host/owner/repo>,
+# index it there, and register it (shallow by default; --full for history)
+glyphtrail analyze https://github.com/owner/repo
+glyphtrail analyze git@github.com:owner/repo.git --full
+
 # Outline the shape of a file or directory (symbols + signatures)
 glyphtrail outline src/api.rs              # standard detail
 glyphtrail outline src --detail minimal    # names only, whole directory

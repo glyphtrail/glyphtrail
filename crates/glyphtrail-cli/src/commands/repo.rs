@@ -88,7 +88,7 @@ pub enum RepoCmd {
     Unlock,
 }
 
-fn registry_path() -> Result<PathBuf> {
+pub(crate) fn registry_path() -> Result<PathBuf> {
     default_registry_path()
         .ok_or_else(|| anyhow!("cannot locate home directory (set HOME or USERPROFILE)"))
 }
@@ -166,28 +166,7 @@ pub fn run(cmd: RepoCmd) -> Result<()> {
             let root = repo
                 .canonicalize()
                 .with_context(|| format!("cannot resolve path {}", repo.display()))?;
-            let entry = entry_for(&path, &root, name);
-            let ids = entry.ids.clone();
-            let name = entry.name.clone();
-            // Loss-proof write: applies under the lock, or defers to a spillover
-            // file when the lock is busy (a later run merges it in) instead of
-            // failing — important when indexing many repos on a slow/contended
-            // network filesystem.
-            match Registry::record(&path, vec![entry])? {
-                RecordOutcome::Applied(res) => {
-                    println!("{}", describe_record(&res[0], &name, &root))
-                }
-                RecordOutcome::Spilled => {
-                    println!(
-                        "registry busy; queued '{}' -> {} (merged on the next run)",
-                        name,
-                        root.display()
-                    );
-                }
-            }
-            for id in &ids {
-                println!("  id {} ({})", id.id, id.source);
-            }
+            register(&path, &root, name)?;
         }
         RepoCmd::Scan {
             dir,
@@ -351,6 +330,29 @@ fn refresh(registry_path: &Path, only: Option<&str>) -> Result<()> {
         })?;
     }
     println!("refresh: {changed} updated, {unchanged} unchanged, {missing} missing");
+    Ok(())
+}
+
+/// Register (or re-register) `root` in the registry at `registry_path`, printing
+/// the outcome and any forge ids. Shared by `repo add` and the remote-clone flow
+/// (#291). Loss-proof: applies under the lock, or defers to a spillover file when
+/// the lock is busy (a later run merges it) rather than failing — important when
+/// registering many repos on a slow/contended network filesystem.
+pub(crate) fn register(registry_path: &Path, root: &Path, name: Option<String>) -> Result<()> {
+    let entry = entry_for(registry_path, root, name);
+    let ids = entry.ids.clone();
+    let name = entry.name.clone();
+    match Registry::record(registry_path, vec![entry])? {
+        RecordOutcome::Applied(res) => println!("{}", describe_record(&res[0], &name, root)),
+        RecordOutcome::Spilled => println!(
+            "registry busy; queued '{}' -> {} (merged on the next run)",
+            name,
+            root.display()
+        ),
+    }
+    for id in &ids {
+        println!("  id {} ({})", id.id, id.source);
+    }
     Ok(())
 }
 

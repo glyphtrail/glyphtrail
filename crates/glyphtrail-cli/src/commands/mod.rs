@@ -22,6 +22,7 @@ pub mod impact;
 pub mod llm;
 pub mod outline;
 pub mod query;
+pub mod remote;
 pub mod repo;
 pub mod serve;
 pub mod setup;
