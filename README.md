@@ -80,6 +80,58 @@ glyphtrail wiki --dry-run                # write the prompts only (no network/ke
 glyphtrail status
 ```
 
+### Registering glyphtrail as an MCP server
+
+`glyphtrail mcp` speaks the [Model Context Protocol](https://modelcontextprotocol.io)
+over stdio, exposing the query / impact / outline / endpoint tools to an agent.
+Index the repo first (`glyphtrail analyze`), then register the server. Each agent
+wires up MCP servers differently:
+
+**Claude Code** (CLI) — add it to the current project:
+
+```sh
+claude mcp add glyphtrail -- glyphtrail mcp --repo .
+```
+
+**Claude Desktop** — download the `glyphtrail-<version>-<target>.mcpb` bundle for
+your platform from a [release](https://github.com/glyphtrail/glyphtrail/releases)
+and open it (Settings → Extensions, or double-click). The bundle ships the
+`glyphtrail` binary and prompts for the repository to query, so there's nothing
+else to install. To wire it up by hand instead, add to
+`claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "glyphtrail": {
+      "command": "glyphtrail",
+      "args": ["mcp", "--repo", "/path/to/your/repo"]
+    }
+  }
+}
+```
+
+**Cursor / Windsurf / VS Code / other MCP clients** — point the client at the same
+stdio command. For example, a project-scoped Cursor `.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "glyphtrail": {
+      "command": "glyphtrail",
+      "args": ["mcp", "--repo", "."]
+    }
+  }
+}
+```
+
+Any MCP client works the same way: command `glyphtrail`, args `mcp --repo <path>`,
+transport stdio. (`glyphtrail serve` additionally exposes the same tools over HTTP
+at `POST /mcp`, for clients that prefer a URL.)
+
+Prefer it managed? `glyphtrail setup` writes an agent skill plus a
+`CLAUDE.md`/`AGENTS.md` section that points coding agents at these tools.
+
 ### Excluding sensitive files
 
 `analyze` honors `.gitignore`/`.git/info/exclude`, skips dotfiles, and reads
