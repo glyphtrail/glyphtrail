@@ -21,8 +21,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Walk a repository, parse it, and build/update the graph.
+    ///
+    /// `path` may be a git remote URL (https/ssh/git@) — it is cloned into
+    /// `~/.glyphtrail/remote/<host/owner/repo>`, indexed there, and registered.
     Analyze {
-        /// Repository root (defaults to the current directory).
+        /// Repository root or a git remote URL (defaults to the current directory).
         #[arg(default_value = ".")]
         path: PathBuf,
         /// Only reparse files whose content changed since the last index.
@@ -31,6 +34,10 @@ enum Command {
         /// Analyze every repository in the global registry instead of `path`.
         #[arg(long)]
         all: bool,
+        /// For a remote URL: clone the full history instead of a shallow
+        /// (`--depth 1`) snapshot — needed for `story` and `impact --since`.
+        #[arg(long)]
+        full: bool,
     },
     /// Query the graph.
     Query {
@@ -177,17 +184,34 @@ fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Analyze { path, update, all } => {
+        Command::Analyze {
+            path,
+            update,
+            all,
+            full,
+        } => {
             if all {
                 commands::repo::analyze_all(update)
             } else {
+                // A git remote URL is cloned into ~/.glyphtrail/remote/<slug> and
+                // registered, then indexed there; a local path is analyzed in place (#291).
+                let target = {
+                    let arg = path.to_string_lossy();
+                    if commands::remote::is_remote_arg(&arg) {
+                        let dest = commands::remote::ensure_cloned(&arg, full)?;
+                        commands::repo::register(&commands::repo::registry_path()?, &dest, None)?;
+                        dest
+                    } else {
+                        path.clone()
+                    }
+                };
                 let started = std::time::Instant::now();
-                let outcome = commands::analyze::run(&path, update)?;
+                let outcome = commands::analyze::run(&target, update)?;
                 let elapsed = started.elapsed();
                 if outcome.ignored {
                     println!(
                         "Skipped: {} is excluded by ~/.glyphtrailignore.",
-                        path.display()
+                        target.display()
                     );
                     return Ok(());
                 }
@@ -238,7 +262,7 @@ fn main() -> anyhow::Result<()> {
                         );
                     }
                     // Hint (read-only): onboarding files are written only by `setup`.
-                    if !path.join(".claude/skills/glyphtrail/SKILL.md").exists() {
+                    if !target.join(".claude/skills/glyphtrail/SKILL.md").exists() {
                         println!("Tip: run `glyphtrail setup` to onboard coding agents (MCP/CLI).");
                     }
                 }
