@@ -15,6 +15,14 @@
 ; identifier immediately followed by a parenthesized token tree (#5/#131).
 (token_tree (identifier) @call . (token_tree))
 
+; References (type usages, not calls): a type named in a signature, field,
+; generic, or impl, and the path prefix of a scoped value like `Protocol::Rest`
+; or `Protocol::from_str`. These become References edges so `impact` and
+; neighbour queries reach a type's users, not only its callers (#310). A
+; type_identifier that is a definition's own name is filtered out downstream.
+(type_identifier) @ref
+(scoped_identifier path: (identifier) @ref)
+
 ; Imports
 (use_declaration argument: (_) @import)
 

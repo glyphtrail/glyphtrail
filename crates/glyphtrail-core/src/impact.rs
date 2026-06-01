@@ -58,6 +58,7 @@ pub fn edge_rules(tokens: &[&str]) -> Result<Vec<EdgeRule>, String> {
     for t in tokens {
         match *t {
             "calls" => rules.push(EdgeRule::incoming(EdgeKind::Calls)),
+            "refs" => rules.push(EdgeRule::incoming(EdgeKind::References)),
             "imports" => rules.push(EdgeRule::incoming(EdgeKind::Imports)),
             "impl" => {
                 rules.push(EdgeRule::incoming(EdgeKind::Implements));
@@ -71,7 +72,7 @@ pub fn edge_rules(tokens: &[&str]) -> Result<Vec<EdgeRule>, String> {
             }
             other => {
                 return Err(format!(
-                    "unknown edge set '{other}' (expected calls, imports, impl, api)"
+                    "unknown edge set '{other}' (expected calls, refs, imports, impl, api)"
                 ));
             }
         }
@@ -104,12 +105,13 @@ pub struct ImpactPolicy {
 }
 
 impl ImpactPolicy {
-    /// In-process reverse dependencies: callers, importers, implementors,
-    /// subtypes. The classic "what breaks if this symbol changes".
+    /// In-process reverse dependencies: callers, type users, importers,
+    /// implementors, subtypes. The classic "what breaks if this symbol changes".
     pub fn in_process(max_depth: usize) -> Self {
         Self {
             edges: vec![
                 EdgeRule::incoming(EdgeKind::Calls),
+                EdgeRule::incoming(EdgeKind::References),
                 EdgeRule::incoming(EdgeKind::Imports),
                 EdgeRule::incoming(EdgeKind::Implements),
                 EdgeRule::incoming(EdgeKind::Extends),
@@ -604,6 +606,37 @@ mod tests {
             .map(|i| (i.node.0.as_str(), i.distance))
             .collect();
         check!(names == vec![("b", 1), ("c", 2)]);
+    }
+
+    // #310: a type used (not called) — `proto: Protocol` — is a References edge
+    // from the user to the type, so the default in-process policy reaches a
+    // type's users, transitively, the same way it reaches callers.
+    #[test]
+    fn type_references_reach_users() {
+        let mut g = MockGraph::default();
+        g.edge(
+            "user",
+            "Protocol",
+            EdgeKind::References,
+            Confidence::Extracted,
+        );
+        g.edge(
+            "caller_of_user",
+            "user",
+            EdgeKind::Calls,
+            Confidence::Extracted,
+        );
+
+        let items = compute_impact(&[id("Protocol")], &ImpactPolicy::in_process(5), &g);
+        let names: Vec<&str> = items.iter().map(|i| i.node.0.as_str()).collect();
+        check!(names.contains(&"user"));
+        check!(names.contains(&"caller_of_user"));
+    }
+
+    #[test]
+    fn refs_edge_set_traverses_references_incoming() {
+        let rules = edge_rules(&["refs"]).unwrap();
+        check!(rules == vec![EdgeRule::incoming(EdgeKind::References)]);
     }
 
     #[test]

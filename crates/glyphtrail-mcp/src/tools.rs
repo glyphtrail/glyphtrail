@@ -102,7 +102,7 @@ pub fn definitions(has_default_repo: bool) -> Vec<Value> {
                 "since": { "type": "string", "description": "Seed symbols changed since a git rev/range (e.g. main..HEAD)." },
                 "staged": { "type": "boolean", "description": "Seed from staged changes." },
                 "diff": { "type": "boolean", "description": "Seed from unstaged working-tree changes." },
-                "edges": { "type": "array", "items": { "type": "string" }, "description": "Edge sets: calls, imports, impl, api." },
+                "edges": { "type": "array", "items": { "type": "string" }, "description": "Edge sets: calls, refs (type usages), imports, impl, api." },
                 "depth": { "type": "integer", "description": "Max hops from a seed (default 5)." },
                 "min_confidence": { "type": "string", "enum": ["extracted", "inferred"] },
                 "cross_boundary": { "type": "boolean", "description": "Include HANDLES/INVOKES/EXPOSES/MOUNTS consumers." },
