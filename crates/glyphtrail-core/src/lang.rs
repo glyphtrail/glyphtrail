@@ -70,7 +70,8 @@ impl Language {
 
     /// Best-effort detection from a file extension.
     pub fn from_path(path: &Path) -> Option<Language> {
-        let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+        let raw = path.extension()?.to_str()?;
+        let ext = raw.to_ascii_lowercase();
         Some(match ext.as_str() {
             "rs" => Language::Rust,
             "py" | "pyi" => Language::Python,
@@ -95,9 +96,10 @@ impl Language {
             "zig" => Language::Zig,
             "r" => Language::R,
             "dart" => Language::Dart,
-            // `.S` is also GNU-as; Merlin claims it (the `.S` repos we target are
-            // 6502). Per-repo dynamic `[[languages]]` can override if needed (#359).
-            "s" => Language::Merlin6502,
+            // Uppercase `.S` is the Merlin / Apple II convention; lowercase `.s`
+            // is left to generic assemblers (GNU as). A non-6502 `.S` repo can
+            // override via a per-repo dynamic `[[languages]]` entry (#359).
+            "s" if raw == "S" => Language::Merlin6502,
             _ => return None,
         })
     }
@@ -158,4 +160,19 @@ impl Language {
         Language::Dart,
         Language::Merlin6502,
     ];
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use assert2::check;
+
+    // #359: Merlin claims uppercase `.S` (Apple II convention); lowercase `.s`
+    // stays with generic assemblers.
+    #[test]
+    fn merlin_claims_uppercase_s_only() {
+        check!(Language::from_path(Path::new("CUBE.S")) == Some(Language::Merlin6502));
+        check!(Language::from_path(Path::new("boot.s")).is_none());
+        check!(Language::from_name("merlin6502") == Some(Language::Merlin6502));
+    }
 }
