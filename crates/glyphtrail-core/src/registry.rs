@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::config::RepoPaths;
-use crate::{CoreError, RepoId, Result};
+use crate::{CoreError, PackageIdentity, RepoId, Result};
 
 /// Sibling lock file for a registry path (`registry.lock`).
 pub fn lock_path(registry_path: &Path) -> PathBuf {
@@ -83,6 +83,14 @@ pub struct RegistryEntry {
     /// repo.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub contributors: Vec<Contributor>,
+    /// Cross-repo package identity (#292): the packages this repo publishes (with
+    /// their exports) and the external packages its files use. Cached here at
+    /// analyze time so federated impact can resolve cross-repo links from the
+    /// loaded registry — and open only the link-connected member stores — instead
+    /// of opening every member just to read its identity. `None` for an entry
+    /// indexed before this cache existed; federation backfills it on demand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<PackageIdentity>,
 }
 
 /// A git author and how many commits they have in a repo (#265).
@@ -268,6 +276,7 @@ impl Registry {
                     missing_since: None,
                     ids: Vec::new(),
                     contributors: Vec::new(),
+                    identity: None,
                 });
                 true
             }
@@ -333,6 +342,21 @@ impl Registry {
     pub fn set_ids(&mut self, name: &str, ids: Vec<RepoId>) {
         if let Some(e) = self.repos.iter_mut().find(|e| e.name == name) {
             e.ids = ids;
+        }
+    }
+
+    /// Cache a repo's cross-repo [`PackageIdentity`] on its entry, matched by
+    /// canonical root (#292). No-op when no registered repo owns `root` (an
+    /// unregistered repo doesn't federate). Returns whether an entry was updated.
+    pub fn set_identity_by_root(&mut self, root: &Path, identity: PackageIdentity) -> bool {
+        let canon = root.canonicalize().ok();
+        let matches =
+            |r: &PathBuf| r == root || (canon.is_some() && r.canonicalize().ok() == canon);
+        if let Some(e) = self.repos.iter_mut().find(|e| e.roots().any(&matches)) {
+            e.identity = Some(identity);
+            true
+        } else {
+            false
         }
     }
 
@@ -625,6 +649,40 @@ mod tests {
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
+    // #292: cross-repo identity rides on the entry, set by canonical root, and an
+    // old registry without the field still loads (identity reads as None).
+    #[test]
+    fn set_identity_by_root_and_back_compat() {
+        let mut reg = Registry::default();
+        reg.add("a".into(), PathBuf::from("/x/a"));
+        check!(reg.repos[0].identity.is_none());
+
+        let id = PackageIdentity {
+            packages: vec![crate::IndexedPackage {
+                ecosystem: crate::Ecosystem::Cargo,
+                name: "a".into(),
+                version: None,
+                dir: String::new(),
+                exports: Vec::new(),
+            }],
+            external_uses: Vec::new(),
+        };
+        check!(reg.set_identity_by_root(Path::new("/x/a"), id));
+        check!(reg.repos[0].identity.is_some());
+        // Unregistered root is a no-op.
+        check!(!reg.set_identity_by_root(Path::new("/nope"), PackageIdentity::default()));
+
+        // Round-trips through JSON…
+        let s = serde_json::to_string(&reg).unwrap();
+        let back: Registry = serde_json::from_str(&s).unwrap();
+        check!(back.repos[0].identity.is_some());
+
+        // …and an older registry.json without `identity` loads as None.
+        let old: Registry =
+            serde_json::from_str(r#"{"repos":[{"name":"a","root":"/x/a"}]}"#).unwrap();
+        check!(old.repos[0].identity.is_none());
+    }
+
     fn reg_dir(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -643,6 +701,7 @@ mod tests {
             missing_since: None,
             ids: Vec::new(),
             contributors: Vec::new(),
+            identity: None,
         }
     }
 
