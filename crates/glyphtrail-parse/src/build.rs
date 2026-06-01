@@ -547,17 +547,36 @@ struct DefInfo {
 }
 
 /// Find the index of the smallest definition whose span encloses `byte`.
-fn enclosing_def(defs: &[DefInfo], byte: usize) -> Option<usize> {
+fn enclosing_def(defs: &[DefInfo], byte: usize, line_oriented: bool) -> Option<usize> {
     let probe = Span {
         start_byte: byte,
         end_byte: byte,
         ..Default::default()
     };
-    defs.iter()
+    // The smallest def whose span contains the byte — a brace language's
+    // enclosing function body.
+    if let Some((i, _)) = defs
+        .iter()
         .enumerate()
         .filter(|(_, d)| contains(&d.span, &probe))
         .min_by_key(|(_, d)| d.span.end_byte - d.span.start_byte)
-        .map(|(i, _)| i)
+    {
+        return Some(i);
+    }
+    // Line-oriented assembly: a label's span is just its own line, not the whole
+    // routine, so a `jsr` on a later line is contained by nothing. Attribute it
+    // to the nearest preceding label — the routine it belongs to (#368). Brace
+    // languages must NOT do this, or a top-level call between two functions would
+    // be mis-attributed to the earlier one.
+    if line_oriented {
+        return defs
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.span.start_byte <= byte)
+            .max_by_key(|(_, d)| d.span.start_byte)
+            .map(|(i, _)| i);
+    }
+    None
 }
 
 /// The immediate enclosing scope of a `Scope::…::name` qualified name — the
@@ -607,6 +626,9 @@ pub fn build_file_graph(
     source: &str,
 ) -> FileGraph {
     let mut fg = FileGraph::default();
+    // Assembly labels span one line, not the whole routine, so call attribution
+    // falls back to the nearest preceding label (#368). See `enclosing_def`.
+    let line_oriented = matches!(lang, Language::Merlin6502);
 
     // Establish parent relationships by span nesting.
     let raw = &parsed.defs;
@@ -710,7 +732,7 @@ pub fn build_file_graph(
 
     // Calls: resolve to a unique local definition, else defer to the global pass.
     for r in &parsed.calls {
-        let caller = enclosing_def(&defs, r.byte)
+        let caller = enclosing_def(&defs, r.byte, line_oriented)
             .map(|i| defs[i].id.clone())
             .unwrap_or_else(|| file_id.clone());
         // A qualified call (`Foo.bar()`) prefers a local def whose enclosing
@@ -755,7 +777,7 @@ pub fn build_file_graph(
     // global pending link), so impact and neighbour queries reach a type's
     // users, not just its callers (#310).
     for r in &parsed.refs {
-        let referrer = enclosing_def(&defs, r.byte)
+        let referrer = enclosing_def(&defs, r.byte, line_oriented)
             .map(|i| defs[i].id.clone())
             .unwrap_or_else(|| file_id.clone());
         if let Some(q) = &r.scope {
@@ -793,7 +815,7 @@ pub fn build_file_graph(
 
     // Inheritance: attach to the enclosing type definition.
     for b in &parsed.bases {
-        let Some(src_idx) = enclosing_def(&defs, b.byte) else {
+        let Some(src_idx) = enclosing_def(&defs, b.byte, line_oriented) else {
             continue;
         };
         let src = defs[src_idx].id.clone();
@@ -821,7 +843,7 @@ pub fn build_file_graph(
         if !has_marker(&c.text) {
             continue;
         }
-        let scope = enclosing_def(&defs, c.span.start_byte)
+        let scope = enclosing_def(&defs, c.span.start_byte, line_oriented)
             .map(|i| defs[i].id.clone())
             .unwrap_or_else(|| file_id.clone());
         let cid = NodeId::derive(&[rel_path, "comment", &c.span.start_byte.to_string()]);

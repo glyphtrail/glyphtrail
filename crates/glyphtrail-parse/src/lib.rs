@@ -184,6 +184,38 @@ mod tests {
         }
     }
 
+    // #368: in a multi-line assembly routine the `jsr` is on a line after the
+    // label, so it is contained by no def span. It must attribute to the routine
+    // (nearest preceding label), not the file — else the asm callgraph is empty.
+    #[test]
+    fn merlin_attributes_calls_in_a_multiline_routine() {
+        use glyphtrail_core::{EdgeKind, NodeId};
+        let src = "handler lda x\n jsr offleft\n rts\noffleft rts\n";
+        let parsed = parse_source(&Language::Merlin6502, src).unwrap();
+        let file_id = NodeId::derive(&["file", "x.S"]);
+        let fg = build_file_graph("x.S", &Language::Merlin6502, &file_id, &parsed, src);
+        let id = |name: &str| {
+            fg.graph
+                .nodes
+                .iter()
+                .find(|n| n.name == name)
+                .map(|n| n.id.clone())
+        };
+        let (handler, offleft) = (id("handler").unwrap(), id("offleft").unwrap());
+        check!(
+            fg.graph
+                .edges
+                .iter()
+                .any(|e| e.src == handler && e.dst == offleft && e.kind == EdgeKind::Calls),
+            "expected handler -> offleft, got {:?}",
+            fg.graph
+                .edges
+                .iter()
+                .map(|e| (&e.src, &e.kind, &e.dst))
+                .collect::<Vec<_>>()
+        );
+    }
+
     // #5: `new Foo()` constructor instantiation is a reference to the class, so
     // it is captured as a call in JS/TS/TSX and Java (Python `Foo()` already is).
     #[test]

@@ -1014,7 +1014,10 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// consumes), so existing indexes re-analyze to gain cross-repo .NET links.
 /// 3: .NET symbol-level candidates from referenced PascalCase identifiers (type
 /// uses, not just calls), so cross-repo .NET links resolve to symbols and chain.
-const ANALYSIS_REVISION: u32 = 3;
+/// 4: assembly call attribution — `jsr`/`jmp` in a line-oriented language now
+/// attribute to the nearest preceding label, so existing `.S` indexes rebuild
+/// to gain the routine-level callgraph (#368).
+const ANALYSIS_REVISION: u32 = 4;
 
 /// Fingerprint of everything that determines analysis output: the crate
 /// version, the manual revision counter, and the built-in tree-sitter query
