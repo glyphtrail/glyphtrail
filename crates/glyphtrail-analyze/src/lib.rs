@@ -12,4 +12,4 @@ pub mod analyze;
 pub mod backend;
 pub mod schema;
 
-pub use analyze::{AnalyzeOutcome, run};
+pub use analyze::{AnalyzeOutcome, Staleness, index_staleness, run};

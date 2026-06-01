@@ -78,8 +78,11 @@ glyphtrail wiki --provider claude        # or openai / openrouter (reads *_API_K
 glyphtrail wiki --dry-run                # write the prompts only (no network/keys)
 #   --base-url lets an OpenAI-compatible gateway (e.g. Kilo) stand in
 
-# Stats
+# Stats (also reports index freshness: fresh / stale / unknown)
 glyphtrail status
+#   read commands (query, impact, outline, drift, cypher) print a stderr note
+#   when the index looks stale (HEAD moved, uncommitted changes, or analyzer
+#   upgraded) so you know to re-run `glyphtrail analyze`
 ```
 
 ### Registering glyphtrail as an MCP server

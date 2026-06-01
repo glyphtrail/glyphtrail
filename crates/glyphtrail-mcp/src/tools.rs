@@ -114,7 +114,10 @@ pub fn definitions(has_default_repo: bool) -> Vec<Value> {
         ),
         tool(
             "status",
-            "Index statistics for the repository.",
+            "Index statistics for the repository, plus a `freshness` field \
+             (fresh/stale/unknown) and `stale`/`stale_reason`: whether the index \
+             still reflects the working tree. If stale, call `analyze` before \
+             trusting query/impact results.",
             json!({}),
             &[],
         ),
@@ -277,9 +280,27 @@ fn dispatch(default_db: Option<&Path>, name: &str, args: &Value) -> Result<Value
                 .into_iter()
                 .map(|(lang, n)| (lang, json!(n)))
                 .collect();
-            Ok(
-                json!({ "nodes": s.nodes, "edges": s.edges, "files": s.files, "languages": languages }),
-            )
+            // Freshness (#313): whether the index still reflects the working
+            // tree, so an agent knows to call `analyze` before trusting results.
+            let staleness = db
+                .parent()
+                .and_then(Path::parent)
+                .map(|root| glyphtrail_analyze::index_staleness(root, &*store))
+                .unwrap_or(glyphtrail_analyze::Staleness::Unknown);
+            let (freshness, reason) = match &staleness {
+                glyphtrail_analyze::Staleness::Fresh => ("fresh", Value::Null),
+                glyphtrail_analyze::Staleness::Stale(why) => ("stale", json!(why)),
+                glyphtrail_analyze::Staleness::Unknown => ("unknown", Value::Null),
+            };
+            Ok(json!({
+                "nodes": s.nodes,
+                "edges": s.edges,
+                "files": s.files,
+                "languages": languages,
+                "freshness": freshness,
+                "stale": staleness.is_stale(),
+                "stale_reason": reason,
+            }))
         }
         other => Err(format!("unknown tool: {other}")),
     }

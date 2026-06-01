@@ -3,6 +3,18 @@
 // (`commands::analyze::run`, `commands::backend::open_existing`) are unchanged.
 pub use glyphtrail_analyze::{analyze, backend};
 
+use glyphtrail_store::GraphStore;
+use std::path::Path;
+
+/// Print a staleness advisory to stderr when the index lags the repo (#313).
+/// On stderr so it never corrupts JSON/YAML emitted on stdout, yet still reaches
+/// a human at the terminal and a shell that forwards stderr.
+pub fn note_staleness(repo: &Path, store: &dyn GraphStore) {
+    if let Some(hint) = glyphtrail_analyze::index_staleness(repo, store).hint() {
+        eprintln!("{hint}");
+    }
+}
+
 pub mod cypher;
 pub mod drift;
 pub mod group;

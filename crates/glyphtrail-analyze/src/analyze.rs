@@ -1178,6 +1178,150 @@ fn git_tree_clean(root: &Path) -> bool {
     })
 }
 
+/// Whether an on-disk index still reflects the working tree (#313). Best-effort
+/// and cheap: it never walks or hashes the tree, so it is safe to call on every
+/// read. When it cannot tell, it says [`Unknown`](Staleness::Unknown) rather
+/// than guessing, so a hint never fires spuriously.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Staleness {
+    /// The index appears current.
+    Fresh,
+    /// The index is known to lag the repo; carries a short reason.
+    Stale(String),
+    /// Indeterminate (e.g. indexed from a dirty or non-git tree).
+    Unknown,
+}
+
+impl Staleness {
+    /// Whether the index is known to be stale.
+    pub fn is_stale(&self) -> bool {
+        matches!(self, Staleness::Stale(_))
+    }
+
+    /// The reason, when stale.
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Staleness::Stale(why) => Some(why),
+            _ => None,
+        }
+    }
+
+    /// A one-line advisory to show the user/agent, when stale.
+    pub fn hint(&self) -> Option<String> {
+        self.reason().map(|why| {
+            format!("note: index may be stale ({why}); run `glyphtrail analyze` to refresh")
+        })
+    }
+}
+
+/// Cheaply assess whether the index at `store` still matches `root`, reusing the
+/// same signals as analyze's fast paths (#273/#110/#251): the analysis revision
+/// (so an analyzer upgrade flags every index as stale) and, for an index built
+/// from a clean git checkout, the recorded HEAD plus working-tree cleanliness.
+pub fn index_staleness(root: &Path, store: &dyn glyphtrail_store::GraphStore) -> Staleness {
+    decide_staleness(
+        store
+            .get_meta("analysis_revision")
+            .ok()
+            .flatten()
+            .as_deref(),
+        &analysis_revision(),
+        store.get_meta("head_commit").ok().flatten().as_deref(),
+        || git_head_commit(root),
+        || git_tree_clean(root),
+    )
+}
+
+/// The pure decision behind [`index_staleness`], with the store and git probed
+/// out so it is deterministically testable. The git probes are lazy: they only
+/// run once the cheaper revision/HEAD-metadata checks haven't already decided.
+fn decide_staleness(
+    stored_revision: Option<&str>,
+    current_revision: &str,
+    stored_head: Option<&str>,
+    head_now: impl FnOnce() -> Option<String>,
+    tree_clean: impl FnOnce() -> bool,
+) -> Staleness {
+    // The extraction logic changed since this index was built (e.g. a new edge
+    // rule): the graph is stale regardless of git. Git-free and high-value.
+    match stored_revision {
+        Some(rev) if rev != current_revision => {
+            return Staleness::Stale("analyzer updated since last index".into());
+        }
+        Some(_) => {}
+        // Pre-revision index or an unreadable store: don't guess.
+        None => return Staleness::Unknown,
+    }
+    // The git signal is only trustworthy when the index was built from a clean
+    // checkout — the write path records the HEAD then, else an empty string.
+    let stored_head = match stored_head {
+        Some(h) if !h.is_empty() => h,
+        _ => return Staleness::Unknown,
+    };
+    match head_now() {
+        Some(head) if head != stored_head => Staleness::Stale("repo is on a new commit".into()),
+        Some(_) if !tree_clean() => Staleness::Stale("uncommitted changes since last index".into()),
+        Some(_) => Staleness::Fresh,
+        // No longer a git checkout: can't apply the git signal.
+        None => Staleness::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod staleness_tests {
+    use super::*;
+    use assert2::check;
+
+    #[test]
+    fn revision_mismatch_is_stale_regardless_of_git() {
+        let s = decide_staleness(
+            Some("old"),
+            "new",
+            Some("abc"),
+            || Some("abc".into()),
+            || true,
+        );
+        check!(s == Staleness::Stale("analyzer updated since last index".into()));
+    }
+
+    #[test]
+    fn missing_revision_is_unknown() {
+        let s = decide_staleness(None, "rev", Some("abc"), || Some("abc".into()), || true);
+        check!(s == Staleness::Unknown);
+    }
+
+    #[test]
+    fn empty_or_missing_head_is_unknown() {
+        // Indexed from a dirty/non-git tree: the write path stored "".
+        check!(decide_staleness(Some("r"), "r", Some(""), || None, || true) == Staleness::Unknown);
+        check!(decide_staleness(Some("r"), "r", None, || None, || true) == Staleness::Unknown);
+    }
+
+    #[test]
+    fn moved_head_is_stale() {
+        let s = decide_staleness(Some("r"), "r", Some("aaa"), || Some("bbb".into()), || true);
+        check!(s == Staleness::Stale("repo is on a new commit".into()));
+    }
+
+    #[test]
+    fn same_head_dirty_tree_is_stale() {
+        let s = decide_staleness(Some("r"), "r", Some("aaa"), || Some("aaa".into()), || false);
+        check!(s == Staleness::Stale("uncommitted changes since last index".into()));
+    }
+
+    #[test]
+    fn same_head_clean_tree_is_fresh() {
+        let s = decide_staleness(Some("r"), "r", Some("aaa"), || Some("aaa".into()), || true);
+        check!(s == Staleness::Fresh);
+    }
+
+    #[test]
+    fn no_longer_git_is_unknown() {
+        let s = decide_staleness(Some("r"), "r", Some("aaa"), || None, || true);
+        check!(s == Staleness::Unknown);
+    }
+}
+
 pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
     let root = path
         .canonicalize()

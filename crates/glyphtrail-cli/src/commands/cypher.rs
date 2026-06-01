@@ -17,6 +17,7 @@ pub fn run(repo: &Path, query: &str) -> Result<()> {
         );
     }
     let store = LadybugStore::open(&dir)?;
+    crate::commands::note_staleness(repo, &store);
     print!("{}", store.cypher(query)?);
     Ok(())
 }

@@ -114,6 +114,7 @@ pub fn run(args: ImpactArgs) -> Result<()> {
 
     let paths = RepoPaths::new(&args.repo);
     let store = backend::open_existing(&paths)?;
+    crate::commands::note_staleness(&args.repo, store.as_ref());
 
     let seed_set = resolve_seeds(store.as_ref(), &args)?;
     let report = if seed_set.seeds.is_empty() {

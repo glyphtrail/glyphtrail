@@ -453,6 +453,7 @@ pub fn print_value(value: &serde_json::Value, emit: Emit) -> Result<()> {
 
 pub fn run(repo: &Path, cmd: QueryCmd, emit: Emit) -> Result<()> {
     let store = open_store(repo)?;
+    crate::commands::note_staleness(repo, store.as_ref());
     let result = execute(&*store, &cmd)?;
     match emit {
         Emit::Text => result.print_text(),
