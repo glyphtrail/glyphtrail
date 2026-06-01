@@ -185,6 +185,11 @@ pub fn definitions(has_default_repo: bool) -> Vec<Value> {
     if !has_default_repo {
         require_repo_argument(&mut defs);
     }
+    // Opt-in project-reporting tool (#370), added last so it never gains a
+    // repo argument (it is not repo-scoped).
+    if file_issue_enabled() {
+        defs.push(file_issue_tool());
+    }
     defs
 }
 
@@ -242,6 +247,14 @@ fn dispatch(
     // Registry-level tools span repos and need no per-repo store.
     if name == "list_repos" {
         return list_repos(args);
+    }
+    // Opt-in, project-level, store-free (#370). Refuse unless enabled, even if a
+    // client somehow calls it off a stale schema.
+    if name == "file_issue" {
+        if !file_issue_enabled() {
+            return Err("file_issue is disabled; set GLYPHTRAIL_MCP_FILE_ISSUE=1 to enable".into());
+        }
+        return Ok(file_issue_guidance(args));
     }
     // Resolve the per-call repo selector (#240): a registered name or a path
     // overrides the server's launch repo; absent, the launch repo is used — and
@@ -967,6 +980,80 @@ fn text_result(value: &Value, is_error: bool) -> Value {
     json!({ "content": [ { "type": "text", "text": text } ], "isError": is_error })
 }
 
+/// Whether the opt-in project-reporting tool is advertised + allowed (#370). Off
+/// by default; set `GLYPHTRAIL_MCP_FILE_ISSUE` to a truthy value to enable.
+fn file_issue_enabled() -> bool {
+    std::env::var("GLYPHTRAIL_MCP_FILE_ISSUE")
+        .map(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(false)
+}
+
+/// The `file_issue` tool definition (#370): guidance for reporting a glyphtrail
+/// bug/idea, deliberately doing nothing itself. Built directly (not via `tool()`)
+/// because it is project-level, not repo-scoped, so it carries no `repo` arg.
+fn file_issue_tool() -> Value {
+    json!({
+        "name": "file_issue",
+        "description": "Guidance for reporting a glyphtrail bug or idea to its \
+             GitHub project. It does NOT file anything — it returns instructions \
+             and a provenance line; you act with your own tools. ALWAYS search \
+             existing OPEN and CLOSED issues first and prefer commenting on a \
+             match over opening a duplicate.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": { "type": "string", "description": "Proposed issue title." },
+                "body": { "type": "string", "description": "Proposed issue body (Markdown)." }
+            },
+            "required": ["title"],
+        },
+        // Returns text only; no mutation, no network.
+        "annotations": { "readOnlyHint": true, "idempotentHint": true, "destructiveHint": false },
+    })
+}
+
+/// Build the `file_issue` response: where and how to report, plus the proposed
+/// title/body with an agent-provenance footer. Performs no network action (#370).
+fn file_issue_guidance(args: &Value) -> Value {
+    const REPO: &str = env!("CARGO_PKG_REPOSITORY");
+    let title = opt_str(args, "title").unwrap_or_default();
+    let body = opt_str(args, "body").unwrap_or_default();
+    let provenance = "_Reported via `glyphtrail-mcp` by an automated agent (not a human); review before acting._";
+    let q = url_query(title);
+    json!({
+        "project": REPO,
+        "files_nothing": true,
+        "steps": [
+            "This returns guidance only — use your own tools (e.g. the `gh` CLI) to act.",
+            format!("Search existing issues, OPEN and CLOSED: {REPO}/issues?q=is%3Aissue+{q}"),
+            "If a matching issue exists, add a comment there instead of opening a duplicate.",
+            "Only file when the information is accurate and not already covered.",
+            "Include the `provenance` line so the report is identifiable as agent-filed.",
+        ],
+        "new_issue_url": format!("{REPO}/issues/new"),
+        "provenance": provenance,
+        "title": title,
+        "body": if body.is_empty() {
+            provenance.to_string()
+        } else {
+            format!("{body}\n\n{provenance}")
+        },
+    })
+}
+
+/// Minimal percent-encoding for a GitHub issue-search query string (#370).
+fn url_query(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b' ' => out.push('+'),
+            b if b.is_ascii_alphanumeric() => out.push(b as char),
+            b => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// The OTHER repos this one declares cross-repo links to (`[[links]]`), so the
 /// `status` tool can point an agent at code that lives in a linked/submodule
 /// repo (#365). Deduplicated; empty when there are none or no config.
@@ -1214,6 +1301,35 @@ mod tests {
         check!(declared_links(Some(&dir)) == vec!["vendor/pop-apple2/".to_string()]);
         check!(declared_links(None).is_empty());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // #370: the opt-in file_issue tool returns guidance and files nothing.
+    #[test]
+    fn file_issue_guidance_reports_without_acting() {
+        let g = file_issue_guidance(&json!({ "title": "outline is slow", "body": "Repro: ..." }));
+        check!(g["files_nothing"] == json!(true));
+        check!(g["project"].as_str().unwrap().contains("glyphtrail"));
+        check!(
+            g["new_issue_url"]
+                .as_str()
+                .unwrap()
+                .ends_with("/issues/new")
+        );
+        check!(g["title"] == json!("outline is slow"));
+        check!(g["body"].as_str().unwrap().contains("glyphtrail-mcp"));
+        let steps = g["steps"].as_array().unwrap();
+        check!(steps.iter().any(|s| s.as_str().unwrap().contains("CLOSED")));
+    }
+
+    // file_issue is advertised exactly when enabled (off by default). Asserting
+    // the iff is deterministic regardless of the ambient env var, with no env
+    // mutation (the workspace forbids `unsafe`).
+    #[test]
+    fn file_issue_tool_advertised_only_when_enabled() {
+        let advertised = definitions(true)
+            .iter()
+            .any(|d| d["name"] == json!("file_issue"));
+        check!(advertised == file_issue_enabled());
     }
 
     // #223: a registry-level tool needs no per-repo index. It reads the global
