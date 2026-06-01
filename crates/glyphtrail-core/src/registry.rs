@@ -342,11 +342,26 @@ impl Registry {
     /// Collapse entries that point at the same physical repository — they share a
     /// root, compared canonically when it resolves on disk and by the path as
     /// written otherwise — into a single entry. The most recently registered name
-    /// wins (a rename's new name), and ids, alternate locations, and contributors
-    /// are unioned. This repairs duplicates left when a repo is re-registered
-    /// under a new name before its forge ids line up — which `upsert_repo`'s
-    /// id/name matching alone does not catch (#350). Returns whether it merged.
+    /// wins (a rename's new name); ids and alternate locations are unioned, and
+    /// contributors are refreshed to the most recent non-empty scan (the same
+    /// semantics as [`Self::upsert_repo`]). This repairs duplicates left when a
+    /// repo is re-registered under a new name before its forge ids line up —
+    /// which `upsert_repo`'s id/name matching alone does not catch (#350).
+    /// Returns whether anything merged.
     pub fn dedup_by_root(&mut self) -> bool {
+        // One pass folds each entry into the *first* kept entry it overlaps, so an
+        // entry whose roots bridge two previously-distinct entries needs a further
+        // pass to collapse them. Repeat to a fixpoint (each merging pass drops at
+        // least one entry, so it terminates).
+        let mut merged_any = false;
+        while self.dedup_pass() {
+            merged_any = true;
+        }
+        merged_any
+    }
+
+    /// A single [`Self::dedup_by_root`] pass. Returns whether anything merged.
+    fn dedup_pass(&mut self) -> bool {
         fn key(p: &Path) -> PathBuf {
             p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
         }
@@ -380,8 +395,12 @@ impl Registry {
                     if target.identity.is_none() {
                         target.identity = entry.identity;
                     }
-                    // Missing only if every merged location was missing.
-                    target.missing_since = target.missing_since.and(entry.missing_since);
+                    // Missing only if *both* were missing; then keep the earliest
+                    // stamp so `prune_missing` isn't delayed.
+                    target.missing_since = match (target.missing_since, entry.missing_since) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        _ => None,
+                    };
                     for k in entry_keys {
                         if !keys.contains(&k) {
                             keys.push(k);
@@ -858,6 +877,20 @@ mod tests {
         check!(reg.repos.len() == 1);
         check!(reg.repos[0].ids.iter().any(|r| r.id == "x"));
         check!(reg.repos[0].ids.iter().any(|r| r.id == "y"));
+    }
+
+    // A later entry whose roots bridge two previously-distinct entries collapses
+    // all three — the fixpoint loop, not just a single first-match pass.
+    #[test]
+    fn dedup_by_root_collapses_transitive_bridge() {
+        let mut reg = Registry::default();
+        reg.repos.push(entry("a", "/x"));
+        reg.repos.push(entry("b", "/y"));
+        let mut bridge = entry("c", "/x");
+        bridge.alt_roots.push(PathBuf::from("/y"));
+        reg.repos.push(bridge);
+        check!(reg.dedup_by_root());
+        check!(reg.repos.len() == 1);
     }
 
     // `record` applies under the lock and reports it.
