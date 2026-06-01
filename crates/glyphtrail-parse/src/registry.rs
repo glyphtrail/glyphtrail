@@ -27,6 +27,8 @@ pub fn grammar(lang: &Language) -> Option<TsLanguage> {
         Language::Swift => tree_sitter_swift::LANGUAGE.into(),
         Language::Elixir => tree_sitter_elixir::LANGUAGE.into(),
         Language::Zig => tree_sitter_zig::LANGUAGE.into(),
+        Language::R => tree_sitter_r::LANGUAGE.into(),
+        Language::Dart => tree_sitter_dart::LANGUAGE.into(),
         Language::Other(_) => return None,
     })
 }
@@ -61,6 +63,8 @@ pub fn query_source(lang: &Language) -> Option<&'static str> {
         Language::Swift => include_str!("../queries/swift.scm"),
         Language::Elixir => include_str!("../queries/elixir.scm"),
         Language::Zig => include_str!("../queries/zig.scm"),
+        Language::R => include_str!("../queries/r.scm"),
+        Language::Dart => include_str!("../queries/dart.scm"),
         Language::Other(_) => return None,
     })
 }

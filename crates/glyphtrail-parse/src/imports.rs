@@ -45,6 +45,8 @@ pub fn resolve_import(importer_rel: &str, raw: &str, lang: &Language) -> Vec<Str
         | Language::Swift
         | Language::Elixir
         | Language::Zig
+        | Language::R
+        | Language::Dart
         | Language::Other(_) => Vec::new(),
     }
 }
