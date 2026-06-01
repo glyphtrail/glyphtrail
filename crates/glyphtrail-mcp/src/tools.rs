@@ -124,7 +124,9 @@ pub fn definitions(has_default_repo: bool) -> Vec<Value> {
             "Index statistics for the repository, plus a `freshness` field \
              (fresh/stale/unknown) and `stale`/`stale_reason`: whether the index \
              still reflects the working tree. If stale, call `analyze` before \
-             trusting query/impact results.",
+             trusting query/impact results. `links` lists OTHER repos this one \
+             declares cross-repo links to (e.g. a vendored/submodule repo) — \
+             pass one as the `repo` argument to search it.",
             json!({}),
             &[],
         ),
@@ -332,13 +334,17 @@ fn dispatch(
                 .into_iter()
                 .map(|(lang, n)| (lang, json!(n)))
                 .collect();
+            let root = db.parent().and_then(Path::parent);
             // Freshness (#313): whether the index still reflects the working
             // tree, so an agent knows to call `analyze` before trusting results.
-            let staleness = db
-                .parent()
-                .and_then(Path::parent)
+            let staleness = root
                 .map(|root| glyphtrail_analyze::index_staleness(root, &*store))
                 .unwrap_or(glyphtrail_analyze::Staleness::Unknown);
+            // Declared cross-repo links (#365): the OTHER repos this one links to
+            // via [[links]] (e.g. a vendored/submodule repo). Surfacing them tells
+            // an agent to target those repos in its searches instead of missing
+            // code that lives outside this one.
+            let links = declared_links(root);
             let (freshness, reason) = match &staleness {
                 glyphtrail_analyze::Staleness::Fresh => ("fresh", Value::Null),
                 glyphtrail_analyze::Staleness::Stale(why) => ("stale", json!(why)),
@@ -357,6 +363,9 @@ fn dispatch(
                 "version": env!("CARGO_PKG_VERSION"),
                 "commit": env!("GLYPHTRAIL_GIT_COMMIT"),
                 "built": env!("GLYPHTRAIL_BUILD_TIMESTAMP"),
+                // OTHER repos this one declares links to (#365), so the agent can
+                // target them; empty when none are declared.
+                "links": links,
             }))
         }
         other => Err(format!("unknown tool: {other}")),
@@ -958,6 +967,26 @@ fn text_result(value: &Value, is_error: bool) -> Value {
     json!({ "content": [ { "type": "text", "text": text } ], "isError": is_error })
 }
 
+/// The OTHER repos this one declares cross-repo links to (`[[links]]`), so the
+/// `status` tool can point an agent at code that lives in a linked/submodule
+/// repo (#365). Deduplicated; empty when there are none or no config.
+fn declared_links(root: Option<&Path>) -> Vec<String> {
+    let mut repos: Vec<String> = root
+        .and_then(|r| glyphtrail_core::Config::load(r).ok())
+        .map(|cfg| {
+            cfg.links
+                .iter()
+                .flat_map(|l| [l.from.repo.clone(), l.to.repo.clone()])
+                .flatten()
+                .filter(|r| r != "." && !r.trim().is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    repos.sort();
+    repos.dedup();
+    repos
+}
+
 /// A stale-index warning for the repo behind `db`, or `None` when the index
 /// still matches the working tree. Reuses the same `index_staleness` check the
 /// `status` tool reports (#313), so every store-based tool carries the signal.
@@ -1166,6 +1195,25 @@ mod tests {
         check!(!parsed["commit"].as_str().unwrap().is_empty());
         check!(parsed["built"].as_str().unwrap().contains('T'));
         std::fs::remove_dir_all(db.parent().unwrap()).ok();
+    }
+
+    // #365: status surfaces the OTHER repos this one links to via [[links]].
+    #[test]
+    fn declared_links_lists_link_targets() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("gt-links-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("glyphtrail.toml"),
+            "[[links]]\nto = { repo = \"vendor/pop-apple2/\" }\n",
+        )
+        .unwrap();
+        check!(declared_links(Some(&dir)) == vec!["vendor/pop-apple2/".to_string()]);
+        check!(declared_links(None).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // #223: a registry-level tool needs no per-repo index. It reads the global
