@@ -29,6 +29,8 @@ pub enum Language {
     Swift,
     Elixir,
     Zig,
+    R,
+    Dart,
     /// A language identified by name but not built in (dynamically loaded).
     Other(String),
 }
@@ -57,6 +59,8 @@ impl Language {
             Language::Swift => "swift",
             Language::Elixir => "elixir",
             Language::Zig => "zig",
+            Language::R => "r",
+            Language::Dart => "dart",
             Language::Other(name) => name,
         }
     }
@@ -86,6 +90,8 @@ impl Language {
             "swift" => Language::Swift,
             "ex" | "exs" => Language::Elixir,
             "zig" => Language::Zig,
+            "r" => Language::R,
+            "dart" => Language::Dart,
             _ => return None,
         })
     }
@@ -113,11 +119,13 @@ impl Language {
             "swift" => Language::Swift,
             "elixir" => Language::Elixir,
             "zig" => Language::Zig,
+            "r" => Language::R,
+            "dart" => Language::Dart,
             _ => return None,
         })
     }
 
-    pub const ALL: [Language; 21] = [
+    pub const ALL: [Language; 23] = [
         Language::Rust,
         Language::Python,
         Language::JavaScript,
@@ -139,5 +147,7 @@ impl Language {
         Language::Swift,
         Language::Elixir,
         Language::Zig,
+        Language::R,
+        Language::Dart,
     ];
 }
