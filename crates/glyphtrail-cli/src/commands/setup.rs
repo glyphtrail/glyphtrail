@@ -14,6 +14,12 @@
 //! usually a mistake, so a target that isn't inside a git repository errors —
 //! unless `--force` (write here anyway) or `--home` (write the global agent
 //! files to the user's home directory) is given.
+//!
+//! The skill and managed-section content are *not* inlined here: they are the
+//! repo's own dogfooded onboarding files (`.claude/skills/glyphtrail/SKILL.md`
+//! and the managed section of `CLAUDE.md`), copied into `assets/` and embedded
+//! below via `include_str!`. `build.rs` fails the build if a copy drifts from
+//! its source; `task assets:sync` regenerates the copies.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,65 +29,14 @@ use anyhow::{Context, Result, anyhow, bail};
 const BEGIN: &str = "<!-- glyphtrail:begin (managed section — edits are overwritten) -->";
 const END: &str = "<!-- glyphtrail:end -->";
 
-/// The skill written to `.claude/skills/glyphtrail/SKILL.md`.
-const SKILL_MD: &str = r#"---
-name: glyphtrail
-description: >-
-  Use when understanding or changing code in this repo: locating where a symbol
-  is defined, what calls it, how a request flows across the API boundary, or the
-  blast radius of a change (which symbols, tests, endpoints — and which other
-  indexed repos — a change affects). Prefer this over ls/grep sweeps.
----
+/// The skill written to `.claude/skills/glyphtrail/SKILL.md`. Bundled copy of
+/// the repo's own skill of the same name (see `build.rs`, `task assets:sync`).
+const SKILL_MD: &str = include_str!("../../assets/SKILL.md");
 
-# Glyphtrail: query the code graph instead of grepping
-
-This repository is indexed by [glyphtrail](https://github.com/glyphtrail/glyphtrail)
-as a semantic graph (definitions, calls, imports, inheritance, API endpoints and
-their clients). Query that graph for code understanding and impact analysis —
-it's faster and more precise than scanning files, and it crosses the web and
-package boundaries.
-
-## How to ask
-
-Glyphtrail exposes an MCP server (`glyphtrail mcp`, also `POST /mcp` under
-`glyphtrail serve`) and a CLI. Use whichever is wired up.
-
-**Locate / explore**
-- `search <query>` — full-text over symbol names and docs.
-- `definition <name>` / `callers <name>` / `callees <name>` / `neighbors <name>`.
-- `endpoints` / `clients` / `serves <path>` / `who_calls <path>` / `api_impact <path>` — API surface and cross-boundary consumers.
-
-**Blast radius (do this before changing a symbol)**
-- `impact <name>` — classified, confidence-aware dependents: tests to run, API
-  surface touched, internal dependents. Seed from a symbol, a `--file`, or a git
-  change set (`--since`, `--staged`, `--diff`).
-- `impact <name> --downstream` (or `--group <name>`) — extends the blast radius
-  into *other* indexed repos that depend on this one, reporting which break and
-  where.
-- `list_repos` — the repos glyphtrail has indexed (with health + forge ids).
-
-CLI equivalents: `glyphtrail query <verb> <name>`, `glyphtrail impact …`.
-
-## Rule of thumb
-
-Reaching for `grep`/`ls` to trace callers, find a definition, or guess what a
-change affects? Ask glyphtrail instead — and run `impact` before editing a
-widely-used symbol so you know the tests and consumers up front.
-"#;
-
-/// The body of the managed agent-file section (wrapped in the markers).
-const AGENT_SECTION_BODY: &str = r#"# Code graph (glyphtrail)
-
-This repo is indexed by [glyphtrail](https://github.com/glyphtrail/glyphtrail).
-For code understanding and change-impact analysis, query the graph via the
-glyphtrail MCP server (`glyphtrail mcp`) or CLI rather than `ls`/`grep`:
-
-- find code: `search`, `definition`, `callers`, `callees`, `neighbors`
-- API flow: `endpoints`, `clients`, `who_calls`, `api_impact`
-- **blast radius before a change**: `impact <symbol>` (add `--downstream` to
-  reach other indexed repos that depend on this one)
-
-See `.claude/skills/glyphtrail/SKILL.md` for details."#;
+/// The body of the managed agent-file section (wrapped in the markers). Bundled
+/// copy of the managed section of the repo's own `CLAUDE.md`; carries a trailing
+/// newline, so the block is `{BEGIN}\n{body}{END}\n`.
+const AGENT_SECTION_BODY: &str = include_str!("../../assets/agent-section.md");
 
 /// Onboard agents: write the skill, upsert the managed section in
 /// `CLAUDE.md`/`AGENTS.md`, and (inside a repo) ignore `.glyphtrail/`.
@@ -155,7 +110,10 @@ fn write_skill(root: &Path) -> Result<()> {
 /// was created. The section is delimited by [`BEGIN`]/[`END`]; on re-run the
 /// span between them is replaced, so the rest of the file is untouched.
 fn upsert_section(path: &Path) -> Result<bool> {
-    let block = format!("{BEGIN}\n{AGENT_SECTION_BODY}\n{END}\n");
+    // `AGENT_SECTION_BODY` already ends with a newline, so the block reads
+    // `{BEGIN}\n{body}{END}\n` — never blindly overwrite the file; only this
+    // span between the markers is owned by glyphtrail.
+    let block = format!("{BEGIN}\n{AGENT_SECTION_BODY}{END}\n");
     let existing = fs::read_to_string(path).unwrap_or_default();
     let created = existing.is_empty();
 
@@ -219,6 +177,25 @@ mod tests {
         dir
     }
 
+    /// The managed-section body (with its trailing newline) between the markers.
+    fn section(s: &str) -> &str {
+        let b = s.find(BEGIN).unwrap();
+        let after = &s[b + BEGIN.len()..];
+        let start = b + BEGIN.len() + after.find('\n').unwrap() + 1;
+        let e = s[start..].find(END).unwrap() + start;
+        &s[start..e]
+    }
+
+    /// Repo root, two levels up from this crate's manifest dir.
+    fn repo_root() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf()
+    }
+
     #[test]
     fn setup_writes_files_and_is_idempotent() {
         let dir = temp_dir("idem");
@@ -266,6 +243,29 @@ mod tests {
         check!(dir.join(".claude/skills/glyphtrail/SKILL.md").exists());
         check!(dir.join("CLAUDE.md").exists());
         check!(!dir.join(".gitignore").exists()); // not a repo -> no gitignore
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Dogfood: what `setup` installs must be byte-for-byte the repo's own
+    // committed onboarding files (the source the bundled assets are copied
+    // from). Guards against the embedded copy drifting from what we ship.
+    #[test]
+    fn setup_reproduces_committed_repo_files() {
+        let root = repo_root();
+        let dir = temp_dir("dogfood");
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        run(&dir, false, false).unwrap();
+
+        let got_skill =
+            std::fs::read_to_string(dir.join(".claude/skills/glyphtrail/SKILL.md")).unwrap();
+        let want_skill =
+            std::fs::read_to_string(root.join(".claude/skills/glyphtrail/SKILL.md")).unwrap();
+        check!(got_skill == want_skill);
+
+        let got = std::fs::read_to_string(dir.join("CLAUDE.md")).unwrap();
+        let want = std::fs::read_to_string(root.join("CLAUDE.md")).unwrap();
+        check!(section(&got) == section(&want));
 
         std::fs::remove_dir_all(&dir).ok();
     }
