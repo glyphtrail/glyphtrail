@@ -155,6 +155,9 @@ struct FileOutput {
     /// `(file, name, value)` module-scope string constants, so a client URL built
     /// from an *imported* constant base resolves to a concrete path (#405).
     string_consts: Vec<(String, String, String)>,
+    /// `(file, name, referenced key)` constant references (`const X = OBJ.PROP`,
+    /// object props naming another const), for the Angular `environment` chain.
+    const_refs: Vec<(String, String, String)>,
 }
 
 /// Parse one discovered file and build its graph fragment + side lists. Pure and
@@ -177,6 +180,7 @@ fn parse_file(
         imports: Vec::new(),
         import_symbols: Vec::new(),
         string_consts: Vec::new(),
+        const_refs: Vec::new(),
     };
 
     // Sensitive record-only file (#136): record that it exists, never read it.
@@ -303,10 +307,18 @@ fn parse_file(
             .into_iter()
             .map(|(sym, module)| (f.rel_path.clone(), sym, module, language.name().to_string())),
     );
+    let consts = glyphtrail_parse::module_constants(&source, language);
     out.string_consts.extend(
-        glyphtrail_parse::module_string_constants(&source, language)
+        consts
+            .strings
             .into_iter()
             .map(|(name, value)| (f.rel_path.clone(), name, value)),
+    );
+    out.const_refs.extend(
+        consts
+            .refs
+            .into_iter()
+            .map(|(name, target)| (f.rel_path.clone(), name, target)),
     );
     Some(out)
 }
@@ -1032,7 +1044,10 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 6: client-call URLs built from an *imported* constant base are resolved
 /// cross-file at analyze time (#405), so existing frontend indexes rebuild to
 /// fold those paths to concrete, matchable routes.
-const ANALYSIS_REVISION: u32 = 6;
+/// 7: constant resolution follows the Angular `environment` chain — a member
+/// alias of an imported config object's string property (#405) — so those
+/// frontend indexes rebuild to fold the common environment-base URL pattern.
+const ANALYSIS_REVISION: u32 = 7;
 
 /// Fingerprint of everything that determines analysis output: the crate
 /// version, the manual revision counter, and the built-in tree-sitter query
@@ -1568,6 +1583,8 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
     let mut import_symbols: Vec<(String, String, String, String)> = Vec::new();
     // (file, name, value) module-scope string constants for client-URL folding (#405).
     let mut string_consts: Vec<(String, String, String)> = Vec::new();
+    // (file, name, referenced key) constant references for the same.
+    let mut const_refs: Vec<(String, String, String)> = Vec::new();
 
     // Pre-resolve dynamic-language grammars once (sequential; warns once per
     // missing grammar) so the parallel parse can read them immutably.
@@ -1613,6 +1630,7 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
         imports.extend(out.imports);
         import_symbols.extend(out.import_symbols);
         string_consts.extend(out.string_consts);
+        const_refs.extend(out.const_refs);
     }
 
     let resolve_progress = resolve_bar();
@@ -1741,12 +1759,17 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
     // folds to the concrete value and re-normalizes to a path that can match a
     // route. Same-file constants were already folded at parse time (#404).
     stage("resolving client URL constants");
-    let mut consts_by_file: HashMap<&str, HashMap<&str, &str>> = HashMap::new();
-    for (file, name, value) in &string_consts {
-        consts_by_file
-            .entry(file.as_str())
-            .or_default()
-            .insert(name.as_str(), value.as_str());
+    let strings_by_file = group_consts(&string_consts);
+    let refs_by_file = group_consts(&const_refs);
+    // Last-resort lookup for an object property (`OBJ.PROP`) whose own module is
+    // not indexed — e.g. a gitignored Angular `environment.ts`, where the
+    // committed `environment.prod.ts` carries the same object. Host/scheme are
+    // normalized away, so an env variant yields the same path signature.
+    let mut global_props: HashMap<&str, &str> = HashMap::new();
+    for (_file, key, value) in &string_consts {
+        if key.contains('.') {
+            global_props.entry(key.as_str()).or_insert(value.as_str());
+        }
     }
     let mut rewritten: Vec<(NodeId, OperationKey)> = Vec::new();
     for (id, key) in store.operations_by_kind(NodeKind::ClientCall)? {
@@ -1757,7 +1780,14 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
         let Some(file) = store.get_node(&id.0)?.map(|n| n.file) else {
             continue;
         };
-        let resolved = resolve_path_constants(&key.path, &file, &symbol_file, &consts_by_file);
+        let resolved = resolve_path_constants(
+            &key.path,
+            &file,
+            &symbol_file,
+            &strings_by_file,
+            &refs_by_file,
+            &global_props,
+        );
         if resolved != key.path {
             rewritten.push((id, OperationKey::rest(method, &resolved)));
         }
@@ -2040,15 +2070,29 @@ fn dynamic_grammar<'a>(
     cache.get(name).and_then(|o| o.as_ref())
 }
 
-/// Substitute resolvable `${NAME}` constants in a client URL path (#405): a
-/// same-file const, or one imported into `file` (via `symbol_file`) whose value
-/// is known in its defining file (`consts_by_file`). Unknown interpolations are
-/// left verbatim so they collapse to a dynamic segment as before.
+/// Index `(file, key, value)` tuples as `file -> {key -> value}` for constant
+/// resolution.
+fn group_consts(rows: &[(String, String, String)]) -> HashMap<&str, HashMap<&str, &str>> {
+    let mut by_file: HashMap<&str, HashMap<&str, &str>> = HashMap::new();
+    for (file, key, value) in rows {
+        by_file
+            .entry(file.as_str())
+            .or_default()
+            .insert(key.as_str(), value.as_str());
+    }
+    by_file
+}
+
+/// Substitute resolvable `${NAME}` constants in a client URL path (#405).
+/// Unknown / non-identifier interpolations are left verbatim so they collapse to
+/// a dynamic segment as before.
 fn resolve_path_constants(
     path: &str,
     file: &str,
     symbol_file: &HashMap<(String, String), String>,
-    consts_by_file: &HashMap<&str, HashMap<&str, &str>>,
+    strings: &HashMap<&str, HashMap<&str, &str>>,
+    refs: &HashMap<&str, HashMap<&str, &str>>,
+    global_props: &HashMap<&str, &str>,
 ) -> String {
     let mut out = String::new();
     let mut rest = path;
@@ -2061,21 +2105,10 @@ fn resolve_path_constants(
         };
         let name = &after[..end];
         let value = is_ident(name)
-            .then(|| {
-                // Same-file const first, then one imported into this file.
-                consts_by_file
-                    .get(file)
-                    .and_then(|m| m.get(name).copied())
-                    .or_else(|| {
-                        symbol_file
-                            .get(&(file.to_string(), name.to_string()))
-                            .and_then(|def| consts_by_file.get(def.as_str()))
-                            .and_then(|m| m.get(name).copied())
-                    })
-            })
+            .then(|| resolve_const(name, file, symbol_file, strings, refs, global_props, 0))
             .flatten();
         match value {
-            Some(v) => out.push_str(v),
+            Some(v) => out.push_str(&v),
             None => {
                 out.push_str("${");
                 out.push_str(name);
@@ -2086,6 +2119,61 @@ fn resolve_path_constants(
     }
     out.push_str(rest);
     out
+}
+
+/// Resolve a constant `key` (a bare `NAME` or an `OBJ.PROP`) seen in `file` to a
+/// string literal, following same-file references, imported constants, and the
+/// Angular `environment` chain (`const X = environment.X` → an imported config
+/// object's string property), with a depth cap (#405).
+fn resolve_const(
+    key: &str,
+    file: &str,
+    symbol_file: &HashMap<(String, String), String>,
+    strings: &HashMap<&str, HashMap<&str, &str>>,
+    refs: &HashMap<&str, HashMap<&str, &str>>,
+    global_props: &HashMap<&str, &str>,
+    depth: usize,
+) -> Option<String> {
+    if depth > 8 {
+        return None;
+    }
+    // A literal here.
+    if let Some(v) = strings.get(file).and_then(|m| m.get(key)) {
+        return Some((*v).to_string());
+    }
+    // A reference here (`const NAME = OTHER` / `OBJ.PROP -> other key`).
+    if let Some(target) = refs.get(file).and_then(|m| m.get(key)) {
+        return resolve_const(
+            target,
+            file,
+            symbol_file,
+            strings,
+            refs,
+            global_props,
+            depth + 1,
+        );
+    }
+    // The base name imported into this file — resolve in its defining file. For a
+    // bare name that's the name itself; for `OBJ.PROP` it's the object `OBJ`
+    // (imported `{ environment }`), resolving the same `OBJ.PROP` key there.
+    let base = key.split('.').next().unwrap_or(key);
+    if let Some(def) = symbol_file.get(&(file.to_string(), base.to_string())) {
+        return resolve_const(
+            key,
+            def,
+            symbol_file,
+            strings,
+            refs,
+            global_props,
+            depth + 1,
+        );
+    }
+    // Last resort: an object property whose own module isn't indexed (a
+    // gitignored config object), matched globally by `OBJ.PROP`.
+    if key.contains('.') {
+        return global_props.get(key).map(|v| (*v).to_string());
+    }
+    None
 }
 
 /// Whether `s` is a single JS identifier (so `${expr}` with a member access or
@@ -2328,11 +2416,14 @@ mod tests {
             ("svc.ts".to_string(), "API_BASE".to_string()),
             "config.ts".to_string(),
         )]);
-        let consts_by_file = HashMap::from([
+        let strings = HashMap::from([
             ("config.ts", HashMap::from([("API_BASE", "https://h/api")])),
             ("svc.ts", HashMap::from([("LOCAL", "/local")])),
         ]);
-        let r = |p: &str| resolve_path_constants(p, "svc.ts", &symbol_file, &consts_by_file);
+        let refs = HashMap::new();
+        let global = HashMap::new();
+        let r =
+            |p: &str| resolve_path_constants(p, "svc.ts", &symbol_file, &strings, &refs, &global);
         // Imported base folds; same-file const folds.
         check!(r("/${API_BASE}/users") == "/https://h/api/users");
         check!(r("${LOCAL}/x") == "/local/x");
@@ -2342,15 +2433,76 @@ mod tests {
         // A nested-brace interpolation is balanced, not split at the inner `}`.
         check!(r("/${foo({a:1})}/x") == "/${foo({a:1})}/x");
         // The folded full-URL value re-normalizes to a concrete route signature.
-        let key = OperationKey::rest(
-            glyphtrail_core::HttpMethod::Get,
-            &r("/${API_BASE}/users/${id}"),
-        );
+        let get = glyphtrail_core::HttpMethod::Get;
+        let key = OperationKey::rest(get, &r("/${API_BASE}/users/${id}"));
         check!(key.path == "/api/users/${id}");
-        check!(
-            OperationKey::rest(glyphtrail_core::HttpMethod::Get, "/api/users/{id}").signature()
-                == key.signature()
-        );
+        check!(OperationKey::rest(get, "/api/users/{id}").signature() == key.signature());
+    }
+
+    // #405: the Angular `environment` chain — `const API_URL = environment.API_URL`
+    // aliasing an imported config object's string property — folds, including a
+    // property that itself names a constant imported from a third file.
+    #[test]
+    fn resolve_path_constants_follows_environment_chain() {
+        let symbol_file = HashMap::from([
+            (
+                ("svc.ts".to_string(), "environment".to_string()),
+                "env.ts".to_string(),
+            ),
+            (
+                ("env.ts".to_string(), "MEDIAN_LOGIN".to_string()),
+                "model.ts".to_string(),
+            ),
+        ]);
+        let strings = HashMap::from([
+            (
+                "env.ts",
+                HashMap::from([("environment.API_URL", "https://h")]),
+            ),
+            ("model.ts", HashMap::from([("MEDIAN_LOGIN", "/signin")])),
+        ]);
+        let refs = HashMap::from([
+            (
+                "svc.ts",
+                HashMap::from([
+                    // `const API_URL = environment.API_URL`
+                    ("API_URL", "environment.API_URL"),
+                    // `const LOGIN = environment.MEDIAN_LOGIN`
+                    ("LOGIN", "environment.MEDIAN_LOGIN"),
+                ]),
+            ),
+            // env.ts object prop `MEDIAN_LOGIN: MEDIAN_LOGIN` (names the import).
+            (
+                "env.ts",
+                HashMap::from([("environment.MEDIAN_LOGIN", "MEDIAN_LOGIN")]),
+            ),
+        ]);
+        let global = HashMap::new();
+        let r =
+            |p: &str| resolve_path_constants(p, "svc.ts", &symbol_file, &strings, &refs, &global);
+        // alias -> object property literal; and a property that itself names a
+        // constant imported from a third file (env.ts -> model.ts).
+        check!(r("/${API_URL}${LOGIN}") == "/https://h/signin");
+        let key = OperationKey::rest(glyphtrail_core::HttpMethod::Get, &r("/${API_URL}${LOGIN}"));
+        check!(key.path == "/signin"); // scheme/host normalized away
+    }
+
+    // #405: when an object's own module isn't indexed (a gitignored Angular
+    // `environment.ts`), an `OBJ.PROP` resolves via the global fallback — e.g.
+    // the committed `environment.prod.ts` carrying the same paths.
+    #[test]
+    fn resolve_path_constants_global_fallback_for_unindexed_object() {
+        let symbol_file = HashMap::new(); // the `environment` import did not resolve
+        let strings: HashMap<&str, HashMap<&str, &str>> = HashMap::new();
+        let refs = HashMap::from([(
+            "svc.ts",
+            HashMap::from([("API_URL", "environment.API_URL")]),
+        )]);
+        let global = HashMap::from([("environment.API_URL", "https://h/v2/")]);
+        let r =
+            |p: &str| resolve_path_constants(p, "svc.ts", &symbol_file, &strings, &refs, &global);
+        let key = OperationKey::rest(glyphtrail_core::HttpMethod::Get, &r("/${API_URL}signin"));
+        check!(key.path == "/v2/signin");
     }
 
     fn temp_repo(tag: &str) -> std::path::PathBuf {
@@ -2731,6 +2883,50 @@ mod tests {
         check!(!uses.iter().any(|u| u.package == "std"));
         check!(uses.iter().all(|u| u.from_package == "app"));
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // #405: a client URL built from the Angular `environment` chain resolves
+    // end-to-end through the full analyze pipeline (import -> alias -> object
+    // property), producing a concrete, matchable op path.
+    #[test]
+    fn client_url_resolves_imported_environment_constant() {
+        let dir = temp_repo("client-env-const");
+        std::fs::create_dir_all(dir.join("src/environments")).unwrap();
+        let svc = dir.join("src/app/core/services/authentication");
+        std::fs::create_dir_all(&svc).unwrap();
+        // Mirror the real structure: a deep relative import, and an env object
+        // property that itself names a constant imported from a third file.
+        std::fs::write(
+            dir.join("src/environments/environment.model.ts"),
+            "export const MEDIAN_LOGIN = '/signin';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/environments/environment.ts"),
+            "import { MEDIAN_LOGIN } from './environment.model';\n\
+             export const environment = { IS_PRODUCTION: false, API_URL: 'https://api.example.test/v2/', MEDIAN_LOGIN: MEDIAN_LOGIN };\n",
+        )
+        .unwrap();
+        std::fs::write(
+            svc.join("auth.service.ts"),
+            "import { HttpClient } from '@angular/common/http';\n\
+             import { environment } from '../../../../environments/environment';\n\
+             const API_URL = environment.API_URL;\n\
+             const MEDIAN_LOGIN = environment.MEDIAN_LOGIN;\n\
+             class S {\n  constructor(private http: HttpClient) {}\n  \
+             login() { return this.http.post(`${API_URL}${MEDIAN_LOGIN}`, null); } }\n",
+        )
+        .unwrap();
+        run(&dir, false).unwrap();
+
+        let store = LadybugStore::open(&RepoPaths::new(&dir).index_dir.join("ladybug")).unwrap();
+        let ops = store.operations_by_kind(NodeKind::ClientCall).unwrap();
+        check!(
+            ops.iter().any(|(_, k)| k.path == "/v2/signin"),
+            "expected resolved /v2/signin, got {:?}",
+            ops.iter().map(|(_, k)| k.path.clone()).collect::<Vec<_>>()
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
