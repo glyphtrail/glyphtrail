@@ -57,6 +57,10 @@ pub trait GraphStore: Adjacency {
     fn insert_operations(&mut self, ops: &[(NodeId, OperationKey)]) -> Result<()>;
     /// Upsert atlas `Commit` side-table rows keyed by node id (#330).
     fn set_commits(&mut self, commits: &[CommitMeta]) -> Result<()>;
+    /// Re-evaluate every stored atlas commit's `in_bounds` against a date window
+    /// (unix seconds, inclusive; `None` = unbounded), so narrowing the window
+    /// re-marks rows out of bounds rather than deleting them (#331).
+    fn remark_commit_bounds(&mut self, since: Option<i64>, until: Option<i64>) -> Result<()>;
     fn insert_pending(&mut self, links: &[PendingLink]) -> Result<()>;
     fn insert_imports(&mut self, imports: &[(String, String, String)]) -> Result<()>;
     fn delete_edges_by_confidence(&mut self, confidence: Confidence) -> Result<usize>;
