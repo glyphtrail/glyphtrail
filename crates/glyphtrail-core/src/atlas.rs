@@ -118,11 +118,20 @@ impl AtlasHeads {
         }
     }
 
-    /// Persist to `heads.json` under `atlas_dir`.
+    /// Persist to `heads.json` under `atlas_dir`. Atomic (staged in a
+    /// process-unique temp file, then renamed) so an interrupted write never
+    /// truncates the watermark; mirrors [`crate::Registry::save`].
     pub fn save(&self, atlas_dir: &Path) -> crate::Result<()> {
         let path = atlas_dir.join("heads.json");
-        let text = serde_json::to_string_pretty(self).unwrap_or_default();
-        std::fs::write(&path, text)?;
+        let json = serde_json::to_string_pretty(self).map_err(|source| {
+            crate::error::CoreError::RegistryParse {
+                path: path.clone(),
+                source,
+            }
+        })?;
+        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        std::fs::write(&tmp, json)?;
+        std::fs::rename(&tmp, &path)?;
         Ok(())
     }
 
@@ -180,11 +189,23 @@ fn date_to_epoch(date: &str, end_of_day: bool) -> Option<i64> {
     let y: i64 = parts.next()?.parse().ok()?;
     let m: i64 = parts.next()?.parse().ok()?;
     let d: i64 = parts.next()?.parse().ok()?;
-    if parts.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+    if parts.next().is_some() || !(1..=12).contains(&m) || d < 1 || d > days_in_month(y, m) {
         return None;
     }
     let base = days_from_civil(y, m, d) * 86_400;
     Some(if end_of_day { base + 86_399 } else { base })
+}
+
+/// Days in month `m` of year `y` (1-based), leap-year aware, so an impossible
+/// calendar date (e.g. `2015-02-31`) is rejected rather than silently shifted.
+fn days_in_month(y: i64, m: i64) -> i64 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) => 29,
+        2 => 28,
+        _ => 0,
+    }
 }
 
 /// Days from 1970-01-01 to a proleptic-Gregorian `y-m-d` (Howard Hinnant's
@@ -282,6 +303,10 @@ mod tests {
             latest: None,
         };
         check!(bad.epoch_bounds() == Err("2015-13-40".to_string()));
+        // Impossible calendar days are rejected, leap-years respected.
+        check!(date_to_epoch("2015-02-31", false).is_none());
+        check!(date_to_epoch("2015-02-29", false).is_none()); // 2015 is not a leap year
+        check!(date_to_epoch("2016-02-29", false).is_some()); // 2016 is
     }
 
     #[test]

@@ -155,7 +155,8 @@ fn sync(dir: &Path, args: SyncArgs) -> Result<()> {
         earliest: args.since.clone().or_else(|| cfg.window.earliest.clone()),
         latest: args.until.clone().or_else(|| cfg.window.latest.clone()),
     };
-    walk.epoch_bounds()
+    let (walk_since, walk_until) = walk
+        .epoch_bounds()
         .map_err(|d| anyhow!("invalid --since/--until date: {d}"))?;
 
     let me = resolve_me(&cfg.me);
@@ -200,10 +201,14 @@ fn sync(dir: &Path, args: SyncArgs) -> Result<()> {
         } else {
             heads.get(&e.name).map(str::to_string)
         };
-        let commits = match gather_commits(root, since_head.as_deref(), &walk) {
+        let commits = match gather_commits(root, since_head.as_deref(), walk_since, walk_until) {
             Ok(c) => c,
-            // A rewritten history (the saved HEAD is gone) -> full re-walk.
-            Err(_) if since_head.is_some() => gather_commits(root, None, &walk)?,
+            // A rewritten history (the saved HEAD is gone) -> full re-walk. Only
+            // on an invalid-range error; a real failure (git missing, broken
+            // repo) keeps its context and propagates.
+            Err(err) if since_head.is_some() && is_bad_revision(&err) => {
+                gather_commits(root, None, walk_since, walk_until)?
+            }
             Err(err) => return Err(err),
         };
 
@@ -221,11 +226,10 @@ fn sync(dir: &Path, args: SyncArgs) -> Result<()> {
     }
 
     heads.save(dir)?;
-    // Re-evaluate every stored commit against the persistent window, so a
-    // narrowing since the last sync re-marks rows out of bounds (not deletes).
-    if cfg.window.is_set() {
-        store.remark_commit_bounds(bound_since, bound_until)?;
-    }
+    // Re-evaluate *every* stored commit against the persistent window, always:
+    // narrowing re-marks rows out of bounds, and removing the window (bounds
+    // become `None`) restores them to in-bounds (not deletes).
+    store.remark_commit_bounds(bound_since, bound_until)?;
     println!("  total:   {total} commits ingested");
     Ok(())
 }
@@ -271,8 +275,15 @@ fn git_user_email() -> Option<String> {
 
 /// Gather non-merge commits with their touched files. `since_head` (a saved
 /// watermark) walks only `<since_head>..HEAD`; `None` walks all of `HEAD`. The
-/// window adds `--since`/`--until` so out-of-range commits are never walked.
-fn gather_commits(root: &Path, since_head: Option<&str>, walk: &Window) -> Result<Vec<RawCommit>> {
+/// window bounds (unix seconds) add `--since=@s`/`--until=@u` so out-of-range
+/// commits are never walked — passed as epochs (`@`) so git stays UTC-aligned
+/// with `committed_at` / `in_bounds` rather than the local timezone.
+fn gather_commits(
+    root: &Path,
+    since_head: Option<&str>,
+    since: Option<i64>,
+    until: Option<i64>,
+) -> Result<Vec<RawCommit>> {
     // A record separator (\x1e) starts each commit; unit separators (\x1f)
     // delimit its fields. The touched files follow on their own lines until the
     // next record separator, so the layout survives any byte in a subject.
@@ -283,11 +294,11 @@ fn gather_commits(root: &Path, since_head: Option<&str>, walk: &Window) -> Resul
         "--name-only",
         "--pretty=format:%x1e%H%x1f%ct%x1f%an%x1f%ae%x1f%s",
     ]);
-    if let Some(d) = &walk.earliest {
-        cmd.arg(format!("--since={d}"));
+    if let Some(s) = since {
+        cmd.arg(format!("--since=@{s}"));
     }
-    if let Some(d) = &walk.latest {
-        cmd.arg(format!("--until={d}"));
+    if let Some(u) = until {
+        cmd.arg(format!("--until=@{u}"));
     }
     if let Some(head) = since_head {
         cmd.arg(format!("{head}..HEAD"));
@@ -300,6 +311,16 @@ fn gather_commits(root: &Path, since_head: Option<&str>, walk: &Window) -> Resul
         );
     }
     Ok(parse_log(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Whether a `gather_commits` error is git rejecting the `<head>..HEAD` range
+/// (a watermark rewritten out of history), the only case worth a full re-walk;
+/// a genuine failure (git missing, broken repo) is not.
+fn is_bad_revision(err: &anyhow::Error) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains("bad revision")
+        || msg.contains("unknown revision")
+        || msg.contains("ambiguous argument")
 }
 
 /// Parse the `\x1e`-delimited `git log --name-only` stream into commits.
