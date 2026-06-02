@@ -568,6 +568,44 @@ pub struct CrateLevelHit {
     pub via: String,
 }
 
+/// One in-scope repo that a federated query couldn't pull impact from, with the
+/// reason — so a `0 downstream` result names what was missed instead of staying
+/// silent (#419).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SkippedRepo {
+    pub repo: String,
+    /// Why it was skipped: e.g. "not registered", "not indexed", "index won't open".
+    pub reason: String,
+}
+
+/// What a federated query actually did (#419): its scope, how many `[[links]]`
+/// hints and automatic web-API matches fed the link graph, and which in-scope
+/// repos were reachable, opened, or skipped. Turns a silent `0 downstream` into
+/// a diagnosis (no hint resolved? producer out of scope? a member's index
+/// wouldn't open? genuinely nothing?).
+#[derive(Debug, Clone, Serialize)]
+pub struct FederatedDiagnostics {
+    /// Human label for the federation scope: "registry" or "group '<name>'".
+    pub scope: String,
+    /// The repos the query actually spanned: the requested scope plus any repo
+    /// it reached (a `--deep` indexed sibling, or one pulled in by a hint). The
+    /// current repo is always included.
+    pub scope_repos: Vec<String>,
+    /// Total `[[links]]` hints declared across the in-scope repos.
+    pub hints_total: usize,
+    /// Of those, how many have a side naming no registered repo (a dead hint).
+    pub hints_unresolved: usize,
+    /// Automatic call↔endpoint web-API matches across repos (#406).
+    pub web_matches: usize,
+    /// Repos reachable from the current one along producer→consumer edges.
+    pub reachable: usize,
+    /// Reachable repos whose index was actually opened to read impact from.
+    pub opened: usize,
+    /// Reachable repos that couldn't be opened, with the reason.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<SkippedRepo>,
+}
+
 /// Cross-repo blast radius: an aggregate summary, per-repo impacted nodes
 /// (origin first then downstream), and coarse crate-level "potentially
 /// affected" consumers. The summary is derived from all per-node items.
@@ -579,6 +617,10 @@ pub struct FederatedReport {
     /// (see [`CrateLevelHit`]); not counted in `summary`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub crate_level: Vec<CrateLevelHit>,
+    /// What the federated query did (#419), when run federated; `None` for a
+    /// plain single-repo report.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<FederatedDiagnostics>,
 }
 
 impl FederatedReport {
@@ -631,6 +673,7 @@ impl FederatedReport {
             summary,
             repos,
             crate_level,
+            diagnostics: None,
         }
     }
 
