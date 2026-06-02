@@ -57,29 +57,123 @@ pub struct RawClientCall {
     pub span: Span,
 }
 
-/// Module-scope `const NAME = "literal"` string constants in a JS/TS/TSX file,
-/// for resolving client URLs built from an *imported* constant base at the
-/// analyze layer (#405). Empty for other languages and on parse failure.
-pub fn module_string_constants(source: &str, lang: &Language) -> Vec<(String, String)> {
+/// Module-scope constants in a JS/TS/TSX file, for resolving client URLs built
+/// from an *imported* constant base at the analyze layer (#405). Keys are a bare
+/// `NAME` or a flattened object property `OBJ.PROP`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ModuleConsts {
+    /// `const NAME = "lit"` and object string properties (`OBJ.PROP -> "lit"`).
+    pub strings: Vec<(String, String)>,
+    /// References resolved later: `const NAME = OTHER` / `const NAME = obj.prop`
+    /// and object properties whose value is an identifier or member access
+    /// (`KEY -> referenced NAME or OBJ.PROP`). Drives the Angular `environment`
+    /// idiom (`const API_URL = environment.API_URL`).
+    pub refs: Vec<(String, String)>,
+}
+
+/// Extract [`ModuleConsts`] from a JS/TS/TSX file; empty for other languages and
+/// on parse failure.
+pub fn module_constants(source: &str, lang: &Language) -> ModuleConsts {
+    let mut out = ModuleConsts::default();
     if !matches!(
         lang,
         Language::JavaScript | Language::TypeScript | Language::Tsx
     ) {
-        return Vec::new();
+        return out;
     }
     let mut parser = Parser::new();
     if parser
         .set_language(&grammar(lang).expect("built-in grammar"))
         .is_err()
     {
-        return Vec::new();
+        return out;
     }
     let Some(tree) = parser.parse(source, None) else {
-        return Vec::new();
+        return out;
     };
-    string_constants(tree.root_node(), source.as_bytes())
-        .into_iter()
-        .collect()
+    let src = source.as_bytes();
+    walk(tree.root_node(), &mut |n| {
+        if n.kind() != "variable_declarator" || enclosing_scope(n).kind() != "program" {
+            return;
+        }
+        let (Some(name), Some(value)) = (
+            n.child_by_field_name("name"),
+            n.child_by_field_name("value"),
+        ) else {
+            return;
+        };
+        if name.kind() != "identifier" {
+            return;
+        }
+        let name = text(name, src);
+        match value.kind() {
+            "string" => {
+                if let Some(s) = js_string(value, src) {
+                    out.strings.push((name, s));
+                }
+            }
+            "identifier" => out.refs.push((name, text(value, src))),
+            "member_expression" => {
+                if let Some(m) = member_path(value, src) {
+                    out.refs.push((name, m));
+                }
+            }
+            "object" => collect_object_consts(&name, value, src, &mut out),
+            _ => {}
+        }
+    });
+    out
+}
+
+/// `obj.prop` for a `member_expression` of `identifier.property_identifier`, else
+/// `None` (nested/computed accesses are out of scope).
+fn member_path(node: Node, src: &[u8]) -> Option<String> {
+    let obj = node.child_by_field_name("object")?;
+    let prop = node.child_by_field_name("property")?;
+    (obj.kind() == "identifier" && prop.kind() == "property_identifier")
+        .then(|| format!("{}.{}", text(obj, src), text(prop, src)))
+}
+
+/// Flatten an object literal's string / identifier / member-access properties
+/// into `OBJ.PROP` entries (`export const environment = { API_URL: "…" }`).
+fn collect_object_consts(obj_name: &str, obj: Node, src: &[u8], out: &mut ModuleConsts) {
+    let mut cursor = obj.walk();
+    for pair in obj.named_children(&mut cursor) {
+        if pair.kind() != "pair" {
+            continue;
+        }
+        let (Some(k), Some(v)) = (
+            pair.child_by_field_name("key"),
+            pair.child_by_field_name("value"),
+        ) else {
+            continue;
+        };
+        let Some(key) = key_name(k, src) else {
+            continue;
+        };
+        let full = format!("{obj_name}.{key}");
+        match v.kind() {
+            "string" => {
+                if let Some(s) = js_string(v, src) {
+                    out.strings.push((full, s));
+                }
+            }
+            "identifier" => out.refs.push((full, text(v, src))),
+            "member_expression" => {
+                if let Some(m) = member_path(v, src) {
+                    out.refs.push((full, m));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Deprecated alias for the string-constant half of [`module_constants`], kept
+/// as a transition shim (#405).
+#[deprecated(note = "use module_constants(source, lang).strings")]
+pub fn module_string_constants(source: &str, lang: &Language) -> Vec<(String, String)> {
+    module_constants(source, lang).strings
 }
 
 /// Extract client HTTP calls from `source`, dispatching by language. Returns
@@ -1282,6 +1376,32 @@ func f(m map[string]int) {
                    f() { const BASE = '/local'; return this.http.get(`${BASE}/x`); } }";
         let calls = extract_client_calls(src, &Language::TypeScript);
         check!(call(&calls, HttpMethod::Get, "${BASE}/x").is_some());
+    }
+
+    // #405: module_constants collects string consts, object string properties
+    // (flattened as OBJ.PROP), and references (aliases / member access / props
+    // naming an identifier) for cross-file resolution.
+    #[test]
+    fn module_constants_collects_strings_objects_and_refs() {
+        let src = "import { LOGIN } from './model';\n\
+                   const BASE = '/api';\n\
+                   const API_URL = environment.API_URL;\n\
+                   export const environment = { API_URL: 'https://h', LOGIN: LOGIN };";
+        let c = module_constants(src, &Language::TypeScript);
+        check!(c.strings.contains(&("BASE".into(), "/api".into())));
+        check!(
+            c.strings
+                .contains(&("environment.API_URL".into(), "https://h".into()))
+        );
+        // Member-access alias and a property naming an identifier are references.
+        check!(
+            c.refs
+                .contains(&("API_URL".into(), "environment.API_URL".into()))
+        );
+        check!(
+            c.refs
+                .contains(&("environment.LOGIN".into(), "LOGIN".into()))
+        );
     }
 
     // A plain (non-parameter-property) constructor param does not become a
