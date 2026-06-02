@@ -38,8 +38,6 @@
 //! interpolations (`/users/${id}`) are preserved verbatim so they collapse to a
 //! dynamic segment in the operation signature.
 
-use std::collections::HashSet;
-
 use glyphtrail_core::{HttpMethod, Language, Span};
 use tree_sitter::{Node, Parser};
 
@@ -514,7 +512,7 @@ fn client_call(
     call: Node,
     src: &[u8],
     clients: &[AxiosBinding],
-    http_fields: &HashSet<String>,
+    http_fields: &[HttpClientField],
 ) -> Option<RawClientCall> {
     let func = call.child_by_field_name("function")?;
     let args = call.child_by_field_name("arguments");
@@ -541,7 +539,9 @@ fn client_call(
             // a field typed `HttpClient`. The verb must be a real HTTP method and
             // the URL a literal, so non-HTTP `this.x.get(...)` doesn't match.
             if let Some(field) = http_client_field(obj, src)
-                && http_fields.contains(&field)
+                && http_fields
+                    .iter()
+                    .any(|f| f.name == field && f.scope.contains(&call.start_byte()))
             {
                 let method = HttpMethod::parse(&prop)?;
                 (method, url_text(named_arg(args, 0)?, src)?)
@@ -579,37 +579,73 @@ fn http_client_field(obj: Node, src: &[u8]) -> Option<String> {
     Some(text(obj.child_by_field_name("property")?, src))
 }
 
-/// Field names typed `HttpClient` in `root` — constructor-injected params
-/// (`constructor(private http: HttpClient)`) or class fields (`http: HttpClient`)
-/// — so `this.<name>.<verb>(url)` can be recognised as an Angular client call.
-fn http_client_fields(root: Node, src: &[u8]) -> HashSet<String> {
-    let mut fields = HashSet::new();
+/// An `HttpClient`-typed field and the byte range of the class it belongs to, so
+/// `this.<name>` resolves per-class — two classes can each name a field `http`
+/// with different types without cross-matching.
+struct HttpClientField {
+    name: String,
+    scope: std::ops::Range<usize>,
+}
+
+/// Fields typed `HttpClient` in `root`, each scoped to its class — constructor
+/// parameter-properties (`constructor(private http: HttpClient)`) or class
+/// fields (`http: HttpClient`) — so `this.<name>.<verb>(url)` is recognised as
+/// an Angular client call only within the declaring class.
+fn http_client_fields(root: Node, src: &[u8]) -> Vec<HttpClientField> {
+    let mut fields = Vec::new();
     walk(root, &mut |n| {
-        if !matches!(
-            n.kind(),
-            "required_parameter" | "optional_parameter" | "public_field_definition"
-        ) {
-            return;
-        }
+        let name = match n.kind() {
+            // A constructor parameter-property must carry an accessibility or
+            // `readonly` modifier; an ordinary parameter doesn't become a field.
+            "required_parameter" | "optional_parameter" => {
+                if !is_parameter_property(n) {
+                    return;
+                }
+                n.child_by_field_name("pattern")
+            }
+            "public_field_definition" => n.child_by_field_name("name"),
+            _ => return,
+        };
+        // `type_annotation` text is `: HttpClient`; match the bare type name.
         let Some(ty) = n.child_by_field_name("type") else {
             return;
         };
-        // `type_annotation` text is `: HttpClient`; match the bare type name.
         if text(ty, src).trim_start_matches(':').trim() != "HttpClient" {
             return;
         }
-        // Constructor params expose `pattern` (an `identifier`); class fields
-        // expose `name` (a `property_identifier`).
-        let name = n
-            .child_by_field_name("pattern")
-            .or_else(|| n.child_by_field_name("name"));
-        if let Some(name) = name
-            && matches!(name.kind(), "identifier" | "property_identifier")
-        {
-            fields.insert(text(name, src));
-        }
+        let Some(name) = name.filter(|x| matches!(x.kind(), "identifier" | "property_identifier"))
+        else {
+            return;
+        };
+        let scope = enclosing_class(n).unwrap_or(root);
+        fields.push(HttpClientField {
+            name: text(name, src),
+            scope: scope.start_byte()..scope.end_byte(),
+        });
     });
     fields
+}
+
+/// Whether a parameter is a TypeScript parameter-property (carries an
+/// accessibility modifier — `public`/`private`/`protected` — or `readonly`),
+/// which is what turns a constructor parameter into a `this.<name>` field.
+fn is_parameter_property(param: Node) -> bool {
+    let mut cursor = param.walk();
+    param
+        .children(&mut cursor)
+        .any(|c| matches!(c.kind(), "accessibility_modifier" | "readonly"))
+}
+
+/// The nearest enclosing class declaration/expression of `node`, if any.
+fn enclosing_class(node: Node) -> Option<Node> {
+    let mut n = node;
+    while let Some(p) = n.parent() {
+        if matches!(p.kind(), "class_declaration" | "class") {
+            return Some(p);
+        }
+        n = p;
+    }
+    None
 }
 
 /// `(method, url)` from an axios config object: `url` is required (and must be
@@ -1001,6 +1037,29 @@ func f(m map[string]int) {
     fn non_http_client_field_is_not_a_call() {
         let src = "class S {\n  constructor(private repo: UserRepo) {}\n  \
                    f(id: string) { return this.repo.get(id); }\n}";
+        check!(extract_client_calls(src, &Language::TypeScript).is_empty());
+    }
+
+    // HttpClient field detection is class-scoped: a same-named `http` field of a
+    // different type in another class must not be treated as a client call.
+    #[test]
+    fn http_client_field_is_class_scoped() {
+        let src = "class A {\n  constructor(private http: HttpClient) {}\n  \
+                   a() { return this.http.get('/api/a'); }\n}\n\
+                   class B {\n  constructor(private http: Other) {}\n  \
+                   b() { return this.http.get('/api/b'); }\n}";
+        let calls = extract_client_calls(src, &Language::TypeScript);
+        check!(call(&calls, HttpMethod::Get, "/api/a").is_some()); // A.http is HttpClient
+        check!(call(&calls, HttpMethod::Get, "/api/b").is_none()); // B.http is Other
+        check!(calls.len() == 1);
+    }
+
+    // A plain (non-parameter-property) constructor param does not become a
+    // `this.` field, so its name must not be picked up.
+    #[test]
+    fn plain_constructor_param_is_not_a_field() {
+        let src = "class S {\n  constructor(http: HttpClient) {}\n  \
+                   f() { return this.http.get('/api/x'); }\n}";
         check!(extract_client_calls(src, &Language::TypeScript).is_empty());
     }
 }
