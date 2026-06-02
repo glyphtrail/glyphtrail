@@ -157,6 +157,27 @@ fn parse_dependency(key: &str, spec: &Value, kind: DepKind) -> CargoDependency {
     }
 }
 
+/// The `repository` URL a manifest declares: `[package].repository`, falling
+/// back to `[workspace.package].repository` (the workspace-root form a member
+/// inherits). `None` when neither is present or the TOML is malformed. Pure —
+/// locating the `Cargo.toml` on disk is the caller's job (#378).
+pub fn manifest_repository(text: &str) -> Option<String> {
+    let table: toml::Table = toml::from_str(text).ok()?;
+    let repository = |t: &Value| {
+        t.as_table()
+            .and_then(|tbl| tbl.get("repository"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    table.get("package").and_then(repository).or_else(|| {
+        table
+            .get("workspace")
+            .and_then(Value::as_table)
+            .and_then(|w| w.get("package"))
+            .and_then(repository)
+    })
+}
+
 /// The workspace `members` entries declared in a manifest's `[workspace]`
 /// table, in declaration order. Each is a path or path glob (e.g. `crates/*`)
 /// relative to the manifest directory; expanding the globs against the
@@ -300,6 +321,22 @@ mod tests {
     #[test]
     fn no_workspace_table_yields_no_members() {
         check!(workspace_members("[package]\nname = \"x\"\n").is_empty());
+    }
+
+    #[test]
+    fn reads_repository_from_package_then_workspace() {
+        let pkg = "[package]\nname = \"x\"\nrepository = \"https://github.com/o/r\"\n";
+        check!(manifest_repository(pkg) == Some("https://github.com/o/r".to_string()));
+
+        let ws = "[workspace.package]\nrepository = \"https://gitlab.com/o/r\"\n";
+        check!(manifest_repository(ws) == Some("https://gitlab.com/o/r".to_string()));
+
+        // `[package]` wins over `[workspace.package]`.
+        let both = "[package]\nname = \"x\"\nrepository = \"https://a/p\"\n\
+                    [workspace.package]\nrepository = \"https://a/w\"\n";
+        check!(manifest_repository(both) == Some("https://a/p".to_string()));
+
+        check!(manifest_repository("[package]\nname = \"x\"\n") == None);
     }
 
     #[test]
