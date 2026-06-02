@@ -148,10 +148,14 @@ impl Visibility {
             "bitbucket.org",
             "sourceforge.net",
         ];
-        if id_sources
-            .into_iter()
-            .any(|src| PUBLIC_HOSTS.iter().any(|h| src.starts_with(h)))
-        {
+        // Canonical sources are `host/owner/repo` or `host#numeric`; compare the
+        // host *segment* exactly so look-alikes like `github.com.evil.com/...`
+        // (which prefix-match `github.com`) stay Private on default-deny paths.
+        let any_public = id_sources.into_iter().any(|src| {
+            let host = src.split(['/', '#']).next().unwrap_or(src);
+            PUBLIC_HOSTS.iter().any(|h| host.eq_ignore_ascii_case(h))
+        });
+        if any_public {
             Visibility::Public
         } else {
             Visibility::Private
@@ -972,8 +976,14 @@ mod tests {
     #[test]
     fn visibility_infers_public_only_from_a_known_forge() {
         check!(Visibility::infer(["github.com/o/r"]) == Visibility::Public);
+        // Numeric-id form (`host#numeric`) still resolves the host segment.
+        check!(Visibility::infer(["codeberg.org#1982264"]) == Visibility::Public);
         check!(Visibility::infer(["git.internal.example/o/r"]) == Visibility::Private);
         check!(Visibility::infer(std::iter::empty::<&str>()) == Visibility::Private);
+        // Look-alike hosts that merely prefix-match a forge stay Private — exact
+        // host-segment compare, no default-deny bypass.
+        check!(Visibility::infer(["github.com.evil.com/o/r"]) == Visibility::Private);
+        check!(Visibility::infer(["notgithub.com/o/r"]) == Visibility::Private);
         check!(Visibility::parse("PROPRIETARY") == Some(Visibility::Proprietary));
         check!(Visibility::parse("nope").is_none());
         check!(Visibility::Private.is_restricted() && Visibility::Proprietary.is_restricted());
