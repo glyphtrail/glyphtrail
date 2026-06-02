@@ -62,8 +62,8 @@ pub struct StoryArgs {
     /// Most recent commits to narrate.
     #[arg(long, default_value_t = 300)]
     pub max_commits: usize,
-    /// Include private/proprietary repos (excluded by default — this output leaves
-    /// the machine).
+    /// Include restricted repos — private, proprietary, or unregistered (excluded
+    /// by default, since this output leaves the machine).
     #[arg(long)]
     pub include_restricted: bool,
     /// Output file for the narrative.
@@ -85,7 +85,8 @@ pub struct ExportArgs {
     /// Most recent commits to export.
     #[arg(long, default_value_t = 1000)]
     pub limit: usize,
-    /// Include private/proprietary repos (excluded by default).
+    /// Include restricted repos — private, proprietary, or unregistered (excluded
+    /// by default).
     #[arg(long)]
     pub include_restricted: bool,
     /// Write to a file instead of stdout.
@@ -551,7 +552,7 @@ fn timeline(dir: &Path, args: TimelineArgs) -> Result<()> {
         repo: args.repo.clone(),
         author: args.author.clone(),
         me: resolve_me(&cfg.me),
-        public_only: false, // local view: private shows, only proprietary is hidden
+        public_only: false, // local view: private shows; proprietary + unregistered hidden
         include_restricted: args.include_proprietary,
         limit: args.limit,
     };
