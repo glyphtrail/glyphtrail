@@ -148,6 +148,12 @@ fn normalize(name: &str) -> String {
     unquote(name).to_ascii_lowercase()
 }
 
+/// Public alias of the table-name normaliser, so other extractors (e.g. JPA)
+/// key tables the same way (#416 Phase B).
+pub fn normalize_name(name: &str) -> String {
+    normalize(name)
+}
+
 /// Keywords that begin a table-level constraint clause, not a column.
 fn is_constraint_kw(w: &str) -> bool {
     matches!(

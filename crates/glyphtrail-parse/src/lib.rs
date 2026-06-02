@@ -9,6 +9,7 @@ pub mod graphql;
 pub mod grpc;
 pub mod import_symbols;
 pub mod imports;
+pub mod jpa;
 pub mod registry;
 pub mod rest;
 pub mod sql;
@@ -28,10 +29,14 @@ pub use dynamic::{DynamicGrammar, load_dynamic};
 pub use extract::{ParsedFile, parse_source, parse_with};
 pub use import_symbols::extract_import_symbols;
 pub use imports::resolve_import;
+pub use jpa::{JpaAccess, JpaExtract, extract_jpa};
 pub use rest::{
     RawEndpoint, RawMount, extract_axum, extract_axum_mounts, extract_utoipa, extract_utoipa_mounts,
 };
-pub use sql::{DbAccess, SqlTable, build_sql_graph, extract_query_access, extract_sql_schema};
+pub use sql::{
+    DbAccess, SqlTable, build_sql_graph, extract_query_access, extract_sql_schema, normalize_name,
+    table_node_id,
+};
 pub use ws::{RawWsConnect, RawWsEvent, WsEventKind, extract_ws_connections, extract_ws_events};
 
 #[cfg(test)]

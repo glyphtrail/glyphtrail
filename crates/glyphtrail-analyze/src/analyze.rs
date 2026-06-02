@@ -164,6 +164,10 @@ struct FileOutput {
     /// `(enclosing fn id, access, table name)` embedded-query accesses (#416 B);
     /// the table name is resolved to `Table` node(s) after the global parse.
     db_accesses: Vec<(NodeId, glyphtrail_parse::DbAccess, String)>,
+    /// `(normalized entity name, normalized table name)` from JPA `@Entity`
+    /// classes (#416 B, Java), so an entity ref in a repo/`@Query` resolves to
+    /// its table.
+    entity_tables: Vec<(String, String)>,
 }
 
 /// The innermost function/method node whose span contains `byte`, for attributing
@@ -200,6 +204,7 @@ fn parse_file(
         string_consts: Vec::new(),
         const_refs: Vec::new(),
         db_accesses: Vec::new(),
+        entity_tables: Vec::new(),
     };
 
     // SQL schema/migration file (#416): the DDL extractor produces table/column
@@ -351,6 +356,21 @@ fn parse_file(
         if let Some(fn_id) = enclosing_fn(&out.graph.nodes, q.byte) {
             for (access, table) in q.accesses {
                 out.db_accesses.push((fn_id.clone(), access, table));
+            }
+        }
+    }
+    // JPA/Hibernate (#416 Phase B, Java): `@Entity` classes become tables, and
+    // repository methods / `@Query` annotations read/write them. Entity refs are
+    // mapped to their tables in the global resolution below.
+    if *language == Language::Java {
+        let jpa = glyphtrail_parse::extract_jpa(&f.rel_path, &file_id, &source, language);
+        out.graph.extend(jpa.graph);
+        out.entity_tables.extend(jpa.entity_tables);
+        for q in jpa.accesses {
+            if let Some(fn_id) = enclosing_fn(&out.graph.nodes, q.byte) {
+                for (access, table) in q.accesses {
+                    out.db_accesses.push((fn_id.clone(), access, table));
+                }
             }
         }
     }
@@ -1122,7 +1142,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 7: constant resolution follows the Angular `environment` chain — a member
 /// alias of an imported config object's string property (#405) — so those
 /// frontend indexes rebuild to fold the common environment-base URL pattern.
-const ANALYSIS_REVISION: u32 = 9;
+const ANALYSIS_REVISION: u32 = 10;
 
 /// Fingerprint of everything that determines analysis output: the crate
 /// version, the manual revision counter, and the built-in tree-sitter query
@@ -1663,6 +1683,8 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
     // (enclosing fn id, access, table name) embedded-query accesses (#416 B),
     // resolved to Table nodes by name after the parse.
     let mut db_accesses: Vec<(NodeId, glyphtrail_parse::DbAccess, String)> = Vec::new();
+    // (entity name, table name) JPA mappings, so an entity ref resolves to its table.
+    let mut entity_tables: Vec<(String, String)> = Vec::new();
 
     // Pre-resolve dynamic-language grammars once (sequential; warns once per
     // missing grammar) so the parallel parse can read them immutably.
@@ -1710,6 +1732,7 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
         string_consts.extend(out.string_consts);
         const_refs.extend(out.const_refs);
         db_accesses.extend(out.db_accesses);
+        entity_tables.extend(out.entity_tables);
     }
 
     // Resolve embedded-query accesses (#416 Phase B): match each query's table
@@ -1719,6 +1742,9 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
     // in this pass is dropped (best-effort; cross-pass resolution is a follow-up).
     let mut db_edges: Vec<Edge> = Vec::new();
     if !db_accesses.is_empty() {
+        // A JPA repository/JPQL access names an entity; map it to that entity's
+        // table before matching (a native query / sqlx already names the table).
+        let entity_to_table: HashMap<String, String> = entity_tables.into_iter().collect();
         let mut tables_by_name: HashMap<String, Vec<NodeId>> = HashMap::new();
         for n in &graph.nodes {
             if n.kind == NodeKind::Table {
@@ -1736,7 +1762,9 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
                 }
             }
         }
-        for (fn_id, access, table) in &db_accesses {
+        for (fn_id, access, ref_name) in &db_accesses {
+            // Map an entity ref to its table, else use the name as-is (a table).
+            let table = entity_to_table.get(ref_name).unwrap_or(ref_name);
             let targets = tables_by_name
                 .get(table)
                 .or_else(|| table.rsplit('.').next().and_then(|b| tables_by_name.get(b)));
@@ -2950,6 +2978,44 @@ mod tests {
                 .any(|(n, _, _)| n.kind == NodeKind::Table && n.name == "users"),
             "expected a Reads edge to the users table, got {:?}",
             reads.iter().map(|(n, _, _)| &n.name).collect::<Vec<_>>()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // #416 Phase B (Java): a Spring Data repository method links to the JPA
+    // entity's table, across files (entity in one file, repo in another).
+    #[test]
+    fn analyze_links_jpa_repository_to_entity_table() {
+        let dir = temp_repo("jpa-link");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("src/User.java"),
+            "@jakarta.persistence.Entity @jakarta.persistence.Table(name = \"users\") class User { @jakarta.persistence.Id Long id; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/UserRepository.java"),
+            "interface UserRepository extends org.springframework.data.jpa.repository.JpaRepository<User, Long> { void deleteByEmail(String e); }\n",
+        )
+        .unwrap();
+        run(&dir, false).unwrap();
+
+        let store = LadybugStore::open(&RepoPaths::new(&dir).index_dir.join("ladybug")).unwrap();
+        let m = store
+            .find_by_name("deleteByEmail")
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("repository method indexed");
+        let writes = store
+            .neighbors(&m.id.0, Some(EdgeKind::Writes), true)
+            .unwrap();
+        check!(
+            writes
+                .iter()
+                .any(|(n, _, _)| n.kind == NodeKind::Table && n.name == "users"),
+            "expected a Writes edge to the users table, got {:?}",
+            writes.iter().map(|(n, _, _)| &n.name).collect::<Vec<_>>()
         );
         std::fs::remove_dir_all(&dir).ok();
     }
