@@ -155,22 +155,32 @@ fn web_links(names: &[String], registry: &Registry) -> WebLinks {
         let ladybug = RepoPaths::new(entry.active_root())
             .index_dir
             .join("ladybug");
-        let Ok(store) = LadybugStore::open(&ladybug) else {
-            continue;
+        let store = match LadybugStore::open(&ladybug) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("note: skipping web links for '{name}': cannot open its index ({e})");
+                continue;
+            }
         };
-        for (id, key) in store
-            .operations_by_kind(NodeKind::Endpoint)
-            .unwrap_or_default()
-        {
+        // Read both operation kinds up front; if either errors, skip the whole
+        // repo rather than contribute partial (misleading) web links.
+        let (eps, ccs) = match (
+            store.operations_by_kind(NodeKind::Endpoint),
+            store.operations_by_kind(NodeKind::ClientCall),
+        ) {
+            (Ok(eps), Ok(ccs)) => (eps, ccs),
+            _ => {
+                eprintln!("note: skipping web links for '{name}': cannot read its operations");
+                continue;
+            }
+        };
+        for (id, key) in eps {
             let sig = key.signature();
             if key.protocol == Protocol::Rest && has_literal_segment(&sig) {
                 endpoints.entry(sig).or_default().push((name.clone(), id));
             }
         }
-        for (id, key) in store
-            .operations_by_kind(NodeKind::ClientCall)
-            .unwrap_or_default()
-        {
+        for (id, key) in ccs {
             let sig = key.signature();
             if key.protocol == Protocol::Rest && has_literal_segment(&sig) {
                 calls.push((name.clone(), sig, id));
@@ -185,11 +195,16 @@ fn web_links(names: &[String], registry: &Registry) -> WebLinks {
 /// signature yield a producer-endpoint → consumer-call edge.
 fn web_match(endpoints: &EndpointsBySig, calls: &[(String, String, NodeId)]) -> WebLinks {
     let mut repo_edges = Vec::new();
+    let mut seen_repo = HashSet::new();
     let mut node_edges = Vec::new();
     for (call_repo, sig, call_id) in calls {
         for (ep_repo, ep_id) in endpoints.get(sig).into_iter().flatten() {
             if ep_repo != call_repo {
-                repo_edges.push((ep_repo.clone(), call_repo.clone()));
+                // Many calls to the same producer collapse to one repo-level edge
+                // (it only drives reachability); keep every node-level edge.
+                if seen_repo.insert((ep_repo.clone(), call_repo.clone())) {
+                    repo_edges.push((ep_repo.clone(), call_repo.clone()));
+                }
                 node_edges.push((qualify(ep_repo, ep_id), qualify(call_repo, call_id)));
             }
         }
