@@ -21,7 +21,9 @@ pub enum LinkCmd {
     },
     /// Add a hint: this repo (`from`) depends on `to_repo`'s symbol/whole repo.
     Add {
-        /// The producer repo this one depends on (the other repo).
+        /// The producer repo this one depends on: a registry name, or a `./`,
+        /// `../`, or absolute *path* (resolved to the registered repo there — so
+        /// a path is distinct from a slashed name like a GitLab `group/repo`).
         to_repo: String,
         /// Producer symbol; omit for a coarse whole-repo link.
         #[arg(long)]
@@ -36,7 +38,8 @@ pub enum LinkCmd {
         /// Consumer REST endpoint in this repo (same format as --to-endpoint).
         #[arg(long)]
         from_endpoint: Option<String>,
-        /// Consumer repo (defaults to this repo, i.e. `.`).
+        /// Consumer repo (defaults to this repo, i.e. `.`): a name or a `./`,
+        /// `../`, or absolute path.
         #[arg(long)]
         from_repo: Option<String>,
         /// Write to the personal override instead of the committed file.
