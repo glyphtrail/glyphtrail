@@ -61,6 +61,26 @@ pub fn resolved_link_repo(
     }
 }
 
+/// How many of `links` have a side whose `repo` names no registered repo (#418)
+/// — the "dead link" count for `status` / the link tooling. `owner_name`/
+/// `owner_root` are the declaring repo (for resolving `.`/relative paths).
+pub fn count_unresolved_links(
+    links: &[LinkHint],
+    owner_name: &str,
+    owner_root: &Path,
+    registry: &Registry,
+) -> usize {
+    links
+        .iter()
+        .filter(|h| {
+            [&h.from, &h.to].into_iter().any(|end| {
+                end.repo.is_some()
+                    && resolved_link_repo(&end.repo, owner_name, owner_root, registry).is_none()
+            })
+        })
+        .count()
+}
+
 /// Pre-unification standalone hints file at the repo root, still read for
 /// back-compat and folded into `glyphtrail.toml` on the next `link`/`config` edit.
 pub const HINTS_FILE: &str = "glyphtrail.links.toml";
@@ -212,6 +232,54 @@ mod tests {
         check!(r(Some("nope")).is_none()); // an unregistered name -> dead
         check!(r(Some("./sub")) == Some("subrepo".into())); // a path -> the name
         check!(r(Some("./nope")).is_none()); // an unresolvable path -> dead
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn count_unresolved_links_counts_dead_sides_only() {
+        use crate::registry::RegistryEntry;
+        let base = std::env::temp_dir().join(format!(
+            "gt-countunresolved-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let meta = base.join("meta");
+        let sub = meta.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let mut registry = Registry::default();
+        registry.repos.push(RegistryEntry {
+            name: "subrepo".into(),
+            root: sub.clone(),
+            alt_roots: vec![],
+            missing_since: None,
+            ids: vec![],
+            contributors: vec![],
+            identity: None,
+            visibility: crate::registry::Visibility::default(),
+        });
+
+        let to = |repo: Option<&str>| LinkHint {
+            from: LinkEnd::default(), // "." -> declaring repo, always live
+            to: LinkEnd {
+                repo: repo.map(String::from),
+                ..Default::default()
+            },
+        };
+        let links = vec![
+            to(Some("subrepo")), // registered name -> live
+            to(Some("./sub")),   // path to that repo -> live
+            to(Some("nope")),    // unregistered name -> dead
+            to(Some("./nope")),  // path to nowhere -> dead
+            LinkHint {
+                from: LinkEnd::default(),
+                to: LinkEnd::default(),
+            }, // both sides "." -> live
+        ];
+        // Only the two dead `to` sides count; live and `.`-only sides don't.
+        check!(count_unresolved_links(&links, "owner", &meta, &registry) == 2);
         std::fs::remove_dir_all(&base).ok();
     }
 }

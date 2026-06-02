@@ -7,8 +7,9 @@ use std::process::Command;
 use glyphtrail_core::config::{INDEX_DIR, RepoPaths};
 use glyphtrail_core::{
     Confidence, Detail, EdgeKind, Groups, HttpMethod, ImpactPolicy, ImpactReport, Node, NodeId,
-    NodeKind, OperationKey, Protocol, Registry, RepoHealth, default_groups_path,
-    default_registry_path, is_outline_kind, operations_matching, outline_symbol,
+    NodeKind, OperationKey, Protocol, Registry, RepoHealth, count_unresolved_links,
+    default_groups_path, default_registry_path, is_outline_kind, operations_matching,
+    outline_symbol,
 };
 use glyphtrail_store::{
     ChangeSpec, FederationScope, GraphStore, LadybugStore, SeedSpec, changed_files,
@@ -362,6 +363,10 @@ fn dispatch(
             // an agent to target those repos in its searches instead of missing
             // code that lives outside this one.
             let links = declared_links(root);
+            // How many of those links are dead — a side names no registered repo
+            // (#418), so the cross-repo edge silently won't form. `null` when the
+            // registry can't be loaded to judge it.
+            let links_unresolved = unresolved_links(root);
             let (freshness, reason) = match &staleness {
                 glyphtrail_analyze::Staleness::Fresh => ("fresh", Value::Null),
                 glyphtrail_analyze::Staleness::Stale(why) => ("stale", json!(why)),
@@ -383,6 +388,9 @@ fn dispatch(
                 // OTHER repos this one declares links to (#365), so the agent can
                 // target them; empty when none are declared.
                 "links": links,
+                // How many declared links resolve to no registered repo (#418):
+                // a dead hint the agent should fix (wrong name / stale path).
+                "links_unresolved": links_unresolved,
             }))
         }
         other => Err(format!("unknown tool: {other}")),
@@ -1154,6 +1162,31 @@ fn declared_links(root: Option<&Path>) -> Vec<String> {
     repos.sort();
     repos.dedup();
     repos
+}
+
+/// How many declared `[[links]]` hints have a side naming no registered repo
+/// (#418) — a "dead link" count surfaced in `status` so an agent sees a wrong
+/// repo name or a path pointing nowhere instead of silently missing the edge.
+/// `None` when we can't judge resolution: no `root`, the config can't be read,
+/// or the registry can't be loaded. `Some(0)` when there are no links at all.
+fn unresolved_links(root: Option<&Path>) -> Option<usize> {
+    let root = root?;
+    let cfg = glyphtrail_core::Config::load(root).ok()?;
+    if cfg.links.is_empty() {
+        return Some(0);
+    }
+    let registry = default_registry_path().and_then(|p| Registry::load(&p).ok())?;
+    let owner_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let owner_name = registry
+        .name_at_root(&owner_root)
+        .unwrap_or(".")
+        .to_string();
+    Some(count_unresolved_links(
+        &cfg.links,
+        &owner_name,
+        &owner_root,
+        &registry,
+    ))
 }
 
 /// A stale-index warning for the repo behind `db`, or `None` when the index
