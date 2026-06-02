@@ -70,6 +70,7 @@ pub fn is_outline_kind(kind: NodeKind) -> bool {
             | NodeKind::Trait
             | NodeKind::Module
             | NodeKind::Constant
+            | NodeKind::Table
     )
 }
 

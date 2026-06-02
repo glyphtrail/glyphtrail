@@ -138,6 +138,9 @@ struct DiscoveredFile {
     /// `None` marks a sensitive record-only file (#136): its existence is
     /// recorded as a `File` node but its contents are never read or parsed.
     language: Option<Language>,
+    /// A `.sql` schema/migration file (#416): parsed by the DDL extractor rather
+    /// than a tree-sitter grammar, so it carries no `Language`.
+    sql: bool,
     hash: String,
 }
 
@@ -182,6 +185,35 @@ fn parse_file(
         string_consts: Vec::new(),
         const_refs: Vec::new(),
     };
+
+    // SQL schema/migration file (#416): the DDL extractor produces table/column
+    // nodes instead of the code pipeline below.
+    if f.sql {
+        let source = std::fs::read_to_string(&f.abs_path).ok()?;
+        out.graph.add_node(Node {
+            id: file_id.clone(),
+            kind: NodeKind::File,
+            name: f.rel_path.clone(),
+            qualified_name: f.rel_path.clone(),
+            file: f.rel_path.clone(),
+            language: Some("sql".to_string()),
+            span: None,
+            doc: None,
+            signature: None,
+        });
+        out.graph.add_edge(
+            repo_id.clone(),
+            file_id.clone(),
+            EdgeKind::Contains,
+            Confidence::Extracted,
+        );
+        out.graph.extend(glyphtrail_parse::build_sql_graph(
+            &f.rel_path,
+            &file_id,
+            &source,
+        ));
+        return Some(out);
+    }
 
     // Sensitive record-only file (#136): record that it exists, never read it.
     let Some(language) = &f.language else {
@@ -440,6 +472,25 @@ fn discover(
                 rel_path: rel,
                 abs_path: path.to_path_buf(),
                 language: None,
+                sql: false,
+            });
+            continue;
+        }
+
+        // SQL schema/migration files (#416): handled by the DDL extractor, not a
+        // tree-sitter grammar, so they carry no `Language`.
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if ext.eq_ignore_ascii_case("sql") {
+            let Ok(bytes) = std::fs::read(path) else {
+                continue;
+            };
+            let hash = blake3::hash(&bytes).to_hex().to_string();
+            out.push(DiscoveredFile {
+                rel_path: rel,
+                abs_path: path.to_path_buf(),
+                language: None,
+                sql: true,
+                hash,
             });
             continue;
         }
@@ -447,16 +498,13 @@ fn discover(
         // Built-in language by extension, else a configured dynamic language.
         let language = match Language::from_path(path) {
             Some(l) => l,
-            None => {
-                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                match dyn_langs
-                    .iter()
-                    .find(|d| d.extensions.iter().any(|e| e == ext))
-                {
-                    Some(d) => Language::Other(d.name.clone()),
-                    None => continue,
-                }
-            }
+            None => match dyn_langs
+                .iter()
+                .find(|d| d.extensions.iter().any(|e| e == ext))
+            {
+                Some(d) => Language::Other(d.name.clone()),
+                None => continue,
+            },
         };
         let Ok(bytes) = std::fs::read(path) else {
             continue;
@@ -466,6 +514,7 @@ fn discover(
             rel_path: rel,
             abs_path: path.to_path_buf(),
             language: Some(language),
+            sql: false,
             hash,
         });
     }
@@ -1047,7 +1096,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 7: constant resolution follows the Angular `environment` chain — a member
 /// alias of an imported config object's string property (#405) — so those
 /// frontend indexes rebuild to fold the common environment-base URL pattern.
-const ANALYSIS_REVISION: u32 = 7;
+const ANALYSIS_REVISION: u32 = 8;
 
 /// Fingerprint of everything that determines analysis output: the crate
 /// version, the manual revision counter, and the built-in tree-sitter query
@@ -1998,11 +2047,14 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
     let file_records: Vec<(String, Option<String>, String)> = changed
         .iter()
         .map(|f| {
-            (
-                f.rel_path.clone(),
-                f.language.as_ref().map(|l| l.name().to_string()),
-                f.hash.clone(),
-            )
+            // A `.sql` file carries no `Language` but is still tagged "sql" so the
+            // language tally reports it rather than "(unknown)" (#416).
+            let lang = match (&f.language, f.sql) {
+                (Some(l), _) => Some(l.name().to_string()),
+                (None, true) => Some("sql".to_string()),
+                (None, false) => None,
+            };
+            (f.rel_path.clone(), lang, f.hash.clone())
         })
         .collect();
     store.set_files(&file_records)?;
@@ -2547,6 +2599,22 @@ mod tests {
         let rels: Vec<&str> = found.iter().map(|f| f.rel_path.as_str()).collect();
         check!(rels == ["main.rs"], "expected only main.rs, got {rels:?}");
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // #416: a `.sql` file is discovered as a SQL artifact (no `Language`, the
+    // `sql` flag set) so the DDL extractor handles it; a `.rs` file does not.
+    #[test]
+    fn discovery_flags_sql_files() {
+        let dir = temp_repo("sql-discovery");
+        std::fs::write(dir.join("schema.sql"), "CREATE TABLE t (id int);\n").unwrap();
+        std::fs::write(dir.join("main.rs"), "fn f() {}\n").unwrap();
+        let found = discover(&dir, &[], &[], false, None).unwrap();
+        let sql = found.iter().find(|f| f.rel_path == "schema.sql").unwrap();
+        check!(sql.sql);
+        check!(sql.language.is_none());
+        let rs = found.iter().find(|f| f.rel_path == "main.rs").unwrap();
+        check!(!rs.sql);
         std::fs::remove_dir_all(&dir).ok();
     }
 
