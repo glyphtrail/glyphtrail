@@ -26,8 +26,8 @@ pub use api::{
 };
 pub use atlas::{
     AtlasConfig, AtlasHeads, AtlasTimelineRow, CommitMeta, MeConfig, Timeline, TimelineQuery,
-    Window, author_matches, author_scope_label, default_atlas_path, filter_timeline, format_date,
-    timeline_value,
+    Window, author_matches, author_scope_label, default_atlas_path, derive_topics, filter_timeline,
+    format_date, timeline_value,
 };
 pub use config::{ApiConfig, Config, DynamicLanguage, SchemaFormat, SchemaSource};
 pub use dotnet::{CsprojProject, parse_csproj};

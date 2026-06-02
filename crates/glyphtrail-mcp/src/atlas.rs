@@ -19,7 +19,12 @@ use crate::tools::text_result;
 
 /// The atlas tool set advertised by `glyphtrail atlas mcp`.
 pub fn definitions() -> Vec<Value> {
-    vec![status_tool(), timeline_tool(), resolve_tool()]
+    vec![
+        status_tool(),
+        timeline_tool(),
+        topics_tool(),
+        resolve_tool(),
+    ]
 }
 
 /// Run an atlas tool, formatting the result like the per-repo tools (YAML by
@@ -35,6 +40,7 @@ fn dispatch(atlas_dir: &Path, name: &str, args: &Value) -> Result<Value, String>
     match name {
         "atlas_status" => status(atlas_dir),
         "atlas_timeline" => timeline(atlas_dir, args),
+        "atlas_topics" => topics(atlas_dir),
         "atlas_resolve" => resolve(args),
         other => Err(format!("unknown atlas tool: {other}")),
     }
@@ -93,14 +99,26 @@ fn timeline(atlas_dir: &Path, args: &Value) -> Result<Value, String> {
         limit: opt_usize(args, "limit").unwrap_or(50),
     };
     let store = atlas_store(atlas_dir)?;
+    let topic = opt_str(args, "topic");
     let rows = store
-        .atlas_timeline(since, until)
+        .atlas_timeline(since, until, topic.as_deref())
         .map_err(|e| e.to_string())?;
     let tl = filter_timeline(rows, &registry(), &query);
     Ok(timeline_value(
         &tl,
         &window.label(),
         &author_scope_label(&query),
+    ))
+}
+
+fn topics(atlas_dir: &Path) -> Result<Value, String> {
+    let store = atlas_store(atlas_dir)?;
+    let topics = store.atlas_topics().map_err(|e| e.to_string())?;
+    Ok(Value::Array(
+        topics
+            .iter()
+            .map(|(name, count)| json!({ "topic": name, "commits": count }))
+            .collect(),
     ))
 }
 
@@ -153,11 +171,23 @@ fn timeline_tool() -> Value {
         json!({
             "repo": { "type": "string", "description": "Restrict to one registered repo name." },
             "author": { "type": "string", "description": "Substring the author email must contain (default: you)." },
+            "topic": { "type": "string", "description": "Only commits tagged with this topic (see atlas_topics)." },
             "since": { "type": "string", "description": "Earliest commit date, YYYY-MM-DD (overrides the config window)." },
             "until": { "type": "string", "description": "Latest commit date, YYYY-MM-DD (overrides the config window)." },
             "include_proprietary": { "type": "boolean", "description": "Include proprietary/unregistered repos (default false)." },
             "limit": { "type": "integer", "description": "Cap how many commits to return (default 50)." }
         }),
+        &[],
+    )
+}
+
+fn topics_tool() -> Value {
+    atlas_tool(
+        "atlas_topics",
+        "The heuristic topics derived across your commits (keywords, areas, \
+         languages) with how many commits each tags, most-tagged first. Use a \
+         topic name as the `topic` argument to `atlas_timeline`.",
+        json!({}),
         &[],
     )
 }
@@ -244,7 +274,7 @@ mod tests {
     #[test]
     fn definitions_are_read_only_atlas_tools() {
         let defs = definitions();
-        check!(defs.len() == 3);
+        check!(defs.len() == 4);
         for d in &defs {
             let name = d["name"].as_str().unwrap();
             check!(name.starts_with("atlas_"));

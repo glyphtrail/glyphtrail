@@ -82,13 +82,17 @@ pub trait GraphStore: Adjacency {
     fn commit_count(&self) -> Result<usize>;
     /// In-bounds atlas commits in `[since, until]` (unix seconds, inclusive;
     /// `None` = unbounded), each joined to its repo name and touched-file count,
-    /// ordered by `committed_at` ascending (#333). Visibility/author filtering is
-    /// the caller's.
+    /// ordered by `committed_at` ascending (#333). `topic`, when set, keeps only
+    /// commits tagged with that topic (#334). Visibility/author filtering is the
+    /// caller's.
     fn atlas_timeline(
         &self,
         since: Option<i64>,
         until: Option<i64>,
+        topic: Option<&str>,
     ) -> Result<Vec<glyphtrail_core::AtlasTimelineRow>>;
+    /// Derived atlas topics with their commit counts, most-tagged first (#334).
+    fn atlas_topics(&self) -> Result<Vec<(String, usize)>>;
     fn all_pending(&self) -> Result<Vec<PendingLink>>;
     fn all_imports(&self) -> Result<Vec<(String, String, String)>>;
     fn node_files(&self) -> Result<Vec<(String, String)>>;
