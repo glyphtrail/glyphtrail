@@ -968,7 +968,7 @@ fn tool(name: &str, description: &str, mut properties: Value, required: &[&str])
 /// Agent-facing output defaults to YAML: lower-boilerplate than JSON, so it costs
 /// fewer tokens for the model to read. Set `GLYPHTRAIL_MCP_FORMAT=json` to restore
 /// pretty-JSON for clients that expect it. (See #109.)
-fn text_result(value: &Value, is_error: bool) -> Value {
+pub(crate) fn text_result(value: &Value, is_error: bool) -> Value {
     let as_json = std::env::var("GLYPHTRAIL_MCP_FORMAT")
         .map(|f| f.eq_ignore_ascii_case("json"))
         .unwrap_or(false);

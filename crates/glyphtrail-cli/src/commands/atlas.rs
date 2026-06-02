@@ -12,11 +12,11 @@ use anyhow::{Result, anyhow, bail};
 use clap::{Args, Subcommand};
 use glyphtrail_core::{
     AtlasConfig, AtlasHeads, CodeGraph, CommitMeta, Confidence, EdgeKind, MeConfig, Node, NodeId,
-    NodeKind, Registry, RegistryEntry, Visibility, Window, default_atlas_path,
-    default_registry_path, format_date, scrub_secrets,
+    NodeKind, Registry, RegistryEntry, TimelineQuery, Window, author_scope_label,
+    default_atlas_path, default_registry_path, filter_timeline, format_date, scrub_secrets,
+    timeline_value,
 };
 use glyphtrail_store::{GraphStore, LadybugStore};
-use serde_json::json;
 
 use super::query::{Emit, print_value};
 
@@ -32,6 +32,8 @@ pub enum AtlasCmd {
     Sync(SyncArgs),
     /// List commits chronologically across repos (mine by default).
     Timeline(TimelineArgs),
+    /// Serve the atlas over MCP (stdio): timeline, status, and the repo+file bridge.
+    Mcp,
 }
 
 #[derive(Args)]
@@ -105,20 +107,9 @@ pub fn run(cmd: AtlasCmd) -> Result<()> {
         AtlasCmd::Status => status(&dir)?,
         AtlasCmd::Sync(args) => sync(&dir, args)?,
         AtlasCmd::Timeline(args) => timeline(&dir, args)?,
+        AtlasCmd::Mcp => glyphtrail_mcp::serve_atlas_stdio(dir)?,
     }
     Ok(())
-}
-
-/// The window as `none` or `earliest..latest` (an open side prints empty).
-fn describe_window(w: &Window) -> String {
-    match (&w.earliest, &w.latest) {
-        (None, None) => "none".to_string(),
-        (earliest, latest) => format!(
-            "{}..{}",
-            earliest.as_deref().unwrap_or(""),
-            latest.as_deref().unwrap_or("")
-        ),
-    }
 }
 
 /// Report state + the active limits. Establishes the convention every later
@@ -140,7 +131,7 @@ fn status(dir: &Path) -> Result<()> {
     println!("nodes:   {}", stats.nodes);
     println!("edges:   {}", stats.edges);
     println!("commits: {commits}");
-    println!("window:  {}", describe_window(&cfg.window));
+    println!("window:  {}", cfg.window.label());
     Ok(())
 }
 
@@ -203,9 +194,9 @@ fn sync(dir: &Path, args: SyncArgs) -> Result<()> {
     }
 
     println!("atlas sync");
-    println!("  window:  {}", describe_window(&cfg.window));
+    println!("  window:  {}", cfg.window.label());
     if walk.earliest != cfg.window.earliest || walk.latest != cfg.window.latest {
-        println!("  walk:    {} (this run only)", describe_window(&walk));
+        println!("  walk:    {} (this run only)", walk.label());
     }
     if args.everyone {
         println!("  authors: everyone");
@@ -290,63 +281,36 @@ fn timeline(dir: &Path, args: TimelineArgs) -> Result<()> {
         Some(p) => Registry::load(&p)?,
         None => Registry::default(),
     };
-    let me = resolve_me(&cfg.me);
-
+    let query = TimelineQuery {
+        repo: args.repo.clone(),
+        author: args.author.clone(),
+        me: resolve_me(&cfg.me),
+        include_restricted: args.include_proprietary,
+        limit: args.limit,
+    };
     let store = LadybugStore::open(&lb)?;
     let rows = store.atlas_timeline(since, until)?;
-
-    // Filter: repo, then visibility (default-deny), then author.
-    let mut excluded_restricted = 0usize;
-    let mut excluded_author = 0usize;
-    let mut kept: Vec<&glyphtrail_core::AtlasTimelineRow> = Vec::new();
-    for row in &rows {
-        if args.repo.as_ref().is_some_and(|name| &row.repo != name) {
-            continue;
-        }
-        // Default-deny: proprietary repos AND any whose registry entry is gone
-        // (removed/renamed/stale) — never show a commit we can't vouch for.
-        let restricted = match registry.get(&row.repo).map(|e| e.visibility) {
-            Some(Visibility::Proprietary) | None => true,
-            Some(_) => false,
-        };
-        if restricted && !args.include_proprietary {
-            excluded_restricted += 1;
-            continue;
-        }
-        if !author_matches(&args.author, &me, &row.commit.author_email) {
-            excluded_author += 1;
-            continue;
-        }
-        kept.push(row);
-    }
-    // Newest first; cap at the limit.
-    kept.reverse();
-    let matched = kept.len();
-    kept.truncate(args.limit);
-
-    let scope = match &args.author {
-        Some(a) => format!("author ~ {a}"),
-        None if me.is_set() => format!("mine ({})", me.display().unwrap_or_default()),
-        None => "anyone (no [me] configured)".to_string(),
-    };
+    let tl = filter_timeline(rows, &registry, &query);
+    let scope = author_scope_label(&query);
+    let window_str = window.label();
 
     let emit = Emit::from_flags(args.json, args.yaml);
     if emit == Emit::Text {
         println!("atlas timeline");
-        println!("  window:  {}", describe_window(&window));
+        println!("  window:  {window_str}");
         println!("  author:  {scope}");
         if let Some(r) = &args.repo {
             println!("  repo:    {r}");
         }
-        if excluded_restricted > 0 {
+        if tl.excluded_restricted > 0 {
             println!(
-                "  hidden:  {excluded_restricted} restricted (proprietary/unregistered; \
-                 use --include-proprietary)"
+                "  hidden:  {} restricted (proprietary/unregistered; use --include-proprietary)",
+                tl.excluded_restricted
             );
         }
-        println!("  showing: {} of {matched} matched", kept.len());
+        println!("  showing: {} of {} matched", tl.rows.len(), tl.matched);
         println!();
-        for row in &kept {
+        for row in &tl.rows {
             println!(
                 "  {}  {:<20}  {} ({} file{})",
                 format_date(row.commit.committed_at),
@@ -357,44 +321,9 @@ fn timeline(dir: &Path, args: TimelineArgs) -> Result<()> {
             );
         }
     } else {
-        let commits: Vec<_> = kept
-            .iter()
-            .map(|r| {
-                json!({
-                    "date": format_date(r.commit.committed_at),
-                    "committed_at": r.commit.committed_at,
-                    "repo": r.repo,
-                    "author": r.commit.author_email,
-                    "subject": r.commit.subject,
-                    "touched": r.touched,
-                    "hash": r.commit.hash,
-                })
-            })
-            .collect();
-        let value = json!({
-            "window": describe_window(&window),
-            "author_scope": scope,
-            "shown": kept.len(),
-            "matched": matched,
-            "excluded": { "restricted": excluded_restricted, "author": excluded_author },
-            "commits": commits,
-        });
-        print_value(&value, emit)?;
+        print_value(&timeline_value(&tl, &window_str, &scope), emit)?;
     }
     Ok(())
-}
-
-/// Whether a commit's author passes the filter: an explicit `--author` substring
-/// (case-insensitive) wins; otherwise scope to me, falling back to everyone only
-/// when no `[me]` and no git email could be resolved.
-fn author_matches(explicit: &Option<String>, me: &MeConfig, email: &str) -> bool {
-    match explicit {
-        Some(sub) => email
-            .to_ascii_lowercase()
-            .contains(&sub.to_ascii_lowercase()),
-        None if me.is_set() => me.matches(email),
-        None => true,
-    }
 }
 
 /// Truncate `s` to `max` chars, appending an ellipsis when cut.
@@ -798,22 +727,6 @@ mod tests {
             .filter(|e| e.kind == EdgeKind::Touched)
             .count();
         check!(touched == 2);
-    }
-
-    #[test]
-    fn author_matches_explicit_substring_then_me_then_everyone() {
-        let me = MeConfig {
-            emails: vec!["ada@x.dev".into()],
-            domains: vec![],
-        };
-        // Explicit substring (case-insensitive) wins, ignoring me.
-        check!(author_matches(&Some("EVE".into()), &me, "eve@evil.dev"));
-        check!(!author_matches(&Some("eve".into()), &me, "ada@x.dev"));
-        // No --author: scope to me.
-        check!(author_matches(&None, &me, "ada@x.dev"));
-        check!(!author_matches(&None, &me, "eve@evil.dev"));
-        // No --author and no [me]: everyone passes.
-        check!(author_matches(&None, &MeConfig::default(), "anyone@here"));
     }
 
     #[test]
