@@ -89,10 +89,12 @@ glyphtrail serve --port 7700           # live explorer at http://127.0.0.1:7700
 # Agent integration (Model Context Protocol)
 glyphtrail mcp                         # MCP server over stdio (query/endpoints/impact/…)
 #   `glyphtrail serve` also exposes the same tools at POST /mcp (JSON-RPC)
-glyphtrail setup                       # onboard agents: write .claude/skills + a
-#   managed CLAUDE.md/AGENTS.md section pointing them at the MCP/CLI, and gitignore
-#   the index. Idempotent and stats-free (won't dirty the files on every commit).
-glyphtrail setup --gitignore           # keep it local-only: write the skill but
+glyphtrail setup --local               # onboard agents in THIS repo: write
+#   .claude/skills + a managed CLAUDE.md/AGENTS.md section pointing them at the
+#   MCP/CLI, and gitignore the index. Idempotent and stats-free.
+glyphtrail setup --user                # same, but user-wide in your home dir
+#   (pick --local and/or --user explicitly — a repo-local install lands in commits)
+glyphtrail setup --local --gitignore   # keep it local-only: write the skill but
 #   gitignore it, skip the CLAUDE.md/AGENTS.md patch, and strip a section a prior
 #   run added (so nothing glyphtrail-related is committed).
 
@@ -192,8 +194,9 @@ every tool call must then name a `repo`, and `list_repos` lists the indexed ones
 (`glyphtrail serve` additionally exposes the same tools over HTTP at `POST /mcp`,
 for clients that prefer a URL.)
 
-Prefer it managed? `glyphtrail setup` writes an agent skill plus a
-`CLAUDE.md`/`AGENTS.md` section that points coding agents at these tools.
+Prefer it managed? `glyphtrail setup --local` (or `--user` for a home-wide
+install) writes an agent skill plus a `CLAUDE.md`/`AGENTS.md` section that points
+coding agents at these tools.
 
 ### Configuration
 

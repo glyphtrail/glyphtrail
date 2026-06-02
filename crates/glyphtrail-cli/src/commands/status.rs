@@ -45,7 +45,7 @@ fn print_text(location: &str, s: &Stats, staleness: &Staleness, skill: Option<u3
     }
     match skill {
         Some(v) if v < setup::SKILL_VERSION => println!(
-            "skill:  v{v} (outdated — bundled v{}; run `glyphtrail setup`)",
+            "skill:  v{v} (outdated — bundled v{}; run `glyphtrail setup --local`)",
             setup::SKILL_VERSION
         ),
         Some(v) => println!("skill:  v{v}"),
