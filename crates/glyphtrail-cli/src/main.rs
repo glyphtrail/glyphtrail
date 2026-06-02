@@ -160,6 +160,11 @@ enum Command {
         #[command(subcommand)]
         cmd: commands::group::GroupCmd,
     },
+    /// Inspect the opt-in, local-only global archaeology index (atlas).
+    Atlas {
+        #[command(subcommand)]
+        cmd: commands::atlas::AtlasCmd,
+    },
     /// Show index statistics.
     Status {
         #[arg(long, default_value = ".")]
@@ -333,6 +338,7 @@ fn main() -> anyhow::Result<()> {
         Command::Remote { cmd } => commands::remote::run(cmd),
         Command::Config { cmd } => commands::config::run(cmd),
         Command::Group { cmd } => commands::group::run(cmd),
+        Command::Atlas { cmd } => commands::atlas::run(cmd),
         Command::Status {
             repo,
             all,

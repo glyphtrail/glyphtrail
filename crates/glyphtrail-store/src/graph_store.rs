@@ -7,8 +7,8 @@
 
 use anyhow::Result;
 use glyphtrail_core::{
-    Adjacency, ClassifiedItem, Confidence, Edge, EdgeKind, ImpactPolicy, Node, NodeId, NodeKind,
-    OperationKey, PendingLink,
+    Adjacency, ClassifiedItem, CommitMeta, Confidence, Edge, EdgeKind, ImpactPolicy, Node, NodeId,
+    NodeKind, OperationKey, PendingLink,
 };
 
 /// Aggregate counts for an index, returned by [`GraphStore::stats`].
@@ -55,6 +55,8 @@ pub trait GraphStore: Adjacency {
         self.insert_graph(&[], edges)
     }
     fn insert_operations(&mut self, ops: &[(NodeId, OperationKey)]) -> Result<()>;
+    /// Upsert atlas `Commit` side-table rows keyed by node id (#330).
+    fn set_commits(&mut self, commits: &[CommitMeta]) -> Result<()>;
     fn insert_pending(&mut self, links: &[PendingLink]) -> Result<()>;
     fn insert_imports(&mut self, imports: &[(String, String, String)]) -> Result<()>;
     fn delete_edges_by_confidence(&mut self, confidence: Confidence) -> Result<usize>;
@@ -69,6 +71,9 @@ pub trait GraphStore: Adjacency {
     fn get_meta(&self, key: &str) -> Result<Option<String>>;
     fn operations_by_kind(&self, kind: NodeKind) -> Result<Vec<(NodeId, OperationKey)>>;
     fn all_operations(&self) -> Result<Vec<(NodeId, OperationKey)>>;
+    /// In-bounds atlas commits in `[since, until]` (unix seconds, inclusive; `None`
+    /// = unbounded), ordered by `committed_at` (#330).
+    fn commits_in_range(&self, since: Option<i64>, until: Option<i64>) -> Result<Vec<CommitMeta>>;
     fn all_pending(&self) -> Result<Vec<PendingLink>>;
     fn all_imports(&self) -> Result<Vec<(String, String, String)>>;
     fn node_files(&self) -> Result<Vec<(String, String)>>;
