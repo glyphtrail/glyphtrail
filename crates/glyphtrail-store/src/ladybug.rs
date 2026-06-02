@@ -14,8 +14,9 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use glyphtrail_core::{
-    Adjacency, ClassifiedItem, Confidence, Direction, Edge, EdgeKind, ImpactPolicy, Node, NodeId,
-    NodeKind, OperationKey, PendingLink, Span, classify, compute_impact, is_cross_boundary_path,
+    Adjacency, ClassifiedItem, CommitMeta, Confidence, Direction, Edge, EdgeKind, ImpactPolicy,
+    Node, NodeId, NodeKind, OperationKey, PendingLink, Span, classify, compute_impact,
+    is_cross_boundary_path,
 };
 use lbug::{Connection, Database, LogicalType, SystemConfig, Value};
 
@@ -39,6 +40,10 @@ const SCHEMA: &[&str] = &[
     "CREATE REL TABLE IF NOT EXISTS Edge(FROM Node TO Node, kind STRING, confidence STRING)",
     "CREATE NODE TABLE IF NOT EXISTS File(path STRING, language STRING, hash STRING, PRIMARY KEY(path))",
     "CREATE NODE TABLE IF NOT EXISTS ApiOp(node_id STRING, protocol STRING, method STRING, path STRING, signature STRING, PRIMARY KEY(node_id))",
+    // Atlas (#329/#330): commit attributes keyed by the Commit node's id; rows
+    // carry `committed_at` (time-ordered queries) and `in_bounds` (0/1, the
+    // date-window state).
+    "CREATE NODE TABLE IF NOT EXISTS Commit(node_id STRING, hash STRING, author_email STRING, committed_at INT64, subject STRING, in_bounds INT64, PRIMARY KEY(node_id))",
     "CREATE NODE TABLE IF NOT EXISTS Pending(pk STRING, anchor STRING, name STRING, kind STRING, name_is_src INT64, PRIMARY KEY(pk))",
     "CREATE NODE TABLE IF NOT EXISTS Import(pk STRING, importer STRING, raw STRING, language STRING, PRIMARY KEY(pk))",
     "CREATE NODE TABLE IF NOT EXISTS Meta(key STRING, value STRING, PRIMARY KEY(key))",
@@ -98,7 +103,9 @@ impl LadybugStore {
             let conn = self.conn()?;
             // Drop the rel table before its node tables. Ignore "missing table"
             // on a partial DB; the schema is recreated immediately after.
-            for tbl in ["Edge", "Node", "File", "ApiOp", "Pending", "Import", "Meta"] {
+            for tbl in [
+                "Edge", "Node", "File", "ApiOp", "Commit", "Pending", "Import", "Meta",
+            ] {
                 let _ = conn.query(&format!("DROP TABLE {tbl}"));
             }
             for ddl in SCHEMA {
@@ -345,6 +352,10 @@ fn parse_kind(s: &str) -> NodeKind {
         "endpoint" => NodeKind::Endpoint,
         "client_call" => NodeKind::ClientCall,
         "router" => NodeKind::Router,
+        "commit" => NodeKind::Commit,
+        "author" => NodeKind::Author,
+        "identity" => NodeKind::Identity,
+        "topic" => NodeKind::Topic,
         _ => NodeKind::SchemaOp,
     }
 }
@@ -362,6 +373,11 @@ fn parse_edge_kind(s: &str) -> EdgeKind {
         "mounts" => EdgeKind::Mounts,
         "exposes" => EdgeKind::Exposes,
         "invokes" => EdgeKind::Invokes,
+        "authored" => EdgeKind::Authored,
+        "alias_of" => EdgeKind::AliasOf,
+        "touched" => EdgeKind::Touched,
+        "tagged" => EdgeKind::Tagged,
+        "part_of" => EdgeKind::PartOf,
         _ => EdgeKind::References,
     }
 }
@@ -392,6 +408,19 @@ fn op_from_row(row: &[Value]) -> (NodeId, OperationKey) {
             path: get_str(row, 3),
         },
     )
+}
+
+/// Decode a `Commit` side-table row (#330): node_id, hash, author_email,
+/// committed_at, subject, in_bounds — in that column order.
+fn commit_from_row(row: &[Value]) -> CommitMeta {
+    CommitMeta {
+        node_id: NodeId(get_str(row, 0)),
+        hash: get_str(row, 1),
+        author_email: get_str(row, 2),
+        committed_at: get_i64(row, 3),
+        subject: get_str(row, 4),
+        in_bounds: get_i64(row, 5) != 0,
+    }
 }
 
 impl Adjacency for LadybugStore {
@@ -601,6 +630,30 @@ impl GraphStore for LadybugStore {
         )
     }
 
+    fn set_commits(&mut self, commits: &[CommitMeta]) -> Result<()> {
+        let conn = self.conn()?;
+        let rows: Vec<Vec<(&str, Value)>> = commits
+            .iter()
+            .map(|c| {
+                vec![
+                    ("id", s(&c.node_id.0)),
+                    ("h", s(&c.hash)),
+                    ("e", s(&c.author_email)),
+                    ("t", Value::Int64(c.committed_at)),
+                    ("subj", s(&c.subject)),
+                    ("ib", Value::Int64(i64::from(c.in_bounds))),
+                ]
+            })
+            .collect();
+        self.exec_unwind(
+            &conn,
+            "UNWIND $rows AS r MERGE (c:Commit {node_id:r.id}) \
+             SET c.hash=r.h, c.author_email=r.e, c.committed_at=r.t, \
+             c.subject=r.subj, c.in_bounds=r.ib",
+            rows,
+        )
+    }
+
     fn insert_pending(&mut self, links: &[PendingLink]) -> Result<()> {
         let conn = self.conn()?;
         let rows: Vec<Vec<(&str, Value)>> = links
@@ -739,6 +792,39 @@ impl GraphStore for LadybugStore {
             .iter()
             .map(|r| op_from_row(r))
             .collect())
+    }
+
+    fn commits_in_range(&self, since: Option<i64>, until: Option<i64>) -> Result<Vec<CommitMeta>> {
+        // Inline the bounds: lbug caches a bound param's type by name across
+        // statements, so binding INT64s here would clash with STRING params
+        // elsewhere; inlining the integers sidesteps it.
+        let mut filter = String::from("c.in_bounds = 1");
+        if let Some(s) = since {
+            filter.push_str(&format!(" AND c.committed_at >= {s}"));
+        }
+        if let Some(u) = until {
+            filter.push_str(&format!(" AND c.committed_at <= {u}"));
+        }
+        Ok(self
+            .run(
+                &format!(
+                    "MATCH (c:Commit) WHERE {filter} RETURN c.node_id, c.hash, \
+                     c.author_email, c.committed_at, c.subject, c.in_bounds \
+                     ORDER BY c.committed_at"
+                ),
+                vec![],
+            )?
+            .iter()
+            .map(|r| commit_from_row(r))
+            .collect())
+    }
+
+    fn commit_count(&self) -> Result<usize> {
+        Ok(self
+            .run("MATCH (c:Commit) RETURN COUNT(*)", vec![])?
+            .first()
+            .map(|r| get_i64(r, 0).max(0) as usize)
+            .unwrap_or(0))
     }
 
     fn all_pending(&self) -> Result<Vec<PendingLink>> {
@@ -1152,6 +1238,54 @@ mod tests {
         // Reopen: the version mismatch drops + recreates, wiping stale data.
         let lb = LadybugStore::open(&dir).unwrap();
         check!(lb.find_by_name("stale").unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Atlas (#330): a Commit node (new kind) + its side-table row round-trip,
+    // filtered by date window and in_bounds.
+    #[test]
+    fn atlas_commit_side_table_roundtrips() {
+        let dir = tmp_dir("atlas-commit");
+        let mut lb = LadybugStore::open(&dir).unwrap();
+        let mut c = node("c1", "fix: thing");
+        c.kind = NodeKind::Commit;
+        lb.insert_graph(&[c], &[]).unwrap();
+        let row = CommitMeta {
+            node_id: NodeId("c1".into()),
+            hash: "deadbeef".into(),
+            author_email: "me@example.com".into(),
+            committed_at: 1_700_000_000,
+            subject: "fix: thing".into(),
+            in_bounds: true,
+        };
+        lb.set_commits(std::slice::from_ref(&row)).unwrap();
+
+        // Round-trips; the new node kind decodes back to Commit.
+        let got = lb.commits_in_range(None, None).unwrap();
+        check!(got == vec![row.clone()]);
+        check!(lb.commit_count().unwrap() == 1);
+        check!(lb.find_by_name("fix: thing").unwrap()[0].kind == NodeKind::Commit);
+        // Date window filters on committed_at.
+        check!(
+            lb.commits_in_range(Some(1_700_000_001), None)
+                .unwrap()
+                .is_empty()
+        );
+        check!(
+            lb.commits_in_range(None, Some(1_699_999_999))
+                .unwrap()
+                .is_empty()
+        );
+        // An out-of-bounds row is excluded (re-marked, not deleted).
+        lb.set_commits(&[CommitMeta {
+            in_bounds: false,
+            ..row
+        }])
+        .unwrap();
+        check!(lb.commits_in_range(None, None).unwrap().is_empty());
+        // commit_count still sees the row — out-of-bounds is marked, not deleted.
+        check!(lb.commit_count().unwrap() == 1);
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

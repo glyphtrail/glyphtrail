@@ -52,6 +52,14 @@ pub enum NodeKind {
     /// Express `express.Router()`); the `MOUNTS` target of `include_router` /
     /// `app.use`.
     Router,
+    /// Atlas (#329): a single commit in the global archaeology index.
+    Commit,
+    /// Atlas: a raw `name <email>` author from a commit.
+    Author,
+    /// Atlas: the unified person; many `Author`s roll up to one `Identity`.
+    Identity,
+    /// Atlas: a derived topic/theme spanning commits and repos.
+    Topic,
 }
 
 impl NodeKind {
@@ -74,6 +82,10 @@ impl NodeKind {
             NodeKind::ClientCall => "client_call",
             NodeKind::SchemaOp => "schema_op",
             NodeKind::Router => "router",
+            NodeKind::Commit => "commit",
+            NodeKind::Author => "author",
+            NodeKind::Identity => "identity",
+            NodeKind::Topic => "topic",
         }
     }
 }
@@ -105,6 +117,16 @@ pub enum EdgeKind {
     Exposes,
     /// A client call site invokes an API endpoint (cross web boundary).
     Invokes,
+    /// Atlas (#329): an author wrote a commit.
+    Authored,
+    /// Atlas: a raw author is an alias of a unified identity.
+    AliasOf,
+    /// Atlas: a commit touched a file/repo.
+    Touched,
+    /// Atlas: a commit or repo is tagged with a topic.
+    Tagged,
+    /// Atlas: a commit/file belongs to a repo (qualification chain).
+    PartOf,
 }
 
 impl EdgeKind {
@@ -122,6 +144,11 @@ impl EdgeKind {
             EdgeKind::Mounts => "mounts",
             EdgeKind::Exposes => "exposes",
             EdgeKind::Invokes => "invokes",
+            EdgeKind::Authored => "authored",
+            EdgeKind::AliasOf => "alias_of",
+            EdgeKind::Touched => "touched",
+            EdgeKind::Tagged => "tagged",
+            EdgeKind::PartOf => "part_of",
         }
     }
 }
