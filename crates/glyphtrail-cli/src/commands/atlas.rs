@@ -39,7 +39,7 @@ pub struct TimelineArgs {
     /// Only commits in this repo (registry name).
     #[arg(long)]
     pub repo: Option<String>,
-    /// Only commits whose author email/name contains this (default: me).
+    /// Only commits whose author email contains this (default: me).
     #[arg(long)]
     pub author: Option<String>,
     /// Earliest commit date (YYYY-MM-DD); overrides the config window.
@@ -295,20 +295,22 @@ fn timeline(dir: &Path, args: TimelineArgs) -> Result<()> {
     let store = LadybugStore::open(&lb)?;
     let rows = store.atlas_timeline(since, until)?;
 
-    // Filter: repo, then visibility (proprietary default-denied), then author.
-    let mut excluded_proprietary = 0usize;
+    // Filter: repo, then visibility (default-deny), then author.
+    let mut excluded_restricted = 0usize;
     let mut excluded_author = 0usize;
     let mut kept: Vec<&glyphtrail_core::AtlasTimelineRow> = Vec::new();
     for row in &rows {
         if args.repo.as_ref().is_some_and(|name| &row.repo != name) {
             continue;
         }
-        let visibility = registry
-            .get(&row.repo)
-            .map(|e| e.visibility)
-            .unwrap_or_default();
-        if !args.include_proprietary && matches!(visibility, Visibility::Proprietary) {
-            excluded_proprietary += 1;
+        // Default-deny: proprietary repos AND any whose registry entry is gone
+        // (removed/renamed/stale) — never show a commit we can't vouch for.
+        let restricted = match registry.get(&row.repo).map(|e| e.visibility) {
+            Some(Visibility::Proprietary) | None => true,
+            Some(_) => false,
+        };
+        if restricted && !args.include_proprietary {
+            excluded_restricted += 1;
             continue;
         }
         if !author_matches(&args.author, &me, &row.commit.author_email) {
@@ -336,8 +338,11 @@ fn timeline(dir: &Path, args: TimelineArgs) -> Result<()> {
         if let Some(r) = &args.repo {
             println!("  repo:    {r}");
         }
-        if excluded_proprietary > 0 {
-            println!("  hidden:  {excluded_proprietary} proprietary (use --include-proprietary)");
+        if excluded_restricted > 0 {
+            println!(
+                "  hidden:  {excluded_restricted} restricted (proprietary/unregistered; \
+                 use --include-proprietary)"
+            );
         }
         println!("  showing: {} of {matched} matched", kept.len());
         println!();
@@ -371,7 +376,7 @@ fn timeline(dir: &Path, args: TimelineArgs) -> Result<()> {
             "author_scope": scope,
             "shown": kept.len(),
             "matched": matched,
-            "excluded": { "proprietary": excluded_proprietary, "author": excluded_author },
+            "excluded": { "restricted": excluded_restricted, "author": excluded_author },
             "commits": commits,
         });
         print_value(&value, emit)?;

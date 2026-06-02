@@ -849,31 +849,35 @@ impl GraphStore for LadybugStore {
         since: Option<i64>,
         until: Option<i64>,
     ) -> Result<Vec<glyphtrail_core::AtlasTimelineRow>> {
-        // Touched-file counts per commit node, in one aggregate (no per-commit
-        // round-trips).
+        // Date bounds shared by both queries. Inline them (lbug param-type-cache
+        // landmine); the in-bounds + commit-node join restricts every aggregate
+        // to the same windowed commit set.
+        let mut bounds = String::new();
+        if let Some(s) = since {
+            bounds.push_str(&format!(" AND c.committed_at >= {s}"));
+        }
+        if let Some(u) = until {
+            bounds.push_str(&format!(" AND c.committed_at <= {u}"));
+        }
+        // Touched-file counts, one aggregate restricted to the windowed commits.
         let mut touched: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
         for r in self.run(
-            "MATCH (cn:Node)-[:Edge {kind:'touched'}]->(:Node) WHERE cn.kind = 'commit' \
-             RETURN cn.id, COUNT(*)",
+            &format!(
+                "MATCH (c:Commit), (cn:Node)-[:Edge {{kind:'touched'}}]->(:Node) \
+                 WHERE c.in_bounds = 1 AND cn.kind = 'commit' AND cn.id = c.node_id{bounds} \
+                 RETURN cn.id, COUNT(*)"
+            ),
             vec![],
         )? {
             touched.insert(get_str(&r, 0), get_i64(&r, 1).max(0) as u32);
         }
-        // In-bounds commits in range, joined to their repo. Inline the bounds
-        // (lbug param-type-cache landmine) and prune the commit node early.
-        let mut filter =
-            String::from("c.in_bounds = 1 AND cn.kind = 'commit' AND cn.id = c.node_id");
-        if let Some(s) = since {
-            filter.push_str(&format!(" AND c.committed_at >= {s}"));
-        }
-        if let Some(u) = until {
-            filter.push_str(&format!(" AND c.committed_at <= {u}"));
-        }
+        // In-bounds commits in range, joined to their repo.
         Ok(self
             .run(
                 &format!(
                     "MATCH (c:Commit), (cn:Node)-[:Edge {{kind:'part_of'}}]->(r:Node) \
-                     WHERE {filter} AND r.kind = 'repo' \
+                     WHERE c.in_bounds = 1 AND cn.kind = 'commit' AND cn.id = c.node_id \
+                     AND r.kind = 'repo'{bounds} \
                      RETURN c.node_id, c.hash, c.author_email, c.committed_at, c.subject, \
                      c.in_bounds, r.name ORDER BY c.committed_at"
                 ),
