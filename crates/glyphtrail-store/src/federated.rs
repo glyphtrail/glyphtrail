@@ -70,6 +70,42 @@ struct ResolvedHint {
     to_endpoint: Option<String>,
 }
 
+/// Resolve a hint side's `repo` to a registry name. `None`/`"."` is the
+/// declaring repo; a `./` or `../` (or absolute) value is a **path** relative to
+/// the declaring repo's root, mapped to the registered repo at that location (so
+/// a link can name a repo by its more-expressive path, distinct from a slashed
+/// registry name like a GitLab `group/subgroup/repo`); anything else is a name.
+/// An unresolvable path is kept verbatim (best-effort).
+fn resolve_link_repo(
+    repo: &Option<String>,
+    owner_name: &str,
+    owner_root: &Path,
+    registry: &Registry,
+) -> String {
+    match repo.as_deref() {
+        None | Some(".") => owner_name.to_string(),
+        Some(r) if is_path_ref(r) => owner_root
+            .join(r)
+            .canonicalize()
+            .ok()
+            .and_then(|abs| {
+                registry.repos.iter().find(|e| {
+                    e.roots()
+                        .any(|root| root.canonicalize().map(|c| c == abs).unwrap_or(false))
+                })
+            })
+            .map(|e| e.name.clone())
+            .unwrap_or_else(|| r.to_string()),
+        Some(r) => r.to_string(),
+    }
+}
+
+/// Whether a link `repo` value is a filesystem path (`./`, `../`, or absolute)
+/// rather than a registry name.
+fn is_path_ref(repo: &str) -> bool {
+    repo.starts_with("./") || repo.starts_with("../") || Path::new(repo).is_absolute()
+}
+
 /// The node ids one side of a precise hint refers to: a `symbol` matched by name
 /// and/or an `endpoint` matched by REST operation signature (#407).
 fn side_node_ids(
@@ -390,15 +426,16 @@ pub fn federated_impact(
         if let Some(entry) = registry.get(name) {
             // Links live in the repo's unified config (`glyphtrail.toml` +
             // personal override + legacy files), loaded best-effort.
-            let links = Config::load(entry.active_root())
+            let owner_root = entry.active_root();
+            let links = Config::load(owner_root)
                 .map(|c| c.links)
                 .unwrap_or_default();
             for h in links {
                 hints.push(ResolvedHint {
-                    from_repo: h.from.repo_or(name),
+                    from_repo: resolve_link_repo(&h.from.repo, name, owner_root, &registry),
                     from_symbol: h.from.symbol,
                     from_endpoint: h.from.endpoint,
-                    to_repo: h.to.repo_or(name),
+                    to_repo: resolve_link_repo(&h.to.repo, name, owner_root, &registry),
                     to_symbol: h.to.symbol,
                     to_endpoint: h.to.endpoint,
                 });
@@ -729,6 +766,51 @@ mod tests {
         check!(ids == vec![NodeId("ep".into())]);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn is_path_ref_distinguishes_paths_from_names() {
+        check!(is_path_ref("./mmh/web"));
+        check!(is_path_ref("../web"));
+        check!(is_path_ref("/abs/web"));
+        check!(!is_path_ref("backend"));
+        // A slashed *name* (e.g. a GitLab nested repo) is not a path.
+        check!(!is_path_ref("group/subgroup/repo"));
+    }
+
+    #[test]
+    fn resolve_link_repo_maps_a_path_to_the_registered_name() {
+        use glyphtrail_core::RegistryEntry;
+        let base = std::env::temp_dir().join(format!(
+            "gt-linkpath-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let meta = base.join("meta");
+        let sub = meta.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let mut registry = Registry::default();
+        registry.repos.push(RegistryEntry {
+            name: "subrepo".into(),
+            root: sub.clone(),
+            alt_roots: vec![],
+            missing_since: None,
+            ids: vec![],
+            contributors: vec![],
+            identity: None,
+            visibility: glyphtrail_core::Visibility::default(),
+        });
+        let r =
+            |s: Option<&str>| resolve_link_repo(&s.map(String::from), "owner", &meta, &registry);
+        check!(r(None) == "owner"); // "." / absent -> declaring repo
+        check!(r(Some(".")) == "owner");
+        check!(r(Some("backend")) == "backend"); // a name passes through
+        check!(r(Some("./sub")) == "subrepo"); // a path -> the registered name
+        check!(r(Some("./nope")) == "./nope"); // unresolvable path kept verbatim
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
