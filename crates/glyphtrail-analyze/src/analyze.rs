@@ -1765,6 +1765,15 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
                         l.kind.as_str().to_string(),
                     ))
                     .and_then(|q| disambiguate_qualifier(candidates, q, &l.name, &node_qualified))
+                    .or_else(|| {
+                        disambiguate_symbol_import(
+                            &l.anchor,
+                            &l.name,
+                            candidates,
+                            &node_file,
+                            &symbol_file,
+                        )
+                    })
                     .or_else(|| disambiguate_import(&l.anchor, candidates, &node_file, &import_map))
                     .or_else(|| disambiguate_dir(&l.anchor, candidates, &node_file))?,
             };
@@ -2024,6 +2033,33 @@ fn disambiguate_import(
         {
             if hit.is_some() {
                 return None; // ambiguous even within imported files
+            }
+            hit = Some(c);
+        }
+    }
+    hit.cloned()
+}
+
+/// Resolve an unqualified call to a *symbol* imported by name — the file the
+/// anchor imported `name` from (e.g. a Java `import static pkg.Class.method;`,
+/// or a JS/Python named import). More precise than [`disambiguate_import`],
+/// which only knows the anchor imports the file, not which symbol: it picks the
+/// unique candidate in the exact file `name` was imported from (#395). `None`
+/// when the symbol wasn't imported, or zero/many candidates live in that file.
+fn disambiguate_symbol_import(
+    anchor: &NodeId,
+    name: &str,
+    candidates: &[NodeId],
+    node_file: &HashMap<String, String>,
+    symbol_file: &HashMap<(String, String), String>,
+) -> Option<NodeId> {
+    let anchor_file = node_file.get(&anchor.0)?;
+    let target = symbol_file.get(&(anchor_file.clone(), name.to_string()))?;
+    let mut hit: Option<&NodeId> = None;
+    for c in candidates {
+        if node_file.get(&c.0) == Some(target) {
+            if hit.is_some() {
+                return None;
             }
             hit = Some(c);
         }
@@ -3019,6 +3055,32 @@ mod tests {
         check!(
             callers_of_def_in(&dir, "helper", "c.ts").is_empty(),
             "the un-imported helper in c.ts should have no caller"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // #395: a Java `import static pkg.Class.method;` then an unqualified
+    // `method()` call must resolve to the static-imported method.
+    #[test]
+    fn java_static_import_unqualified_call_resolves() {
+        let dir = temp_repo("java-static-import");
+        std::fs::write(
+            dir.join("MathUtil.java"),
+            "package util;\npublic class MathUtil {\n  public static int square(int x) { return x * x; }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("Calc.java"),
+            "package app;\nimport static util.MathUtil.square;\n\
+             public class Calc {\n  public int run(int n) { return square(n); }\n}\n",
+        )
+        .unwrap();
+        run(&dir, false).unwrap();
+
+        check!(
+            callers_of_def_in(&dir, "square", "MathUtil.java").contains(&"run".to_string()),
+            "run() should resolve to the static-imported square in MathUtil.java"
         );
 
         std::fs::remove_dir_all(&dir).ok();
