@@ -249,8 +249,8 @@ fn add(
         && let Some(reason) = unresolved_sides(&hint, &owner_name, &owner_root, reg)
     {
         eprintln!(
-            "warning: {reason} resolves to no registered repo — use a registry name (`glyphtrail \
-             repo list`) or a ./path"
+            "warning: no registered repo for {reason} — use a registry name (`glyphtrail repo \
+             list`) or a ./path"
         );
     }
     Ok(())
