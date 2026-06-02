@@ -197,15 +197,29 @@ tasks:
     cmds:
       - cargo test --workspace {{.PROFILE_FLAG}} {{.CLI_ARGS}}
 
-  # Formats all Rust source files in place.
+  # Formats all Rust source files in place, then re-syncs the bundled agent
+  # assets so an edit to the skill / CLAUDE.md section can't leave the embedded
+  # copies (and the cli build.rs guard) stale.
   fmt:
-    desc: Format all code with rustfmt
+    desc: Format all code with rustfmt and sync bundled agent assets
     aliases: [format]
     preconditions:
       - sh: rustup component list --installed 2>/dev/null | grep -q rustfmt || command -v rustfmt
         msg: "rustfmt not found — rustup component add rustfmt"
     cmds:
       - cargo fmt --all
+      - task: assets:sync
+
+  # Regenerates the bundled agent assets that `glyphtrail setup` embeds, from the
+  # repo's own source-of-truth onboarding files (`.claude/skills/glyphtrail/
+  # SKILL.md` and the managed section of `CLAUDE.md`). The cli `build.rs` fails
+  # the build when these drift, so run this (or `task fmt`) after editing either.
+  assets:sync:
+    desc: Sync bundled agent assets from the repo-root skill + CLAUDE.md section
+    cmds:
+      - mkdir -p crates/glyphtrail-cli/assets
+      - cp .claude/skills/glyphtrail/SKILL.md crates/glyphtrail-cli/assets/SKILL.md
+      - awk '/<!-- glyphtrail:begin/{f=1;next} /<!-- glyphtrail:end/{f=0} f' CLAUDE.md > crates/glyphtrail-cli/assets/agent-section.md
 
   # Checks formatting without modifying files. Used in CI.
   fmt:check:
@@ -282,3 +296,28 @@ tasks:
     desc: Remove generated graph.html
     cmds:
       - rm -f graph.html
+
+  # Dry-run publish of the cli: lists the packaged files (confirm the bundled
+  # `assets/` are present) and builds the crate from an isolated tarball, which
+  # proves the `include_str!`'d assets resolve without the repo-root sources.
+  publish:dry:
+    desc: Dry-run publish of glyphtrail-cli (verifies bundled assets pack)
+    cmds:
+      - cargo package -p glyphtrail-cli --list
+      - cargo publish -p glyphtrail-cli --dry-run {{.CLI_ARGS}}
+
+  # Publishes every workspace crate to crates.io in dependency order. crates.io
+  # may need a moment to index each crate before the next that depends on it;
+  # re-run if a publish fails waiting on a just-published dependency.
+  publish:
+    desc: Publish all workspace crates to crates.io (dependency order)
+    cmds:
+      - cargo publish -p glyphtrail-forge-id {{.CLI_ARGS}}
+      - cargo publish -p glyphtrail-core {{.CLI_ARGS}}
+      - cargo publish -p glyphtrail-parse {{.CLI_ARGS}}
+      - cargo publish -p glyphtrail-store {{.CLI_ARGS}}
+      - cargo publish -p glyphtrail-analyze {{.CLI_ARGS}}
+      - cargo publish -p glyphtrail-viz {{.CLI_ARGS}}
+      - cargo publish -p glyphtrail-mcp {{.CLI_ARGS}}
+      - cargo publish -p glyphtrail-server {{.CLI_ARGS}}
+      - cargo publish -p glyphtrail-cli {{.CLI_ARGS}}

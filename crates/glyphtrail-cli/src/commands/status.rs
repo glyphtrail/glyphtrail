@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 
 use crate::commands::backend;
 use crate::commands::query::{Emit, print_value};
+use crate::commands::setup;
 
 pub fn run(repo: &Path, emit: Emit) -> Result<()> {
     let paths = RepoPaths::new(repo);
@@ -17,14 +18,16 @@ pub fn run(repo: &Path, emit: Emit) -> Result<()> {
     // Whether the index still reflects the working tree (#313). Reported inline
     // rather than as the stderr note other read commands use.
     let staleness = glyphtrail_analyze::index_staleness(repo, store.as_ref());
+    // The installed agent-onboarding version, if any (None when not onboarded).
+    let skill = setup::installed_version(repo);
     match emit {
-        Emit::Text => print_text(&location, &s, &staleness),
-        _ => print_value(&stats_value(&location, &s, &staleness), emit)?,
+        Emit::Text => print_text(&location, &s, &staleness, skill),
+        _ => print_value(&stats_value(&location, &s, &staleness, skill), emit)?,
     }
     Ok(())
 }
 
-fn print_text(location: &str, s: &Stats, staleness: &Staleness) {
+fn print_text(location: &str, s: &Stats, staleness: &Staleness, skill: Option<u32>) {
     println!("index:  {location}");
     println!("files:  {}", s.files);
     println!("nodes:  {}", s.nodes);
@@ -40,10 +43,19 @@ fn print_text(location: &str, s: &Stats, staleness: &Staleness) {
         // Indeterminate (dirty/non-git index): say nothing rather than guess.
         Staleness::Unknown => {}
     }
+    match skill {
+        Some(v) if v < setup::SKILL_VERSION => println!(
+            "skill:  v{v} (outdated — bundled v{}; run `glyphtrail setup`)",
+            setup::SKILL_VERSION
+        ),
+        Some(v) => println!("skill:  v{v}"),
+        // Not onboarded: nothing to report.
+        None => {}
+    }
 }
 
 /// Index statistics as a structured value for `--json` / `--yaml` (#109).
-fn stats_value(location: &str, s: &Stats, staleness: &Staleness) -> Value {
+fn stats_value(location: &str, s: &Stats, staleness: &Staleness, skill: Option<u32>) -> Value {
     let languages: serde_json::Map<String, Value> = s
         .languages
         .iter()
@@ -63,6 +75,9 @@ fn stats_value(location: &str, s: &Stats, staleness: &Staleness) -> Value {
         "freshness": freshness,
         "stale": staleness.is_stale(),
         "stale_reason": reason,
+        "skill_version": skill,
+        "bundled_skill_version": setup::SKILL_VERSION,
+        "skill_outdated": skill.is_some_and(|v| v < setup::SKILL_VERSION),
     })
 }
 
@@ -88,7 +103,7 @@ mod tests {
             edges: 100,
             languages: vec![("rust".into(), 2), ("python".into(), 1)],
         };
-        let fresh = stats_value("/repo/.glyphtrail/ladybug", &s, &Staleness::Fresh);
+        let fresh = stats_value("/repo/.glyphtrail/ladybug", &s, &Staleness::Fresh, Some(0));
         check!(fresh["files"] == json!(3));
         check!(fresh["nodes"] == json!(42));
         check!(fresh["edges"] == json!(100));
@@ -98,14 +113,21 @@ mod tests {
         check!(fresh["freshness"] == json!("fresh"));
         check!(fresh["stale"] == json!(false));
         check!(fresh["stale_reason"] == json!(null));
+        // An older installed skill is reported outdated; not-onboarded is null.
+        check!(fresh["skill_version"] == json!(0));
+        check!(fresh["bundled_skill_version"] == json!(setup::SKILL_VERSION));
+        check!(fresh["skill_outdated"] == json!(true));
 
         let stale = stats_value(
             "/x",
             &s,
             &Staleness::Stale("repo is on a new commit".into()),
+            None,
         );
         check!(stale["freshness"] == json!("stale"));
         check!(stale["stale"] == json!(true));
         check!(stale["stale_reason"] == json!("repo is on a new commit"));
+        check!(stale["skill_version"] == json!(null));
+        check!(stale["skill_outdated"] == json!(false));
     }
 }

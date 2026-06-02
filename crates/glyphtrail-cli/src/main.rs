@@ -281,6 +281,11 @@ fn main() -> anyhow::Result<()> {
                         println!("Tip: run `glyphtrail setup` to onboard coding agents (MCP/CLI).");
                     }
                 }
+                // Hint (read-only): the bundled skill is newer than the
+                // installed one — `setup` updates it, `analyze` never writes.
+                if let Some(hint) = commands::setup::staleness_hint(&target) {
+                    println!("{hint}");
+                }
                 Ok(())
             }
         }
