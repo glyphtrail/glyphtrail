@@ -91,6 +91,76 @@ pub struct RegistryEntry {
     /// indexed before this cache existed; federation backfills it on demand.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<PackageIdentity>,
+    /// Atlas visibility tier (#332). Default-deny: `Private`/`Proprietary` are
+    /// excluded or redacted on every atlas output path unless explicitly opted
+    /// in. serde-defaults to `Private` for pre-#332 entries, like `identity`.
+    #[serde(default)]
+    pub visibility: Visibility,
+}
+
+/// Atlas visibility tier of a repo (#332), driving default-deny on every atlas
+/// output path. Inferred at registration (a recognised public forge → `Public`,
+/// else `Private`); `Proprietary` is set only explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Visibility {
+    /// Hosted on a recognised public forge.
+    Public,
+    /// No public remote, or a self-hosted/unknown one. The default.
+    #[default]
+    Private,
+    /// Closed-source / under NDA; never inferred, set only by hand.
+    Proprietary,
+}
+
+impl Visibility {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Visibility::Public => "public",
+            Visibility::Private => "private",
+            Visibility::Proprietary => "proprietary",
+        }
+    }
+
+    /// Parse a tier name (case-insensitive). `None` for an unknown value.
+    pub fn parse(s: &str) -> Option<Visibility> {
+        match s.to_ascii_lowercase().as_str() {
+            "public" => Some(Visibility::Public),
+            "private" => Some(Visibility::Private),
+            "proprietary" => Some(Visibility::Proprietary),
+            _ => None,
+        }
+    }
+
+    /// Excluded from atlas output by default — anything but `Public`. The check
+    /// every atlas output path (#333/#336) gates on.
+    pub fn is_restricted(self) -> bool {
+        !matches!(self, Visibility::Public)
+    }
+
+    /// Infer a tier from a repo's forge-id sources (#332): any recognised public
+    /// forge host → `Public`, else `Private`. Never infers `Proprietary`.
+    pub fn infer<'a>(id_sources: impl IntoIterator<Item = &'a str>) -> Visibility {
+        const PUBLIC_HOSTS: &[&str] = &[
+            "github.com",
+            "gitlab.com",
+            "codeberg.org",
+            "bitbucket.org",
+            "sourceforge.net",
+        ];
+        // Canonical sources are `host/owner/repo` or `host#numeric`; compare the
+        // host *segment* exactly so look-alikes like `github.com.evil.com/...`
+        // (which prefix-match `github.com`) stay Private on default-deny paths.
+        let any_public = id_sources.into_iter().any(|src| {
+            let host = src.split(['/', '#']).next().unwrap_or(src);
+            PUBLIC_HOSTS.iter().any(|h| host.eq_ignore_ascii_case(h))
+        });
+        if any_public {
+            Visibility::Public
+        } else {
+            Visibility::Private
+        }
+    }
 }
 
 /// A git author and how many commits they have in a repo (#265).
@@ -283,6 +353,7 @@ impl Registry {
                     ids: Vec::new(),
                     contributors: Vec::new(),
                     identity: None,
+                    visibility: Visibility::default(),
                 });
                 true
             }
@@ -783,6 +854,7 @@ mod tests {
             ids: Vec::new(),
             contributors: Vec::new(),
             identity: None,
+            visibility: Visibility::default(),
         }
     }
 
@@ -897,6 +969,32 @@ mod tests {
         let reloaded = Registry::load(&path).unwrap();
         check!(reloaded.repos.len() == 1);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // #332: visibility is inferred Public only from a recognised public forge;
+    // anything else (self-hosted, no remote) is Private; Proprietary is explicit.
+    #[test]
+    fn visibility_infers_public_only_from_a_known_forge() {
+        check!(Visibility::infer(["github.com/o/r"]) == Visibility::Public);
+        // Numeric-id form (`host#numeric`) still resolves the host segment.
+        check!(Visibility::infer(["codeberg.org#1982264"]) == Visibility::Public);
+        check!(Visibility::infer(["git.internal.example/o/r"]) == Visibility::Private);
+        check!(Visibility::infer(std::iter::empty::<&str>()) == Visibility::Private);
+        // Look-alike hosts that merely prefix-match a forge stay Private — exact
+        // host-segment compare, no default-deny bypass.
+        check!(Visibility::infer(["github.com.evil.com/o/r"]) == Visibility::Private);
+        check!(Visibility::infer(["notgithub.com/o/r"]) == Visibility::Private);
+        check!(Visibility::parse("PROPRIETARY") == Some(Visibility::Proprietary));
+        check!(Visibility::parse("nope").is_none());
+        check!(Visibility::Private.is_restricted() && Visibility::Proprietary.is_restricted());
+        check!(!Visibility::Public.is_restricted());
+    }
+
+    // Back-compat: a pre-#332 entry with no `visibility` loads as Private.
+    #[test]
+    fn registry_entry_without_visibility_defaults_to_private() {
+        let e: RegistryEntry = serde_json::from_str(r#"{"name":"old","root":"/o"}"#).unwrap();
+        check!(e.visibility == Visibility::Private);
     }
 
     // A later entry whose roots bridge two previously-distinct entries collapses
