@@ -15,10 +15,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use glyphtrail_core::config::{Config, RepoPaths};
 use glyphtrail_core::{
     Adjacency, ClassifiedItem, Confidence, CrateLevelHit, FederatedAdjacency, FederatedReport,
-    Groups, ImpactPolicy, IndexedPackage, META_EXTERNAL_USES, META_PACKAGES, NodeId, NodeKind,
-    PackageIdentity, Registry, RepoHealth, RepoIdentity, RepoImpact, classify, compute_impact,
-    default_groups_path, default_registry_path, is_cross_boundary_path, qualify, resolve_links,
-    unqualify,
+    Groups, HttpMethod, ImpactPolicy, IndexedPackage, META_EXTERNAL_USES, META_PACKAGES, NodeId,
+    NodeKind, PackageIdentity, Protocol, Registry, RepoHealth, RepoIdentity, RepoImpact, classify,
+    compute_impact, default_groups_path, default_registry_path, is_cross_boundary_path,
+    path_signature, qualify, resolve_links, unqualify,
 };
 
 use crate::{ChangeSpec, GraphStore, LadybugStore, changed_files, seed_nodes};
@@ -64,8 +64,68 @@ fn owning_package<'a>(packages: &'a [IndexedPackage], file: &str) -> Option<&'a 
 struct ResolvedHint {
     from_repo: String,
     from_symbol: Option<String>,
+    from_endpoint: Option<String>,
     to_repo: String,
     to_symbol: Option<String>,
+    to_endpoint: Option<String>,
+}
+
+/// The node ids one side of a precise hint refers to: a `symbol` matched by name
+/// and/or an `endpoint` matched by REST operation signature (#407).
+fn side_node_ids(
+    store: &dyn GraphStore,
+    symbol: &Option<String>,
+    endpoint: &Option<String>,
+) -> Result<Vec<NodeId>> {
+    let mut ids = Vec::new();
+    if let Some(sym) = symbol {
+        ids.extend(store.find_by_name(sym)?.into_iter().map(|n| n.id));
+    }
+    if let Some(spec) = endpoint {
+        ids.extend(endpoint_op_ids(store, spec)?);
+    }
+    // Dedup (a symbol and an endpoint can resolve to the same node) so a hint
+    // doesn't emit repeated cross-edges.
+    let mut seen = HashSet::new();
+    ids.retain(|id| seen.insert(id.clone()));
+    Ok(ids)
+}
+
+/// Node ids of REST operations (`Endpoint`/`ClientCall`) in `store` whose
+/// signature matches the endpoint spec (`"POST /signin"`, or `"/signin"` for any
+/// method), so a hint can pin a call to an endpoint by route rather than symbol.
+fn endpoint_op_ids(store: &dyn GraphStore, spec: &str) -> Result<Vec<NodeId>> {
+    let Some((method, path_sig)) = parse_endpoint_spec(spec) else {
+        return Ok(Vec::new());
+    };
+    let mut ids = Vec::new();
+    // Only code-side operations — a `SchemaOp` also carries a REST key but isn't
+    // a call or endpoint to pin.
+    for kind in [NodeKind::Endpoint, NodeKind::ClientCall] {
+        ids.extend(
+            store
+                .operations_by_kind(kind)?
+                .into_iter()
+                .filter_map(|(id, key)| {
+                    (key.protocol == Protocol::Rest
+                        && method.is_none_or(|m| key.method == Some(m))
+                        && path_signature(&key.path) == path_sig)
+                        .then_some(id)
+                }),
+        );
+    }
+    Ok(ids)
+}
+
+/// Parse an endpoint spec into `(method?, path signature)`: `"POST /x"` →
+/// `(Some(POST), sig("/x"))`; a bare `"/x"` → `(None, sig("/x"))` (any method).
+fn parse_endpoint_spec(spec: &str) -> Option<(Option<HttpMethod>, String)> {
+    let spec = spec.trim();
+    match spec.split_once(char::is_whitespace) {
+        Some((m, p)) => Some((Some(HttpMethod::parse(m.trim())?), path_signature(p.trim()))),
+        None if spec.starts_with('/') => Some((None, path_signature(spec))),
+        None => None,
+    }
 }
 
 /// Compute the cross-repo blast radius: seed in the repo at `current_root` and
@@ -243,8 +303,10 @@ pub fn federated_impact(
                 hints.push(ResolvedHint {
                     from_repo: h.from.repo_or(name),
                     from_symbol: h.from.symbol,
+                    from_endpoint: h.from.endpoint,
                     to_repo: h.to.repo_or(name),
                     to_symbol: h.to.symbol,
+                    to_endpoint: h.to.endpoint,
                 });
             }
         }
@@ -391,32 +453,34 @@ pub fn federated_impact(
     // hint (a side without a symbol) flags the whole `from` repo when the producer
     // side is the repo being changed.
     for h in &hints {
-        match (&h.to_symbol, &h.from_symbol) {
-            (Some(to_sym), Some(from_sym)) => {
-                let (Some(to_store), Some(from_store)) =
-                    (stores.get(&h.to_repo), stores.get(&h.from_repo))
-                else {
-                    continue; // a referenced repo isn't indexed/openable — skip
-                };
-                let consumers = from_store.find_by_name(from_sym)?;
-                for producer in to_store.find_by_name(to_sym)? {
-                    let edges = cross.entry(qualify(&h.to_repo, &producer.id)).or_default();
-                    for c in &consumers {
-                        edges.push((qualify(&h.from_repo, &c.id), Confidence::Inferred));
-                    }
+        let to_precise = h.to_symbol.is_some() || h.to_endpoint.is_some();
+        let from_precise = h.from_symbol.is_some() || h.from_endpoint.is_some();
+        if to_precise && from_precise {
+            // A precise hint: each side resolves to nodes by symbol name or, for
+            // a call/endpoint, by REST operation signature (#407). Cross-edge from
+            // each producer (`to`) node to each consumer (`from`) node.
+            let (Some(to_store), Some(from_store)) =
+                (stores.get(&h.to_repo), stores.get(&h.from_repo))
+            else {
+                continue; // a referenced repo isn't indexed/openable — skip
+            };
+            let consumers = side_node_ids(&**from_store, &h.from_symbol, &h.from_endpoint)?;
+            let producers = side_node_ids(&**to_store, &h.to_symbol, &h.to_endpoint)?;
+            for pid in &producers {
+                let edges = cross.entry(qualify(&h.to_repo, pid)).or_default();
+                for cid in &consumers {
+                    edges.push((qualify(&h.from_repo, cid), Confidence::Inferred));
                 }
             }
+        } else if h.to_repo == current && !local_seeds.is_empty() {
             // Coarse whole-repo hint: relevant when the producer side is the repo
             // being changed (seeds live in `current`).
-            _ if h.to_repo == current && !local_seeds.is_empty() => {
-                crate_level.push(CrateLevelHit {
-                    repo: h.from_repo.clone(),
-                    package: h.from_repo.clone(),
-                    file: "(manual link hint)".to_string(),
-                    via: h.to_repo.clone(),
-                });
-            }
-            _ => {}
+            crate_level.push(CrateLevelHit {
+                repo: h.from_repo.clone(),
+                package: h.from_repo.clone(),
+                file: "(manual link hint)".to_string(),
+                via: h.to_repo.clone(),
+            });
         }
     }
 
@@ -466,4 +530,87 @@ pub fn federated_impact(
         })
         .collect();
     Ok(FederatedReport::new(repos, crate_level))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use assert2::check;
+
+    #[test]
+    fn parse_endpoint_spec_handles_method_and_path() {
+        // "METHOD /path" -> method + path signature.
+        let (m, sig) = parse_endpoint_spec("POST /signin").unwrap();
+        check!(m == Some(HttpMethod::Post));
+        check!(sig == path_signature("/signin"));
+        // A concrete param collapses in the signature, so a hint path with a
+        // placeholder matches a route with a different concrete value.
+        let (m, sig) = parse_endpoint_spec("GET /users/{id}").unwrap();
+        check!(m == Some(HttpMethod::Get));
+        check!(sig == path_signature("/users/42"));
+        // A bare path -> any method.
+        let (m, sig) = parse_endpoint_spec("/signin").unwrap();
+        check!(m.is_none() && sig == path_signature("/signin"));
+        // Garbage / unknown method -> None.
+        check!(parse_endpoint_spec("nope").is_none());
+        check!(parse_endpoint_spec("BOGUS /x").is_none());
+    }
+
+    #[test]
+    fn endpoint_op_ids_matches_by_route_signature() {
+        use glyphtrail_core::{Node, OperationKey};
+        let dir = std::env::temp_dir().join(format!(
+            "glyphtrail-fed-ep-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut store = LadybugStore::open(&dir).unwrap();
+        let mk = |id: &str, name: &str, kind: NodeKind| Node {
+            id: NodeId(id.into()),
+            kind,
+            name: name.into(),
+            qualified_name: name.into(),
+            file: "r.ts".into(),
+            language: None,
+            span: None,
+            doc: None,
+            signature: None,
+        };
+        store
+            .insert_graph(
+                &[
+                    mk("ep", "POST /signin", NodeKind::Endpoint),
+                    mk("other", "GET /health", NodeKind::Endpoint),
+                ],
+                &[],
+            )
+            .unwrap();
+        store
+            .insert_operations(&[
+                // A concrete path param; the hint uses a placeholder.
+                (
+                    NodeId("ep".into()),
+                    OperationKey::rest(HttpMethod::Post, "/signin"),
+                ),
+                (
+                    NodeId("other".into()),
+                    OperationKey::rest(HttpMethod::Get, "/health"),
+                ),
+            ])
+            .unwrap();
+
+        let ids = endpoint_op_ids(&store, "POST /signin").unwrap();
+        check!(ids == vec![NodeId("ep".into())]);
+        // Method matters; a bare path matches any method.
+        check!(endpoint_op_ids(&store, "GET /signin").unwrap().is_empty());
+        check!(endpoint_op_ids(&store, "/signin").unwrap() == vec![NodeId("ep".into())]);
+        // side_node_ids combines the endpoint resolution with a symbol lookup.
+        let ids = side_node_ids(&store, &None, &Some("POST /signin".into())).unwrap();
+        check!(ids == vec![NodeId("ep".into())]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

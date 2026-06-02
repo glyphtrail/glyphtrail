@@ -29,7 +29,11 @@ pub const HINTS_FILE: &str = "glyphtrail.links.toml";
 pub const LOCAL_HINTS_FILE: &str = "links.toml";
 
 /// One end of a hinted link. `repo` defaults to `.` (the declaring repo); a
-/// missing `symbol` means the whole repo (a coarse link).
+/// side with neither `symbol` nor `endpoint` means the whole repo (a coarse
+/// link). `endpoint` names a REST operation (`"POST /signin"`, or `"/signin"`
+/// for any method) and resolves to the matching `Endpoint`/`ClientCall` nodes
+/// by signature — the precise call↔endpoint pin when a path is dynamic and a
+/// symbol name isn't enough (#407).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LinkEnd {
@@ -37,6 +41,8 @@ pub struct LinkEnd {
     pub repo: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub symbol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
 }
 
 impl LinkEnd {
@@ -52,7 +58,7 @@ impl LinkEnd {
     /// Whether this end carries nothing (the default "here, whole repo"), so it
     /// can be omitted when serializing a hint.
     pub fn is_empty(&self) -> bool {
-        self.repo.is_none() && self.symbol.is_none()
+        self.repo.is_none() && self.symbol.is_none() && self.endpoint.is_none()
     }
 }
 
@@ -103,5 +109,24 @@ mod tests {
         check!(coarse.from.repo_or("web-client") == "web-client"); // omitted -> here
         check!(coarse.from.symbol.is_none());
         check!(coarse.to.symbol.is_none()); // whole-repo
+    }
+
+    #[test]
+    fn parses_endpoint_link_pinning_a_call_to_a_route() {
+        let toml = r#"
+            [[links]]
+            from = { symbol = "login" }
+            to   = { repo = "backend", endpoint = "POST /signin" }
+        "#;
+        let hints: LinkHints = toml::from_str(toml).unwrap();
+        let h = &hints.links[0];
+        check!(h.from.symbol.as_deref() == Some("login"));
+        check!(h.to.endpoint.as_deref() == Some("POST /signin"));
+        // An endpoint-only side is not empty (so it serializes + resolves).
+        check!(!h.to.is_empty());
+        check!(LinkEnd::default().is_empty());
+        // Round-trips, keeping the endpoint key.
+        let back = toml::to_string(&hints).unwrap();
+        check!(back.contains("endpoint = \"POST /signin\""));
     }
 }

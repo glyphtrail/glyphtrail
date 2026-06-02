@@ -26,9 +26,16 @@ pub enum LinkCmd {
         /// Producer symbol; omit for a coarse whole-repo link.
         #[arg(long)]
         to_symbol: Option<String>,
+        /// Producer REST endpoint (e.g. "POST /signin", or "/signin" for any
+        /// method) — pins the call to the route by signature, not symbol name.
+        #[arg(long)]
+        to_endpoint: Option<String>,
         /// Consumer symbol in this repo; omit for a coarse link.
         #[arg(long)]
         from_symbol: Option<String>,
+        /// Consumer REST endpoint in this repo (same format as --to-endpoint).
+        #[arg(long)]
+        from_endpoint: Option<String>,
         /// Consumer repo (defaults to this repo, i.e. `.`).
         #[arg(long)]
         from_repo: Option<String>,
@@ -56,22 +63,44 @@ pub fn run(cmd: LinkCmd) -> Result<()> {
         LinkCmd::Add {
             to_repo,
             to_symbol,
+            to_endpoint,
             from_symbol,
+            from_endpoint,
             from_repo,
             local,
             repo,
-        } => add(&repo, local, to_repo, to_symbol, from_repo, from_symbol),
+        } => add(
+            &repo,
+            local,
+            to_repo,
+            to_symbol,
+            to_endpoint,
+            from_repo,
+            from_symbol,
+            from_endpoint,
+        ),
         LinkCmd::Remove { index, local, repo } => remove(&repo, local, index),
     }
 }
 
-/// One line describing a hint, e.g. `.:fetchUser -> user-svc:get_user`.
+/// One line describing a hint, e.g. `.:fetchUser -> user-svc:get_user` or
+/// `.:login -> backend:[POST /signin]`.
 fn describe(h: &LinkHint) -> String {
-    let end = |e: &LinkEnd| match (&e.repo, &e.symbol) {
-        (Some(r), Some(s)) => format!("{r}:{s}"),
-        (Some(r), None) => r.clone(),
-        (None, Some(s)) => format!(".:{s}"),
-        (None, None) => ".".to_string(),
+    let end = |e: &LinkEnd| {
+        let repo = e.repo.as_deref().unwrap_or(".");
+        // A side may carry a symbol, an endpoint, or both (resolved as a union).
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(s) = &e.symbol {
+            parts.push(s.clone());
+        }
+        if let Some(ep) = &e.endpoint {
+            parts.push(format!("[{ep}]"));
+        }
+        if parts.is_empty() {
+            repo.to_string()
+        } else {
+            format!("{repo}:{}", parts.join("+"))
+        }
     };
     format!("{} -> {}", end(&h.from), end(&h.to))
 }
@@ -110,13 +139,16 @@ fn list(repo: &Path) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn add(
     repo: &Path,
     local: bool,
     to_repo: String,
     to_symbol: Option<String>,
+    to_endpoint: Option<String>,
     from_repo: Option<String>,
     from_symbol: Option<String>,
+    from_endpoint: Option<String>,
 ) -> Result<()> {
     config_file::migrate_legacy(repo)?;
     let path = config_file::target(repo, local);
@@ -125,10 +157,12 @@ fn add(
             // `.`/None means "this repo"; only record a real other repo.
             repo: from_repo.filter(|r| r != "."),
             symbol: from_symbol,
+            endpoint: from_endpoint,
         },
         to: LinkEnd {
             repo: Some(to_repo),
             symbol: to_symbol,
+            endpoint: to_endpoint,
         },
     };
     let value = toml::Value::try_from(&hint)?;
