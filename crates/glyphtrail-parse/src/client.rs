@@ -8,7 +8,10 @@
 //!   object (method defaults to GET); and
 //! - instance clients created in the same file via `const api = axios.create(…)`
 //!   — `api.get(url)`, `api(config)`, `api.request(config)` are treated like
-//!   their `axios` equivalents.
+//!   their `axios` equivalents; and
+//! - Angular `HttpClient`: a field injected/declared as `HttpClient` (e.g.
+//!   `constructor(private http: HttpClient)`) makes `this.http.get(url)` /
+//!   `.post` / `.put` / `.delete` / `.patch` / `.head` client calls.
 //!
 //! Rust (reqwest):
 //! - `reqwest::get(url)` and builder verbs `client.get(url)` / `.post(...)` /
@@ -146,10 +149,11 @@ fn js_client_calls(source: &str, lang: &Language) -> Vec<RawClientCall> {
     let src = source.as_bytes();
     let root = tree.root_node();
     let clients = axios_clients(root, src);
+    let http_fields = http_client_fields(root, src);
     let mut out = Vec::new();
     walk(root, &mut |n| {
         if n.kind() == "call_expression"
-            && let Some(call) = client_call(n, src, &clients)
+            && let Some(call) = client_call(n, src, &clients, &http_fields)
         {
             out.push(call);
         }
@@ -501,9 +505,15 @@ fn is_axios_create(node: Node, src: &[u8]) -> bool {
             == Some("create")
 }
 
-/// Classify a `call_expression` as a `fetch`/`axios` HTTP call and pull its
-/// `(method, url)`; `None` if it is neither or the URL is non-literal.
-fn client_call(call: Node, src: &[u8], clients: &[AxiosBinding]) -> Option<RawClientCall> {
+/// Classify a `call_expression` as a `fetch`/`axios`/Angular-`HttpClient` HTTP
+/// call and pull its `(method, url)`; `None` if it is none of those or the URL
+/// is non-literal.
+fn client_call(
+    call: Node,
+    src: &[u8],
+    clients: &[AxiosBinding],
+    http_fields: &[HttpClientField],
+) -> Option<RawClientCall> {
     let func = call.child_by_field_name("function")?;
     let args = call.child_by_field_name("arguments");
     let (method, path) = match func.kind() {
@@ -524,17 +534,28 @@ fn client_call(call: Node, src: &[u8], clients: &[AxiosBinding]) -> Option<RawCl
         }
         "member_expression" => {
             let obj = func.child_by_field_name("object")?;
-            if !is_axios_client(clients, &text(obj, src), obj.start_byte()) {
-                return None;
-            }
             let prop = text(func.child_by_field_name("property")?, src);
-            if prop == "request" {
-                // `axios.request(config)` / `instance.request(config)`.
-                config_call(named_arg(args, 0)?, src)?
-            } else {
-                // `axios.get(url)` / `instance.post(url, ...)`.
+            // Angular `HttpClient`: `this.<field>.<verb>(url)` where `<field>` is
+            // a field typed `HttpClient`. The verb must be a real HTTP method and
+            // the URL a literal, so non-HTTP `this.x.get(...)` doesn't match.
+            if let Some(field) = http_client_field(obj, src)
+                && http_fields
+                    .iter()
+                    .any(|f| f.name == field && f.scope.contains(&call.start_byte()))
+            {
                 let method = HttpMethod::parse(&prop)?;
                 (method, url_text(named_arg(args, 0)?, src)?)
+            } else if is_axios_client(clients, &text(obj, src), obj.start_byte()) {
+                if prop == "request" {
+                    // `axios.request(config)` / `instance.request(config)`.
+                    config_call(named_arg(args, 0)?, src)?
+                } else {
+                    // `axios.get(url)` / `instance.post(url, ...)`.
+                    let method = HttpMethod::parse(&prop)?;
+                    (method, url_text(named_arg(args, 0)?, src)?)
+                }
+            } else {
+                return None;
             }
         }
         _ => return None,
@@ -544,6 +565,87 @@ fn client_call(call: Node, src: &[u8], clients: &[AxiosBinding]) -> Option<RawCl
         path,
         span: span_of(call),
     })
+}
+
+/// The field name of a `this.<field>` receiver (a `member_expression` whose
+/// object is `this`), e.g. `http` for `this.http`. `None` otherwise.
+fn http_client_field(obj: Node, src: &[u8]) -> Option<String> {
+    if obj.kind() != "member_expression" {
+        return None;
+    }
+    if text(obj.child_by_field_name("object")?, src) != "this" {
+        return None;
+    }
+    Some(text(obj.child_by_field_name("property")?, src))
+}
+
+/// An `HttpClient`-typed field and the byte range of the class it belongs to, so
+/// `this.<name>` resolves per-class — two classes can each name a field `http`
+/// with different types without cross-matching.
+struct HttpClientField {
+    name: String,
+    scope: std::ops::Range<usize>,
+}
+
+/// Fields typed `HttpClient` in `root`, each scoped to its class — constructor
+/// parameter-properties (`constructor(private http: HttpClient)`) or class
+/// fields (`http: HttpClient`) — so `this.<name>.<verb>(url)` is recognised as
+/// an Angular client call only within the declaring class.
+fn http_client_fields(root: Node, src: &[u8]) -> Vec<HttpClientField> {
+    let mut fields = Vec::new();
+    walk(root, &mut |n| {
+        let name = match n.kind() {
+            // A constructor parameter-property must carry an accessibility or
+            // `readonly` modifier; an ordinary parameter doesn't become a field.
+            "required_parameter" | "optional_parameter" => {
+                if !is_parameter_property(n) {
+                    return;
+                }
+                n.child_by_field_name("pattern")
+            }
+            "public_field_definition" => n.child_by_field_name("name"),
+            _ => return,
+        };
+        // `type_annotation` text is `: HttpClient`; match the bare type name.
+        let Some(ty) = n.child_by_field_name("type") else {
+            return;
+        };
+        if text(ty, src).trim_start_matches(':').trim() != "HttpClient" {
+            return;
+        }
+        let Some(name) = name.filter(|x| matches!(x.kind(), "identifier" | "property_identifier"))
+        else {
+            return;
+        };
+        let scope = enclosing_class(n).unwrap_or(root);
+        fields.push(HttpClientField {
+            name: text(name, src),
+            scope: scope.start_byte()..scope.end_byte(),
+        });
+    });
+    fields
+}
+
+/// Whether a parameter is a TypeScript parameter-property (carries an
+/// accessibility modifier — `public`/`private`/`protected` — or `readonly`),
+/// which is what turns a constructor parameter into a `this.<name>` field.
+fn is_parameter_property(param: Node) -> bool {
+    let mut cursor = param.walk();
+    param
+        .children(&mut cursor)
+        .any(|c| matches!(c.kind(), "accessibility_modifier" | "readonly"))
+}
+
+/// The nearest enclosing class declaration/expression of `node`, if any.
+fn enclosing_class(node: Node) -> Option<Node> {
+    let mut n = node;
+    while let Some(p) = n.parent() {
+        if matches!(p.kind(), "class_declaration" | "class") {
+            return Some(p);
+        }
+        n = p;
+    }
+    None
 }
 
 /// `(method, url)` from an axios config object: `url` is required (and must be
@@ -905,5 +1007,59 @@ func f(m map[string]int) {
 }
 "#;
         check!(extract_client_calls(src, &Language::Go).is_empty());
+    }
+
+    // #398: Angular `HttpClient` injected via the constructor — `this.http.<verb>`
+    // calls are detected (verb from the method, URL literal or template).
+    #[test]
+    fn angular_http_client_verbs() {
+        let src = "import { HttpClient } from '@angular/common/http';\n\
+                   class ApiService {\n\
+                     constructor(private http: HttpClient) {}\n\
+                     getUser(id: string) { return this.http.get(`/api/users/${id}`); }\n\
+                     createUser(b: unknown) { return this.http.post('/api/users', b); }\n\
+                   }";
+        let calls = extract_client_calls(src, &Language::TypeScript);
+        check!(call(&calls, HttpMethod::Get, "/api/users/${id}").is_some());
+        check!(call(&calls, HttpMethod::Post, "/api/users").is_some());
+    }
+
+    // A field declared `HttpClient` (not constructor-injected) works too.
+    #[test]
+    fn angular_http_client_field_declaration() {
+        let src = "class S {\n  http: HttpClient;\n  f() { return this.http.delete('/api/x'); }\n}";
+        let calls = extract_client_calls(src, &Language::TypeScript);
+        check!(call(&calls, HttpMethod::Delete, "/api/x").is_some());
+    }
+
+    // A `this.<field>.<verb>()` on a non-HttpClient field is not a client call.
+    #[test]
+    fn non_http_client_field_is_not_a_call() {
+        let src = "class S {\n  constructor(private repo: UserRepo) {}\n  \
+                   f(id: string) { return this.repo.get(id); }\n}";
+        check!(extract_client_calls(src, &Language::TypeScript).is_empty());
+    }
+
+    // HttpClient field detection is class-scoped: a same-named `http` field of a
+    // different type in another class must not be treated as a client call.
+    #[test]
+    fn http_client_field_is_class_scoped() {
+        let src = "class A {\n  constructor(private http: HttpClient) {}\n  \
+                   a() { return this.http.get('/api/a'); }\n}\n\
+                   class B {\n  constructor(private http: Other) {}\n  \
+                   b() { return this.http.get('/api/b'); }\n}";
+        let calls = extract_client_calls(src, &Language::TypeScript);
+        check!(call(&calls, HttpMethod::Get, "/api/a").is_some()); // A.http is HttpClient
+        check!(call(&calls, HttpMethod::Get, "/api/b").is_none()); // B.http is Other
+        check!(calls.len() == 1);
+    }
+
+    // A plain (non-parameter-property) constructor param does not become a
+    // `this.` field, so its name must not be picked up.
+    #[test]
+    fn plain_constructor_param_is_not_a_field() {
+        let src = "class S {\n  constructor(http: HttpClient) {}\n  \
+                   f() { return this.http.get('/api/x'); }\n}";
+        check!(extract_client_calls(src, &Language::TypeScript).is_empty());
     }
 }
