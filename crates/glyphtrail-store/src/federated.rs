@@ -162,20 +162,25 @@ fn web_links(names: &[String], registry: &Registry) -> WebLinks {
                 continue;
             }
         };
-        let ops = |kind| match store.operations_by_kind(kind) {
-            Ok(ops) => ops,
-            Err(e) => {
-                eprintln!("note: skipping web links for '{name}': {e}");
-                Vec::new()
+        // Read both operation kinds up front; if either errors, skip the whole
+        // repo rather than contribute partial (misleading) web links.
+        let (eps, ccs) = match (
+            store.operations_by_kind(NodeKind::Endpoint),
+            store.operations_by_kind(NodeKind::ClientCall),
+        ) {
+            (Ok(eps), Ok(ccs)) => (eps, ccs),
+            _ => {
+                eprintln!("note: skipping web links for '{name}': cannot read its operations");
+                continue;
             }
         };
-        for (id, key) in ops(NodeKind::Endpoint) {
+        for (id, key) in eps {
             let sig = key.signature();
             if key.protocol == Protocol::Rest && has_literal_segment(&sig) {
                 endpoints.entry(sig).or_default().push((name.clone(), id));
             }
         }
-        for (id, key) in ops(NodeKind::ClientCall) {
+        for (id, key) in ccs {
             let sig = key.signature();
             if key.protocol == Protocol::Rest && has_literal_segment(&sig) {
                 calls.push((name.clone(), sig, id));
