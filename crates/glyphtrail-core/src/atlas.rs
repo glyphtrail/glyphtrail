@@ -138,7 +138,6 @@ const TOPIC_STOPWORDS: &[&str] = &[
     "test",
     "tests",
     "todo",
-    "wip",
 ];
 
 /// Directory segments too generic to name an area of work (#334).
