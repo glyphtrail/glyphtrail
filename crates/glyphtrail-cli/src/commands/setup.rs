@@ -130,18 +130,23 @@ fn write_skill(root: &Path) -> Result<()> {
 }
 
 /// Insert or replace the managed section in `path`, returning whether the file
-/// was created. The section is delimited by [`BEGIN`]/[`END`]; on re-run the
-/// span between them is replaced, so the rest of the file is untouched.
+/// was created. The section is delimited by the `glyphtrail:begin`/
+/// `glyphtrail:end` markers ([`BEGIN_PREFIX`]/[`END`]); on re-run the span
+/// between them is replaced, so the rest of the file is untouched.
 fn upsert_section(path: &Path) -> Result<bool> {
     // `AGENT_SECTION_BODY` already ends with a newline, so the block reads
-    // `{BEGIN}\n{body}{END}\n` — never blindly overwrite the file; only this
+    // `{begin}\n{body}{END}\n` — never blindly overwrite the file; only this
     // span between the markers is owned by glyphtrail.
     let block = format!("{}\n{AGENT_SECTION_BODY}{END}\n", begin_marker());
     let existing = fs::read_to_string(path).unwrap_or_default();
     let created = existing.is_empty();
 
-    let updated = match (existing.find(BEGIN_PREFIX), existing.find(END)) {
-        (Some(b), Some(e)) if e > b => {
+    // Find the end marker *after* the begin marker — a stray `glyphtrail:end`
+    // earlier in the file must not be mistaken for our section's terminator.
+    let begin = existing.find(BEGIN_PREFIX);
+    let end_start = begin.and_then(|b| existing[b..].find(END).map(|e| b + e));
+    let updated = match (begin, end_start) {
+        (Some(b), Some(e)) => {
             let end = e + END.len();
             // Drop a trailing newline inside the old span so we don't accumulate blanks.
             let tail = existing[end..]
@@ -314,6 +319,31 @@ mod tests {
         check!(dir.join(".claude/skills/glyphtrail/SKILL.md").exists());
         check!(dir.join("CLAUDE.md").exists());
         check!(!dir.join(".gitignore").exists()); // not a repo -> no gitignore
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // A stray end-marker *before* the section (e.g. quoted in prose) must not be
+    // mistaken for our terminator — otherwise a re-run appends a duplicate (#392).
+    #[test]
+    fn upsert_ignores_end_marker_before_begin() {
+        let dir = temp_dir("stray-end");
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(
+            dir.join("CLAUDE.md"),
+            "# Notes\n\nExample delimiter: <!-- glyphtrail:end -->\n",
+        )
+        .unwrap();
+
+        run(&dir, false, false).unwrap();
+        let c1 = std::fs::read_to_string(dir.join("CLAUDE.md")).unwrap();
+        check!(c1.matches(BEGIN_PREFIX).count() == 1);
+
+        // Re-run: the section is found and replaced in place, not duplicated.
+        run(&dir, false, false).unwrap();
+        let c2 = std::fs::read_to_string(dir.join("CLAUDE.md")).unwrap();
+        check!(c2 == c1);
+        check!(c2.matches(BEGIN_PREFIX).count() == 1);
 
         std::fs::remove_dir_all(&dir).ok();
     }

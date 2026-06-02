@@ -219,7 +219,7 @@ tasks:
     cmds:
       - mkdir -p crates/glyphtrail-cli/assets
       - cp .claude/skills/glyphtrail/SKILL.md crates/glyphtrail-cli/assets/SKILL.md
-      - awk '/glyphtrail:begin/{f=1;next} /glyphtrail:end/{f=0} f' CLAUDE.md > crates/glyphtrail-cli/assets/agent-section.md
+      - awk '/<!-- glyphtrail:begin/{f=1;next} /<!-- glyphtrail:end/{f=0} f' CLAUDE.md > crates/glyphtrail-cli/assets/agent-section.md
 
   # Checks formatting without modifying files. Used in CI.
   fmt:check:
