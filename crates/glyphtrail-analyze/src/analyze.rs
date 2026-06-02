@@ -2040,9 +2040,6 @@ fn dynamic_grammar<'a>(
     cache.get(name).and_then(|o| o.as_ref())
 }
 
-/// Pick the repository file an import resolves to: an exact path match first,
-/// then a *unique* path-suffix match (so source roots like `src/` resolve),
-/// else `None`. Ambiguous suffix matches are left unresolved on purpose.
 /// Substitute resolvable `${NAME}` constants in a client URL path (#405): a
 /// same-file const, or one imported into `file` (via `symbol_file`) whose value
 /// is known in its defining file (`consts_by_file`). Unknown interpolations are
@@ -2058,7 +2055,7 @@ fn resolve_path_constants(
     while let Some(start) = rest.find("${") {
         out.push_str(&rest[..start]);
         let after = &rest[start + 2..];
-        let Some(end) = after.find('}') else {
+        let Some(end) = matching_brace(after) else {
             out.push_str(&rest[start..]); // unterminated `${` — keep verbatim
             return out;
         };
@@ -2099,6 +2096,24 @@ fn is_ident(s: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
 }
 
+/// Byte index of the `}` that closes a `${`, balancing nested braces (so
+/// `${foo({a: 1})}` is treated as one interpolation, not split at the inner `}`).
+fn matching_brace(s: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, c) in s.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' if depth == 0 => return Some(i),
+            '}' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Pick the repository file an import resolves to: an exact path match first,
+/// then a *unique* path-suffix match (so source roots like `src/` resolve),
+/// else `None`. Ambiguous suffix matches are left unresolved on purpose.
 fn resolve_target(
     candidates: &[String],
     files: &[String],
@@ -2324,6 +2339,8 @@ mod tests {
         // Unknown name and non-identifier interpolations stay verbatim.
         check!(r("/${UNKNOWN}/x") == "/${UNKNOWN}/x");
         check!(r("/${this.base}/x") == "/${this.base}/x");
+        // A nested-brace interpolation is balanced, not split at the inner `}`.
+        check!(r("/${foo({a:1})}/x") == "/${foo({a:1})}/x");
         // The folded full-URL value re-normalizes to a concrete route signature.
         let key = OperationKey::rest(
             glyphtrail_core::HttpMethod::Get,
