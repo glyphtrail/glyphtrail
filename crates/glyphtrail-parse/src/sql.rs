@@ -8,9 +8,10 @@
 //! It recognises `CREATE TABLE` and `CREATE [MATERIALIZED] VIEW`, yielding a
 //! [`NodeKind::Table`] per object, a [`NodeKind::Column`] per column (contained by
 //! the table), and a `References` edge for a foreign key / a view's `FROM` target
-//! that is defined in the same file. A table is identified by its (schema-qualified)
-//! name, so `ALTER`/`CREATE` of the same table across migration files land on one
-//! node.
+//! that is defined in the same file. Node ids are file-scoped (the declaring
+//! file's path is part of the id) so the store's per-file incremental cleanup
+//! removes them cleanly; a single cross-file identity for the same table across
+//! migrations is a deliberate follow-up.
 
 use std::collections::HashSet;
 
@@ -298,10 +299,13 @@ fn line_of(source: &str, byte: usize) -> usize {
         + 1
 }
 
-/// Deterministic id for a table by its normalised name, so the same table across
-/// migration files (and FK references to it) resolve to one node.
-pub fn table_node_id(name: &str) -> NodeId {
-    NodeId::derive(&["sql_table", name])
+/// Deterministic id for a table, scoped to the file that declares it so the
+/// store's per-file incremental cleanup (`delete_file_data`, which deletes nodes
+/// by `Node.file`) removes it cleanly when the file changes. References therefore
+/// resolve only within a file (see [`build_sql_graph`]); a single cross-file
+/// identity for the same table across migrations is a follow-up.
+pub fn table_node_id(rel_path: &str, name: &str) -> NodeId {
+    NodeId::derive(&["sql_table", rel_path, name])
 }
 
 /// Build the SQL schema fragment for one `.sql` file: table + column nodes,
@@ -316,7 +320,7 @@ pub fn build_sql_graph(rel_path: &str, file_id: &NodeId, source: &str) -> CodeGr
     let mut seen_table: HashSet<NodeId> = HashSet::new();
 
     for t in &tables {
-        let table_id = table_node_id(&t.name);
+        let table_id = table_node_id(rel_path, &t.name);
         let line = line_of(source, t.byte);
         let span = Some(Span {
             start_byte: t.byte,
@@ -354,7 +358,7 @@ pub fn build_sql_graph(rel_path: &str, file_id: &NodeId, source: &str) -> CodeGr
             if !seen_col.insert(col_norm.clone()) {
                 continue;
             }
-            let col_id = NodeId::derive(&["sql_column", &t.name, &col_norm]);
+            let col_id = NodeId::derive(&["sql_column", rel_path, &t.name, &col_norm]);
             graph.add_node(Node {
                 id: col_id.clone(),
                 kind: NodeKind::Column,
@@ -362,7 +366,9 @@ pub fn build_sql_graph(rel_path: &str, file_id: &NodeId, source: &str) -> CodeGr
                 qualified_name: format!("{}.{}", t.name, col_norm),
                 file: rel_path.to_string(),
                 language: Some("sql".to_string()),
-                span,
+                // No per-column byte offset is tracked yet, so omit the span
+                // rather than point every column at the table's location.
+                span: None,
                 doc: None,
                 signature: None,
             });
@@ -380,7 +386,7 @@ pub fn build_sql_graph(rel_path: &str, file_id: &NodeId, source: &str) -> CodeGr
             if r != &t.name && defined.contains(r.as_str()) && seen_ref.insert(r.as_str()) {
                 graph.add_edge(
                     table_id.clone(),
-                    table_node_id(r),
+                    table_node_id(rel_path, r),
                     EdgeKind::References,
                     Confidence::Extracted,
                 );
@@ -456,8 +462,8 @@ mod tests {
         check!(tables == 2);
         check!(cols == 3);
         // a table node is reachable from the file, and b references a.
-        let a = table_node_id("a");
-        let b = table_node_id("b");
+        let a = table_node_id("schema.sql", "a");
+        let b = table_node_id("schema.sql", "b");
         check!(
             g.edges
                 .iter()

@@ -60,8 +60,7 @@ pub enum NodeKind {
     Identity,
     /// Atlas: a derived topic/theme spanning commits and repos.
     Topic,
-    /// A database table or view defined in SQL DDL (#416). Identified by its
-    /// (schema-qualified) name, so migrations across files attach to one node.
+    /// A database table or view defined in SQL DDL (#416).
     Table,
     /// A column within a [`NodeKind::Table`] (contained by it).
     Column,
