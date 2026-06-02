@@ -3,7 +3,7 @@
 mod commands;
 mod ui;
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{ArgGroup, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use std::path::PathBuf;
 
@@ -136,20 +136,28 @@ enum Command {
         #[arg(long)]
         repo: Option<PathBuf>,
     },
-    /// Onboard coding agents: write skill + CLAUDE.md/AGENTS.md section + gitignore.
+    /// Onboard coding agents: write the skill + CLAUDE.md/AGENTS.md section.
+    ///
+    /// Choose a destination explicitly — `--local` (this repo) and/or `--user`
+    /// (your home directory); a repo-local install lands in commits, so there's
+    /// no default.
+    #[command(group(ArgGroup::new("setup_target").args(["local", "user"]).required(true).multiple(true)))]
     Setup {
-        /// Repository root (defaults to the current directory).
+        /// Repository root for `--local` (defaults to the current directory).
         #[arg(default_value = ".")]
         path: PathBuf,
-        /// Write the files even when `path` is not inside a git repository.
+        /// Write into this repository (its CLAUDE.md/AGENTS.md + .claude/skills).
+        #[arg(long)]
+        local: bool,
+        /// Write user-wide agent files into your home directory.
+        #[arg(long, alias = "home")]
+        user: bool,
+        /// Write the files even when `path` is not inside a git repository (--local).
         #[arg(long)]
         force: bool,
-        /// Write global agent files to the user's home directory instead of `path`.
-        #[arg(long)]
-        home: bool,
-        /// Keep glyphtrail local-only: gitignore the skill, skip the
+        /// Keep the local install out of VCS: gitignore the skill, skip the
         /// CLAUDE.md/AGENTS.md patch, and strip any section a prior run added.
-        #[arg(long, conflicts_with = "home")]
+        #[arg(long, requires = "local")]
         gitignore: bool,
     },
     /// Manage the global repository registry (~/.glyphtrail/registry.json).
@@ -296,7 +304,9 @@ fn main() -> anyhow::Result<()> {
                     }
                     // Hint (read-only): onboarding files are written only by `setup`.
                     if !target.join(".claude/skills/glyphtrail/SKILL.md").exists() {
-                        println!("Tip: run `glyphtrail setup` to onboard coding agents (MCP/CLI).");
+                        println!(
+                            "Tip: run `glyphtrail setup --local` to onboard coding agents (MCP/CLI)."
+                        );
                     }
                 }
                 // Hint (read-only): the bundled skill is newer than the
@@ -358,10 +368,11 @@ fn main() -> anyhow::Result<()> {
         Command::Mcp { repo } => glyphtrail_mcp::serve_stdio(repo),
         Command::Setup {
             path,
+            local,
+            user,
             force,
-            home,
             gitignore,
-        } => commands::setup::run(&path, force, home, gitignore),
+        } => commands::setup::run(&path, local, user, force, gitignore),
         Command::Repo { cmd } => commands::repo::run(cmd),
         Command::Remote { cmd } => commands::remote::run(cmd),
         Command::Config { cmd } => commands::config::run(cmd),

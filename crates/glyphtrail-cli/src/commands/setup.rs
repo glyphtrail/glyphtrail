@@ -10,10 +10,10 @@
 //! doesn't dirty the files on every commit (a pitfall of similar tools). Run by
 //! the user explicitly; `analyze` never modifies repo files, it only hints.
 //!
-//! Safe outside a repo (#245): writing agent files into a random directory is
-//! usually a mistake, so a target that isn't inside a git repository errors —
-//! unless `--force` (write here anyway) or `--home` (write the global agent
-//! files to the user's home directory) is given.
+//! The destination is explicit (#390): `--local` writes into the repo, `--user`
+//! into the home directory, and `setup` errors without one (a repo-local install
+//! lands in commits, so it never guesses). Safe outside a repo (#245): `--local`
+//! in a non-repository directory errors unless `--force` is given.
 //!
 //! The skill and managed-section content are *not* inlined here: they are the
 //! repo's own dogfooded onboarding files (`.claude/skills/glyphtrail/SKILL.md`
@@ -51,46 +51,59 @@ const SKILL_MD: &str = include_str!("../../assets/SKILL.md");
 /// newline, so the block is `{BEGIN}\n{body}{END}\n`.
 const AGENT_SECTION_BODY: &str = include_str!("../../assets/agent-section.md");
 
-/// Onboard agents: write the skill, upsert the managed section in
-/// `CLAUDE.md`/`AGENTS.md`, and (inside a repo) ignore `.glyphtrail/`.
-/// Idempotent.
+/// Onboard agents by writing the skill and the managed `CLAUDE.md`/`AGENTS.md`
+/// section. The destination is chosen explicitly (#390) — a repo-local install
+/// ends up in commits, so `setup` never guesses: pass `local` (this repo),
+/// `user` (your home directory), or both. With neither, it errors.
 ///
-/// `home` targets the user's home directory (global agent config) instead of
-/// `path`. Otherwise, when `path` is not inside a git repository, this errors
-/// unless `force` is set — so the files don't land in a random directory by
-/// mistake.
-///
-/// `gitignore` keeps glyphtrail local-only: the skill is still written but
-/// gitignored, the `CLAUDE.md`/`AGENTS.md` patch is skipped, and any section a
-/// previous `setup` added is stripped back out.
-pub fn run(path: &Path, force: bool, home: bool, gitignore: bool) -> Result<()> {
-    if home && gitignore {
-        bail!("--gitignore edits a repository .gitignore and cannot be combined with --home");
-    }
-
-    let target = if home {
-        home_dir()
-            .ok_or_else(|| anyhow!("cannot locate home directory (set HOME or USERPROFILE)"))?
-    } else {
-        path.canonicalize()
-            .with_context(|| format!("cannot resolve path {}", path.display()))?
-    };
-
-    let in_repo = in_git_repo(&target);
-    if !home && !force && !in_repo {
+/// `force` lets `--local` write outside a git repository. `gitignore` keeps the
+/// local install out of VCS (skill written but gitignored, no `CLAUDE.md` patch,
+/// any prior section stripped); it applies to the local target only.
+pub fn run(path: &Path, local: bool, user: bool, force: bool, gitignore: bool) -> Result<()> {
+    if !local && !user {
         bail!(
-            "{} is not inside a git repository.\n  \
-             Run setup inside a repo, or pass --force to write here anyway, \
-             or --home to write global agent files to your home directory.",
-            target.display()
+            "choose where to write agent files: --local (this repository) and/or \
+             --user (your home directory). A repo-local install lands in commits, \
+             so setup won't guess."
         );
     }
+    if gitignore && !local {
+        bail!("--gitignore applies to a repository's files; pass it together with --local");
+    }
 
+    if local {
+        let target = path
+            .canonicalize()
+            .with_context(|| format!("cannot resolve path {}", path.display()))?;
+        let in_repo = in_git_repo(&target);
+        if !force && !in_repo {
+            bail!(
+                "{} is not inside a git repository.\n  \
+                 Run --local inside a repo, or pass --force to write here anyway.",
+                target.display()
+            );
+        }
+        apply_to(&target, in_repo, gitignore)?;
+    }
+
+    if user {
+        let target = home_dir()
+            .ok_or_else(|| anyhow!("cannot locate home directory (set HOME or USERPROFILE)"))?;
+        // Home is not a repository, so there is no `.gitignore` to touch and
+        // `--gitignore` (local-only) does not apply here.
+        apply_to(&target, false, false)?;
+    }
+    Ok(())
+}
+
+/// Install (or, with `gitignore`, un-install) the agent files under `target`.
+/// `in_repo` enables the `.gitignore` edits, which only make sense inside a repo.
+fn apply_to(target: &Path, in_repo: bool, gitignore: bool) -> Result<()> {
     // Capture the previously-installed version before we overwrite anything, so
     // we can report a version transition below.
-    let prior = installed_version(&target);
+    let prior = installed_version(target);
 
-    write_skill(&target)?;
+    write_skill(target)?;
     println!(
         "wrote {}",
         target.join(".claude/skills/glyphtrail/SKILL.md").display()
@@ -115,10 +128,10 @@ pub fn run(path: &Path, force: bool, home: bool, gitignore: bool) -> Result<()> 
 
     // `.gitignore` only makes sense inside a repository.
     if in_repo {
-        if add_ignore(&target, ".glyphtrail/")? {
+        if add_ignore(target, ".glyphtrail/")? {
             println!("added .glyphtrail/ to .gitignore");
         }
-        if gitignore && add_ignore(&target, ".claude/skills/glyphtrail/")? {
+        if gitignore && add_ignore(target, ".claude/skills/glyphtrail/")? {
             println!("added .claude/skills/glyphtrail/ to .gitignore");
         }
     }
@@ -273,7 +286,7 @@ pub fn staleness_hint(repo: &Path) -> Option<String> {
         format!(
             "note: glyphtrail agent files are out of date \
              (installed v{installed}, bundled v{SKILL_VERSION}) — \
-             run `glyphtrail setup` to update"
+             run `glyphtrail setup --local` (or --user) to update"
         )
     })
 }
@@ -340,7 +353,7 @@ mod tests {
         std::fs::write(dir.join("CLAUDE.md"), "# My project\n\nNotes.\n").unwrap();
         std::fs::write(dir.join(".gitignore"), "target/\n").unwrap();
 
-        run(&dir, false, false, false).unwrap();
+        run(&dir, true, false, false, false).unwrap();
         let claude1 = std::fs::read_to_string(dir.join("CLAUDE.md")).unwrap();
         check!(claude1.starts_with("# My project")); // preserved existing content
         check!(claude1.contains(BEGIN_PREFIX) && claude1.contains("Code graph (glyphtrail)"));
@@ -358,7 +371,7 @@ mod tests {
         check!(gi.contains("target/") && gi.contains(".glyphtrail/"));
 
         // Re-run: no duplication.
-        run(&dir, false, false, false).unwrap();
+        run(&dir, true, false, false, false).unwrap();
         let claude2 = std::fs::read_to_string(dir.join("CLAUDE.md")).unwrap();
         check!(claude2 == claude1);
         check!(claude2.matches(BEGIN_PREFIX).count() == 1);
@@ -373,10 +386,10 @@ mod tests {
     #[test]
     fn setup_outside_repo_errors_unless_forced() {
         let dir = temp_dir("no-repo"); // no .git
-        check!(run(&dir, false, false, false).is_err());
+        check!(run(&dir, true, false, false, false).is_err());
         check!(!dir.join("CLAUDE.md").exists()); // nothing written on error
 
-        run(&dir, true, false, false).unwrap(); // --force
+        run(&dir, true, false, true, false).unwrap(); // --force
         check!(dir.join(".claude/skills/glyphtrail/SKILL.md").exists());
         check!(dir.join("CLAUDE.md").exists());
         check!(!dir.join(".gitignore").exists()); // not a repo -> no gitignore
@@ -396,12 +409,12 @@ mod tests {
         )
         .unwrap();
 
-        run(&dir, false, false, false).unwrap();
+        run(&dir, true, false, false, false).unwrap();
         let c1 = std::fs::read_to_string(dir.join("CLAUDE.md")).unwrap();
         check!(c1.matches(BEGIN_PREFIX).count() == 1);
 
         // Re-run: the section is found and replaced in place, not duplicated.
-        run(&dir, false, false, false).unwrap();
+        run(&dir, true, false, false, false).unwrap();
         let c2 = std::fs::read_to_string(dir.join("CLAUDE.md")).unwrap();
         check!(c2 == c1);
         check!(c2.matches(BEGIN_PREFIX).count() == 1);
@@ -417,7 +430,7 @@ mod tests {
         let root = repo_root();
         let dir = temp_dir("dogfood");
         std::fs::create_dir_all(dir.join(".git")).unwrap();
-        run(&dir, false, false, false).unwrap();
+        run(&dir, true, false, false, false).unwrap();
 
         let got_skill =
             std::fs::read_to_string(dir.join(".claude/skills/glyphtrail/SKILL.md")).unwrap();
@@ -437,7 +450,7 @@ mod tests {
     fn staleness_hint_fires_only_when_older() {
         let dir = temp_dir("stale");
         std::fs::create_dir_all(dir.join(".git")).unwrap();
-        run(&dir, false, false, false).unwrap();
+        run(&dir, true, false, false, false).unwrap();
         check!(installed_version(&dir) == Some(SKILL_VERSION));
         check!(staleness_hint(&dir).is_none());
 
@@ -466,7 +479,7 @@ mod tests {
         std::fs::write(dir.join("CLAUDE.md"), "# My project\n\nNotes.\n").unwrap();
 
         // A normal setup first, which appends the managed section.
-        run(&dir, false, false, false).unwrap();
+        run(&dir, true, false, false, false).unwrap();
         check!(
             std::fs::read_to_string(dir.join("CLAUDE.md"))
                 .unwrap()
@@ -475,7 +488,7 @@ mod tests {
 
         // --gitignore: section stripped (content restored byte-for-byte), skill
         // still present, both glyphtrail paths gitignored.
-        run(&dir, false, false, true).unwrap();
+        run(&dir, true, false, false, true).unwrap();
         let claude = std::fs::read_to_string(dir.join("CLAUDE.md")).unwrap();
         check!(claude == "# My project\n\nNotes.\n");
         check!(!claude.contains(BEGIN_PREFIX));
@@ -485,19 +498,30 @@ mod tests {
         check!(gi.contains(".claude/skills/glyphtrail/"));
 
         // Idempotent: re-running adds no duplicate ignore lines.
-        run(&dir, false, false, true).unwrap();
+        run(&dir, true, false, false, true).unwrap();
         let gi2 = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
         check!(gi2.matches(".claude/skills/glyphtrail/").count() == 1);
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // --home and --gitignore are mutually exclusive (the latter edits a repo
-    // .gitignore). Rejected before any path resolution, so it never touches HOME.
+    // #390: a target is mandatory — bare setup (no --local/--user) errors
+    // rather than defaulting to a repo-local install that lands in commits.
     #[test]
-    fn gitignore_conflicts_with_home() {
+    fn setup_requires_a_target() {
+        let dir = temp_dir("no-target");
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        check!(run(&dir, false, false, false, false).is_err());
+        check!(!dir.join("CLAUDE.md").exists()); // nothing written
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --gitignore is local-only; with --user but no --local it's rejected before
+    // any path resolution, so the test never touches the real HOME.
+    #[test]
+    fn gitignore_requires_local() {
         let dir = temp_dir("conflict");
-        check!(run(&dir, false, true, true).is_err());
+        check!(run(&dir, false, true, false, true).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 }
