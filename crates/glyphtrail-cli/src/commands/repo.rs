@@ -81,6 +81,13 @@ pub enum RepoCmd {
         /// Only refresh this repo (defaults to all registered repos).
         name: Option<String>,
     },
+    /// Set a repo's atlas visibility tier (#332): public, private, or proprietary.
+    SetVisibility {
+        /// Registered repo name.
+        name: String,
+        /// `public` | `private` | `proprietary`.
+        visibility: String,
+    },
     /// Force-release a stuck registry lock (escape hatch for a lock left by a
     /// dead writer on a network/FUSE filesystem). Safe: only removes the lock
     /// file; the registry self-heals stale locks automatically, so this is
@@ -225,7 +232,13 @@ pub fn run(cmd: RepoCmd) -> Result<()> {
                         format!("  (missing{})", missing_for(e.missing_since))
                     }
                 };
-                println!("{:<20} {}{}", e.name, e.root.display(), note);
+                println!(
+                    "{:<20} {}{}  [{}]",
+                    e.name,
+                    e.root.display(),
+                    note,
+                    e.visibility.as_str()
+                );
                 for alt in &e.alt_roots {
                     println!("{:<20} ↳ also at {}", "", alt.display());
                 }
@@ -260,6 +273,22 @@ pub fn run(cmd: RepoCmd) -> Result<()> {
             None => println!("no registry lock held"),
         },
         RepoCmd::Link { cmd } => super::link::run(cmd)?,
+        RepoCmd::SetVisibility { name, visibility } => {
+            let vis = glyphtrail_core::Visibility::parse(&visibility).ok_or_else(|| {
+                anyhow!("invalid visibility '{visibility}' (public|private|proprietary)")
+            })?;
+            let mut found = false;
+            Registry::mutate(&path, |r| {
+                if let Some(e) = r.repos.iter_mut().find(|e| e.name == name) {
+                    e.visibility = vis;
+                    found = true;
+                }
+            })?;
+            if !found {
+                bail!("no registered repo named '{name}'");
+            }
+            println!("{name}: visibility = {}", vis.as_str());
+        }
     }
     Ok(())
 }
@@ -380,6 +409,9 @@ fn entry_for(registry_path: &Path, root: &Path, name: Option<String>) -> Registr
             ids.push(numeric);
         }
     }
+    // Infer the atlas visibility tier from the forge-id sources (#332): a public
+    // forge → Public, else Private; never Proprietary (explicit only).
+    let visibility = glyphtrail_core::Visibility::infer(ids.iter().map(|i| i.source.as_str()));
     RegistryEntry {
         name,
         root: root.to_path_buf(),
@@ -388,6 +420,7 @@ fn entry_for(registry_path: &Path, root: &Path, name: Option<String>) -> Registr
         ids,
         contributors: git_contributors(root),
         identity: None,
+        visibility,
     }
 }
 

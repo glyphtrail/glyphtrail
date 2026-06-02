@@ -53,7 +53,7 @@ pub use matcher::{ClientCall, Endpoint, Match, Matcher};
 pub use model::{CodeGraph, Confidence, Edge, EdgeKind, Node, NodeId, NodeKind, PendingLink, Span};
 pub use outline::{Detail, OutlineSymbol, is_outline_kind, outline_symbol, slice_signature};
 pub use registry::{
-    Contributor, RecordOutcome, Registry, RegistryEntry, RepoHealth, Resolution,
+    Contributor, RecordOutcome, Registry, RegistryEntry, RepoHealth, Resolution, Visibility,
     default_registry_path, lock_path,
 };
 pub use rewrite::{PrefixRewrite, RewriteCandidate, RewriteEngine};
