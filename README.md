@@ -6,13 +6,21 @@
 
 [![unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)](https://github.com/rust-secure-code/safety-dance/)
 
-Glyphtrail maps codebases as **semantic and historical graphs**, so you can query
-structure, trace lineage, and discover recurring ideas across time.
+**Local code intelligence graph for AI coding agents:** Tree-sitter static
+analysis, structural code search, dependency impact, blast-radius analysis, CLI
+and MCP server.
 
-It parses source with [tree-sitter](https://tree-sitter.github.io/), extracts
-symbols, calls, imports, inheritance, design-rationale comments, and
-cross-boundary API links, stores them in a per-repo LadybugDB graph, and lets
-you query or visualize the result.
+Glyphtrail is **local-first code intelligence**: it builds a **code knowledge
+graph** from your repositories so AI coding agents (and you) can query structure,
+trace lineage, and discover recurring ideas across time. [Tree-sitter](https://tree-sitter.github.io/)
+based static analysis extracts symbols, calls, imports, inheritance,
+design-rationale comments, and cross-boundary API links into a per-repo LadybugDB
+graph.
+
+Over that graph it powers **structural code search**, **call graph and dependency
+graph** traversal, and **blast-radius / impact analysis**: a GraphRAG substrate
+for codebases that agents reach through an **MCP server for code intelligence** or
+the CLI. Use it as a repo index for Claude Code, Cursor, Windsurf, and Codex.
 
 Built native in Rust.
 
@@ -133,8 +141,8 @@ same repo-per-call behavior as the bundle):
 }
 ```
 
-**Cursor / Windsurf / VS Code** — point the client at the same stdio command. For
-example, a project-scoped Cursor `.cursor/mcp.json`:
+**Cursor / Windsurf / VS Code / Codex** — point the client at the same stdio
+command. For example, a project-scoped Cursor `.cursor/mcp.json`:
 
 ```json
 {
