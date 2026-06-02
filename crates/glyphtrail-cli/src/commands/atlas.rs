@@ -32,8 +32,23 @@ pub enum AtlasCmd {
     Sync(SyncArgs),
     /// List commits chronologically across repos (mine by default).
     Timeline(TimelineArgs),
+    /// List the derived topics and how many commits each tags.
+    Topics(TopicsArgs),
     /// Serve the atlas over MCP (stdio): timeline, status, and the repo+file bridge.
     Mcp,
+}
+
+#[derive(Args)]
+pub struct TopicsArgs {
+    /// Cap how many topics are shown (most-tagged first).
+    #[arg(long, default_value_t = 40)]
+    pub limit: usize,
+    /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
+    /// Emit YAML.
+    #[arg(long)]
+    pub yaml: bool,
 }
 
 #[derive(Args)]
@@ -44,6 +59,9 @@ pub struct TimelineArgs {
     /// Only commits whose author email contains this (default: me).
     #[arg(long)]
     pub author: Option<String>,
+    /// Only commits tagged with this topic (see `atlas topics`).
+    #[arg(long)]
+    pub topic: Option<String>,
     /// Earliest commit date (YYYY-MM-DD); overrides the config window.
     #[arg(long)]
     pub since: Option<String>,
@@ -107,7 +125,38 @@ pub fn run(cmd: AtlasCmd) -> Result<()> {
         AtlasCmd::Status => status(&dir)?,
         AtlasCmd::Sync(args) => sync(&dir, args)?,
         AtlasCmd::Timeline(args) => timeline(&dir, args)?,
+        AtlasCmd::Topics(args) => topics(&dir, args)?,
         AtlasCmd::Mcp => glyphtrail_mcp::serve_atlas_stdio(dir)?,
+    }
+    Ok(())
+}
+
+/// `glyphtrail atlas topics` — the derived topics and their commit counts.
+fn topics(dir: &Path, args: TopicsArgs) -> Result<()> {
+    let lb = ladybug_dir(dir);
+    if !lb.exists() {
+        bail!("atlas is disabled; run `glyphtrail atlas init` first");
+    }
+    let store = LadybugStore::open(&lb)?;
+    let mut topics = store.atlas_topics()?;
+    topics.truncate(args.limit);
+
+    let emit = Emit::from_flags(args.json, args.yaml);
+    if emit == Emit::Text {
+        if topics.is_empty() {
+            println!("no topics yet (run `glyphtrail atlas sync`)");
+        }
+        for (name, count) in &topics {
+            println!("  {count:>5}  {name}");
+        }
+    } else {
+        let value = serde_json::Value::Array(
+            topics
+                .iter()
+                .map(|(name, count)| serde_json::json!({ "topic": name, "commits": count }))
+                .collect(),
+        );
+        print_value(&value, emit)?;
     }
     Ok(())
 }
@@ -289,7 +338,7 @@ fn timeline(dir: &Path, args: TimelineArgs) -> Result<()> {
         limit: args.limit,
     };
     let store = LadybugStore::open(&lb)?;
-    let rows = store.atlas_timeline(since, until)?;
+    let rows = store.atlas_timeline(since, until, args.topic.as_deref())?;
     let tl = filter_timeline(rows, &registry, &query);
     let scope = author_scope_label(&query);
     let window_str = window.label();
@@ -301,6 +350,9 @@ fn timeline(dir: &Path, args: TimelineArgs) -> Result<()> {
         println!("  author:  {scope}");
         if let Some(r) = &args.repo {
             println!("  repo:    {r}");
+        }
+        if let Some(t) = &args.topic {
+            println!("  topic:   {t}");
         }
         if tl.excluded_restricted > 0 {
             println!(
@@ -526,6 +578,8 @@ fn build_repo_graph(
         kept += 1;
         let email = c.author_email.trim().to_ascii_lowercase();
         let subject = scrub_secrets(&c.subject).into_owned();
+        // Heuristic topics from the scrubbed subject + touched paths (#334).
+        let topics = glyphtrail_core::derive_topics(&subject, &c.files);
 
         let commit_id = NodeId::derive(&["commit", &e.name, &c.hash]);
         push_node(
@@ -631,6 +685,28 @@ fn build_repo_graph(
                 repo_id.clone(),
                 EdgeKind::PartOf,
                 Confidence::Extracted,
+            );
+        }
+
+        // Topic tags: a shared Topic node per derived keyword, the commit tagged
+        // with each (#334). Topics span repos, so they merge across the atlas.
+        for topic in &topics {
+            let topic_id = NodeId::derive(&["topic", topic]);
+            push_node(
+                &mut g,
+                &mut seen,
+                atlas_node(
+                    topic_id.clone(),
+                    NodeKind::Topic,
+                    topic.clone(),
+                    topic.clone(),
+                ),
+            );
+            g.add_edge(
+                commit_id.clone(),
+                topic_id,
+                EdgeKind::Tagged,
+                Confidence::Inferred,
             );
         }
     }

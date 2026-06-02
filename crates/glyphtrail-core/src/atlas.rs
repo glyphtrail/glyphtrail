@@ -54,6 +54,172 @@ pub struct AtlasTimelineRow {
     pub touched: u32,
 }
 
+/// Words too generic to be a useful topic — common git verbs and English filler
+/// that would otherwise dominate every commit (#334).
+const TOPIC_STOPWORDS: &[&str] = &[
+    "add",
+    "added",
+    "adds",
+    "fix",
+    "fixed",
+    "fixes",
+    "update",
+    "updated",
+    "updates",
+    "remove",
+    "removed",
+    "removes",
+    "delete",
+    "deleted",
+    "refactor",
+    "rename",
+    "renamed",
+    "move",
+    "moved",
+    "bump",
+    "merge",
+    "revert",
+    "wip",
+    "use",
+    "used",
+    "make",
+    "made",
+    "set",
+    "get",
+    "init",
+    "clean",
+    "cleanup",
+    "improve",
+    "improved",
+    "change",
+    "changed",
+    "changes",
+    "support",
+    "implement",
+    "handle",
+    "allow",
+    "avoid",
+    "ensure",
+    "the",
+    "and",
+    "for",
+    "with",
+    "from",
+    "into",
+    "this",
+    "that",
+    "when",
+    "then",
+    "also",
+    "via",
+    "not",
+    "but",
+    "are",
+    "was",
+    "has",
+    "had",
+    "can",
+    "all",
+    "new",
+    "now",
+    "one",
+    "two",
+    "more",
+    "less",
+    "some",
+    "any",
+    "out",
+    "off",
+    "per",
+    "you",
+    "your",
+    "its",
+    "their",
+    "test",
+    "tests",
+    "todo",
+];
+
+/// Directory segments too generic to name an area of work (#334).
+const TOPIC_GENERIC_DIRS: &[&str] = &[
+    "src",
+    "lib",
+    "test",
+    "tests",
+    "crates",
+    "crate",
+    "app",
+    "apps",
+    "pkg",
+    "packages",
+    "internal",
+    "cmd",
+    "main",
+    "mod",
+    "index",
+    "bin",
+    "dist",
+    "build",
+    "target",
+    "node_modules",
+    "vendor",
+    "docs",
+    "doc",
+    "examples",
+    "example",
+    "include",
+    "assets",
+    "static",
+];
+
+/// The most topics any single commit contributes — bounds noise (#334).
+const MAX_TOPICS_PER_COMMIT: usize = 12;
+
+/// Derive heuristic topic tags for a commit (#334) from its scrubbed subject
+/// (significant keywords), its touched directories (areas of the tree), and the
+/// languages of its touched files. Lower-cased, de-duplicated, stop-worded, and
+/// capped. No network, no LLM — enrichment is a later option.
+pub fn derive_topics(subject: &str, files: &[String]) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let mut topics: BTreeSet<String> = BTreeSet::new();
+
+    // Subject keywords.
+    for token in subject.split(|c: char| !c.is_alphanumeric()) {
+        let token = token.to_ascii_lowercase();
+        if token.len() >= 3
+            && token.chars().any(|c| c.is_alphabetic())
+            && !TOPIC_STOPWORDS.contains(&token.as_str())
+        {
+            topics.insert(token);
+        }
+    }
+
+    // Touched directory segments + file languages.
+    for file in files {
+        let path = std::path::Path::new(file);
+        if let Some(parent) = path.parent() {
+            for component in parent.components() {
+                if let std::path::Component::Normal(seg) = component {
+                    let seg = seg.to_string_lossy().to_ascii_lowercase();
+                    // Directory names are curated and low-noise, so accept short
+                    // areas like `ui`/`io`/`db` that the subject filter drops.
+                    if seg.len() >= 2
+                        && seg.chars().any(|c| c.is_alphabetic())
+                        && !TOPIC_GENERIC_DIRS.contains(&seg.as_str())
+                    {
+                        topics.insert(seg);
+                    }
+                }
+            }
+        }
+        if let Some(lang) = crate::lang::Language::from_path(path) {
+            topics.insert(lang.name().to_ascii_lowercase());
+        }
+    }
+
+    topics.into_iter().take(MAX_TOPICS_PER_COMMIT).collect()
+}
+
 /// How to filter an atlas timeline (#333/#335) — shared by the CLI and the MCP
 /// server so both gate identically.
 #[derive(Debug, Clone, Default)]
@@ -566,6 +732,35 @@ mod tests {
             },
         );
         check!(tl.rows.len() == 4 && tl.excluded_restricted == 0);
+    }
+
+    #[test]
+    fn derive_topics_pulls_keywords_dirs_and_languages() {
+        let topics = derive_topics(
+            "Add parser recovery for nested blocks",
+            &[
+                "src/parser/recover.rs".into(),
+                "src/ui/io/buf.rs".into(),
+                "src/lib.rs".into(),
+            ],
+        );
+        // Significant subject keywords kept; "add"/"for" dropped as stopwords.
+        check!(topics.contains(&"parser".to_string()));
+        check!(topics.contains(&"recovery".to_string()));
+        check!(topics.contains(&"nested".to_string()));
+        check!(!topics.contains(&"add".to_string()));
+        check!(!topics.contains(&"for".to_string()));
+        // A meaningful directory becomes a topic; generic "src" does not.
+        check!(!topics.contains(&"src".to_string()));
+        // Short area directories (2 chars) survive as topics.
+        check!(topics.contains(&"ui".to_string()));
+        check!(topics.contains(&"io".to_string()));
+        // Language inferred from the extension.
+        check!(topics.contains(&"rust".to_string()));
+        // Output is sorted + de-duplicated.
+        let mut sorted = topics.clone();
+        sorted.sort();
+        check!(topics == sorted);
     }
 
     #[test]

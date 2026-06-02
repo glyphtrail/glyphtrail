@@ -844,10 +844,23 @@ impl GraphStore for LadybugStore {
             .unwrap_or(0))
     }
 
+    fn atlas_topics(&self) -> Result<Vec<(String, usize)>> {
+        Ok(self
+            .run(
+                "MATCH (cn:Node {kind:'commit'})-[:Edge {kind:'tagged'}]->(t:Node {kind:'topic'}) \
+                 RETURN t.name, COUNT(*) AS n ORDER BY n DESC, t.name",
+                vec![],
+            )?
+            .iter()
+            .map(|r| (get_str(r, 0), get_i64(r, 1).max(0) as usize))
+            .collect())
+    }
+
     fn atlas_timeline(
         &self,
         since: Option<i64>,
         until: Option<i64>,
+        topic: Option<&str>,
     ) -> Result<Vec<glyphtrail_core::AtlasTimelineRow>> {
         // Date bounds shared by both queries. Inline them (lbug param-type-cache
         // landmine); the in-bounds + commit-node join restricts every aggregate
@@ -871,17 +884,27 @@ impl GraphStore for LadybugStore {
         )? {
             touched.insert(get_str(&r, 0), get_i64(&r, 1).max(0) as u32);
         }
-        // In-bounds commits in range, joined to their repo.
+        // In-bounds commits in range, joined to their repo. An optional topic
+        // join keeps only commits tagged with it (#334); the topic rides as a
+        // string param (no int params here, so no type-cache clash).
+        let mut tagged_match = String::new();
+        let mut tagged_where = String::new();
+        let mut params: Vec<(&str, Value)> = Vec::new();
+        if let Some(t) = topic {
+            tagged_match = ", (cn)-[:Edge {kind:'tagged'}]->(tp:Node {kind:'topic'})".to_string();
+            tagged_where = " AND tp.name = $topic".to_string();
+            params.push(("topic", s(t)));
+        }
         Ok(self
             .run(
                 &format!(
-                    "MATCH (c:Commit), (cn:Node)-[:Edge {{kind:'part_of'}}]->(r:Node) \
+                    "MATCH (c:Commit), (cn:Node)-[:Edge {{kind:'part_of'}}]->(r:Node){tagged_match} \
                      WHERE c.in_bounds = 1 AND cn.kind = 'commit' AND cn.id = c.node_id \
-                     AND r.kind = 'repo'{bounds} \
+                     AND r.kind = 'repo'{bounds}{tagged_where} \
                      RETURN c.node_id, c.hash, c.author_email, c.committed_at, c.subject, \
                      c.in_bounds, r.name ORDER BY c.committed_at"
                 ),
-                vec![],
+                params,
             )?
             .iter()
             .map(|r| glyphtrail_core::AtlasTimelineRow {
@@ -1436,17 +1459,69 @@ mod tests {
         }])
         .unwrap();
 
-        let rows = lb.atlas_timeline(None, None).unwrap();
+        let rows = lb.atlas_timeline(None, None, None).unwrap();
         check!(rows.len() == 1);
         check!(rows[0].repo == "myrepo");
         check!(rows[0].touched == 2);
         check!(rows[0].commit.hash == "deadbeef");
         // Out-of-window excludes it.
         check!(
-            lb.atlas_timeline(Some(1_600_000_001), None)
+            lb.atlas_timeline(Some(1_600_000_001), None, None)
                 .unwrap()
                 .is_empty()
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Atlas (#334): Tagged edges to Topic nodes drive `atlas_topics` counts and
+    // the timeline topic filter.
+    #[test]
+    fn atlas_topics_and_topic_filter() {
+        let dir = tmp_dir("atlas-topics");
+        let mut lb = LadybugStore::open(&dir).unwrap();
+        let kinded = |id: &str, name: &str, k: NodeKind| {
+            let mut n = node(id, name);
+            n.kind = k;
+            n
+        };
+        let edge = |src: &str, dst: &str, kind: EdgeKind| Edge {
+            src: NodeId(src.into()),
+            dst: NodeId(dst.into()),
+            kind,
+            confidence: Confidence::Inferred,
+        };
+        // Two commits in one repo; only c1 is tagged "parser".
+        lb.insert_graph(
+            &[
+                kinded("c1", "add parser", NodeKind::Commit),
+                kinded("c2", "tweak ui", NodeKind::Commit),
+                kinded("rp", "myrepo", NodeKind::Repo),
+                kinded("tp", "parser", NodeKind::Topic),
+            ],
+            &[
+                edge("c1", "rp", EdgeKind::PartOf),
+                edge("c2", "rp", EdgeKind::PartOf),
+                edge("c1", "tp", EdgeKind::Tagged),
+            ],
+        )
+        .unwrap();
+        let meta = |id: &str, at: i64| CommitMeta {
+            node_id: NodeId(id.into()),
+            hash: id.into(),
+            author_email: "me@x.dev".into(),
+            committed_at: at,
+            subject: id.into(),
+            in_bounds: true,
+        };
+        lb.set_commits(&[meta("c1", 1), meta("c2", 2)]).unwrap();
+
+        let topics = lb.atlas_topics().unwrap();
+        check!(topics == vec![("parser".to_string(), 1)]);
+        // The topic filter keeps only the tagged commit.
+        let rows = lb.atlas_timeline(None, None, Some("parser")).unwrap();
+        check!(rows.len() == 1 && rows[0].commit.hash == "c1");
+        // Unfiltered sees both.
+        check!(lb.atlas_timeline(None, None, None).unwrap().len() == 2);
         std::fs::remove_dir_all(&dir).ok();
     }
 
