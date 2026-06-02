@@ -54,6 +54,129 @@ pub struct AtlasTimelineRow {
     pub touched: u32,
 }
 
+/// How to filter an atlas timeline (#333/#335) — shared by the CLI and the MCP
+/// server so both gate identically.
+#[derive(Debug, Clone, Default)]
+pub struct TimelineQuery {
+    /// Restrict to one repo (registry name).
+    pub repo: Option<String>,
+    /// Substring (case-insensitive) the author email must contain; `None` scopes
+    /// to [`Self::me`].
+    pub author: Option<String>,
+    /// Who "I" am, for the default author scope.
+    pub me: MeConfig,
+    /// Include restricted repos — proprietary or unregistered (default-denied).
+    pub include_restricted: bool,
+    /// Cap how many rows are returned (most recent kept).
+    pub limit: usize,
+}
+
+/// A filtered timeline view: the kept rows (newest first, capped) plus the
+/// transparency counts the caller echoes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Timeline {
+    pub rows: Vec<AtlasTimelineRow>,
+    /// Matched the filters before the `limit` cap.
+    pub matched: usize,
+    /// Hidden because their repo is proprietary or no longer registered.
+    pub excluded_restricted: usize,
+    /// Hidden because the author didn't match.
+    pub excluded_author: usize,
+}
+
+/// Filter store-produced timeline rows by repo, visibility, and author, newest
+/// first, capped at `q.limit` (#333). Default-deny: a commit whose repo is
+/// proprietary OR has no registry entry (removed/renamed/stale) is excluded
+/// unless `include_restricted`. Visibility is resolved from the registry
+/// (authoritative, mutable via `repo set-visibility`).
+pub fn filter_timeline(
+    rows: Vec<AtlasTimelineRow>,
+    registry: &crate::registry::Registry,
+    q: &TimelineQuery,
+) -> Timeline {
+    let mut excluded_restricted = 0;
+    let mut excluded_author = 0;
+    let mut kept: Vec<AtlasTimelineRow> = Vec::new();
+    for row in rows {
+        if q.repo.as_ref().is_some_and(|name| &row.repo != name) {
+            continue;
+        }
+        let restricted = match registry.get(&row.repo).map(|e| e.visibility) {
+            Some(crate::registry::Visibility::Proprietary) | None => true,
+            Some(_) => false,
+        };
+        if restricted && !q.include_restricted {
+            excluded_restricted += 1;
+            continue;
+        }
+        if !author_matches(&q.author, &q.me, &row.commit.author_email) {
+            excluded_author += 1;
+            continue;
+        }
+        kept.push(row);
+    }
+    // Newest first, then cap.
+    kept.reverse();
+    let matched = kept.len();
+    kept.truncate(q.limit);
+    Timeline {
+        rows: kept,
+        matched,
+        excluded_restricted,
+        excluded_author,
+    }
+}
+
+/// Whether a commit's author passes the filter: an explicit substring
+/// (case-insensitive) wins; otherwise scope to me, falling back to everyone only
+/// when no `[me]` and no git email could be resolved.
+pub fn author_matches(explicit: &Option<String>, me: &MeConfig, email: &str) -> bool {
+    match explicit {
+        Some(sub) => email
+            .to_ascii_lowercase()
+            .contains(&sub.to_ascii_lowercase()),
+        None if me.is_set() => me.matches(email),
+        None => true,
+    }
+}
+
+/// A human label for the author scope of a timeline query.
+pub fn author_scope_label(q: &TimelineQuery) -> String {
+    match &q.author {
+        Some(a) => format!("author ~ {a}"),
+        None if q.me.is_set() => format!("mine ({})", q.me.display().unwrap_or_default()),
+        None => "anyone (no [me] configured)".to_string(),
+    }
+}
+
+/// The structured timeline value emitted by the CLI (`--json`/`--yaml`) and the
+/// MCP timeline tool, so both render identically.
+pub fn timeline_value(tl: &Timeline, window: &str, author_scope: &str) -> serde_json::Value {
+    let commits: Vec<_> = tl
+        .rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "date": format_date(r.commit.committed_at),
+                "committed_at": r.commit.committed_at,
+                "repo": r.repo,
+                "author": r.commit.author_email,
+                "subject": r.commit.subject,
+                "touched": r.touched,
+                "hash": r.commit.hash,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "window": window,
+        "author_scope": author_scope,
+        "shown": tl.rows.len(),
+        "matched": tl.matched,
+        "excluded": { "restricted": tl.excluded_restricted, "author": tl.excluded_author },
+        "commits": commits,
+    })
+}
+
 /// Format a unix-second timestamp as a `YYYY-MM-DD` UTC calendar date — the
 /// inverse of [`date_to_epoch`] (Howard Hinnant's `civil_from_days`), so the
 /// timeline reads dates back without a time-crate dependency.
@@ -192,6 +315,18 @@ impl Window {
     /// Whether any bound is set.
     pub fn is_set(&self) -> bool {
         self.earliest.is_some() || self.latest.is_some()
+    }
+
+    /// The window as `none` or `earliest..latest` (an open side prints empty).
+    pub fn label(&self) -> String {
+        match (&self.earliest, &self.latest) {
+            (None, None) => "none".to_string(),
+            (earliest, latest) => format!(
+                "{}..{}",
+                earliest.as_deref().unwrap_or(""),
+                latest.as_deref().unwrap_or("")
+            ),
+        }
     }
 
     /// The window as inclusive unix-second bounds (UTC): `earliest` at the start
@@ -353,6 +488,84 @@ mod tests {
         }
         // End-of-day still reads back as the same calendar date.
         check!(format_date(date_to_epoch("2020-07-15", true).unwrap()) == "2020-07-15");
+    }
+
+    #[test]
+    fn author_matches_explicit_substring_then_me_then_everyone() {
+        let me = MeConfig {
+            emails: vec!["ada@x.dev".into()],
+            domains: vec![],
+        };
+        // Explicit substring (case-insensitive) wins, ignoring me.
+        check!(author_matches(&Some("EVE".into()), &me, "eve@evil.dev"));
+        check!(!author_matches(&Some("eve".into()), &me, "ada@x.dev"));
+        // No author filter: scope to me.
+        check!(author_matches(&None, &me, "ada@x.dev"));
+        check!(!author_matches(&None, &me, "eve@evil.dev"));
+        // No author filter and no [me]: everyone passes.
+        check!(author_matches(&None, &MeConfig::default(), "anyone@here"));
+    }
+
+    #[test]
+    fn filter_timeline_default_denies_proprietary_and_unregistered() {
+        use crate::registry::{Registry, RegistryEntry, Visibility};
+        let row = |repo: &str, email: &str, at: i64| AtlasTimelineRow {
+            commit: CommitMeta {
+                node_id: NodeId(format!("{repo}-{at}")),
+                hash: "h".into(),
+                author_email: email.into(),
+                committed_at: at,
+                subject: "s".into(),
+                in_bounds: true,
+            },
+            repo: repo.into(),
+            touched: 1,
+        };
+        let entry = |name: &str, v: Visibility| RegistryEntry {
+            name: name.into(),
+            root: format!("/{name}").into(),
+            alt_roots: vec![],
+            missing_since: None,
+            ids: vec![],
+            contributors: vec![],
+            identity: None,
+            visibility: v,
+        };
+        let mut registry = Registry::default();
+        registry.repos.push(entry("pub", Visibility::Public));
+        registry.repos.push(entry("priv", Visibility::Private));
+        registry.repos.push(entry("prop", Visibility::Proprietary));
+        // As the store yields them: ascending by committed_at (oldest first).
+        let rows = vec![
+            row("ghost", "ada@x.dev", 0), // not in the registry
+            row("prop", "ada@x.dev", 1),
+            row("priv", "ada@x.dev", 2),
+            row("pub", "ada@x.dev", 3),
+        ];
+        let q = TimelineQuery {
+            me: MeConfig {
+                emails: vec!["ada@x.dev".into()],
+                domains: vec![],
+            },
+            limit: 10,
+            ..Default::default()
+        };
+        // Default-deny hides proprietary + unregistered; public + private show.
+        let tl = filter_timeline(rows.clone(), &registry, &q);
+        check!(tl.rows.len() == 2);
+        check!(tl.excluded_restricted == 2);
+        check!(tl.rows[0].repo == "pub"); // newest first
+        check!(tl.rows[1].repo == "priv");
+        // Opt-in includes them.
+        let tl = filter_timeline(
+            rows,
+            &registry,
+            &TimelineQuery {
+                include_restricted: true,
+                ..q
+            },
+        );
+        check!(tl.rows.len() == 4 && tl.excluded_restricted == 0);
     }
 
     #[test]

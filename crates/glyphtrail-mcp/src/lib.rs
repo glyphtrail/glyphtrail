@@ -8,6 +8,7 @@
 //! structure and API boundaries. The transport is hand-rolled on `serde_json`
 //! to keep the dependency surface small.
 
+mod atlas;
 mod tools;
 
 use std::io::{BufRead, Write};
@@ -33,6 +34,21 @@ const PROTOCOL_VERSION: &str = "2024-11-05";
 pub fn serve_stdio(repo: Option<PathBuf>) -> Result<()> {
     let repo = repo.or_else(tools::infer_cwd_repo);
     let default_db = repo.map(|r| RepoPaths::new(&r).db_path);
+    run_stdio(|msg| handle_request(default_db.as_deref(), msg))
+}
+
+/// Serve the MCP protocol over stdio pointed at the **atlas** store (#335):
+/// `glyphtrail atlas mcp`. Same transport, but the atlas recall tools
+/// (`atlas_timeline`/`atlas_status`/`atlas_resolve`) over `atlas_dir`'s store,
+/// not a per-repo graph.
+pub fn serve_atlas_stdio(atlas_dir: PathBuf) -> Result<()> {
+    run_stdio(|msg| handle_atlas_request(&atlas_dir, msg))
+}
+
+/// The newline-delimited JSON-RPC stdio loop, parameterised by the per-message
+/// handler so the per-repo and atlas servers share one transport. Runs until
+/// stdin reaches EOF.
+fn run_stdio(mut handle: impl FnMut(&Value) -> Option<Value>) -> Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut reader = stdin.lock();
@@ -48,7 +64,7 @@ pub fn serve_stdio(repo: Option<PathBuf>) -> Result<()> {
             continue;
         }
         let response = match serde_json::from_str::<Value>(trimmed) {
-            Ok(msg) => handle_request(default_db.as_deref(), &msg),
+            Ok(msg) => handle(&msg),
             // Malformed JSON: reply with a parse error and a null id (JSON-RPC).
             Err(e) => Some(error(Value::Null, -32700, &format!("parse error: {e}"))),
         };
@@ -58,6 +74,29 @@ pub fn serve_stdio(repo: Option<PathBuf>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Dispatch a JSON-RPC message for the atlas server: the shared lifecycle
+/// methods, with `tools/list` + `tools/call` routed to the atlas tool set.
+fn handle_atlas_request(atlas_dir: &Path, msg: &Value) -> Option<Value> {
+    let method = msg.get("method").and_then(Value::as_str)?;
+    let id = msg.get("id").cloned();
+    match method {
+        "initialize" => Some(success(id?, initialize_result())),
+        "ping" => Some(success(id?, json!({}))),
+        "tools/list" => Some(success(id?, json!({ "tools": atlas::definitions() }))),
+        "tools/call" => {
+            let id = id?;
+            let params = msg.get("params").cloned().unwrap_or(Value::Null);
+            let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+            let args = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            Some(success(id, atlas::call(atlas_dir, name, &args)))
+        }
+        _ => id.map(|id| error(id, -32601, &format!("method not found: {method}"))),
+    }
 }
 
 /// Dispatch a single JSON-RPC message. `default_db` is the server's launch
