@@ -114,7 +114,13 @@ over stdio, exposing the query / impact / outline / endpoint tools to an agent.
 Index the repo first (`glyphtrail analyze`), then register the server. Each agent
 wires up MCP servers differently:
 
-**Claude Code** (CLI) — add it to the current project:
+**Claude Code** (CLI) — add it to the system:
+
+```sh
+claude mcp add -s user glyphtrail -- glyphtrail mcp
+```
+
+or, if you prefer, to a specific repo only:
 
 ```sh
 claude mcp add glyphtrail -- glyphtrail mcp --repo .
