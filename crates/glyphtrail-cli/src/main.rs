@@ -136,7 +136,8 @@ enum Command {
         #[arg(long)]
         repo: Option<PathBuf>,
     },
-    /// Onboard coding agents: write the skill + CLAUDE.md/AGENTS.md section.
+    /// Onboard coding agents: write the skill + CLAUDE.md/AGENTS.md section (and,
+    /// for `--local` in a repo, gitignore the index).
     ///
     /// Choose a destination explicitly — `--local` (this repo) and/or `--user`
     /// (your home directory); a repo-local install lands in commits, so there's
@@ -152,8 +153,8 @@ enum Command {
         /// Write user-wide agent files into your home directory.
         #[arg(long, alias = "home")]
         user: bool,
-        /// Write the files even when `path` is not inside a git repository (--local).
-        #[arg(long)]
+        /// With --local, write even when `path` is not inside a git repository.
+        #[arg(long, requires = "local")]
         force: bool,
         /// Keep the local install out of VCS: gitignore the skill, skip the
         /// CLAUDE.md/AGENTS.md patch, and strip any section a prior run added.
