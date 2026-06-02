@@ -76,8 +76,14 @@ pub fn definitions(has_default_repo: bool) -> Vec<Value> {
         ),
         tool(
             "clients",
-            "List client-side API call sites.",
-            proto_arg,
+            "List client-side API call sites. With `unmatched: true`, list only \
+             the REST calls that link to no endpoint, with the reason (dynamic \
+             path, or no endpoint with that signature in scope) — each a \
+             candidate for a precise [[links]] endpoint hint.",
+            json!({
+                "protocol": { "type": "string", "enum": ["rest", "grpc", "graphql"] },
+                "unmatched": { "type": "boolean", "description": "Only REST calls that match no endpoint, with the reason." }
+            }),
             &[],
         ),
         tool(
@@ -305,6 +311,9 @@ fn dispatch(
             Ok(neighbors_json(&items))
         }
         "endpoints" => operations_list(&*store, NodeKind::Endpoint, args, true),
+        "clients" if args.get("unmatched").and_then(Value::as_bool) == Some(true) => {
+            unmatched_clients_json(&*store, args)
+        }
         "clients" => operations_list(&*store, NodeKind::ClientCall, args, false),
         "serves" => {
             let matched = matched_endpoints(&*store, args)?;
@@ -592,6 +601,64 @@ fn operations_list(
             None
         };
         out.push(operation_json(&key, node.as_ref(), handler));
+    }
+    Ok(Value::Array(out))
+}
+
+/// Whether a REST route signature has a concrete (non-parameter, non-empty) path
+/// segment; a call with none has a dynamic/unresolved path. Mirrors the federated
+/// web-matcher gate (#406) so the unmatched reason agrees with the matcher.
+fn has_literal_segment(signature: &str) -> bool {
+    signature
+        .rsplit('|')
+        .next()
+        .is_some_and(|path| path.split('/').any(|s| !s.is_empty() && s != "{}"))
+}
+
+/// REST client calls that link to no endpoint, with the reason (#421) — each a
+/// candidate for a precise `[[links]]` endpoint hint. `unmatched` = no outgoing
+/// INVOKES edge; the reason distinguishes a dynamic path from a simply-unmatched
+/// one. Honours the optional `protocol` filter.
+fn unmatched_clients_json(store: &dyn GraphStore, args: &Value) -> Result<Value, String> {
+    let proto = match opt_str(args, "protocol") {
+        Some(p) => Some(Protocol::parse(p).ok_or_else(|| format!("unknown protocol '{p}'"))?),
+        None => None,
+    };
+    let mut out = Vec::new();
+    for (id, key) in store
+        .operations_by_kind(NodeKind::ClientCall)
+        .map_err(err)?
+    {
+        if key.protocol != Protocol::Rest || proto.is_some_and(|p| key.protocol != p) {
+            continue;
+        }
+        if !store
+            .neighbors(&id.0, Some(EdgeKind::Invokes), true)
+            .map_err(err)?
+            .is_empty()
+        {
+            continue;
+        }
+        let node = store.get_node(&id.0).map_err(err)?;
+        let enclosing = store
+            .neighbors(&id.0, Some(EdgeKind::Calls), false)
+            .map_err(err)?
+            .into_iter()
+            .next()
+            .map(|(n, _, _)| n.qualified_name);
+        let reason = if has_literal_segment(&key.signature()) {
+            "no endpoint with this signature in scope"
+        } else {
+            "dynamic path (no literal segment to match)"
+        };
+        out.push(json!({
+            "method": key.method.map(|m| m.as_str().to_string()),
+            "path": key.path,
+            "file": node.as_ref().map(|n| n.file.clone()),
+            "line": node.as_ref().and_then(|n| n.span.map(|s| s.start_line)),
+            "enclosing": enclosing,
+            "reason": reason,
+        }));
     }
     Ok(Value::Array(out))
 }
