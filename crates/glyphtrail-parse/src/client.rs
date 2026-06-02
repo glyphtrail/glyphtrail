@@ -57,6 +57,31 @@ pub struct RawClientCall {
     pub span: Span,
 }
 
+/// Module-scope `const NAME = "literal"` string constants in a JS/TS/TSX file,
+/// for resolving client URLs built from an *imported* constant base at the
+/// analyze layer (#405). Empty for other languages and on parse failure.
+pub fn module_string_constants(source: &str, lang: &Language) -> Vec<(String, String)> {
+    if !matches!(
+        lang,
+        Language::JavaScript | Language::TypeScript | Language::Tsx
+    ) {
+        return Vec::new();
+    }
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&grammar(lang).expect("built-in grammar"))
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+    string_constants(tree.root_node(), source.as_bytes())
+        .into_iter()
+        .collect()
+}
+
 /// Extract client HTTP calls from `source`, dispatching by language. Returns
 /// empty on parse failure or for languages with no client extractor.
 pub fn extract_client_calls(source: &str, lang: &Language) -> Vec<RawClientCall> {
