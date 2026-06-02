@@ -654,6 +654,23 @@ impl GraphStore for LadybugStore {
         )
     }
 
+    fn remark_commit_bounds(&mut self, since: Option<i64>, until: Option<i64>) -> Result<()> {
+        // Inline the bounds (lbug caches a bound param's type by name across
+        // statements, so an INT64 param here would clash with STRING params
+        // elsewhere). Unbounded sides become the i64 extremes, which include
+        // every row.
+        let lo = since.unwrap_or(i64::MIN);
+        let hi = until.unwrap_or(i64::MAX);
+        self.run(
+            &format!(
+                "MATCH (c:Commit) SET c.in_bounds = \
+                 CASE WHEN c.committed_at >= {lo} AND c.committed_at <= {hi} THEN 1 ELSE 0 END"
+            ),
+            vec![],
+        )?;
+        Ok(())
+    }
+
     fn insert_pending(&mut self, links: &[PendingLink]) -> Result<()> {
         let conn = self.conn()?;
         let rows: Vec<Vec<(&str, Value)>> = links
@@ -1285,6 +1302,47 @@ mod tests {
         check!(lb.commits_in_range(None, None).unwrap().is_empty());
         // commit_count still sees the row — out-of-bounds is marked, not deleted.
         check!(lb.commit_count().unwrap() == 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Atlas (#331): narrowing the window re-marks stored commits in/out of bounds
+    // without deleting them, and widening brings them back.
+    #[test]
+    fn remark_commit_bounds_reflags_without_deleting() {
+        let dir = tmp_dir("atlas-remark");
+        let mut lb = LadybugStore::open(&dir).unwrap();
+        let mk = |id: &str, at: i64| {
+            let mut n = node(id, id);
+            n.kind = NodeKind::Commit;
+            (
+                n,
+                CommitMeta {
+                    node_id: NodeId(id.into()),
+                    hash: id.into(),
+                    author_email: "me@x.dev".into(),
+                    committed_at: at,
+                    subject: id.into(),
+                    in_bounds: true,
+                },
+            )
+        };
+        let (n_old, c_old) = mk("old", 1_000_000_000); // 2001
+        let (n_new, c_new) = mk("new", 1_700_000_000); // 2023
+        lb.insert_graph(&[n_old, n_new], &[]).unwrap();
+        lb.set_commits(&[c_old, c_new]).unwrap();
+        check!(lb.commits_in_range(None, None).unwrap().len() == 2);
+
+        // Narrow to >= 2015: the 2001 commit falls out of bounds (still counted).
+        lb.remark_commit_bounds(Some(1_420_070_400), None).unwrap();
+        let in_bounds = lb.commits_in_range(None, None).unwrap();
+        check!(in_bounds.len() == 1);
+        check!(in_bounds[0].node_id == NodeId("new".into()));
+        check!(lb.commit_count().unwrap() == 2);
+
+        // Widen back to unbounded: both are in bounds again.
+        lb.remark_commit_bounds(None, None).unwrap();
+        check!(lb.commits_in_range(None, None).unwrap().len() == 2);
 
         std::fs::remove_dir_all(&dir).ok();
     }
