@@ -2,6 +2,7 @@
 
 pub mod build;
 pub mod client;
+pub mod db_client;
 pub mod dynamic;
 pub mod extract;
 pub mod graphql;
@@ -22,6 +23,7 @@ pub use build::{
 #[allow(deprecated)]
 pub use client::module_string_constants;
 pub use client::{ModuleConsts, RawClientCall, extract_client_calls, module_constants};
+pub use db_client::{RawDbQuery, extract_db_queries};
 pub use dynamic::{DynamicGrammar, load_dynamic};
 pub use extract::{ParsedFile, parse_source, parse_with};
 pub use import_symbols::extract_import_symbols;
@@ -29,7 +31,7 @@ pub use imports::resolve_import;
 pub use rest::{
     RawEndpoint, RawMount, extract_axum, extract_axum_mounts, extract_utoipa, extract_utoipa_mounts,
 };
-pub use sql::{SqlTable, build_sql_graph, extract_sql_schema};
+pub use sql::{DbAccess, SqlTable, build_sql_graph, extract_query_access, extract_sql_schema};
 pub use ws::{RawWsConnect, RawWsEvent, WsEventKind, extract_ws_connections, extract_ws_events};
 
 #[cfg(test)]

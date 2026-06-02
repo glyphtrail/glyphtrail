@@ -123,6 +123,10 @@ pub enum EdgeKind {
     Exposes,
     /// A client call site invokes an API endpoint (cross web boundary).
     Invokes,
+    /// A function/method reads from a database table (a `SELECT`), #416 Phase B.
+    Reads,
+    /// A function/method writes a database table (`INSERT`/`UPDATE`/`DELETE`).
+    Writes,
     /// Atlas (#329): an author wrote a commit.
     Authored,
     /// Atlas: a raw author is an alias of a unified identity.
@@ -150,6 +154,8 @@ impl EdgeKind {
             EdgeKind::Mounts => "mounts",
             EdgeKind::Exposes => "exposes",
             EdgeKind::Invokes => "invokes",
+            EdgeKind::Reads => "reads",
+            EdgeKind::Writes => "writes",
             EdgeKind::Authored => "authored",
             EdgeKind::AliasOf => "alias_of",
             EdgeKind::Touched => "touched",

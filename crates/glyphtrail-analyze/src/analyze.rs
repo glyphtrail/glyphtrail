@@ -161,6 +161,21 @@ struct FileOutput {
     /// `(file, name, referenced key)` constant references (`const X = OBJ.PROP`,
     /// object props naming another const), for the Angular `environment` chain.
     const_refs: Vec<(String, String, String)>,
+    /// `(enclosing fn id, access, table name)` embedded-query accesses (#416 B);
+    /// the table name is resolved to `Table` node(s) after the global parse.
+    db_accesses: Vec<(NodeId, glyphtrail_parse::DbAccess, String)>,
+}
+
+/// The innermost function/method node whose span contains `byte`, for attributing
+/// an embedded query to the routine that runs it (#416 Phase B).
+fn enclosing_fn(nodes: &[Node], byte: usize) -> Option<NodeId> {
+    nodes
+        .iter()
+        .filter(|n| matches!(n.kind, NodeKind::Function | NodeKind::Method))
+        .filter_map(|n| n.span.map(|s| (n, s)))
+        .filter(|(_, s)| s.start_byte <= byte && byte < s.end_byte)
+        .min_by_key(|(_, s)| s.end_byte - s.start_byte)
+        .map(|(n, _)| n.id.clone())
 }
 
 /// Parse one discovered file and build its graph fragment + side lists. Pure and
@@ -184,6 +199,7 @@ fn parse_file(
         import_symbols: Vec::new(),
         string_consts: Vec::new(),
         const_refs: Vec::new(),
+        db_accesses: Vec::new(),
     };
 
     // SQL schema/migration file (#416): the DDL extractor produces table/column
@@ -327,6 +343,16 @@ fn parse_file(
     out.graph.extend(fg.graph);
     for e in enclosing_edges {
         out.graph.add_edge(e.src, e.dst, e.kind, e.confidence);
+    }
+    // Embedded DB queries (sqlx) → the enclosing function reads/writes a table
+    // (#416 Phase B). The function is resolved now (same file); the table name is
+    // matched to `Table` node(s) after the global parse.
+    for q in glyphtrail_parse::extract_db_queries(&source, language) {
+        if let Some(fn_id) = enclosing_fn(&out.graph.nodes, q.byte) {
+            for (access, table) in q.accesses {
+                out.db_accesses.push((fn_id.clone(), access, table));
+            }
+        }
     }
     out.pending.extend(fg.pending);
     out.imports.extend(
@@ -1096,7 +1122,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 7: constant resolution follows the Angular `environment` chain — a member
 /// alias of an imported config object's string property (#405) — so those
 /// frontend indexes rebuild to fold the common environment-base URL pattern.
-const ANALYSIS_REVISION: u32 = 8;
+const ANALYSIS_REVISION: u32 = 9;
 
 /// Fingerprint of everything that determines analysis output: the crate
 /// version, the manual revision counter, and the built-in tree-sitter query
@@ -1634,6 +1660,9 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
     let mut string_consts: Vec<(String, String, String)> = Vec::new();
     // (file, name, referenced key) constant references for the same.
     let mut const_refs: Vec<(String, String, String)> = Vec::new();
+    // (enclosing fn id, access, table name) embedded-query accesses (#416 B),
+    // resolved to Table nodes by name after the parse.
+    let mut db_accesses: Vec<(NodeId, glyphtrail_parse::DbAccess, String)> = Vec::new();
 
     // Pre-resolve dynamic-language grammars once (sequential; warns once per
     // missing grammar) so the parallel parse can read them immutably.
@@ -1680,6 +1709,52 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
         import_symbols.extend(out.import_symbols);
         string_consts.extend(out.string_consts);
         const_refs.extend(out.const_refs);
+        db_accesses.extend(out.db_accesses);
+    }
+
+    // Resolve embedded-query accesses (#416 Phase B): match each query's table
+    // name to the `Table` node(s) parsed this pass and add a `Reads`/`Writes`
+    // edge from the enclosing function. Matching is by normalized name, qualified
+    // or bare (`users` matches `public.users`). A reference with no matching table
+    // in this pass is dropped (best-effort; cross-pass resolution is a follow-up).
+    let mut db_edges: Vec<Edge> = Vec::new();
+    if !db_accesses.is_empty() {
+        let mut tables_by_name: HashMap<String, Vec<NodeId>> = HashMap::new();
+        for n in &graph.nodes {
+            if n.kind == NodeKind::Table {
+                tables_by_name
+                    .entry(n.qualified_name.clone())
+                    .or_default()
+                    .push(n.id.clone());
+                if let Some(bare) = n.qualified_name.rsplit('.').next()
+                    && bare != n.qualified_name
+                {
+                    tables_by_name
+                        .entry(bare.to_string())
+                        .or_default()
+                        .push(n.id.clone());
+                }
+            }
+        }
+        for (fn_id, access, table) in &db_accesses {
+            let targets = tables_by_name
+                .get(table)
+                .or_else(|| table.rsplit('.').next().and_then(|b| tables_by_name.get(b)));
+            if let Some(ids) = targets {
+                let kind = match access {
+                    glyphtrail_parse::DbAccess::Read => EdgeKind::Reads,
+                    glyphtrail_parse::DbAccess::Write => EdgeKind::Writes,
+                };
+                for tid in ids {
+                    db_edges.push(Edge {
+                        src: fn_id.clone(),
+                        dst: tid.clone(),
+                        kind,
+                        confidence: Confidence::Inferred,
+                    });
+                }
+            }
+        }
     }
 
     let resolve_progress = resolve_bar();
@@ -1932,6 +2007,8 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
         })
         .collect();
     persist_edges(&mut *store, &mut seen, &inferred, fresh)?;
+    // Code↔DB Reads/Writes edges (#416 Phase B), resolved above to Table nodes.
+    persist_edges(&mut *store, &mut seen, &db_edges, fresh)?;
     resolve_progress.inc(1);
 
     // Rebuild IMPORTS edges from the resolved import set: real file targets
@@ -2834,6 +2911,46 @@ mod tests {
             widget.exports.iter().map(|e| &e.name).collect::<Vec<_>>()
         );
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // #416 Phase B: a sqlx query in a function links to the SQL table it reads,
+    // so a table change can reach the code that touches it.
+    #[test]
+    fn analyze_links_sqlx_query_to_its_table() {
+        let dir = temp_repo("sqlx-link");
+        std::fs::create_dir_all(dir.join("db")).unwrap();
+        std::fs::write(
+            dir.join("db/schema.sql"),
+            "CREATE TABLE users (id int, email text);\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("src/repo.rs"),
+            "pub async fn load_user(db: &Pool) { \
+             sqlx::query_as!(User, \"SELECT id FROM users WHERE id = $1\", x).fetch_one(db).await.unwrap(); }\n",
+        )
+        .unwrap();
+        run(&dir, false).unwrap();
+
+        let store = LadybugStore::open(&RepoPaths::new(&dir).index_dir.join("ladybug")).unwrap();
+        let f = store
+            .find_by_name("load_user")
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("function indexed");
+        let reads = store
+            .neighbors(&f.id.0, Some(EdgeKind::Reads), true)
+            .unwrap();
+        check!(
+            reads
+                .iter()
+                .any(|(n, _, _)| n.kind == NodeKind::Table && n.name == "users"),
+            "expected a Reads edge to the users table, got {:?}",
+            reads.iter().map(|(n, _, _)| &n.name).collect::<Vec<_>>()
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
