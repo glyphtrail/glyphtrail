@@ -70,40 +70,18 @@ struct ResolvedHint {
     to_endpoint: Option<String>,
 }
 
-/// Resolve a hint side's `repo` to a registry name. `None`/`"."` is the
-/// declaring repo; a `./` or `../` (or absolute) value is a **path** relative to
-/// the declaring repo's root, mapped to the registered repo at that location (so
-/// a link can name a repo by its more-expressive path, distinct from a slashed
-/// registry name like a GitLab `group/subgroup/repo`); anything else is a name.
-/// An unresolvable path is kept verbatim (best-effort).
+/// Resolve a hint side's `repo` to a registry name for federation: the shared
+/// resolver ([`glyphtrail_core::resolved_link_repo`]), falling back to the value
+/// verbatim when it names no registered repo (best-effort; the link tooling
+/// instead reports such a value as a dead link, #418).
 fn resolve_link_repo(
     repo: &Option<String>,
     owner_name: &str,
     owner_root: &Path,
     registry: &Registry,
 ) -> String {
-    match repo.as_deref() {
-        None | Some(".") => owner_name.to_string(),
-        Some(r) if is_path_ref(r) => owner_root
-            .join(r)
-            .canonicalize()
-            .ok()
-            .and_then(|abs| {
-                registry.repos.iter().find(|e| {
-                    e.roots()
-                        .any(|root| root.canonicalize().map(|c| c == abs).unwrap_or(false))
-                })
-            })
-            .map(|e| e.name.clone())
-            .unwrap_or_else(|| r.to_string()),
-        Some(r) => r.to_string(),
-    }
-}
-
-/// Whether a link `repo` value is a filesystem path (`./`, `../`, or absolute)
-/// rather than a registry name.
-fn is_path_ref(repo: &str) -> bool {
-    repo.starts_with("./") || repo.starts_with("../") || Path::new(repo).is_absolute()
+    glyphtrail_core::resolved_link_repo(repo, owner_name, owner_root, registry)
+        .unwrap_or_else(|| repo.clone().unwrap_or_else(|| owner_name.to_string()))
 }
 
 /// The node ids one side of a precise hint refers to: a `symbol` matched by name
@@ -766,16 +744,6 @@ mod tests {
         check!(ids == vec![NodeId("ep".into())]);
 
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn is_path_ref_distinguishes_paths_from_names() {
-        check!(is_path_ref("./mmh/web"));
-        check!(is_path_ref("../web"));
-        check!(is_path_ref("/abs/web"));
-        check!(!is_path_ref("backend"));
-        // A slashed *name* (e.g. a GitLab nested repo) is not a path.
-        check!(!is_path_ref("group/subgroup/repo"));
     }
 
     #[test]

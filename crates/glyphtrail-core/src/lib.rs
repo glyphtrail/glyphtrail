@@ -48,7 +48,7 @@ pub use impact::{
     compute_impact, edge_rules, is_cross_boundary_path, parse_confidence,
 };
 pub use lang::Language;
-pub use link_hints::{LinkEnd, LinkHint, LinkHints};
+pub use link_hints::{LinkEnd, LinkHint, LinkHints, is_path_ref, resolved_link_repo};
 pub use links::{CrossRepoLink, LinkKind, RepoIdentity, imported_symbols, resolve_links};
 pub use manifest::{
     CargoDependency, CargoPackage, DepKind, DepSource, manifest_repository, parse_cargo_manifest,
