@@ -382,9 +382,10 @@ pub fn extract_query_access(sql: &str) -> Vec<(DbAccess, String)> {
 
 /// 1-based line number of `byte` in `source`.
 fn line_of(source: &str, byte: usize) -> usize {
-    source[..byte.min(source.len())]
-        .bytes()
-        .filter(|&b| b == b'\n')
+    let end = byte.min(source.len());
+    source.as_bytes()[..end]
+        .iter()
+        .filter(|&&b| b == b'\n')
         .count()
         + 1
 }

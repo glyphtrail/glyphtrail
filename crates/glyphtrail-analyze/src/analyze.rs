@@ -1744,7 +1744,20 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
     if !db_accesses.is_empty() {
         // A JPA repository/JPQL access names an entity; map it to that entity's
         // table before matching (a native query / sqlx already names the table).
-        let entity_to_table: HashMap<String, String> = entity_tables.into_iter().collect();
+        // Two entities with the same simple name (different packages) mapping to
+        // different tables is ambiguous — drop the mapping so we don't link to the
+        // wrong one (the access then falls back to a literal table-name match).
+        let mut entity_to_table: HashMap<String, Option<String>> = HashMap::new();
+        for (entity, table) in entity_tables {
+            entity_to_table
+                .entry(entity)
+                .and_modify(|v| {
+                    if v.as_deref() != Some(table.as_str()) {
+                        *v = None;
+                    }
+                })
+                .or_insert(Some(table));
+        }
         let mut tables_by_name: HashMap<String, Vec<NodeId>> = HashMap::new();
         for n in &graph.nodes {
             if n.kind == NodeKind::Table {
@@ -1763,8 +1776,12 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
             }
         }
         for (fn_id, access, ref_name) in &db_accesses {
-            // Map an entity ref to its table, else use the name as-is (a table).
-            let table = entity_to_table.get(ref_name).unwrap_or(ref_name);
+            // Map an entity ref to its table (unique mappings only), else use the
+            // name as-is (a native/sqlx table, or an ambiguous entity name).
+            let table = match entity_to_table.get(ref_name) {
+                Some(Some(t)) => t,
+                _ => ref_name,
+            };
             let targets = tables_by_name
                 .get(table)
                 .or_else(|| table.rsplit('.').next().and_then(|b| tables_by_name.get(b)));

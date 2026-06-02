@@ -99,6 +99,7 @@ pub fn extract_jpa(rel_path: &str, file_id: &NodeId, source: &str, lang: &Langua
                     &entity.table_name,
                     &table_norm,
                     rel_path,
+                    entity.byte,
                     line,
                 );
                 for col in &entity.columns {
@@ -131,10 +132,12 @@ struct Entity {
 /// Parse a `class_declaration` as a JPA entity, or `None` if it isn't `@Entity`.
 fn extract_entity(class: Node, src: &[u8]) -> Option<Entity> {
     let mods = modifiers_of(class)?;
-    find_annotation(mods, "Entity", src)?;
+    let entity_anno = find_annotation(mods, "Entity", src)?;
     let name_node = class.child_by_field_name("name")?;
-    let entity_name = text(name_node, src);
-    // Table name: @Table(name="…") wins, else the class name.
+    let class_name = text(name_node, src);
+    // Entity name (what JPQL/repos reference): @Entity(name="…") overrides the class.
+    let entity_name = anno_string(entity_anno, "name", src).unwrap_or_else(|| class_name.clone());
+    // Table name: @Table(name="…") wins, else the entity name (Hibernate default).
     let table_name = find_annotation(mods, "Table", src)
         .and_then(|t| anno_string(t, "name", src))
         .unwrap_or_else(|| entity_name.clone());
@@ -357,15 +360,18 @@ fn text(node: Node, src: &[u8]) -> String {
     node.utf8_text(src).unwrap_or("").to_string()
 }
 
+/// 1-based line of `byte`, counting newlines over raw bytes so a non-char-boundary
+/// offset (tree-sitter offsets can land inside a multibyte character) never panics.
 fn line_of(source: &str, byte: usize) -> usize {
-    source[..byte.min(source.len())]
-        .bytes()
-        .filter(|&b| b == b'\n')
+    let end = byte.min(source.len());
+    source.as_bytes()[..end]
+        .iter()
+        .filter(|&&b| b == b'\n')
         .count()
         + 1
 }
 
-/// Add a `Table` node for a JPA entity (its location is the class declaration)
+/// Add a `Table` node for a JPA entity (located at its class declaration `byte`)
 /// plus the `file → table` containment edge. File-scoped id, matching the `.sql`
 /// scheme so the same table name across sources resolves by name in analyze.
 #[allow(clippy::too_many_arguments)]
@@ -376,6 +382,7 @@ fn add_table(
     display: &str,
     table_norm: &str,
     rel_path: &str,
+    byte: usize,
     line: usize,
 ) {
     graph.add_node(GraphNode {
@@ -386,8 +393,8 @@ fn add_table(
         file: rel_path.to_string(),
         language: Some("java".to_string()),
         span: Some(glyphtrail_core::Span {
-            start_byte: 0,
-            end_byte: 0,
+            start_byte: byte,
+            end_byte: byte,
             start_line: line,
             end_line: line,
         }),
@@ -477,6 +484,13 @@ mod tests {
     fn entity_without_table_annotation_uses_class_name() {
         let e = extract("@Entity class Org { Long id; }");
         check!(e.entity_tables == vec![("org".to_string(), "org".to_string())]);
+    }
+
+    #[test]
+    fn entity_name_override_is_used_for_jpql_mapping() {
+        // @Entity(name="Acct") sets the JPQL entity name; the table defaults to it.
+        let e = extract("@Entity(name = \"Acct\") class AccountEntity { Long id; }");
+        check!(e.entity_tables == vec![("acct".to_string(), "acct".to_string())]);
     }
 
     fn refs(e: &JpaExtract) -> Vec<(DbAccess, String)> {
