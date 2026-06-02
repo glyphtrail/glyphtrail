@@ -26,7 +26,7 @@ use rayon::prelude::*;
 
 /// Number of labeled stages in the reference-resolution phase, used as the
 /// length of [`resolve_bar`]. Keep in sync with the `stage(...)` calls in `run`.
-const RESOLVE_STAGES: u64 = 10;
+const RESOLVE_STAGES: u64 = 11;
 
 /// Worker-thread stack for the parallel parse pool. AST extraction recurses, and
 /// a deeply nested file overflows the default (~2MB) worker stack on a large
@@ -152,6 +152,9 @@ struct FileOutput {
     /// `(file, local symbol, module, language)` for symbol-level import
     /// resolution — links an imported router variable to its defining file (#167).
     import_symbols: Vec<(String, String, String, String)>,
+    /// `(file, name, value)` module-scope string constants, so a client URL built
+    /// from an *imported* constant base resolves to a concrete path (#405).
+    string_consts: Vec<(String, String, String)>,
 }
 
 /// Parse one discovered file and build its graph fragment + side lists. Pure and
@@ -173,6 +176,7 @@ fn parse_file(
         pending: Vec::new(),
         imports: Vec::new(),
         import_symbols: Vec::new(),
+        string_consts: Vec::new(),
     };
 
     // Sensitive record-only file (#136): record that it exists, never read it.
@@ -298,6 +302,11 @@ fn parse_file(
         glyphtrail_parse::extract_import_symbols(&source, language)
             .into_iter()
             .map(|(sym, module)| (f.rel_path.clone(), sym, module, language.name().to_string())),
+    );
+    out.string_consts.extend(
+        glyphtrail_parse::module_string_constants(&source, language)
+            .into_iter()
+            .map(|(name, value)| (f.rel_path.clone(), name, value)),
     );
     Some(out)
 }
@@ -1020,7 +1029,10 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 5: JS/TS client extraction gained `inject(HttpClient)`, `HttpClient.request`,
 /// and same-file const/concatenation URL folding (#404/#405), so existing
 /// frontend indexes rebuild to surface the additional client calls.
-const ANALYSIS_REVISION: u32 = 5;
+/// 6: client-call URLs built from an *imported* constant base are resolved
+/// cross-file at analyze time (#405), so existing frontend indexes rebuild to
+/// fold those paths to concrete, matchable routes.
+const ANALYSIS_REVISION: u32 = 6;
 
 /// Fingerprint of everything that determines analysis output: the crate
 /// version, the manual revision counter, and the built-in tree-sitter query
@@ -1554,6 +1566,8 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
     let mut imports: Vec<(String, String, String)> = Vec::new();
     // (file, local symbol, module, language) for symbol→file resolution (#167).
     let mut import_symbols: Vec<(String, String, String, String)> = Vec::new();
+    // (file, name, value) module-scope string constants for client-URL folding (#405).
+    let mut string_consts: Vec<(String, String, String)> = Vec::new();
 
     // Pre-resolve dynamic-language grammars once (sequential; warns once per
     // missing grammar) so the parallel parse can read them immutably.
@@ -1598,6 +1612,7 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
         pending.extend(out.pending);
         imports.extend(out.imports);
         import_symbols.extend(out.import_symbols);
+        string_consts.extend(out.string_consts);
     }
 
     let resolve_progress = resolve_bar();
@@ -1720,6 +1735,37 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
             symbol_file.insert((file.clone(), symbol.clone()), target);
         }
     }
+
+    // Resolve imported string constants in client-call URLs (#405): a path like
+    // `${API_BASE}/x`, whose `API_BASE` is imported from a constants module,
+    // folds to the concrete value and re-normalizes to a path that can match a
+    // route. Same-file constants were already folded at parse time (#404).
+    stage("resolving client URL constants");
+    let mut consts_by_file: HashMap<&str, HashMap<&str, &str>> = HashMap::new();
+    for (file, name, value) in &string_consts {
+        consts_by_file
+            .entry(file.as_str())
+            .or_default()
+            .insert(name.as_str(), value.as_str());
+    }
+    let mut rewritten: Vec<(NodeId, OperationKey)> = Vec::new();
+    for (id, key) in store.operations_by_kind(NodeKind::ClientCall)? {
+        if key.protocol != Protocol::Rest || !key.path.contains("${") {
+            continue;
+        }
+        let Some(method) = key.method else { continue };
+        let Some(file) = store.get_node(&id.0)?.map(|n| n.file) else {
+            continue;
+        };
+        let resolved = resolve_path_constants(&key.path, &file, &symbol_file, &consts_by_file);
+        if resolved != key.path {
+            rewritten.push((id, OperationKey::rest(method, &resolved)));
+        }
+    }
+    if !rewritten.is_empty() {
+        store.insert_operations(&rewritten)?;
+    }
+    resolve_progress.inc(1);
 
     let mut resolved_imports: Vec<(String, String, Option<String>)> = Vec::new();
     let mut import_map: HashMap<String, HashSet<String>> = HashMap::new();
@@ -1994,6 +2040,77 @@ fn dynamic_grammar<'a>(
     cache.get(name).and_then(|o| o.as_ref())
 }
 
+/// Substitute resolvable `${NAME}` constants in a client URL path (#405): a
+/// same-file const, or one imported into `file` (via `symbol_file`) whose value
+/// is known in its defining file (`consts_by_file`). Unknown interpolations are
+/// left verbatim so they collapse to a dynamic segment as before.
+fn resolve_path_constants(
+    path: &str,
+    file: &str,
+    symbol_file: &HashMap<(String, String), String>,
+    consts_by_file: &HashMap<&str, HashMap<&str, &str>>,
+) -> String {
+    let mut out = String::new();
+    let mut rest = path;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = matching_brace(after) else {
+            out.push_str(&rest[start..]); // unterminated `${` — keep verbatim
+            return out;
+        };
+        let name = &after[..end];
+        let value = is_ident(name)
+            .then(|| {
+                // Same-file const first, then one imported into this file.
+                consts_by_file
+                    .get(file)
+                    .and_then(|m| m.get(name).copied())
+                    .or_else(|| {
+                        symbol_file
+                            .get(&(file.to_string(), name.to_string()))
+                            .and_then(|def| consts_by_file.get(def.as_str()))
+                            .and_then(|m| m.get(name).copied())
+                    })
+            })
+            .flatten();
+        match value {
+            Some(v) => out.push_str(v),
+            None => {
+                out.push_str("${");
+                out.push_str(name);
+                out.push('}');
+            }
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Whether `s` is a single JS identifier (so `${expr}` with a member access or
+/// call is left alone, only a bare constant name is substituted).
+fn is_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+
+/// Byte index of the `}` that closes a `${`, balancing nested braces (so
+/// `${foo({a: 1})}` is treated as one interpolation, not split at the inner `}`).
+fn matching_brace(s: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, c) in s.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' if depth == 0 => return Some(i),
+            '}' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Pick the repository file an import resolves to: an exact path match first,
 /// then a *unique* path-suffix match (so source roots like `src/` resolve),
 /// else `None`. Ambiguous suffix matches are left unresolved on purpose.
@@ -2202,6 +2319,39 @@ mod tests {
     use super::*;
     use assert2::check;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    // #405: imported (and same-file) string constants fold into a client URL,
+    // and the result re-normalizes to a concrete, matchable path.
+    #[test]
+    fn resolve_path_constants_folds_imported_and_same_file() {
+        let symbol_file = HashMap::from([(
+            ("svc.ts".to_string(), "API_BASE".to_string()),
+            "config.ts".to_string(),
+        )]);
+        let consts_by_file = HashMap::from([
+            ("config.ts", HashMap::from([("API_BASE", "https://h/api")])),
+            ("svc.ts", HashMap::from([("LOCAL", "/local")])),
+        ]);
+        let r = |p: &str| resolve_path_constants(p, "svc.ts", &symbol_file, &consts_by_file);
+        // Imported base folds; same-file const folds.
+        check!(r("/${API_BASE}/users") == "/https://h/api/users");
+        check!(r("${LOCAL}/x") == "/local/x");
+        // Unknown name and non-identifier interpolations stay verbatim.
+        check!(r("/${UNKNOWN}/x") == "/${UNKNOWN}/x");
+        check!(r("/${this.base}/x") == "/${this.base}/x");
+        // A nested-brace interpolation is balanced, not split at the inner `}`.
+        check!(r("/${foo({a:1})}/x") == "/${foo({a:1})}/x");
+        // The folded full-URL value re-normalizes to a concrete route signature.
+        let key = OperationKey::rest(
+            glyphtrail_core::HttpMethod::Get,
+            &r("/${API_BASE}/users/${id}"),
+        );
+        check!(key.path == "/api/users/${id}");
+        check!(
+            OperationKey::rest(glyphtrail_core::HttpMethod::Get, "/api/users/{id}").signature()
+                == key.signature()
+        );
+    }
 
     fn temp_repo(tag: &str) -> std::path::PathBuf {
         let nanos = SystemTime::now()
