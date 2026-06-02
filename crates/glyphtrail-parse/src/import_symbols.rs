@@ -32,6 +32,13 @@ pub fn extract_import_symbols(source: &str, lang: &Language) -> Vec<(String, Str
                 }
             });
         }
+        Language::Java => {
+            walk(tree.root_node(), &mut |n| {
+                if n.kind() == "import_declaration" {
+                    java_static_import(n, src, &mut out);
+                }
+            });
+        }
         _ => {}
     }
     out
@@ -150,6 +157,31 @@ fn py_from_import(n: Node, src: &[u8], out: &mut Vec<(String, String)>) {
     }
 }
 
+/// `import static pkg.Class.method;` -> `(method, "pkg.Class")` so an unqualified
+/// `method()` call can resolve to the declaring class's file (#395). Non-static
+/// imports name a type (handled by the module-level extractor), and static
+/// wildcards (`import static pkg.Class.*;`) name no specific symbol, so both are
+/// skipped here.
+fn java_static_import(n: Node, src: &[u8], out: &mut Vec<(String, String)>) {
+    let mut cursor = n.walk();
+    let children: Vec<Node> = n.children(&mut cursor).collect();
+    let is_static = children.iter().any(|c| c.kind() == "static");
+    let is_wildcard = children.iter().any(|c| c.kind() == "asterisk");
+    if !is_static || is_wildcard {
+        return;
+    }
+    let Some(scoped) = children.iter().find(|c| c.kind() == "scoped_identifier") else {
+        return;
+    };
+    let full = text(*scoped, src); // `pkg.Class.method`
+    if let Some((module, symbol)) = full.rsplit_once('.')
+        && !module.is_empty()
+        && !symbol.is_empty()
+    {
+        out.push((symbol.to_string(), module.to_string()));
+    }
+}
+
 fn text(n: Node, src: &[u8]) -> String {
     n.utf8_text(src).unwrap_or("").to_string()
 }
@@ -200,6 +232,18 @@ mod tests {
         check!(got.contains(&("b".into(), ".api".into())));
         // Plain `import os` is not a from-import; not captured here.
         check!(!got.iter().any(|(s, _)| s == "os"));
+    }
+
+    #[test]
+    fn java_static_imports() {
+        let src = "package app;\n\
+                   import static util.MathUtil.square;\n\
+                   import util.Other;\n\
+                   import static util.MathUtil.*;\n";
+        let got = extract_import_symbols(src, &Language::Java);
+        // The static single-member import binds `square` from `util.MathUtil`.
+        check!(got == vec![("square".to_string(), "util.MathUtil".to_string())]);
+        // A plain type import and a static wildcard contribute no symbol here.
     }
 
     #[test]
