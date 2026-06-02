@@ -3065,22 +3065,39 @@ mod tests {
     #[test]
     fn java_static_import_unqualified_call_resolves() {
         let dir = temp_repo("java-static-import");
+        // Two `square` definitions in package-aligned directories force the
+        // ambiguous-name path (no `[one]` fast-path), so resolution must use the
+        // static-import tier to pick the right one.
+        std::fs::create_dir_all(dir.join("util")).unwrap();
+        std::fs::create_dir_all(dir.join("other")).unwrap();
+        std::fs::create_dir_all(dir.join("app")).unwrap();
         std::fs::write(
-            dir.join("MathUtil.java"),
+            dir.join("util/MathUtil.java"),
             "package util;\npublic class MathUtil {\n  public static int square(int x) { return x * x; }\n}\n",
         )
         .unwrap();
         std::fs::write(
-            dir.join("Calc.java"),
+            dir.join("other/OtherUtil.java"),
+            "package other;\npublic class OtherUtil {\n  public static int square(int x) { return x + x; }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("app/Calc.java"),
             "package app;\nimport static util.MathUtil.square;\n\
              public class Calc {\n  public int run(int n) { return square(n); }\n}\n",
         )
         .unwrap();
         run(&dir, false).unwrap();
 
+        // The call resolves to the statically-imported `util.MathUtil.square`,
+        // not the same-named `other.OtherUtil.square`.
         check!(
-            callers_of_def_in(&dir, "square", "MathUtil.java").contains(&"run".to_string()),
-            "run() should resolve to the static-imported square in MathUtil.java"
+            callers_of_def_in(&dir, "square", "util/MathUtil.java").contains(&"run".to_string()),
+            "run() should resolve to the static-imported square in util/MathUtil.java"
+        );
+        check!(
+            callers_of_def_in(&dir, "square", "other/OtherUtil.java").is_empty(),
+            "the un-imported square in other/OtherUtil.java should have no caller"
         );
 
         std::fs::remove_dir_all(&dir).ok();
