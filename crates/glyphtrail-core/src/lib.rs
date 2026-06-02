@@ -43,9 +43,10 @@ pub use identity::{
     PackageIdentity,
 };
 pub use impact::{
-    Adjacency, ClassifiedItem, CrateLevelHit, Direction, EdgeRule, FederatedReport, ImpactClass,
-    ImpactItem, ImpactLevel, ImpactPolicy, ImpactReport, ImpactSummary, RepoImpact, classify,
-    compute_impact, edge_rules, is_cross_boundary_path, parse_confidence,
+    Adjacency, ClassifiedItem, CrateLevelHit, Direction, EdgeRule, FederatedDiagnostics,
+    FederatedReport, ImpactClass, ImpactItem, ImpactLevel, ImpactPolicy, ImpactReport,
+    ImpactSummary, RepoImpact, SkippedRepo, classify, compute_impact, edge_rules,
+    is_cross_boundary_path, parse_confidence,
 };
 pub use lang::Language;
 pub use link_hints::{

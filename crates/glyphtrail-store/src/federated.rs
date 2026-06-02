@@ -14,11 +14,12 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow, bail};
 use glyphtrail_core::config::{Config, RepoPaths};
 use glyphtrail_core::{
-    Adjacency, ClassifiedItem, Confidence, CrateLevelHit, FederatedAdjacency, FederatedReport,
-    Groups, HttpMethod, ImpactPolicy, IndexedPackage, META_EXTERNAL_USES, META_PACKAGES, NodeId,
-    NodeKind, PackageIdentity, Protocol, Registry, RepoHealth, RepoIdentity, RepoImpact, classify,
-    compute_impact, default_groups_path, default_registry_path, is_cross_boundary_path,
-    path_signature, qualify, resolve_links, unqualify,
+    Adjacency, ClassifiedItem, Confidence, CrateLevelHit, FederatedAdjacency, FederatedDiagnostics,
+    FederatedReport, Groups, HttpMethod, ImpactPolicy, IndexedPackage, META_EXTERNAL_USES,
+    META_PACKAGES, NodeId, NodeKind, PackageIdentity, Protocol, Registry, RepoHealth, RepoIdentity,
+    RepoImpact, SkippedRepo, classify, compute_impact, count_unresolved_links, default_groups_path,
+    default_registry_path, is_cross_boundary_path, path_signature, qualify, resolve_links,
+    unqualify,
 };
 
 use crate::{ChangeSpec, GraphStore, LadybugStore, changed_files, seed_nodes};
@@ -400,6 +401,10 @@ pub fn federated_impact(
     // `from` (consumer) depends on `to` (producer) — changing `to` impacts
     // `from` — and a side's repo defaults to the declaring repo (".").
     let mut hints: Vec<ResolvedHint> = Vec::new();
+    // Diagnostics (#419): how many declared hints fed the graph, and how many
+    // have a dead side (so a `0 downstream` can name an unresolved hint).
+    let mut hints_total = 0usize;
+    let mut hints_unresolved = 0usize;
     for name in &names {
         if let Some(entry) = registry.get(name) {
             // Links live in the repo's unified config (`glyphtrail.toml` +
@@ -408,6 +413,11 @@ pub fn federated_impact(
             let links = Config::load(owner_root)
                 .map(|c| c.links)
                 .unwrap_or_default();
+            hints_total += links.len();
+            let owner_canon = owner_root
+                .canonicalize()
+                .unwrap_or_else(|_| owner_root.to_path_buf());
+            hints_unresolved += count_unresolved_links(&links, name, &owner_canon, &registry);
             for h in links {
                 hints.push(ResolvedHint {
                     from_repo: resolve_link_repo(&h.from.repo, name, owner_root, &registry),
@@ -490,6 +500,41 @@ pub fn federated_impact(
             }
         }
     }
+    // Diagnostics (#419): which reachable repos we could not open, and why, so a
+    // missing downstream edge points at the cause instead of vanishing.
+    let mut skipped: Vec<SkippedRepo> = reachable
+        .iter()
+        .filter(|name| !stores.contains_key(*name))
+        .map(|name| {
+            let reason = match registry.get(name) {
+                None => "not registered",
+                Some(e) if e.health() != RepoHealth::Indexed => "not indexed",
+                Some(_) => "index won't open",
+            };
+            SkippedRepo {
+                repo: name.clone(),
+                reason: reason.to_string(),
+            }
+        })
+        .collect();
+    skipped.sort_by(|a, b| a.repo.cmp(&b.repo));
+    let mut scope_repos = names.clone();
+    scope_repos.sort();
+    scope_repos.dedup();
+    let diagnostics = FederatedDiagnostics {
+        scope: match scope {
+            FederationScope::Registry => "registry".to_string(),
+            FederationScope::Group(g) => format!("group '{g}'"),
+        },
+        scope_repos,
+        hints_total,
+        hints_unresolved,
+        web_matches: web_node_edges.len(),
+        reachable: reachable.len(),
+        opened: stores.len(),
+        skipped,
+    };
+
     let current_store = stores
         .get(&current)
         .ok_or_else(|| anyhow!("current repo '{current}' has no index — run `analyze` first"))?;
@@ -661,7 +706,9 @@ pub fn federated_impact(
             items,
         })
         .collect();
-    Ok(FederatedReport::new(repos, crate_level))
+    let mut report = FederatedReport::new(repos, crate_level);
+    report.diagnostics = Some(diagnostics);
+    Ok(report)
 }
 
 #[cfg(test)]

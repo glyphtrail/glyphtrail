@@ -230,10 +230,14 @@ fn run_federated(args: &ImpactArgs, format: Format) -> Result<()> {
         for r in &mut report.repos {
             retag_configured_tests(&mut r.items, &cfg.impact.test_globs)?;
         }
+        // `new` derives a fresh report and drops the diagnostics; carry them over
+        // so the `--downstream` explanation (#419) survives the rebuild.
+        let diagnostics = report.diagnostics.take();
         report = FederatedReport::new(
             std::mem::take(&mut report.repos),
             std::mem::take(&mut report.crate_level),
         );
+        report.diagnostics = diagnostics;
     }
     emit_federated(&report, format)
 }
@@ -284,6 +288,40 @@ fn print_federated_text(report: &FederatedReport) {
             println!("  {} {} (via {})", h.repo, h.file, h.via);
         }
     }
+    print_diagnostics_text(report);
+}
+
+/// Footer (#419) explaining what the federated query did — its scope, the hints
+/// and web matches that fed the graph, and which reachable repos opened or were
+/// skipped — so a `0 downstream` result is a diagnosis, not a silent dead end.
+fn print_diagnostics_text(report: &FederatedReport) {
+    let Some(d) = &report.diagnostics else {
+        return;
+    };
+    println!(
+        "\nscope:  {} ({} repo(s): {})",
+        d.scope,
+        d.scope_repos.len(),
+        d.scope_repos.join(", ")
+    );
+    println!(
+        "links:  {} hint(s) applied ({} resolved, {} unresolved), {} automatic web match(es)",
+        d.hints_total,
+        d.hints_total.saturating_sub(d.hints_unresolved),
+        d.hints_unresolved,
+        d.web_matches
+    );
+    print!("stores: opened {}/{}", d.opened, d.reachable);
+    if d.skipped.is_empty() {
+        println!(" (0 skipped)");
+    } else {
+        let detail: Vec<String> = d
+            .skipped
+            .iter()
+            .map(|s| format!("{} ({})", s.repo, s.reason))
+            .collect();
+        println!(" ({} skipped: {})", d.skipped.len(), detail.join(", "));
+    }
 }
 
 fn federated_markdown(report: &FederatedReport) -> String {
@@ -320,6 +358,40 @@ fn federated_markdown(report: &FederatedReport) -> String {
         md.push_str("\n### Potentially affected (crate-level, unresolved symbol)\n\n");
         for h in &report.crate_level {
             md.push_str(&format!("- {} `{}` (via {})\n", h.repo, h.file, h.via));
+        }
+    }
+    if let Some(d) = &report.diagnostics {
+        md.push_str("\n### Query\n\n");
+        md.push_str(&format!(
+            "- **scope**: {} ({} repo(s): {})\n",
+            d.scope,
+            d.scope_repos.len(),
+            d.scope_repos.join(", ")
+        ));
+        md.push_str(&format!(
+            "- **links**: {} hint(s) applied ({} resolved, {} unresolved), {} automatic web match(es)\n",
+            d.hints_total,
+            d.hints_total.saturating_sub(d.hints_unresolved),
+            d.hints_unresolved,
+            d.web_matches
+        ));
+        md.push_str(&format!(
+            "- **stores**: opened {}/{}",
+            d.opened, d.reachable
+        ));
+        if d.skipped.is_empty() {
+            md.push_str(" (0 skipped)\n");
+        } else {
+            let detail: Vec<String> = d
+                .skipped
+                .iter()
+                .map(|s| format!("{} ({})", s.repo, s.reason))
+                .collect();
+            md.push_str(&format!(
+                " ({} skipped: {})\n",
+                d.skipped.len(),
+                detail.join(", ")
+            ));
         }
     }
     md
@@ -579,5 +651,34 @@ mod tests {
     fn invalid_glob_is_an_error() {
         let mut items = vec![item("a.rs", ImpactClass::Internal)];
         check!(retag_configured_tests(&mut items, &["[".to_string()]).is_err());
+    }
+
+    // #419: a federated report carrying diagnostics renders a "Query" section
+    // that explains scope, hints, web matches, and skipped repos.
+    #[test]
+    fn federated_markdown_explains_the_query() {
+        use glyphtrail_core::{FederatedDiagnostics, SkippedRepo};
+        let mut report = FederatedReport::new(Vec::new(), Vec::new());
+        report.diagnostics = Some(FederatedDiagnostics {
+            scope: "group 'mmh'".into(),
+            scope_repos: vec!["backend".into(), "web".into()],
+            hints_total: 5,
+            hints_unresolved: 1,
+            web_matches: 2,
+            reachable: 3,
+            opened: 2,
+            skipped: vec![SkippedRepo {
+                repo: "legacy".into(),
+                reason: "not indexed".into(),
+            }],
+        });
+        let md = federated_markdown(&report);
+        check!(md.contains("### Query"));
+        check!(md.contains("group 'mmh' (2 repo(s): backend, web)"));
+        // 5 applied, 1 unresolved -> 4 resolved; both web matches surfaced.
+        check!(
+            md.contains("5 hint(s) applied (4 resolved, 1 unresolved), 2 automatic web match(es)")
+        );
+        check!(md.contains("opened 2/3 (1 skipped: legacy (not indexed))"));
     }
 }
