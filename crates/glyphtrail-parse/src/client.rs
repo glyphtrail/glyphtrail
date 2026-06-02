@@ -744,6 +744,12 @@ fn string_constants(root: Node, src: &[u8]) -> HashMap<String, String> {
         if n.kind() != "variable_declarator" {
             return;
         }
+        // Only module-scope declarations, so a name shadowed/redeclared inside a
+        // block can't contaminate calls elsewhere (base-URL consts live at module
+        // scope). `enclosing_scope` returns `program` for a top-level decl.
+        if enclosing_scope(n).kind() != "program" {
+            return;
+        }
         let (Some(name), Some(value)) = (
             n.child_by_field_name("name"),
             n.child_by_field_name("value"),
@@ -1241,6 +1247,16 @@ func f(m map[string]int) {
                    f() { return this.http.get(BASE + '/users'); } }";
         let calls = extract_client_calls(src, &Language::TypeScript);
         check!(call(&calls, HttpMethod::Get, "/api/users").is_some());
+    }
+
+    // #405: only module-scope consts fold; a same-named const inside a block
+    // must not contaminate — `${BASE}` stays verbatim (dynamic) when BASE is local.
+    #[test]
+    fn inner_block_const_does_not_fold() {
+        let src = "class S {\n  constructor(private http: HttpClient) {}\n  \
+                   f() { const BASE = '/local'; return this.http.get(`${BASE}/x`); } }";
+        let calls = extract_client_calls(src, &Language::TypeScript);
+        check!(call(&calls, HttpMethod::Get, "${BASE}/x").is_some());
     }
 
     // A plain (non-parameter-property) constructor param does not become a
