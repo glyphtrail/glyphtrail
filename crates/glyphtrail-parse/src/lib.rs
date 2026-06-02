@@ -110,6 +110,48 @@ mod tests {
         }
     }
 
+    // #5: arrow-function and function-expression assignments (`const f = () => {}`,
+    // `const g = function () {}`) — the dominant modern JS/TS/TSX form, including
+    // React components — are extracted as function definitions; non-function
+    // bindings are not.
+    #[test]
+    fn extracts_named_arrow_and_function_expressions() {
+        use glyphtrail_core::NodeId;
+        let cases = [
+            (
+                Language::JavaScript,
+                "const arrow = () => {};\nconst expr = function(){};\nconst notFn = 5;\n",
+            ),
+            (
+                Language::TypeScript,
+                "export const handler = (x: number) => x;\nconst notFn = 5;\n",
+            ),
+            (Language::Tsx, "export const App = () => null;\n"),
+        ];
+        for (lang, src) in cases {
+            let parsed = parse_source(&lang, src).unwrap();
+            let fid = NodeId::derive(&["file", "x"]);
+            let fg = build_file_graph("x", &lang, &fid, &parsed, src);
+            let names: Vec<&str> = fg.graph.nodes.iter().map(|n| n.name.as_str()).collect();
+            let has = |want: &str| names.contains(&want);
+            match lang {
+                Language::JavaScript => {
+                    check!(has("arrow"), "got {names:?}");
+                    check!(has("expr"), "got {names:?}");
+                    check!(!has("notFn"));
+                }
+                Language::TypeScript => {
+                    check!(has("handler"), "got {names:?}");
+                    check!(!has("notFn"));
+                }
+                Language::Tsx => {
+                    check!(has("App"), "got {names:?}");
+                }
+                _ => {}
+            }
+        }
+    }
+
     // #5/#131: calls in an async fn body and calls nested inside a macro
     // invocation (e.g. `helper()` in `println!("{}", helper())`) are both
     // captured. The macro body is a raw token tree, so a macro-arg callee is

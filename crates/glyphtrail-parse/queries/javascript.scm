@@ -1,5 +1,10 @@
 ; Definitions
 (function_declaration name: (identifier) @name) @def.function
+; Arrow / function-expression bound to a name: `const handler = () => {}`,
+; `const f = function () {}` — the dominant way functions and React components
+; are declared in modern JS (#5).
+(variable_declarator name: (identifier) @name value: (arrow_function)) @def.function
+(variable_declarator name: (identifier) @name value: (function_expression)) @def.function
 (method_definition name: (property_identifier) @name) @def.method
 (class_declaration name: (identifier) @name) @def.class
 
