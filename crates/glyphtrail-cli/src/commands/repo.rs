@@ -594,9 +594,11 @@ fn spinner(msg: &str) -> ProgressBar {
 /// every stray checkout. `--analyze` indexes each repo as it's found (so it then
 /// qualifies); `--all` registers everything regardless.
 /// Recursively discover repositories under `dir`, analyze each, and register
-/// them — the multi-repo form of `glyphtrail analyze` (#386). Equivalent to
-/// `repo scan --analyze --all --recursive`: it descends into nested repos and,
-/// because each is indexed, registers them all.
+/// the ones that end up indexed — the multi-repo form of `glyphtrail analyze`
+/// (#386). Equivalent to `repo scan --analyze --recursive`: it descends into
+/// nested repos and registers only successfully-analyzed repos, so a repo whose
+/// analysis failed is left out of the registry rather than added without an
+/// index.
 pub fn analyze_tree(dir: &Path, update: bool, hidden: bool) -> Result<()> {
     scan(
         &registry_path()?,
@@ -604,7 +606,7 @@ pub fn analyze_tree(dir: &Path, update: bool, hidden: bool) -> Result<()> {
         ScanOpts {
             analyze: true,
             update,
-            all: true,
+            all: false,
             recursive: true,
             hidden,
         },
