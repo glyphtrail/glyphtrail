@@ -587,7 +587,9 @@ pub struct SkippedRepo {
 pub struct FederatedDiagnostics {
     /// Human label for the federation scope: "registry" or "group '<name>'".
     pub scope: String,
-    /// The repos the scope expanded to (the current repo always included).
+    /// The repos the query actually spanned: the requested scope plus any repo
+    /// it reached (a `--deep` indexed sibling, or one pulled in by a hint). The
+    /// current repo is always included.
     pub scope_repos: Vec<String>,
     /// Total `[[links]]` hints declared across the in-scope repos.
     pub hints_total: usize,

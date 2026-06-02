@@ -518,7 +518,11 @@ pub fn federated_impact(
         })
         .collect();
     skipped.sort_by(|a, b| a.repo.cmp(&b.repo));
-    let mut scope_repos = names.clone();
+    // The repos the query actually spanned: the requested scope plus any repo it
+    // reached — `--deep` can fold in indexed siblings that were never `repo add`ed,
+    // and a hint can pull in a repo outside `names`, so reporting `names` alone
+    // would undercount against the reachable/opened figures below (#419 review).
+    let mut scope_repos: Vec<String> = names.iter().chain(reachable.iter()).cloned().collect();
     scope_repos.sort();
     scope_repos.dedup();
     let diagnostics = FederatedDiagnostics {
