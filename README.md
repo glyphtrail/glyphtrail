@@ -46,6 +46,10 @@ glyphtrail analyze .
 # Re-index only files that changed
 glyphtrail analyze . --update
 
+# Index a whole directory of repositories: discover every repo under the path
+# (descending into nested repos), analyze each, and register them all
+glyphtrail analyze ~/code --recursive          # add --hidden to scan dot-dirs
+
 # Index a remote repository: clone into ~/.glyphtrail/remote/<host/owner/repo>,
 # index it there, and register it (shallow by default; --full for history)
 glyphtrail analyze https://github.com/owner/repo

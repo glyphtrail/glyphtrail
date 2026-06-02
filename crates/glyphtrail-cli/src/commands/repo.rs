@@ -593,6 +593,26 @@ fn spinner(msg: &str) -> ProgressBar {
 /// registration was lost (e.g. to a stuck lock) is recovered without pulling in
 /// every stray checkout. `--analyze` indexes each repo as it's found (so it then
 /// qualifies); `--all` registers everything regardless.
+/// Recursively discover repositories under `dir`, analyze each, and register
+/// the ones that end up indexed — the multi-repo form of `glyphtrail analyze`
+/// (#386). Equivalent to `repo scan --analyze --recursive`: it descends into
+/// nested repos and registers only successfully-analyzed repos, so a repo whose
+/// analysis failed is left out of the registry rather than added without an
+/// index.
+pub fn analyze_tree(dir: &Path, update: bool, hidden: bool) -> Result<()> {
+    scan(
+        &registry_path()?,
+        dir,
+        ScanOpts {
+            analyze: true,
+            update,
+            all: false,
+            recursive: true,
+            hidden,
+        },
+    )
+}
+
 fn scan(registry_path: &Path, dir: &Path, opts: ScanOpts) -> Result<()> {
     let root = dir
         .canonicalize()

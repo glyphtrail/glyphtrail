@@ -38,6 +38,14 @@ enum Command {
         /// (`--depth 1`) snapshot — needed for `story` and `impact --since`.
         #[arg(long)]
         full: bool,
+        /// Treat `path` as a directory of repositories: discover every repo
+        /// under it (descending into nested repos), analyze each, and register
+        /// them. The multi-repo form of analyze.
+        #[arg(long, conflicts_with_all = ["all", "full"])]
+        recursive: bool,
+        /// With --recursive, also descend into dot-directories (`.git`, caches).
+        #[arg(long, requires = "recursive")]
+        hidden: bool,
     },
     /// Query the graph.
     Query {
@@ -208,9 +216,15 @@ fn main() -> anyhow::Result<()> {
             update,
             all,
             full,
+            recursive,
+            hidden,
         } => {
             if all {
                 commands::repo::analyze_all(update)
+            } else if recursive {
+                // A directory of repositories: discover, analyze, and register
+                // each (#386) — the multi-repo form of analyze.
+                commands::repo::analyze_tree(&path, update, hidden)
             } else {
                 // A git remote URL is cloned into ~/.glyphtrail/remote/<slug> and
                 // registered, then indexed there; a local path is analyzed in place (#291).
