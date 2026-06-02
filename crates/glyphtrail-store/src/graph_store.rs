@@ -74,6 +74,8 @@ pub trait GraphStore: Adjacency {
     /// In-bounds atlas commits in `[since, until]` (unix seconds, inclusive; `None`
     /// = unbounded), ordered by `committed_at` (#330).
     fn commits_in_range(&self, since: Option<i64>, until: Option<i64>) -> Result<Vec<CommitMeta>>;
+    /// Total atlas commits in the side-table (cheap `COUNT`, no materialization).
+    fn commit_count(&self) -> Result<usize>;
     fn all_pending(&self) -> Result<Vec<PendingLink>>;
     fn all_imports(&self) -> Result<Vec<(String, String, String)>>;
     fn node_files(&self) -> Result<Vec<(String, String)>>;

@@ -22,9 +22,9 @@ pub fn default_atlas_path() -> Option<PathBuf> {
 }
 
 /// A row of the `Commit` side-table (#330): commit attributes keyed by the
-/// `Commit` node's id and indexed on `committed_at`, mirroring `ApiOp`.
-/// `in_bounds` carries the date-window state, so narrowing the window later
-/// re-marks stored commits out of bounds rather than deleting them.
+/// `Commit` node's id, carrying `committed_at` for time-ordered queries,
+/// mirroring `ApiOp`. `in_bounds` carries the date-window state, so narrowing
+/// the window later re-marks stored commits out of bounds rather than deleting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitMeta {
     /// The `Commit` node's id this row belongs to.

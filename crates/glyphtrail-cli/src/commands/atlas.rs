@@ -58,7 +58,7 @@ fn status(dir: &Path) -> Result<()> {
     }
     let store = LadybugStore::open(&lb)?;
     let stats = store.stats()?;
-    let commits = store.commits_in_range(None, None)?.len();
+    let commits = store.commit_count()?;
     let cfg = AtlasConfig::load(dir)?;
     let window = match (&cfg.window.earliest, &cfg.window.latest) {
         (None, None) => "none".to_string(),

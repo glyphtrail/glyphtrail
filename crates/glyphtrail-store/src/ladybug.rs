@@ -40,8 +40,9 @@ const SCHEMA: &[&str] = &[
     "CREATE REL TABLE IF NOT EXISTS Edge(FROM Node TO Node, kind STRING, confidence STRING)",
     "CREATE NODE TABLE IF NOT EXISTS File(path STRING, language STRING, hash STRING, PRIMARY KEY(path))",
     "CREATE NODE TABLE IF NOT EXISTS ApiOp(node_id STRING, protocol STRING, method STRING, path STRING, signature STRING, PRIMARY KEY(node_id))",
-    // Atlas (#329/#330): commit attributes keyed by the Commit node's id, indexed
-    // on committed_at; `in_bounds` (0/1) carries the date-window state.
+    // Atlas (#329/#330): commit attributes keyed by the Commit node's id; rows
+    // carry `committed_at` (time-ordered queries) and `in_bounds` (0/1, the
+    // date-window state).
     "CREATE NODE TABLE IF NOT EXISTS Commit(node_id STRING, hash STRING, author_email STRING, committed_at INT64, subject STRING, in_bounds INT64, PRIMARY KEY(node_id))",
     "CREATE NODE TABLE IF NOT EXISTS Pending(pk STRING, anchor STRING, name STRING, kind STRING, name_is_src INT64, PRIMARY KEY(pk))",
     "CREATE NODE TABLE IF NOT EXISTS Import(pk STRING, importer STRING, raw STRING, language STRING, PRIMARY KEY(pk))",
@@ -818,6 +819,14 @@ impl GraphStore for LadybugStore {
             .collect())
     }
 
+    fn commit_count(&self) -> Result<usize> {
+        Ok(self
+            .run("MATCH (c:Commit) RETURN COUNT(*)", vec![])?
+            .first()
+            .map(|r| get_i64(r, 0).max(0) as usize)
+            .unwrap_or(0))
+    }
+
     fn all_pending(&self) -> Result<Vec<PendingLink>> {
         Ok(self
             .run(
@@ -1254,6 +1263,7 @@ mod tests {
         // Round-trips; the new node kind decodes back to Commit.
         let got = lb.commits_in_range(None, None).unwrap();
         check!(got == vec![row.clone()]);
+        check!(lb.commit_count().unwrap() == 1);
         check!(lb.find_by_name("fix: thing").unwrap()[0].kind == NodeKind::Commit);
         // Date window filters on committed_at.
         check!(
@@ -1273,6 +1283,8 @@ mod tests {
         }])
         .unwrap();
         check!(lb.commits_in_range(None, None).unwrap().is_empty());
+        // commit_count still sees the row — out-of-bounds is marked, not deleted.
+        check!(lb.commit_count().unwrap() == 1);
 
         std::fs::remove_dir_all(&dir).ok();
     }
