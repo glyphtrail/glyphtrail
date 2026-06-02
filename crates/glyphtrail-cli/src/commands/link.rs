@@ -88,10 +88,18 @@ pub fn run(cmd: LinkCmd) -> Result<()> {
 fn describe(h: &LinkHint) -> String {
     let end = |e: &LinkEnd| {
         let repo = e.repo.as_deref().unwrap_or(".");
-        match (&e.symbol, &e.endpoint) {
-            (Some(s), _) => format!("{repo}:{s}"),
-            (None, Some(ep)) => format!("{repo}:[{ep}]"),
-            (None, None) => repo.to_string(),
+        // A side may carry a symbol, an endpoint, or both (resolved as a union).
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(s) = &e.symbol {
+            parts.push(s.clone());
+        }
+        if let Some(ep) = &e.endpoint {
+            parts.push(format!("[{ep}]"));
+        }
+        if parts.is_empty() {
+            repo.to_string()
+        } else {
+            format!("{repo}:{}", parts.join("+"))
         }
     };
     format!("{} -> {}", end(&h.from), end(&h.to))

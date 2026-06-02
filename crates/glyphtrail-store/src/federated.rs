@@ -84,6 +84,10 @@ fn side_node_ids(
     if let Some(spec) = endpoint {
         ids.extend(endpoint_op_ids(store, spec)?);
     }
+    // Dedup (a symbol and an endpoint can resolve to the same node) so a hint
+    // doesn't emit repeated cross-edges.
+    let mut seen = HashSet::new();
+    ids.retain(|id| seen.insert(id.clone()));
     Ok(ids)
 }
 
@@ -94,16 +98,23 @@ fn endpoint_op_ids(store: &dyn GraphStore, spec: &str) -> Result<Vec<NodeId>> {
     let Some((method, path_sig)) = parse_endpoint_spec(spec) else {
         return Ok(Vec::new());
     };
-    Ok(store
-        .all_operations()?
-        .into_iter()
-        .filter(|(_, key)| {
-            key.protocol == Protocol::Rest
-                && method.is_none_or(|m| key.method == Some(m))
-                && path_signature(&key.path) == path_sig
-        })
-        .map(|(id, _)| id)
-        .collect())
+    let mut ids = Vec::new();
+    // Only code-side operations — a `SchemaOp` also carries a REST key but isn't
+    // a call or endpoint to pin.
+    for kind in [NodeKind::Endpoint, NodeKind::ClientCall] {
+        ids.extend(
+            store
+                .operations_by_kind(kind)?
+                .into_iter()
+                .filter_map(|(id, key)| {
+                    (key.protocol == Protocol::Rest
+                        && method.is_none_or(|m| key.method == Some(m))
+                        && path_signature(&key.path) == path_sig)
+                        .then_some(id)
+                }),
+        );
+    }
+    Ok(ids)
 }
 
 /// Parse an endpoint spec into `(method?, path signature)`: `"POST /x"` →
@@ -549,7 +560,8 @@ mod tests {
     fn endpoint_op_ids_matches_by_route_signature() {
         use glyphtrail_core::{Node, OperationKey};
         let dir = std::env::temp_dir().join(format!(
-            "glyphtrail-fed-ep-{}",
+            "glyphtrail-fed-ep-{}-{}",
+            std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
