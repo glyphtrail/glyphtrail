@@ -83,8 +83,9 @@ fn timeline(atlas_dir: &Path, args: &Value) -> Result<Value, String> {
     let query = TimelineQuery {
         repo: opt_str(args, "repo"),
         author: opt_str(args, "author"),
-        // No git shell-out in the server: scope to the configured [me] only.
-        me: cfg.me.clone(),
+        // Scope to me, matching the CLI: the configured [me], else git's
+        // user.email — so an unset [me] doesn't silently widen to everyone.
+        me: resolve_me(&cfg.me),
         include_restricted: args
             .get("include_proprietary")
             .and_then(Value::as_bool)
@@ -122,9 +123,10 @@ fn resolve(args: &Value) -> Result<Value, String> {
     }
     let store = LadybugStore::open(&ladybug).map_err(|e| e.to_string())?;
     let nodes = store.nodes_in_file(file).map_err(|e| e.to_string())?;
+    // Deliberately no absolute `root` in the payload — the agent has repo+file;
+    // the local path would only leak the host's directory layout.
     Ok(json!({
         "repo": repo,
-        "root": root.display().to_string(),
         "file": file,
         "symbols": serde_json::to_value(&nodes).unwrap_or(Value::Null),
     }))
@@ -189,6 +191,31 @@ fn atlas_tool(name: &str, description: &str, properties: Value, required: &[&str
         },
         "annotations": { "readOnlyHint": true, "idempotentHint": true, "destructiveHint": false },
     })
+}
+
+/// Resolve "me" like the CLI: the configured `[me]`, else seeded from `git
+/// config user.email`, so the timeline scopes to you even when `atlas.toml` has
+/// no `[me]` rather than silently widening to every author.
+fn resolve_me(configured: &glyphtrail_core::MeConfig) -> glyphtrail_core::MeConfig {
+    if configured.is_set() {
+        return configured.clone();
+    }
+    let mut me = glyphtrail_core::MeConfig::default();
+    if let Some(email) = git_user_email() {
+        me.emails.push(email);
+    }
+    me
+}
+
+/// The user's configured git email (`git config --get user.email`), or `None`.
+fn git_user_email() -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["config", "--get", "user.email"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let email = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!email.is_empty()).then_some(email)
 }
 
 fn opt_str(args: &Value, key: &str) -> Option<String> {
