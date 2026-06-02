@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand};
 use glyphtrail_core::{
     AtlasConfig, AtlasHeads, CodeGraph, CommitMeta, Confidence, EdgeKind, MeConfig, Node, NodeId,
@@ -34,8 +34,67 @@ pub enum AtlasCmd {
     Timeline(TimelineArgs),
     /// List the derived topics and how many commits each tags.
     Topics(TopicsArgs),
+    /// Narrate the evolution of your work across repos via an LLM (public-only).
+    Story(StoryArgs),
+    /// Export the gated atlas timeline as structured data (public-only).
+    Export(ExportArgs),
     /// Serve the atlas over MCP (stdio): timeline, status, and the repo+file bridge.
     Mcp,
+}
+
+#[derive(Args)]
+pub struct StoryArgs {
+    /// LLM provider.
+    #[arg(long, value_enum, default_value_t)]
+    pub provider: crate::commands::llm::Provider,
+    /// Model id (defaults to a sensible per-provider model).
+    #[arg(long)]
+    pub model: Option<String>,
+    /// Override the API base URL (for OpenAI-compatible gateways).
+    #[arg(long)]
+    pub base_url: Option<String>,
+    /// Earliest commit date (YYYY-MM-DD); overrides the config window.
+    #[arg(long)]
+    pub since: Option<String>,
+    /// Latest commit date (YYYY-MM-DD); overrides the config window.
+    #[arg(long)]
+    pub until: Option<String>,
+    /// Most recent commits to narrate.
+    #[arg(long, default_value_t = 300)]
+    pub max_commits: usize,
+    /// Include restricted repos — private, proprietary, or unregistered (excluded
+    /// by default, since this output leaves the machine).
+    #[arg(long)]
+    pub include_restricted: bool,
+    /// Output file for the narrative.
+    #[arg(long, default_value = "ATLAS.md")]
+    pub output: PathBuf,
+    /// Write the composed prompt instead of calling the LLM (no network/keys).
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Args)]
+pub struct ExportArgs {
+    /// Earliest commit date (YYYY-MM-DD); overrides the config window.
+    #[arg(long)]
+    pub since: Option<String>,
+    /// Latest commit date (YYYY-MM-DD); overrides the config window.
+    #[arg(long)]
+    pub until: Option<String>,
+    /// Most recent commits to export.
+    #[arg(long, default_value_t = 1000)]
+    pub limit: usize,
+    /// Include restricted repos — private, proprietary, or unregistered (excluded
+    /// by default).
+    #[arg(long)]
+    pub include_restricted: bool,
+    /// Write to a file instead of stdout.
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+    /// Emit JSON instead of YAML.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args)]
@@ -126,7 +185,166 @@ pub fn run(cmd: AtlasCmd) -> Result<()> {
         AtlasCmd::Sync(args) => sync(&dir, args)?,
         AtlasCmd::Timeline(args) => timeline(&dir, args)?,
         AtlasCmd::Topics(args) => topics(&dir, args)?,
+        AtlasCmd::Story(args) => story(&dir, args)?,
+        AtlasCmd::Export(args) => export(&dir, args)?,
         AtlasCmd::Mcp => glyphtrail_mcp::serve_atlas_stdio(dir)?,
+    }
+    Ok(())
+}
+
+const ATLAS_SYSTEM: &str = "You are a technical writer narrating the evolution of one \
+developer's work across their projects, from a chronological commit log spanning several \
+repositories. Use only the provided facts — do not invent commits, features, dates, or people. \
+Write engaging, accurate GitHub-flavored Markdown: the arc of what they worked on over time, \
+recurring themes, and how their focus shifted between projects. Group related commits into themes \
+rather than listing them verbatim.";
+
+/// Gather the **outbound** (public-only) gated timeline shared by `atlas story`
+/// and `atlas export` (#336): private/proprietary/unregistered repos are
+/// excluded unless `include_restricted`, since this output leaves the machine.
+/// Returns the filtered timeline, the window label, and the author-scope label.
+fn outbound_timeline(
+    dir: &Path,
+    since: Option<String>,
+    until: Option<String>,
+    include_restricted: bool,
+    limit: usize,
+) -> Result<(glyphtrail_core::Timeline, String, String)> {
+    let lb = ladybug_dir(dir);
+    if !lb.exists() {
+        bail!("atlas is disabled; run `glyphtrail atlas init` first");
+    }
+    let cfg = AtlasConfig::load(dir)?;
+    let window = Window {
+        earliest: since.or_else(|| cfg.window.earliest.clone()),
+        latest: until.or_else(|| cfg.window.latest.clone()),
+    };
+    let (since, until) = window
+        .epoch_bounds()
+        .map_err(|d| anyhow!("invalid date: {d}"))?;
+    let registry = match default_registry_path() {
+        Some(p) => Registry::load(&p)?,
+        None => Registry::default(),
+    };
+    let query = TimelineQuery {
+        repo: None,
+        author: None,
+        me: resolve_me(&cfg.me),
+        public_only: true,
+        include_restricted,
+        limit,
+    };
+    let store = LadybugStore::open(&lb)?;
+    let rows = store.atlas_timeline(since, until, None)?;
+    let tl = filter_timeline(rows, &registry, &query);
+    Ok((tl, window.label(), author_scope_label(&query)))
+}
+
+/// `glyphtrail atlas story` — an LLM narrative of the evolution of your work
+/// across repos, over the public-only gated timeline (#336).
+fn story(dir: &Path, args: StoryArgs) -> Result<()> {
+    let (tl, window, _scope) = outbound_timeline(
+        dir,
+        args.since,
+        args.until,
+        args.include_restricted,
+        args.max_commits,
+    )?;
+    if tl.rows.is_empty() {
+        bail!(
+            "no public commits to narrate (run `glyphtrail atlas sync`, or pass \
+             --include-restricted to include private/proprietary repos)"
+        );
+    }
+    eprintln!(
+        "atlas story: {} commits; {} restricted hidden",
+        tl.rows.len(),
+        tl.excluded_restricted
+    );
+    let prompt = atlas_story_prompt(&tl, &window);
+
+    if args.dry_run {
+        std::fs::write(
+            &args.output,
+            format!("# SYSTEM\n{ATLAS_SYSTEM}\n\n# USER\n{prompt}\n"),
+        )
+        .with_context(|| format!("cannot write {}", args.output.display()))?;
+        println!(
+            "wrote {} ({} commits; dry run, no LLM called)",
+            args.output.display(),
+            tl.rows.len()
+        );
+        return Ok(());
+    }
+
+    let llm = crate::commands::llm::Llm::new(args.provider, args.model, args.base_url)?;
+    let md = llm
+        .complete(ATLAS_SYSTEM, &prompt)
+        .context("generating atlas story")?;
+    std::fs::write(&args.output, md)
+        .with_context(|| format!("cannot write {}", args.output.display()))?;
+    println!("wrote {}", args.output.display());
+    Ok(())
+}
+
+/// Compose the narration prompt from the gated timeline: a facts header plus the
+/// commit log oldest-first (so the model reads a forward arc).
+fn atlas_story_prompt(tl: &glyphtrail_core::Timeline, window: &str) -> String {
+    use std::collections::BTreeSet;
+    let repos: BTreeSet<&str> = tl.rows.iter().map(|r| r.repo.as_str()).collect();
+    let log = tl
+        .rows
+        .iter()
+        .rev() // rows are newest-first; narrate oldest-first
+        .map(|r| {
+            format!(
+                "- {} [{}] {}",
+                format_date(r.commit.committed_at),
+                r.repo,
+                r.commit.subject
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Window: {window}\nRepositories ({}): {}\nCommits: {}\n\n\
+         Commit log (oldest first):\n{log}\n\n\
+         Write a narrative of how my work evolved over this window — the arc across \
+         these projects, recurring themes, and how my focus shifted between them.",
+        repos.len(),
+        repos.into_iter().collect::<Vec<_>>().join(", "),
+        tl.rows.len(),
+    )
+}
+
+/// `glyphtrail atlas export` — the gated timeline as structured JSON/YAML, to
+/// stdout or a file (#336). Public-only by default.
+fn export(dir: &Path, args: ExportArgs) -> Result<()> {
+    let (tl, window, scope) = outbound_timeline(
+        dir,
+        args.since,
+        args.until,
+        args.include_restricted,
+        args.limit,
+    )?;
+    eprintln!(
+        "atlas export: {} commits; {} restricted hidden",
+        tl.rows.len(),
+        tl.excluded_restricted
+    );
+    let value = timeline_value(&tl, &window, &scope);
+    let text = if args.json {
+        serde_json::to_string_pretty(&value)?
+    } else {
+        serde_norway::to_string(&value)?
+    };
+    match &args.output {
+        Some(path) => {
+            std::fs::write(path, &text)
+                .with_context(|| format!("cannot write {}", path.display()))?;
+            println!("wrote {} ({} commits)", path.display(), tl.rows.len());
+        }
+        None => print!("{text}"),
     }
     Ok(())
 }
@@ -334,6 +552,7 @@ fn timeline(dir: &Path, args: TimelineArgs) -> Result<()> {
         repo: args.repo.clone(),
         author: args.author.clone(),
         me: resolve_me(&cfg.me),
+        public_only: false, // local view: private shows; proprietary + unregistered hidden
         include_restricted: args.include_proprietary,
         limit: args.limit,
     };
@@ -809,6 +1028,41 @@ mod tests {
     fn truncate_caps_and_ellipsizes() {
         check!(truncate("short", 20) == "short");
         check!(truncate("0123456789", 5) == "0123…");
+    }
+
+    #[test]
+    fn atlas_story_prompt_lists_repos_and_oldest_first_log() {
+        let row = |repo: &str, at: i64, subject: &str| glyphtrail_core::AtlasTimelineRow {
+            commit: CommitMeta {
+                node_id: NodeId("x".into()),
+                hash: "h".into(),
+                author_email: "ada@x.dev".into(),
+                committed_at: at,
+                subject: subject.into(),
+                in_bounds: true,
+            },
+            repo: repo.into(),
+            touched: 1,
+        };
+        // As `filter_timeline` yields them: newest first.
+        let tl = glyphtrail_core::Timeline {
+            rows: vec![
+                row("beta", 1_600_000_100, "second thing"),
+                row("alpha", 1_600_000_000, "first thing"),
+            ],
+            matched: 2,
+            excluded_restricted: 0,
+            excluded_author: 0,
+        };
+        let p = atlas_story_prompt(&tl, "2020-09-01..");
+        check!(p.contains("Window: 2020-09-01.."));
+        check!(p.contains("Repositories (2): alpha, beta"));
+        check!(p.contains("Commits: 2"));
+        // Log is oldest-first: "first thing" precedes "second thing".
+        let first = p.find("first thing").unwrap();
+        let second = p.find("second thing").unwrap();
+        check!(first < second);
+        check!(p.contains("how my work evolved"));
     }
 
     fn raw(
