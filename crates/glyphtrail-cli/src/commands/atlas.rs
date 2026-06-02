@@ -12,10 +12,13 @@ use anyhow::{Result, anyhow, bail};
 use clap::{Args, Subcommand};
 use glyphtrail_core::{
     AtlasConfig, AtlasHeads, CodeGraph, CommitMeta, Confidence, EdgeKind, MeConfig, Node, NodeId,
-    NodeKind, Registry, RegistryEntry, Window, default_atlas_path, default_registry_path,
-    scrub_secrets,
+    NodeKind, Registry, RegistryEntry, Visibility, Window, default_atlas_path,
+    default_registry_path, format_date, scrub_secrets,
 };
 use glyphtrail_store::{GraphStore, LadybugStore};
+use serde_json::json;
+
+use super::query::{Emit, print_value};
 
 #[derive(Subcommand)]
 pub enum AtlasCmd {
@@ -27,6 +30,36 @@ pub enum AtlasCmd {
     Path,
     /// Ingest git history into the atlas (mine-only by default, incremental).
     Sync(SyncArgs),
+    /// List commits chronologically across repos (mine by default).
+    Timeline(TimelineArgs),
+}
+
+#[derive(Args)]
+pub struct TimelineArgs {
+    /// Only commits in this repo (registry name).
+    #[arg(long)]
+    pub repo: Option<String>,
+    /// Only commits whose author email contains this (default: me).
+    #[arg(long)]
+    pub author: Option<String>,
+    /// Earliest commit date (YYYY-MM-DD); overrides the config window.
+    #[arg(long)]
+    pub since: Option<String>,
+    /// Latest commit date (YYYY-MM-DD); overrides the config window.
+    #[arg(long)]
+    pub until: Option<String>,
+    /// Include commits from proprietary repos (excluded by default).
+    #[arg(long)]
+    pub include_proprietary: bool,
+    /// Cap how many commits are shown (most recent kept).
+    #[arg(long, default_value_t = 50)]
+    pub limit: usize,
+    /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
+    /// Emit YAML.
+    #[arg(long)]
+    pub yaml: bool,
 }
 
 #[derive(Args)]
@@ -71,6 +104,7 @@ pub fn run(cmd: AtlasCmd) -> Result<()> {
         AtlasCmd::Path => println!("{}", ladybug_dir(&dir).display()),
         AtlasCmd::Status => status(&dir)?,
         AtlasCmd::Sync(args) => sync(&dir, args)?,
+        AtlasCmd::Timeline(args) => timeline(&dir, args)?,
     }
     Ok(())
 }
@@ -232,6 +266,145 @@ fn sync(dir: &Path, args: SyncArgs) -> Result<()> {
     store.remark_commit_bounds(bound_since, bound_until)?;
     println!("  total:   {total} commits ingested");
     Ok(())
+}
+
+/// `glyphtrail atlas timeline` — chronological commits across repos. Default-deny
+/// on proprietary repos and scoped to me, unless `--author`/`--include-proprietary`
+/// widen it. Echoes the effective window + what was hidden.
+fn timeline(dir: &Path, args: TimelineArgs) -> Result<()> {
+    let lb = ladybug_dir(dir);
+    if !lb.exists() {
+        bail!("atlas is disabled; run `glyphtrail atlas init` first");
+    }
+    let cfg = AtlasConfig::load(dir)?;
+    // Effective window: CLI flags override the config window.
+    let window = Window {
+        earliest: args.since.clone().or_else(|| cfg.window.earliest.clone()),
+        latest: args.until.clone().or_else(|| cfg.window.latest.clone()),
+    };
+    let (since, until) = window
+        .epoch_bounds()
+        .map_err(|d| anyhow!("invalid date: {d}"))?;
+
+    let registry = match default_registry_path() {
+        Some(p) => Registry::load(&p)?,
+        None => Registry::default(),
+    };
+    let me = resolve_me(&cfg.me);
+
+    let store = LadybugStore::open(&lb)?;
+    let rows = store.atlas_timeline(since, until)?;
+
+    // Filter: repo, then visibility (default-deny), then author.
+    let mut excluded_restricted = 0usize;
+    let mut excluded_author = 0usize;
+    let mut kept: Vec<&glyphtrail_core::AtlasTimelineRow> = Vec::new();
+    for row in &rows {
+        if args.repo.as_ref().is_some_and(|name| &row.repo != name) {
+            continue;
+        }
+        // Default-deny: proprietary repos AND any whose registry entry is gone
+        // (removed/renamed/stale) — never show a commit we can't vouch for.
+        let restricted = match registry.get(&row.repo).map(|e| e.visibility) {
+            Some(Visibility::Proprietary) | None => true,
+            Some(_) => false,
+        };
+        if restricted && !args.include_proprietary {
+            excluded_restricted += 1;
+            continue;
+        }
+        if !author_matches(&args.author, &me, &row.commit.author_email) {
+            excluded_author += 1;
+            continue;
+        }
+        kept.push(row);
+    }
+    // Newest first; cap at the limit.
+    kept.reverse();
+    let matched = kept.len();
+    kept.truncate(args.limit);
+
+    let scope = match &args.author {
+        Some(a) => format!("author ~ {a}"),
+        None if me.is_set() => format!("mine ({})", me.display().unwrap_or_default()),
+        None => "anyone (no [me] configured)".to_string(),
+    };
+
+    let emit = Emit::from_flags(args.json, args.yaml);
+    if emit == Emit::Text {
+        println!("atlas timeline");
+        println!("  window:  {}", describe_window(&window));
+        println!("  author:  {scope}");
+        if let Some(r) = &args.repo {
+            println!("  repo:    {r}");
+        }
+        if excluded_restricted > 0 {
+            println!(
+                "  hidden:  {excluded_restricted} restricted (proprietary/unregistered; \
+                 use --include-proprietary)"
+            );
+        }
+        println!("  showing: {} of {matched} matched", kept.len());
+        println!();
+        for row in &kept {
+            println!(
+                "  {}  {:<20}  {} ({} file{})",
+                format_date(row.commit.committed_at),
+                truncate(&row.repo, 20),
+                row.commit.subject,
+                row.touched,
+                if row.touched == 1 { "" } else { "s" },
+            );
+        }
+    } else {
+        let commits: Vec<_> = kept
+            .iter()
+            .map(|r| {
+                json!({
+                    "date": format_date(r.commit.committed_at),
+                    "committed_at": r.commit.committed_at,
+                    "repo": r.repo,
+                    "author": r.commit.author_email,
+                    "subject": r.commit.subject,
+                    "touched": r.touched,
+                    "hash": r.commit.hash,
+                })
+            })
+            .collect();
+        let value = json!({
+            "window": describe_window(&window),
+            "author_scope": scope,
+            "shown": kept.len(),
+            "matched": matched,
+            "excluded": { "restricted": excluded_restricted, "author": excluded_author },
+            "commits": commits,
+        });
+        print_value(&value, emit)?;
+    }
+    Ok(())
+}
+
+/// Whether a commit's author passes the filter: an explicit `--author` substring
+/// (case-insensitive) wins; otherwise scope to me, falling back to everyone only
+/// when no `[me]` and no git email could be resolved.
+fn author_matches(explicit: &Option<String>, me: &MeConfig, email: &str) -> bool {
+    match explicit {
+        Some(sub) => email
+            .to_ascii_lowercase()
+            .contains(&sub.to_ascii_lowercase()),
+        None if me.is_set() => me.matches(email),
+        None => true,
+    }
+}
+
+/// Truncate `s` to `max` chars, appending an ellipsis when cut.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{head}…")
+    }
 }
 
 /// Resolve "me": the configured `[me]`, or a best-effort fallback seeded from
@@ -625,6 +798,28 @@ mod tests {
             .filter(|e| e.kind == EdgeKind::Touched)
             .count();
         check!(touched == 2);
+    }
+
+    #[test]
+    fn author_matches_explicit_substring_then_me_then_everyone() {
+        let me = MeConfig {
+            emails: vec!["ada@x.dev".into()],
+            domains: vec![],
+        };
+        // Explicit substring (case-insensitive) wins, ignoring me.
+        check!(author_matches(&Some("EVE".into()), &me, "eve@evil.dev"));
+        check!(!author_matches(&Some("eve".into()), &me, "ada@x.dev"));
+        // No --author: scope to me.
+        check!(author_matches(&None, &me, "ada@x.dev"));
+        check!(!author_matches(&None, &me, "eve@evil.dev"));
+        // No --author and no [me]: everyone passes.
+        check!(author_matches(&None, &MeConfig::default(), "anyone@here"));
+    }
+
+    #[test]
+    fn truncate_caps_and_ellipsizes() {
+        check!(truncate("short", 20) == "short");
+        check!(truncate("0123456789", 5) == "0123…");
     }
 
     fn raw(

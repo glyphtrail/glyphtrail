@@ -844,6 +844,54 @@ impl GraphStore for LadybugStore {
             .unwrap_or(0))
     }
 
+    fn atlas_timeline(
+        &self,
+        since: Option<i64>,
+        until: Option<i64>,
+    ) -> Result<Vec<glyphtrail_core::AtlasTimelineRow>> {
+        // Date bounds shared by both queries. Inline them (lbug param-type-cache
+        // landmine); the in-bounds + commit-node join restricts every aggregate
+        // to the same windowed commit set.
+        let mut bounds = String::new();
+        if let Some(s) = since {
+            bounds.push_str(&format!(" AND c.committed_at >= {s}"));
+        }
+        if let Some(u) = until {
+            bounds.push_str(&format!(" AND c.committed_at <= {u}"));
+        }
+        // Touched-file counts, one aggregate restricted to the windowed commits.
+        let mut touched: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        for r in self.run(
+            &format!(
+                "MATCH (c:Commit), (cn:Node)-[:Edge {{kind:'touched'}}]->(:Node) \
+                 WHERE c.in_bounds = 1 AND cn.kind = 'commit' AND cn.id = c.node_id{bounds} \
+                 RETURN cn.id, COUNT(*)"
+            ),
+            vec![],
+        )? {
+            touched.insert(get_str(&r, 0), get_i64(&r, 1).max(0) as u32);
+        }
+        // In-bounds commits in range, joined to their repo.
+        Ok(self
+            .run(
+                &format!(
+                    "MATCH (c:Commit), (cn:Node)-[:Edge {{kind:'part_of'}}]->(r:Node) \
+                     WHERE c.in_bounds = 1 AND cn.kind = 'commit' AND cn.id = c.node_id \
+                     AND r.kind = 'repo'{bounds} \
+                     RETURN c.node_id, c.hash, c.author_email, c.committed_at, c.subject, \
+                     c.in_bounds, r.name ORDER BY c.committed_at"
+                ),
+                vec![],
+            )?
+            .iter()
+            .map(|r| glyphtrail_core::AtlasTimelineRow {
+                touched: touched.get(&get_str(r, 0)).copied().unwrap_or(0),
+                repo: get_str(r, 6),
+                commit: commit_from_row(r),
+            })
+            .collect())
+    }
+
     fn all_pending(&self) -> Result<Vec<PendingLink>> {
         Ok(self
             .run(
@@ -1344,6 +1392,61 @@ mod tests {
         lb.remark_commit_bounds(None, None).unwrap();
         check!(lb.commits_in_range(None, None).unwrap().len() == 2);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Atlas (#333): the timeline join resolves each in-bounds commit's repo name
+    // and touched-file count, ordered by date, and honours the window.
+    #[test]
+    fn atlas_timeline_joins_repo_and_touched_count() {
+        let dir = tmp_dir("atlas-timeline");
+        let mut lb = LadybugStore::open(&dir).unwrap();
+        let kinded = |id: &str, name: &str, k: NodeKind| {
+            let mut n = node(id, name);
+            n.kind = k;
+            n
+        };
+        let edge = |src: &str, dst: &str, kind: EdgeKind| Edge {
+            src: NodeId(src.into()),
+            dst: NodeId(dst.into()),
+            kind,
+            confidence: Confidence::Extracted,
+        };
+        lb.insert_graph(
+            &[
+                kinded("cm", "did a thing", NodeKind::Commit),
+                kinded("rp", "myrepo", NodeKind::Repo),
+                kinded("f1", "a.rs", NodeKind::File),
+                kinded("f2", "b.rs", NodeKind::File),
+            ],
+            &[
+                edge("cm", "rp", EdgeKind::PartOf),
+                edge("cm", "f1", EdgeKind::Touched),
+                edge("cm", "f2", EdgeKind::Touched),
+            ],
+        )
+        .unwrap();
+        lb.set_commits(&[CommitMeta {
+            node_id: NodeId("cm".into()),
+            hash: "deadbeef".into(),
+            author_email: "me@x.dev".into(),
+            committed_at: 1_600_000_000,
+            subject: "did a thing".into(),
+            in_bounds: true,
+        }])
+        .unwrap();
+
+        let rows = lb.atlas_timeline(None, None).unwrap();
+        check!(rows.len() == 1);
+        check!(rows[0].repo == "myrepo");
+        check!(rows[0].touched == 2);
+        check!(rows[0].commit.hash == "deadbeef");
+        // Out-of-window excludes it.
+        check!(
+            lb.atlas_timeline(Some(1_600_000_001), None)
+                .unwrap()
+                .is_empty()
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
