@@ -9,8 +9,51 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, bail};
 use clap::Subcommand;
 use glyphtrail_core::link_hints::{LinkEnd, LinkHint};
+use glyphtrail_core::{Registry, default_registry_path, resolved_link_repo};
 
 use crate::commands::config_file;
+
+/// The registry + the declaring repo's `(name, canonical root)`, for resolving a
+/// hint's `repo` sides. `None` registry when it can't be loaded (validation is
+/// then skipped). The owner name falls back to `.` for an unregistered repo.
+fn link_context(repo: &Path) -> (Option<Registry>, String, std::path::PathBuf) {
+    let registry = default_registry_path().and_then(|p| Registry::load(&p).ok());
+    let owner_root = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
+    let owner_name = registry
+        .as_ref()
+        .and_then(|r| {
+            r.repos
+                .iter()
+                .find(|e| {
+                    e.roots().any(|root| {
+                        root.canonicalize().ok().as_deref() == Some(owner_root.as_path())
+                    })
+                })
+                .map(|e| e.name.clone())
+        })
+        .unwrap_or_else(|| ".".to_string());
+    (registry, owner_name, owner_root)
+}
+
+/// The unresolved sides of a hint (`"from 'x', to 'y'"`), or `None` when every
+/// explicit-repo side resolves to a registered repo (#418). A `.`/absent side is
+/// always the declaring repo, so it's never dead.
+fn unresolved_sides(
+    h: &LinkHint,
+    owner_name: &str,
+    owner_root: &Path,
+    registry: &Registry,
+) -> Option<String> {
+    let mut dead = Vec::new();
+    for (label, end) in [("from", &h.from), ("to", &h.to)] {
+        if let Some(repo) = &end.repo
+            && resolved_link_repo(&end.repo, owner_name, owner_root, registry).is_none()
+        {
+            dead.push(format!("{label} '{repo}'"));
+        }
+    }
+    (!dead.is_empty()).then(|| dead.join(", "))
+}
 
 #[derive(Subcommand)]
 pub enum LinkCmd {
@@ -121,7 +164,9 @@ fn links_of(path: &Path) -> Result<Vec<LinkHint>> {
 }
 
 fn list(repo: &Path) -> Result<()> {
+    let (registry, owner_name, owner_root) = link_context(repo);
     let mut any = false;
+    let mut unresolved = 0usize;
     for (label, path) in [
         ("committed", config_file::committed(repo)),
         ("local", config_file::local(repo)),
@@ -133,11 +178,25 @@ fn list(repo: &Path) -> Result<()> {
         any = true;
         println!("{label} ({}):", path.display());
         for (i, h) in links.iter().enumerate() {
-            println!("  {}. {}", i + 1, describe(h));
+            let dead = registry
+                .as_ref()
+                .and_then(|reg| unresolved_sides(h, &owner_name, &owner_root, reg));
+            match dead {
+                Some(reason) => {
+                    unresolved += 1;
+                    println!("  {}. {}  ✗ unresolved: {reason}", i + 1, describe(h));
+                }
+                None => println!("  {}. {}", i + 1, describe(h)),
+            }
         }
     }
     if !any {
         println!("no link hints (use `glyphtrail repo link add <repo> [--to-symbol ..]`)");
+    } else if unresolved > 0 {
+        println!(
+            "\n{unresolved} unresolved (a repo names no registered repo — use a registry name, \
+             or a ./path)"
+        );
     }
     Ok(())
 }
@@ -180,6 +239,20 @@ fn add(
     }
     config_file::save(&path, &table)?;
     println!("added: {}  ({})", describe(&hint), path.display());
+
+    // #420: flag a side whose repo names no registered repo, so the mistake
+    // (a wrong name or a path pointing nowhere) is seen now, not as a silently
+    // dead hint later. The hint is still written — the target may not be
+    // registered yet.
+    let (registry, owner_name, owner_root) = link_context(repo);
+    if let Some(reg) = &registry
+        && let Some(reason) = unresolved_sides(&hint, &owner_name, &owner_root, reg)
+    {
+        eprintln!(
+            "warning: {reason} resolves to no registered repo — use a registry name (`glyphtrail \
+             repo list`) or a ./path"
+        );
+    }
     Ok(())
 }
 

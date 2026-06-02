@@ -20,7 +20,46 @@
 //! to   = { repo = "user-svc", symbol = "get_user" }
 //! ```
 
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
+
+use crate::registry::Registry;
+
+/// Whether a link `repo` value is a filesystem path (`./`, `../`, or absolute)
+/// rather than a registry name — only the path forms are resolved against the
+/// filesystem; a bare slashed value (a GitLab `group/sub/repo`) stays a name.
+pub fn is_path_ref(repo: &str) -> bool {
+    repo.starts_with("./") || repo.starts_with("../") || Path::new(repo).is_absolute()
+}
+
+/// Resolve a link side's `repo` to a registered repo NAME, or `None` when it
+/// names no registered repo. `None`/`"."` is the declaring repo (`owner_name`,
+/// always valid); a `./`/`../`/absolute value is a path relative to `owner_root`,
+/// mapped to the registered repo rooted there; anything else is a name, checked
+/// against the registry. Shared by federated impact (which falls back to the
+/// verbatim value) and the link tooling (which treats `None` as a dead link).
+pub fn resolved_link_repo(
+    repo: &Option<String>,
+    owner_name: &str,
+    owner_root: &Path,
+    registry: &Registry,
+) -> Option<String> {
+    match repo.as_deref() {
+        None | Some(".") => Some(owner_name.to_string()),
+        Some(r) if is_path_ref(r) => owner_root.join(r).canonicalize().ok().and_then(|abs| {
+            registry
+                .repos
+                .iter()
+                .find(|e| {
+                    e.roots()
+                        .any(|root| root.canonicalize().map(|c| c == abs).unwrap_or(false))
+                })
+                .map(|e| e.name.clone())
+        }),
+        Some(r) => registry.get(r).map(|e| e.name.clone()),
+    }
+}
 
 /// Pre-unification standalone hints file at the repo root, still read for
 /// back-compat and folded into `glyphtrail.toml` on the next `link`/`config` edit.
@@ -128,5 +167,51 @@ mod tests {
         // Round-trips, keeping the endpoint key.
         let back = toml::to_string(&hints).unwrap();
         check!(back.contains("endpoint = \"POST /signin\""));
+    }
+
+    #[test]
+    fn is_path_ref_distinguishes_paths_from_names() {
+        check!(is_path_ref("./mmh/web"));
+        check!(is_path_ref("../web"));
+        check!(is_path_ref("/abs/web"));
+        check!(!is_path_ref("backend"));
+        // A slashed *name* (e.g. a GitLab nested repo) is not a path.
+        check!(!is_path_ref("group/subgroup/repo"));
+    }
+
+    #[test]
+    fn resolved_link_repo_maps_path_and_name_to_registered_or_none() {
+        use crate::registry::RegistryEntry;
+        let base = std::env::temp_dir().join(format!(
+            "gt-resolvelink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let meta = base.join("meta");
+        let sub = meta.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let mut registry = Registry::default();
+        registry.repos.push(RegistryEntry {
+            name: "subrepo".into(),
+            root: sub.clone(),
+            alt_roots: vec![],
+            missing_since: None,
+            ids: vec![],
+            contributors: vec![],
+            identity: None,
+            visibility: crate::registry::Visibility::default(),
+        });
+        let r =
+            |s: Option<&str>| resolved_link_repo(&s.map(String::from), "owner", &meta, &registry);
+        check!(r(None) == Some("owner".into())); // "." / absent -> declaring repo
+        check!(r(Some(".")) == Some("owner".into()));
+        check!(r(Some("subrepo")) == Some("subrepo".into())); // a *registered* name
+        check!(r(Some("nope")).is_none()); // an unregistered name -> dead
+        check!(r(Some("./sub")) == Some("subrepo".into())); // a path -> the name
+        check!(r(Some("./nope")).is_none()); // an unresolvable path -> dead
+        std::fs::remove_dir_all(&base).ok();
     }
 }
