@@ -1000,16 +1000,18 @@ fn file_issue_tool() -> Value {
         "name": "file_issue",
         "description": "Guidance for reporting a bug or idea to a repository's \
              issue tracker. It does NOT file anything — it returns instructions \
-             and a provenance line; you act with your own tools. The tracker is \
-             taken from the repo's git remote, then its Cargo manifest, so forks \
-             get their own tracker. ALWAYS search existing OPEN and CLOSED issues \
-             first and prefer commenting on a match over opening a duplicate.",
+             and a provenance line; you act with your own tools. The tracker base \
+             is taken from the repo's git remote, then its Cargo manifest, so \
+             forks get their own tracker; the example links use GitHub-style \
+             paths, so adapt them on another forge. ALWAYS search existing OPEN \
+             and CLOSED issues first and prefer commenting on a match over \
+             opening a duplicate.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "title": { "type": "string", "description": "Proposed issue title." },
                 "body": { "type": "string", "description": "Proposed issue body (Markdown)." },
-                "repo": { "type": "string", "description": "Which repo's tracker to target: a registered repo name or an absolute path. Defaults to the server's launch repo." }
+                "repo": { "type": "string", "description": "Which repo's tracker to target: a registered repo name or an absolute path. Defaults to the server's launch repo, or the upstream glyphtrail project when the server has no launch repo." }
             },
             "required": ["title"],
         },
