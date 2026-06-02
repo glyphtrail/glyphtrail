@@ -297,6 +297,18 @@ pub fn path_signature(path: &str) -> String {
     out
 }
 
+/// Whether a route [`OperationKey::signature`] has a concrete (non-parameter,
+/// non-empty) path segment, so a generic route like `GET /` or `/{}` isn't
+/// treated as matchable. A client call whose path has none is dynamic — its
+/// base/path didn't resolve to a literal. Shared by the federated web-matcher
+/// (#406) and the unmatched-clients reporting (#421) so they agree.
+pub fn signature_has_literal_segment(signature: &str) -> bool {
+    signature
+        .rsplit('|')
+        .next()
+        .is_some_and(|path| path.split('/').any(|s| !s.is_empty() && s != "{}"))
+}
+
 /// Rewrite a single path segment from a framework param syntax to `{name}`,
 /// or return `None` if it is a literal segment.
 fn canon_param_segment(seg: &str) -> Option<String> {
@@ -464,6 +476,15 @@ mod tests {
         check!(server.signature() == client_tmpl.signature());
         check!(server.signature() == client_uuid.signature());
         check!(server.signature() == "rest|GET|/api/users/{}");
+    }
+
+    #[test]
+    fn literal_segment_anchors_matchable_routes() {
+        check!(signature_has_literal_segment("rest|GET|/users/{}"));
+        check!(signature_has_literal_segment("rest|POST|/signin"));
+        // All-dynamic / root routes have nothing concrete to match on.
+        check!(!signature_has_literal_segment("rest|GET|/{}"));
+        check!(!signature_has_literal_segment("rest|GET|/"));
     }
 
     #[test]

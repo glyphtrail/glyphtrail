@@ -6,7 +6,7 @@ use glyphtrail_core::config::RepoPaths;
 use glyphtrail_core::operations_matching as match_operations;
 use glyphtrail_core::{
     EdgeKind, HttpMethod, Node, NodeKind, OperationKey, Protocol, Registry, RegistryEntry,
-    default_registry_path,
+    default_registry_path, signature_has_literal_segment,
 };
 use glyphtrail_store::GraphStore;
 use serde::Serialize;
@@ -47,6 +47,11 @@ pub enum QueryCmd {
         /// Restrict to a protocol: rest, grpc, graphql.
         #[arg(long)]
         protocol: Option<String>,
+        /// Only the REST calls that match no endpoint in the index, with the
+        /// reason (dynamic path, or no endpoint with that signature in scope) —
+        /// each a candidate for a precise `[[links]]` endpoint hint (#421).
+        #[arg(long)]
+        unmatched: bool,
     },
     /// Find the endpoint(s) that serve a path (template- and value-aware).
     Serves {
@@ -100,6 +105,7 @@ enum QueryResult {
     Operations(Vec<OperationOut>),
     ApiImpact(Vec<ApiImpactOut>),
     Drift(DriftReport),
+    UnmatchedClients(Vec<UnmatchedClientOut>),
 }
 
 impl QueryResult {
@@ -110,6 +116,7 @@ impl QueryResult {
             QueryResult::Operations(v) => serde_json::to_value(v),
             QueryResult::ApiImpact(v) => serde_json::to_value(v),
             QueryResult::Drift(v) => serde_json::to_value(v),
+            QueryResult::UnmatchedClients(v) => serde_json::to_value(v),
         }
         .unwrap_or(serde_json::Value::Null)
     }
@@ -121,6 +128,7 @@ impl QueryResult {
             QueryResult::Operations(v) => operations_text(v),
             QueryResult::ApiImpact(v) => api_impact_text(v),
             QueryResult::Drift(v) => drift_text(v),
+            QueryResult::UnmatchedClients(v) => unmatched_clients_text(v),
         }
     }
 }
@@ -190,6 +198,24 @@ struct ApiImpactOut {
     handlers: Vec<Node>,
     callers: Vec<Node>,
     schema_ops: Vec<Node>,
+}
+
+/// A REST client call that links to no endpoint, with the reason — a candidate
+/// for a precise `[[links]]` endpoint hint (#421).
+#[derive(Serialize)]
+struct UnmatchedClientOut {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    method: Option<String>,
+    path: String,
+    file: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    line: Option<usize>,
+    /// The enclosing function/method the call sits in, if resolved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enclosing: Option<String>,
+    /// Why it matches nothing: a dynamic path, or no endpoint with that
+    /// signature in scope.
+    reason: String,
 }
 
 #[derive(Serialize)]
@@ -282,6 +308,66 @@ fn collect_operations(
     Ok(out)
 }
 
+/// REST client calls in `store` that link to no endpoint (no outgoing INVOKES),
+/// each with the reason it can't match — a candidate for a precise `[[links]]`
+/// endpoint hint (#421). Only REST is supported (routes match by signature); a
+/// non-REST `protocol` is rejected by the caller rather than silently emptied.
+fn unmatched_clients(store: &dyn GraphStore) -> Result<Vec<UnmatchedClientOut>> {
+    let mut out = Vec::new();
+    for (id, key) in store.operations_by_kind(NodeKind::ClientCall)? {
+        if key.protocol != Protocol::Rest {
+            continue;
+        }
+        // Matched calls carry an outgoing INVOKES edge to the endpoint they hit.
+        if !store
+            .neighbors(&id.0, Some(EdgeKind::Invokes), true)?
+            .is_empty()
+        {
+            continue;
+        }
+        let node = store.get_node(&id.0)?;
+        // The enclosing function reaches the call via an incoming CALLS edge (#130).
+        let enclosing = store
+            .neighbors(&id.0, Some(EdgeKind::Calls), false)?
+            .into_iter()
+            .next()
+            .map(|(n, _, _)| n.qualified_name);
+        let reason = if signature_has_literal_segment(&key.signature()) {
+            "no endpoint with this signature in scope".to_string()
+        } else {
+            "dynamic path (no literal segment to match)".to_string()
+        };
+        out.push(UnmatchedClientOut {
+            method: key.method.map(|m| m.as_str().to_string()),
+            path: key.path.clone(),
+            file: node.as_ref().map(|n| n.file.clone()).unwrap_or_default(),
+            line: node.as_ref().and_then(|n| n.span.map(|s| s.start_line)),
+            enclosing,
+            reason,
+        });
+    }
+    Ok(out)
+}
+
+fn unmatched_clients_text(items: &[UnmatchedClientOut]) {
+    if items.is_empty() {
+        println!("(no unmatched REST client calls)");
+    }
+    for c in items {
+        let loc = match c.line {
+            Some(l) => format!("{}:{}", c.file, l),
+            None => c.file.clone(),
+        };
+        let verb = c.method.as_deref().unwrap_or("REST");
+        let enc = c
+            .enclosing
+            .as_deref()
+            .map(|e| format!(" in {e}"))
+            .unwrap_or_default();
+        println!("{verb:>6} {} ({loc}){enc}  — {}", c.path, c.reason);
+    }
+}
+
 fn open_store(repo: &Path) -> Result<Box<dyn GraphStore + Send>> {
     backend::open_existing(&RepoPaths::new(repo))
 }
@@ -326,14 +412,28 @@ fn execute(store: &dyn GraphStore, cmd: &QueryCmd) -> Result<QueryResult> {
             let proto = parse_protocol_filter(protocol.as_deref())?;
             QueryResult::Operations(collect_operations(store, NodeKind::Endpoint, proto, true)?)
         }
-        QueryCmd::Clients { protocol } => {
+        QueryCmd::Clients {
+            protocol,
+            unmatched,
+        } => {
             let proto = parse_protocol_filter(protocol.as_deref())?;
-            QueryResult::Operations(collect_operations(
-                store,
-                NodeKind::ClientCall,
-                proto,
-                false,
-            )?)
+            if *unmatched {
+                // Matching is REST-only; a non-REST protocol would silently empty
+                // the result, so reject it rather than mislead (#421 review).
+                if matches!(proto, Some(p) if p != Protocol::Rest) {
+                    bail!(
+                        "--unmatched applies to REST only; drop --protocol or use --protocol rest"
+                    );
+                }
+                QueryResult::UnmatchedClients(unmatched_clients(store)?)
+            } else {
+                QueryResult::Operations(collect_operations(
+                    store,
+                    NodeKind::ClientCall,
+                    proto,
+                    false,
+                )?)
+            }
         }
         QueryCmd::Serves { path, method } => {
             let m = parse_method_opt(method.as_deref())?;
