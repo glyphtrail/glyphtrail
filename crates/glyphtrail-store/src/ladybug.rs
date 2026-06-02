@@ -356,6 +356,8 @@ fn parse_kind(s: &str) -> NodeKind {
         "author" => NodeKind::Author,
         "identity" => NodeKind::Identity,
         "topic" => NodeKind::Topic,
+        "table" => NodeKind::Table,
+        "column" => NodeKind::Column,
         _ => NodeKind::SchemaOp,
     }
 }

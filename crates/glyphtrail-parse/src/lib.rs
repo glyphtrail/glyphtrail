@@ -10,6 +10,7 @@ pub mod import_symbols;
 pub mod imports;
 pub mod registry;
 pub mod rest;
+pub mod sql;
 pub mod ws;
 
 pub use build::{
@@ -28,6 +29,7 @@ pub use imports::resolve_import;
 pub use rest::{
     RawEndpoint, RawMount, extract_axum, extract_axum_mounts, extract_utoipa, extract_utoipa_mounts,
 };
+pub use sql::{SqlTable, build_sql_graph, extract_sql_schema};
 pub use ws::{RawWsConnect, RawWsEvent, WsEventKind, extract_ws_connections, extract_ws_events};
 
 #[cfg(test)]
