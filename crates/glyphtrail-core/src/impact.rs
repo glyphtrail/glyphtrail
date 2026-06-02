@@ -70,9 +70,14 @@ pub fn edge_rules(tokens: &[&str]) -> Result<Vec<EdgeRule>, String> {
                 rules.push(EdgeRule::incoming(EdgeKind::Invokes));
                 rules.push(EdgeRule::incoming(EdgeKind::Mounts));
             }
+            "db" => {
+                // From a changed table, reach the code that reads/writes it.
+                rules.push(EdgeRule::incoming(EdgeKind::Reads));
+                rules.push(EdgeRule::incoming(EdgeKind::Writes));
+            }
             other => {
                 return Err(format!(
-                    "unknown edge set '{other}' (expected calls, refs, imports, impl, api)"
+                    "unknown edge set '{other}' (expected calls, refs, imports, impl, api, db)"
                 ));
             }
         }
@@ -132,6 +137,9 @@ impl ImpactPolicy {
             EdgeRule::outgoing(EdgeKind::Exposes),
             EdgeRule::incoming(EdgeKind::Invokes),
             EdgeRule::incoming(EdgeKind::Mounts),
+            // A changed table reaches the functions that read/write it (#416 B).
+            EdgeRule::incoming(EdgeKind::Reads),
+            EdgeRule::incoming(EdgeKind::Writes),
         ]);
         p
     }
@@ -321,7 +329,13 @@ pub fn compute_impact<A: Adjacency + ?Sized>(
 /// API edges (`Handles`/`Exposes`/`Mounts`) stay within the service and are
 /// reported as ordinary API surface, not cross-boundary consumers.
 pub fn is_cross_boundary_path(path: &[EdgeKind]) -> bool {
-    path.contains(&EdgeKind::Invokes)
+    path.iter().any(|k| {
+        matches!(
+            k,
+            // Web boundary (#222) and the code↔DB boundary (#416 Phase B).
+            EdgeKind::Invokes | EdgeKind::Reads | EdgeKind::Writes
+        )
+    })
 }
 
 /// A classified, resolved impacted node, ready for reporting.
@@ -337,7 +351,8 @@ pub struct ClassifiedItem {
     pub class: ImpactClass,
     pub distance: usize,
     pub min_confidence: Confidence,
-    /// Reached across the service boundary (HANDLES/INVOKES/EXPOSES/MOUNTS).
+    /// Reached across a boundary: the web service boundary (INVOKES) or the
+    /// code↔DB boundary (READS/WRITES).
     pub cross_boundary: bool,
     /// Edge-kind path from a seed (string form for stable JSON).
     pub path: Vec<String>,
@@ -940,6 +955,9 @@ mod tests {
             EdgeKind::Handles,
             EdgeKind::Invokes
         ])); // across the wire
+        // The code↔DB boundary counts too (#416 Phase B).
+        check!(is_cross_boundary_path(&[EdgeKind::Reads]));
+        check!(is_cross_boundary_path(&[EdgeKind::Writes]));
     }
 
     #[test]

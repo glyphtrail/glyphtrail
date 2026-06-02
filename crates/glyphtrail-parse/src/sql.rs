@@ -17,6 +17,14 @@ use std::collections::HashSet;
 
 use glyphtrail_core::{CodeGraph, Confidence, EdgeKind, Node, NodeId, NodeKind, Span};
 
+/// Whether a query reads from a table (`SELECT`) or writes it
+/// (`INSERT`/`UPDATE`/`DELETE`), for the code↔DB edges (#416 Phase B).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbAccess {
+    Read,
+    Write,
+}
+
 /// One DDL object (table or view) read from a SQL file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SqlTable {
@@ -290,6 +298,82 @@ fn view_references(toks: &[Tok], lc: &[String], start: usize) -> Vec<String> {
     refs
 }
 
+/// The tables a SQL query (a DML statement, e.g. an embedded `sqlx::query!`
+/// string) reads or writes, as `(access, normalized table name)` (#416 Phase B).
+/// Best-effort over possibly-many statements: a statement's leading verb sets the
+/// primary access (`INSERT`/`UPDATE`/`DELETE` → write, `SELECT` → read), and every
+/// `FROM`/`JOIN` source is a read (so an `INSERT … SELECT` records both). Comma-
+/// joins beyond the first table and CTE bodies are best-effort.
+pub fn extract_query_access(sql: &str) -> Vec<(DbAccess, String)> {
+    let clean = blank_noise(sql);
+    let toks = tokenize(&clean);
+    let lc: Vec<String> = toks.iter().map(|t| t.text.to_ascii_lowercase()).collect();
+    let mut out: Vec<(DbAccess, String)> = Vec::new();
+    let mut seen: HashSet<(bool, String)> = HashSet::new();
+    let mut push = |acc: DbAccess, name: &str, out: &mut Vec<(DbAccess, String)>| {
+        let n = normalize(name);
+        // A bare identifier; skip a subquery open-paren or an empty token.
+        if n.is_empty() || n == "(" {
+            return;
+        }
+        if seen.insert((matches!(acc, DbAccess::Write), n.clone())) {
+            out.push((acc, n));
+        }
+    };
+    // Process one statement (a `;`-delimited token range) at a time.
+    let mut start = 0;
+    for end in (0..=toks.len()).filter(|&k| k == toks.len() || toks[k].text == ";") {
+        let stmt: &[usize] = &(start..end).collect::<Vec<_>>();
+        if !stmt.is_empty() {
+            let verb = lc[stmt[0]].as_str();
+            // The statement's primary write target, and the token index that is
+            // the write `FROM` (for DELETE) so it isn't double-counted as a read.
+            let mut delete_from: Option<usize> = None;
+            match verb {
+                "insert" => {
+                    if let Some(p) = stmt.iter().position(|&i| lc[i] == "into")
+                        && let Some(&t) = stmt.get(p + 1)
+                    {
+                        push(DbAccess::Write, &toks[t].text, &mut out);
+                    }
+                }
+                "update" => {
+                    // UPDATE [ONLY] table
+                    let mut p = 1;
+                    if stmt.get(p).map(|&i| lc[i].as_str()) == Some("only") {
+                        p += 1;
+                    }
+                    if let Some(&t) = stmt.get(p) {
+                        push(DbAccess::Write, &toks[t].text, &mut out);
+                    }
+                }
+                "delete" => {
+                    if let Some(p) = stmt.iter().position(|&i| lc[i] == "from")
+                        && let Some(&t) = stmt.get(p + 1)
+                    {
+                        push(DbAccess::Write, &toks[t].text, &mut out);
+                        delete_from = Some(p);
+                    }
+                }
+                _ => {}
+            }
+            // Every FROM/JOIN source is a read (subquery sources included), except
+            // the DELETE write target above.
+            for (pos, &i) in stmt.iter().enumerate() {
+                if (lc[i] == "from" || lc[i] == "join")
+                    && Some(pos) != delete_from
+                    && let Some(&t) = stmt.get(pos + 1)
+                    && toks[t].text != "("
+                {
+                    push(DbAccess::Read, &toks[t].text, &mut out);
+                }
+            }
+        }
+        start = end + 1;
+    }
+    out
+}
+
 /// 1-based line number of `byte` in `source`.
 fn line_of(source: &str, byte: usize) -> usize {
     source[..byte.min(source.len())]
@@ -446,6 +530,65 @@ mod tests {
     fn string_literals_do_not_create_phantom_tables() {
         let src = "INSERT INTO log (msg) VALUES ('CREATE TABLE not_a_real_table (x int)');";
         check!(extract_sql_schema(src).is_empty());
+    }
+
+    fn access(sql: &str) -> Vec<(DbAccess, String)> {
+        let mut a = extract_query_access(sql);
+        a.sort_by(|x, y| {
+            (x.1.clone(), format!("{:?}", x.0)).cmp(&(y.1.clone(), format!("{:?}", y.0)))
+        });
+        a
+    }
+
+    #[test]
+    fn query_access_reads_selects_and_writes_mutations() {
+        check!(
+            access("SELECT id, name FROM users WHERE id = $1")
+                == vec![(DbAccess::Read, "users".into())]
+        );
+        check!(
+            access("INSERT INTO audit_log (msg) VALUES ($1)")
+                == vec![(DbAccess::Write, "audit_log".into())]
+        );
+        check!(
+            access("UPDATE users SET email = $1 WHERE id = $2")
+                == vec![(DbAccess::Write, "users".into())]
+        );
+        check!(
+            access("DELETE FROM sessions WHERE expired")
+                == vec![(DbAccess::Write, "sessions".into())]
+        );
+    }
+
+    #[test]
+    fn query_access_joins_are_reads_and_insert_select_records_both() {
+        check!(
+            access("SELECT * FROM orders o JOIN customers c ON c.id = o.customer_id")
+                == vec![
+                    (DbAccess::Read, "customers".into()),
+                    (DbAccess::Read, "orders".into()),
+                ]
+        );
+        // INSERT … SELECT: write target + the read source.
+        check!(
+            access("INSERT INTO archive SELECT * FROM events")
+                == vec![
+                    (DbAccess::Write, "archive".into()),
+                    (DbAccess::Read, "events".into()),
+                ]
+        );
+    }
+
+    #[test]
+    fn query_access_handles_schema_qualified_and_ignores_string_noise() {
+        check!(
+            access("SELECT 1 FROM public.users") == vec![(DbAccess::Read, "public.users".into())]
+        );
+        // A keyword inside a string literal isn't a statement.
+        check!(
+            access("SELECT 'delete from x' AS msg FROM logs")
+                == vec![(DbAccess::Read, "logs".into())]
+        );
     }
 
     #[test]

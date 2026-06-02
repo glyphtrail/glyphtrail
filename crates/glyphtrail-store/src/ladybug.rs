@@ -375,6 +375,8 @@ fn parse_edge_kind(s: &str) -> EdgeKind {
         "mounts" => EdgeKind::Mounts,
         "exposes" => EdgeKind::Exposes,
         "invokes" => EdgeKind::Invokes,
+        "reads" => EdgeKind::Reads,
+        "writes" => EdgeKind::Writes,
         "authored" => EdgeKind::Authored,
         "alias_of" => EdgeKind::AliasOf,
         "touched" => EdgeKind::Touched,
