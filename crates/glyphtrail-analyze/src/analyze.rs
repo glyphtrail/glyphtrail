@@ -1017,7 +1017,10 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 4: assembly call attribution — `jsr`/`jmp` in a line-oriented language now
 /// attribute to the nearest preceding label, so existing `.S` indexes rebuild
 /// to gain the routine-level callgraph (#368).
-const ANALYSIS_REVISION: u32 = 4;
+/// 5: JS/TS client extraction gained `inject(HttpClient)`, `HttpClient.request`,
+/// and same-file const/concatenation URL folding (#404/#405), so existing
+/// frontend indexes rebuild to surface the additional client calls.
+const ANALYSIS_REVISION: u32 = 5;
 
 /// Fingerprint of everything that determines analysis output: the crate
 /// version, the manual revision counter, and the built-in tree-sitter query

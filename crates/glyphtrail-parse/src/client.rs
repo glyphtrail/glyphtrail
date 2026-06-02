@@ -9,9 +9,10 @@
 //! - instance clients created in the same file via `const api = axios.create(…)`
 //!   — `api.get(url)`, `api(config)`, `api.request(config)` are treated like
 //!   their `axios` equivalents; and
-//! - Angular `HttpClient`: a field injected/declared as `HttpClient` (e.g.
-//!   `constructor(private http: HttpClient)`) makes `this.http.get(url)` /
-//!   `.post` / `.put` / `.delete` / `.patch` / `.head` client calls.
+//! - Angular `HttpClient`: a field injected/declared as `HttpClient` —
+//!   `constructor(private http: HttpClient)`, a `http: HttpClient` field, or
+//!   `http = inject(HttpClient)` — makes `this.http.get(url)` / `.post` / … and
+//!   `this.http.request(method, url, …)` (generated services) client calls.
 //!
 //! Rust (reqwest):
 //! - `reqwest::get(url)` and builder verbs `client.get(url)` / `.post(...)` /
@@ -33,10 +34,13 @@
 //!   `Session`) all match without per-instance tracking. f-string URLs keep
 //!   their interpolation (`f"/users/{id}"` -> `/users/{id}`).
 //!
-//! Only string-literal and template-literal URLs are extracted; fully dynamic
-//! URLs (bare variables, concatenations) are out of scope. Template
-//! interpolations (`/users/${id}`) are preserved verbatim so they collapse to a
-//! dynamic segment in the operation signature.
+//! String-literal, template-literal, and `+`-concatenation URLs are extracted;
+//! same-file `const NAME = "literal"` bases are folded in (`` `${BASE}/x` `` /
+//! `BASE + "/x"`). A fully dynamic URL (a bare non-constant variable) is out of
+//! scope. Unresolved template interpolations (`/users/${id}`) are preserved
+//! verbatim so they collapse to a dynamic segment in the operation signature.
+
+use std::collections::HashMap;
 
 use glyphtrail_core::{HttpMethod, Language, Span};
 use tree_sitter::{Node, Parser};
@@ -150,10 +154,11 @@ fn js_client_calls(source: &str, lang: &Language) -> Vec<RawClientCall> {
     let root = tree.root_node();
     let clients = axios_clients(root, src);
     let http_fields = http_client_fields(root, src);
+    let consts = string_constants(root, src);
     let mut out = Vec::new();
     walk(root, &mut |n| {
         if n.kind() == "call_expression"
-            && let Some(call) = client_call(n, src, &clients, &http_fields)
+            && let Some(call) = client_call(n, src, &clients, &http_fields, &consts)
         {
             out.push(call);
         }
@@ -513,6 +518,7 @@ fn client_call(
     src: &[u8],
     clients: &[AxiosBinding],
     http_fields: &[HttpClientField],
+    consts: &HashMap<String, String>,
 ) -> Option<RawClientCall> {
     let func = call.child_by_field_name("function")?;
     let args = call.child_by_field_name("arguments");
@@ -520,14 +526,14 @@ fn client_call(
         "identifier" => {
             let name = text(func, src);
             if name == "fetch" {
-                let path = url_text(named_arg(args, 0)?, src)?;
+                let path = resolve_url(named_arg(args, 0)?, src, consts)?;
                 let method = named_arg(args, 1)
                     .map(|o| object_method(o, src))
                     .unwrap_or(HttpMethod::Get);
                 (method, path)
             } else if is_axios_client(clients, &name, func.start_byte()) {
                 // `axios(config)` / `instance(config)`.
-                config_call(named_arg(args, 0)?, src)?
+                config_call(named_arg(args, 0)?, src, consts)?
             } else {
                 return None;
             }
@@ -543,16 +549,25 @@ fn client_call(
                     .iter()
                     .any(|f| f.name == field && f.scope.contains(&call.start_byte()))
             {
-                let method = HttpMethod::parse(&prop)?;
-                (method, url_text(named_arg(args, 0)?, src)?)
+                if prop == "request" {
+                    // `HttpClient.request(method, url, options)` — the overload
+                    // generated/OpenAPI Angular services use. Method is the first
+                    // string arg, URL the second.
+                    let method =
+                        js_string(named_arg(args, 0)?, src).and_then(|s| HttpMethod::parse(&s))?;
+                    (method, resolve_url(named_arg(args, 1)?, src, consts)?)
+                } else {
+                    let method = HttpMethod::parse(&prop)?;
+                    (method, resolve_url(named_arg(args, 0)?, src, consts)?)
+                }
             } else if is_axios_client(clients, &text(obj, src), obj.start_byte()) {
                 if prop == "request" {
                     // `axios.request(config)` / `instance.request(config)`.
-                    config_call(named_arg(args, 0)?, src)?
+                    config_call(named_arg(args, 0)?, src, consts)?
                 } else {
                     // `axios.get(url)` / `instance.post(url, ...)`.
                     let method = HttpMethod::parse(&prop)?;
-                    (method, url_text(named_arg(args, 0)?, src)?)
+                    (method, resolve_url(named_arg(args, 0)?, src, consts)?)
                 }
             } else {
                 return None;
@@ -606,11 +621,15 @@ fn http_client_fields(root: Node, src: &[u8]) -> Vec<HttpClientField> {
             "public_field_definition" => n.child_by_field_name("name"),
             _ => return,
         };
-        // `type_annotation` text is `: HttpClient`; match the bare type name.
-        let Some(ty) = n.child_by_field_name("type") else {
-            return;
-        };
-        if text(ty, src).trim_start_matches(':').trim() != "HttpClient" {
+        // Either a `: HttpClient` type annotation, or an `= inject(HttpClient)`
+        // initialiser (Angular's functional injection, which has no type).
+        let typed = n
+            .child_by_field_name("type")
+            .is_some_and(|ty| text(ty, src).trim_start_matches(':').trim() == "HttpClient");
+        let injected = n
+            .child_by_field_name("value")
+            .is_some_and(|v| is_inject_httpclient(v, src));
+        if !typed && !injected {
             return;
         }
         let Some(name) = name.filter(|x| matches!(x.kind(), "identifier" | "property_identifier"))
@@ -624,6 +643,22 @@ fn http_client_fields(root: Node, src: &[u8]) -> Vec<HttpClientField> {
         });
     });
     fields
+}
+
+/// Whether `node` is an `inject(HttpClient)` call (Angular functional injection).
+fn is_inject_httpclient(node: Node, src: &[u8]) -> bool {
+    node.kind() == "call_expression"
+        && node
+            .child_by_field_name("function")
+            .map(|f| text(f, src))
+            .as_deref()
+            == Some("inject")
+        && node
+            .child_by_field_name("arguments")
+            .and_then(|a| named_arg(Some(a), 0))
+            .map(|a| text(a, src))
+            .as_deref()
+            == Some("HttpClient")
 }
 
 /// Whether a parameter is a TypeScript parameter-property (carries an
@@ -648,10 +683,14 @@ fn enclosing_class(node: Node) -> Option<Node> {
     None
 }
 
-/// `(method, url)` from an axios config object: `url` is required (and must be
-/// a literal), `method` defaults to GET.
-fn config_call(config: Node, src: &[u8]) -> Option<(HttpMethod, String)> {
-    let url = url_text(object_field(config, "url", src)?, src)?;
+/// `(method, url)` from an axios config object: `url` is required, `method`
+/// defaults to GET. The URL folds known same-file constants.
+fn config_call(
+    config: Node,
+    src: &[u8],
+    consts: &HashMap<String, String>,
+) -> Option<(HttpMethod, String)> {
+    let url = resolve_url(object_field(config, "url", src)?, src, consts)?;
     Some((object_method(config, src), url))
 }
 
@@ -695,12 +734,119 @@ fn key_name(key: Node, src: &[u8]) -> Option<String> {
     }
 }
 
-/// URL string from a literal or template argument; `None` for dynamic URLs.
-fn url_text(node: Node, src: &[u8]) -> Option<String> {
+/// Same-file `const NAME = "literal"` string constants, so a URL built from a
+/// base constant (`` `${BASE}/x` `` or `BASE + "/x"`) folds to a concrete path
+/// that can match a server route. Imported constants are resolved later, at the
+/// analyze layer.
+fn string_constants(root: Node, src: &[u8]) -> HashMap<String, String> {
+    let mut consts = HashMap::new();
+    walk(root, &mut |n| {
+        if n.kind() != "variable_declarator" {
+            return;
+        }
+        let (Some(name), Some(value)) = (
+            n.child_by_field_name("name"),
+            n.child_by_field_name("value"),
+        ) else {
+            return;
+        };
+        if name.kind() == "identifier"
+            && value.kind() == "string"
+            && let Some(s) = js_string(value, src)
+        {
+            consts.insert(text(name, src), s);
+        }
+    });
+    consts
+}
+
+/// URL string from a literal, template, `+`-concatenation, or bare constant,
+/// folding known same-file string constants; `None` for a fully dynamic URL.
+fn resolve_url(node: Node, src: &[u8], consts: &HashMap<String, String>) -> Option<String> {
     match node.kind() {
         "string" => js_string(node, src),
-        // Keep `${...}` verbatim; it canonicalizes to a dynamic segment.
-        "template_string" => Some(text(node, src).trim_matches('`').to_string()),
+        "template_string" => Some(resolve_template(node, src, consts)),
+        "binary_expression" => resolve_concat(node, src, consts),
+        // A bare constant identifier used directly as the URL.
+        "identifier" => consts.get(&text(node, src)).cloned(),
+        _ => None,
+    }
+}
+
+/// Reconstruct a template literal, folding `${NAME}` for a known const and
+/// keeping any other `${...}` verbatim (so it collapses to a dynamic segment).
+fn resolve_template(node: Node, src: &[u8], consts: &HashMap<String, String>) -> String {
+    let mut out = String::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "string_fragment" | "escape_sequence" => out.push_str(&text(child, src)),
+            "template_substitution" => {
+                let folded = child
+                    .named_child(0)
+                    .filter(|e| e.kind() == "identifier")
+                    .and_then(|e| consts.get(&text(e, src)).cloned());
+                match folded {
+                    Some(v) => out.push_str(&v),
+                    None => out.push_str(&text(child, src)), // `${...}` verbatim
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Resolve a `+` string concatenation, folding constants; an unresolvable
+/// operand becomes a `${dyn}` dynamic segment. `None` when nothing concrete
+/// resolves (a fully dynamic expression), so a bare `a + b` is still skipped.
+fn resolve_concat(node: Node, src: &[u8], consts: &HashMap<String, String>) -> Option<String> {
+    let mut parts = Vec::new();
+    let mut any_concrete = false;
+    flatten_concat(node, src, consts, &mut parts, &mut any_concrete);
+    any_concrete.then(|| parts.concat())
+}
+
+fn flatten_concat(
+    node: Node,
+    src: &[u8],
+    consts: &HashMap<String, String>,
+    parts: &mut Vec<String>,
+    any_concrete: &mut bool,
+) {
+    let is_plus = node.kind() == "binary_expression"
+        && node
+            .child_by_field_name("operator")
+            .map(|o| text(o, src))
+            .as_deref()
+            == Some("+");
+    if !is_plus {
+        match resolve_operand(node, src, consts) {
+            Some(v) => {
+                parts.push(v);
+                *any_concrete = true;
+            }
+            None => parts.push("${dyn}".to_string()),
+        }
+        return;
+    }
+    for side in [
+        node.child_by_field_name("left"),
+        node.child_by_field_name("right"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        flatten_concat(side, src, consts, parts, any_concrete);
+    }
+}
+
+/// Resolve a single concatenation operand to a string, folding a known const.
+fn resolve_operand(node: Node, src: &[u8], consts: &HashMap<String, String>) -> Option<String> {
+    match node.kind() {
+        "string" => js_string(node, src),
+        "template_string" => Some(resolve_template(node, src, consts)),
+        "identifier" => consts.get(&text(node, src)).cloned(),
         _ => None,
     }
 }
@@ -1052,6 +1198,49 @@ func f(m map[string]int) {
         check!(call(&calls, HttpMethod::Get, "/api/a").is_some()); // A.http is HttpClient
         check!(call(&calls, HttpMethod::Get, "/api/b").is_none()); // B.http is Other
         check!(calls.len() == 1);
+    }
+
+    // #404: `inject(HttpClient)` functional injection (no type annotation) is a
+    // recognised HttpClient field.
+    #[test]
+    fn angular_inject_function_field() {
+        let src = "import { inject } from '@angular/core';\n\
+                   class S {\n  private http = inject(HttpClient);\n  \
+                   f() { return this.http.get('/api/x'); } }";
+        let calls = extract_client_calls(src, &Language::TypeScript);
+        check!(call(&calls, HttpMethod::Get, "/api/x").is_some());
+    }
+
+    // #404: `HttpClient.request(method, url, …)` — the overload generated Angular
+    // services use. Method from arg 0, URL from arg 1.
+    #[test]
+    fn angular_http_client_request_overload() {
+        let src = "class S {\n  constructor(private http: HttpClient) {}\n  \
+                   f() { return this.http.request('POST', '/api/x', { body: {} }); } }";
+        let calls = extract_client_calls(src, &Language::TypeScript);
+        check!(call(&calls, HttpMethod::Post, "/api/x").is_some());
+    }
+
+    // #405: a same-file `const` base folds into a template-literal URL so the
+    // path is concrete enough to match a server route.
+    #[test]
+    fn client_url_folds_same_file_const_in_template() {
+        let src = "const BASE = '/api';\n\
+                   class S {\n  constructor(private http: HttpClient) {}\n  \
+                   f(id: string) { return this.http.get(`${BASE}/users/${id}`); } }";
+        let calls = extract_client_calls(src, &Language::TypeScript);
+        // BASE folded; the unknown `${id}` stays dynamic.
+        check!(call(&calls, HttpMethod::Get, "/api/users/${id}").is_some());
+    }
+
+    // #405: the same base folds across `+` string concatenation.
+    #[test]
+    fn client_url_folds_same_file_const_in_concat() {
+        let src = "const BASE = '/api';\n\
+                   class S {\n  constructor(private http: HttpClient) {}\n  \
+                   f() { return this.http.get(BASE + '/users'); } }";
+        let calls = extract_client_calls(src, &Language::TypeScript);
+        check!(call(&calls, HttpMethod::Get, "/api/users").is_some());
     }
 
     // A plain (non-parameter-property) constructor param does not become a
