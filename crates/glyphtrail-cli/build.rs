@@ -10,12 +10,13 @@
 //! On an isolated `cargo publish` verify build the repo-root sources are absent;
 //! there the bundled copies are authoritative and the check is skipped.
 //!
-//! Keep `BEGIN`/`END` in sync with the same constants in
-//! `src/commands/setup.rs`.
+//! Keep `BEGIN_PREFIX`/`END` in sync with the same constants in
+//! `src/commands/setup.rs`. The begin marker carries a `v=N` version stamp, so
+//! match on the version-independent prefix.
 
 use std::path::Path;
 
-const BEGIN: &str = "<!-- glyphtrail:begin (managed section — edits are overwritten) -->";
+const BEGIN_PREFIX: &str = "<!-- glyphtrail:begin";
 const END: &str = "<!-- glyphtrail:end -->";
 
 fn main() {
@@ -58,10 +59,9 @@ fn read(p: &Path) -> String {
 
 /// The managed-section body (including its trailing newline) between the markers.
 fn section_body(s: &str) -> Option<String> {
-    let b = s.find(BEGIN)?;
-    let after = &s[b + BEGIN.len()..];
-    let nl = after.find('\n')?; // end of the begin-marker line
-    let start = b + BEGIN.len() + nl + 1; // first byte of the body
+    let b = s.find(BEGIN_PREFIX)?;
+    let nl = s[b..].find('\n')?; // end of the begin-marker line
+    let start = b + nl + 1; // first byte of the body
     let e = s[start..].find(END)? + start; // start of the end marker
     Some(s[start..e].to_string())
 }

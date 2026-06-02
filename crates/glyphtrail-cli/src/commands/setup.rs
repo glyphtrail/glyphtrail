@@ -26,8 +26,21 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 
-const BEGIN: &str = "<!-- glyphtrail:begin (managed section — edits are overwritten) -->";
+/// Version of the bundled skill + managed section. Bump when the content in
+/// `assets/` changes (and the `glyphtrail-version` in the skill frontmatter).
+/// An install stamped with a lower version is reported stale — a hint only;
+/// `analyze`/`status` never rewrite the files, only `setup` does.
+pub const SKILL_VERSION: u32 = 1;
+
+/// Version-independent prefix of the begin marker, so an existing section is
+/// detected (and replaced) regardless of the `v=` it was written with.
+const BEGIN_PREFIX: &str = "<!-- glyphtrail:begin";
 const END: &str = "<!-- glyphtrail:end -->";
+
+/// The begin marker for the current [`SKILL_VERSION`].
+fn begin_marker() -> String {
+    format!("<!-- glyphtrail:begin v={SKILL_VERSION} (managed section — edits are overwritten) -->")
+}
 
 /// The skill written to `.claude/skills/glyphtrail/SKILL.md`. Bundled copy of
 /// the repo's own skill of the same name (see `build.rs`, `task assets:sync`).
@@ -65,6 +78,10 @@ pub fn run(path: &Path, force: bool, home: bool) -> Result<()> {
         );
     }
 
+    // Capture the previously-installed version before we overwrite anything, so
+    // we can report a version transition below.
+    let prior = installed_version(&target);
+
     write_skill(&target)?;
     println!(
         "wrote {}",
@@ -83,6 +100,12 @@ pub fn run(path: &Path, force: bool, home: bool) -> Result<()> {
     // `.gitignore` only makes sense inside a repository.
     if in_repo && ensure_gitignore(&target)? {
         println!("added .glyphtrail/ to .gitignore");
+    }
+
+    if let Some(v) = prior
+        && v < SKILL_VERSION
+    {
+        println!("updated glyphtrail agent files (v{v} -> v{SKILL_VERSION})");
     }
     Ok(())
 }
@@ -113,11 +136,11 @@ fn upsert_section(path: &Path) -> Result<bool> {
     // `AGENT_SECTION_BODY` already ends with a newline, so the block reads
     // `{BEGIN}\n{body}{END}\n` — never blindly overwrite the file; only this
     // span between the markers is owned by glyphtrail.
-    let block = format!("{BEGIN}\n{AGENT_SECTION_BODY}{END}\n");
+    let block = format!("{}\n{AGENT_SECTION_BODY}{END}\n", begin_marker());
     let existing = fs::read_to_string(path).unwrap_or_default();
     let created = existing.is_empty();
 
-    let updated = match (existing.find(BEGIN), existing.find(END)) {
+    let updated = match (existing.find(BEGIN_PREFIX), existing.find(END)) {
         (Some(b), Some(e)) if e > b => {
             let end = e + END.len();
             // Drop a trailing newline inside the old span so we don't accumulate blanks.
@@ -162,6 +185,55 @@ fn ensure_gitignore(root: &Path) -> Result<bool> {
     Ok(true)
 }
 
+/// The glyphtrail version installed in `repo`, if onboarded. Prefers the skill's
+/// frontmatter (written in every mode); falls back to the `v=` in the
+/// `CLAUDE.md` managed-section marker. An onboarded repo without a version
+/// stamp (a pre-versioning install) counts as 0.
+pub fn installed_version(repo: &Path) -> Option<u32> {
+    if let Ok(skill) = fs::read_to_string(repo.join(".claude/skills/glyphtrail/SKILL.md")) {
+        return Some(frontmatter_version(&skill));
+    }
+    let claude = fs::read_to_string(repo.join("CLAUDE.md")).ok()?;
+    let b = claude.find(BEGIN_PREFIX)?;
+    let line_end = claude[b..].find('\n').map_or(claude.len(), |n| b + n);
+    Some(marker_version(&claude[b..line_end]))
+}
+
+/// A stale-skill advisory for `repo`, if the installed version is older than the
+/// bundled [`SKILL_VERSION`]. `None` when current, newer, or not onboarded.
+pub fn staleness_hint(repo: &Path) -> Option<String> {
+    let installed = installed_version(repo)?;
+    (installed < SKILL_VERSION).then(|| {
+        format!(
+            "note: glyphtrail agent files are out of date \
+             (installed v{installed}, bundled v{SKILL_VERSION}) — \
+             run `glyphtrail setup` to update"
+        )
+    })
+}
+
+/// Parse `glyphtrail-version: N` from skill frontmatter (0 if absent).
+fn frontmatter_version(skill: &str) -> u32 {
+    skill
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("glyphtrail-version:"))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Parse the `v=N` stamped in a begin-marker line (0 if absent).
+fn marker_version(line: &str) -> u32 {
+    line.find("v=")
+        .and_then(|i| {
+            let digits: String = line[i + 2..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            digits.parse().ok()
+        })
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,9 +251,8 @@ mod tests {
 
     /// The managed-section body (with its trailing newline) between the markers.
     fn section(s: &str) -> &str {
-        let b = s.find(BEGIN).unwrap();
-        let after = &s[b + BEGIN.len()..];
-        let start = b + BEGIN.len() + after.find('\n').unwrap() + 1;
+        let b = s.find(BEGIN_PREFIX).unwrap();
+        let start = b + s[b..].find('\n').unwrap() + 1;
         let e = s[start..].find(END).unwrap() + start;
         &s[start..e]
     }
@@ -206,11 +277,11 @@ mod tests {
         run(&dir, false, false).unwrap();
         let claude1 = std::fs::read_to_string(dir.join("CLAUDE.md")).unwrap();
         check!(claude1.starts_with("# My project")); // preserved existing content
-        check!(claude1.contains(BEGIN) && claude1.contains("Code graph (glyphtrail)"));
+        check!(claude1.contains(BEGIN_PREFIX) && claude1.contains("Code graph (glyphtrail)"));
         check!(
             std::fs::read_to_string(dir.join("AGENTS.md"))
                 .unwrap()
-                .contains(BEGIN)
+                .contains(BEGIN_PREFIX)
         );
         check!(
             std::fs::read_to_string(dir.join(".claude/skills/glyphtrail/SKILL.md"))
@@ -224,7 +295,7 @@ mod tests {
         run(&dir, false, false).unwrap();
         let claude2 = std::fs::read_to_string(dir.join("CLAUDE.md")).unwrap();
         check!(claude2 == claude1);
-        check!(claude2.matches(BEGIN).count() == 1);
+        check!(claude2.matches(BEGIN_PREFIX).count() == 1);
         let gi2 = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
         check!(gi2.matches(".glyphtrail/").count() == 1);
 
@@ -266,6 +337,30 @@ mod tests {
         let got = std::fs::read_to_string(dir.join("CLAUDE.md")).unwrap();
         let want = std::fs::read_to_string(root.join("CLAUDE.md")).unwrap();
         check!(section(&got) == section(&want));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // A fresh setup is current (no hint); an install stamped older is flagged.
+    #[test]
+    fn staleness_hint_fires_only_when_older() {
+        let dir = temp_dir("stale");
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        run(&dir, false, false).unwrap();
+        check!(installed_version(&dir) == Some(SKILL_VERSION));
+        check!(staleness_hint(&dir).is_none());
+
+        // Simulate an older install by rewriting the skill's version stamp.
+        let skill_path = dir.join(".claude/skills/glyphtrail/SKILL.md");
+        let skill = std::fs::read_to_string(&skill_path).unwrap();
+        let aged = skill.replace(
+            &format!("glyphtrail-version: {SKILL_VERSION}"),
+            "glyphtrail-version: 0",
+        );
+        check!(aged != skill); // the stamp was present and changed
+        std::fs::write(&skill_path, aged).unwrap();
+        check!(installed_version(&dir) == Some(0));
+        check!(staleness_hint(&dir).unwrap().contains("out of date"));
 
         std::fs::remove_dir_all(&dir).ok();
     }

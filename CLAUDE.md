@@ -6,7 +6,7 @@ installs into a consuming repo — this repo dogfoods its own onboarding, and th
 bundled copies under `crates/glyphtrail-cli/assets/` are derived from here (run
 `task assets:sync` after editing the skill or this section).
 
-<!-- glyphtrail:begin (managed section — edits are overwritten) -->
+<!-- glyphtrail:begin v=1 (managed section — edits are overwritten) -->
 # Code graph (glyphtrail)
 
 This repo is indexed by [glyphtrail](https://github.com/glyphtrail/glyphtrail).

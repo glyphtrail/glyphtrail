@@ -1,5 +1,6 @@
 ---
 name: glyphtrail
+glyphtrail-version: 1
 description: >-
   Use when understanding or changing code in this repo: locating where a symbol
   is defined, what calls it, how a request flows across the API boundary, or the
