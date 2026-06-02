@@ -1167,7 +1167,8 @@ fn declared_links(root: Option<&Path>) -> Vec<String> {
 /// How many declared `[[links]]` hints have a side naming no registered repo
 /// (#418) — a "dead link" count surfaced in `status` so an agent sees a wrong
 /// repo name or a path pointing nowhere instead of silently missing the edge.
-/// `None` when the registry can't be loaded (we can't judge resolution then).
+/// `None` when we can't judge resolution: no `root`, the config can't be read,
+/// or the registry can't be loaded. `Some(0)` when there are no links at all.
 fn unresolved_links(root: Option<&Path>) -> Option<usize> {
     let root = root?;
     let cfg = glyphtrail_core::Config::load(root).ok()?;

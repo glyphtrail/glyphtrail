@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::Result;
 use glyphtrail_analyze::Staleness;
 use glyphtrail_core::config::{Config, RepoPaths};
-use glyphtrail_core::{Registry, count_unresolved_links, default_registry_path};
+use glyphtrail_core::{LinkHint, Registry, count_unresolved_links, default_registry_path};
 use glyphtrail_store::Stats;
 use serde_json::{Value, json};
 
@@ -32,23 +32,37 @@ pub fn run(repo: &Path, emit: Emit) -> Result<()> {
 }
 
 /// `(configured, unresolved)` cross-repo link hints for this repo (#418), or
-/// `None` when none are declared. Validates each hint's repo against the
-/// registry; when the registry can't be loaded, reports 0 unresolved.
-fn link_health(repo: &Path) -> Option<(usize, usize)> {
+/// `None` when none are declared. `unresolved` is itself `None` when there's no
+/// registry to validate against — distinct from `Some(0)` (validated, all live),
+/// so the output never claims zero dead links when it couldn't actually check.
+fn link_health(repo: &Path) -> Option<(usize, Option<usize>)> {
     let links = Config::load(repo).ok()?.links;
+    let registry = default_registry_path().and_then(|p| Registry::load(&p).ok());
+    link_health_of(&links, registry.as_ref(), repo)
+}
+
+/// Count `(configured, unresolved)` for already-loaded `links` against an
+/// optional `registry`, split out so it's testable without a HOME registry.
+/// `None` when no links are declared; `unresolved` is `None` when there's no
+/// registry to judge resolution.
+fn link_health_of(
+    links: &[LinkHint],
+    registry: Option<&Registry>,
+    repo: &Path,
+) -> Option<(usize, Option<usize>)> {
     if links.is_empty() {
         return None;
     }
-    let Some(registry) = default_registry_path().and_then(|p| Registry::load(&p).ok()) else {
-        return Some((links.len(), 0));
+    let Some(registry) = registry else {
+        return Some((links.len(), None));
     };
     let owner_root = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
     let owner_name = registry
         .name_at_root(&owner_root)
         .unwrap_or(".")
         .to_string();
-    let unresolved = count_unresolved_links(&links, &owner_name, &owner_root, &registry);
-    Some((links.len(), unresolved))
+    let unresolved = count_unresolved_links(links, &owner_name, &owner_root, registry);
+    Some((links.len(), Some(unresolved)))
 }
 
 fn print_text(
@@ -56,7 +70,7 @@ fn print_text(
     s: &Stats,
     staleness: &Staleness,
     skill: Option<u32>,
-    links: Option<(usize, usize)>,
+    links: Option<(usize, Option<usize>)>,
 ) {
     println!("index:  {location}");
     println!("files:  {}", s.files);
@@ -67,10 +81,11 @@ fn print_text(
     }
     if let Some((configured, unresolved)) = links {
         match unresolved {
-            0 => println!("links:  {configured} cross-repo"),
-            k => println!(
+            Some(0) => println!("links:  {configured} cross-repo"),
+            Some(k) => println!(
                 "links:  {configured} cross-repo ({k} unresolved — `glyphtrail repo link list`)"
             ),
+            None => println!("links:  {configured} cross-repo (resolution unknown — no registry)"),
         }
     }
     match staleness {
@@ -98,7 +113,7 @@ fn stats_value(
     s: &Stats,
     staleness: &Staleness,
     skill: Option<u32>,
-    links: Option<(usize, usize)>,
+    links: Option<(usize, Option<usize>)>,
 ) -> Value {
     let languages: serde_json::Map<String, Value> = s
         .languages
@@ -156,7 +171,7 @@ mod tests {
             &s,
             &Staleness::Fresh,
             Some(0),
-            Some((5, 2)),
+            Some((5, Some(2))),
         );
         check!(fresh["files"] == json!(3));
         check!(fresh["links"]["configured"] == json!(5));
@@ -187,5 +202,57 @@ mod tests {
         check!(stale["skill_version"] == json!(null));
         check!(stale["skill_outdated"] == json!(false));
         check!(stale["links"] == json!(null)); // no links declared
+
+        // Links present but unvalidated (no registry): unresolved is null, not 0,
+        // so the output never claims zero dead links it couldn't actually check.
+        let unknown = stats_value("/x", &s, &Staleness::Fresh, Some(0), Some((3, None)));
+        check!(unknown["links"]["configured"] == json!(3));
+        check!(unknown["links"]["unresolved"] == json!(null));
+    }
+
+    #[test]
+    fn link_health_of_counts_against_registry_and_is_unknown_without_one() {
+        use glyphtrail_core::link_hints::LinkEnd;
+        use glyphtrail_core::registry::RegistryEntry;
+
+        let base = std::env::temp_dir().join(format!(
+            "gt-linkhealth-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+
+        let to = |repo: &str| LinkHint {
+            from: LinkEnd::default(), // "." -> the declaring repo, always live
+            to: LinkEnd {
+                repo: Some(repo.into()),
+                ..Default::default()
+            },
+        };
+        let links = vec![to("known"), to("nope")];
+
+        // No registry: configured is known, unresolved is unknown (None), not 0.
+        check!(link_health_of(&links, None, &base) == Some((2, None)));
+        // No links declared: nothing to report.
+        check!(link_health_of(&[], None, &base) == None);
+
+        // With a registry: the registered name resolves, the bogus one is dead.
+        let mut registry = Registry::default();
+        registry.repos.push(RegistryEntry {
+            name: "known".into(),
+            root: base.clone(),
+            alt_roots: vec![],
+            missing_since: None,
+            ids: vec![],
+            contributors: vec![],
+            identity: None,
+            visibility: glyphtrail_core::registry::Visibility::default(),
+        });
+        check!(link_health_of(&links, Some(&registry), &base) == Some((2, Some(1))));
+
+        std::fs::remove_dir_all(&base).ok();
     }
 }
