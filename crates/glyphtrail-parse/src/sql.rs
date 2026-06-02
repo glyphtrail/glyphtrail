@@ -148,6 +148,12 @@ fn normalize(name: &str) -> String {
     unquote(name).to_ascii_lowercase()
 }
 
+/// Public alias of the table-name normaliser, so other extractors (e.g. JPA)
+/// key tables the same way (#416 Phase B).
+pub fn normalize_name(name: &str) -> String {
+    normalize(name)
+}
+
 /// Keywords that begin a table-level constraint clause, not a column.
 fn is_constraint_kw(w: &str) -> bool {
     matches!(
@@ -376,9 +382,10 @@ pub fn extract_query_access(sql: &str) -> Vec<(DbAccess, String)> {
 
 /// 1-based line number of `byte` in `source`.
 fn line_of(source: &str, byte: usize) -> usize {
-    source[..byte.min(source.len())]
-        .bytes()
-        .filter(|&b| b == b'\n')
+    let end = byte.min(source.len());
+    source.as_bytes()[..end]
+        .iter()
+        .filter(|&&b| b == b'\n')
         .count()
         + 1
 }
