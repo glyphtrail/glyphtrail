@@ -92,6 +92,7 @@ fn timeline(atlas_dir: &Path, args: &Value) -> Result<Value, String> {
         // Scope to me, matching the CLI: the configured [me], else git's
         // user.email — so an unset [me] doesn't silently widen to everyone.
         me: resolve_me(&cfg.me),
+        public_only: false, // local recall: private shows, only proprietary hidden
         include_restricted: args
             .get("include_proprietary")
             .and_then(Value::as_bool)

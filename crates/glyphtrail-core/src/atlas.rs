@@ -231,7 +231,12 @@ pub struct TimelineQuery {
     pub author: Option<String>,
     /// Who "I" am, for the default author scope.
     pub me: MeConfig,
-    /// Include restricted repos — proprietary or unregistered (default-denied).
+    /// Outbound gate (#336): when set, only `Public` repos pass by default —
+    /// the stricter `is_restricted` rule for narration/export that leaves the
+    /// machine. When clear (the local `timeline` view), only proprietary and
+    /// unregistered repos are restricted; private repos show.
+    pub public_only: bool,
+    /// Include restricted repos despite the gate (explicit opt-in).
     pub include_restricted: bool,
     /// Cap how many rows are returned (most recent kept).
     pub limit: usize,
@@ -268,7 +273,12 @@ pub fn filter_timeline(
             continue;
         }
         let restricted = match registry.get(&row.repo).map(|e| e.visibility) {
-            Some(crate::registry::Visibility::Proprietary) | None => true,
+            // Unregistered (removed/renamed/stale) is always restricted.
+            None => true,
+            // Outbound (story/export): anything but Public.
+            Some(v) if q.public_only => v.is_restricted(),
+            // Local view: only proprietary; private repos show.
+            Some(crate::registry::Visibility::Proprietary) => true,
             Some(_) => false,
         };
         if restricted && !q.include_restricted {
@@ -724,14 +734,25 @@ mod tests {
         check!(tl.rows[1].repo == "priv");
         // Opt-in includes them.
         let tl = filter_timeline(
-            rows,
+            rows.clone(),
             &registry,
             &TimelineQuery {
                 include_restricted: true,
-                ..q
+                ..q.clone()
             },
         );
         check!(tl.rows.len() == 4 && tl.excluded_restricted == 0);
+        // Outbound (public_only): private is restricted too — only `pub` shows.
+        let tl = filter_timeline(
+            rows,
+            &registry,
+            &TimelineQuery {
+                public_only: true,
+                ..q
+            },
+        );
+        check!(tl.rows.len() == 1 && tl.rows[0].repo == "pub");
+        check!(tl.excluded_restricted == 3); // priv + prop + ghost
     }
 
     #[test]
