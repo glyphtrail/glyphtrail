@@ -169,6 +169,13 @@ fn collect_object_consts(obj_name: &str, obj: Node, src: &[u8], out: &mut Module
     }
 }
 
+/// Deprecated alias for the string-constant half of [`module_constants`], kept
+/// as a transition shim (#405).
+#[deprecated(note = "use module_constants(source, lang).strings")]
+pub fn module_string_constants(source: &str, lang: &Language) -> Vec<(String, String)> {
+    module_constants(source, lang).strings
+}
+
 /// Extract client HTTP calls from `source`, dispatching by language. Returns
 /// empty on parse failure or for languages with no client extractor.
 pub fn extract_client_calls(source: &str, lang: &Language) -> Vec<RawClientCall> {

@@ -1763,14 +1763,27 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
     let refs_by_file = group_consts(&const_refs);
     // Last-resort lookup for an object property (`OBJ.PROP`) whose own module is
     // not indexed — e.g. a gitignored Angular `environment.ts`, where the
-    // committed `environment.prod.ts` carries the same object. Host/scheme are
-    // normalized away, so an env variant yields the same path signature.
-    let mut global_props: HashMap<&str, &str> = HashMap::new();
+    // committed `environment.prod.ts` carries the same object. Only when the
+    // value is unambiguous across files: a key defined with conflicting values
+    // (a dev vs prod env with different paths) stays unresolved rather than risk
+    // folding to the wrong route. `None` marks a key seen with differing values.
+    let mut prop_values: HashMap<&str, Option<&str>> = HashMap::new();
     for (_file, key, value) in &string_consts {
         if key.contains('.') {
-            global_props.entry(key.as_str()).or_insert(value.as_str());
+            prop_values
+                .entry(key.as_str())
+                .and_modify(|e| {
+                    if *e != Some(value.as_str()) {
+                        *e = None;
+                    }
+                })
+                .or_insert(Some(value.as_str()));
         }
     }
+    let global_props: HashMap<&str, &str> = prop_values
+        .into_iter()
+        .filter_map(|(k, v)| Some((k, v?)))
+        .collect();
     let mut rewritten: Vec<(NodeId, OperationKey)> = Vec::new();
     for (id, key) in store.operations_by_kind(NodeKind::ClientCall)? {
         if key.protocol != Protocol::Rest || !key.path.contains("${") {
@@ -2503,6 +2516,11 @@ mod tests {
             |p: &str| resolve_path_constants(p, "svc.ts", &symbol_file, &strings, &refs, &global);
         let key = OperationKey::rest(glyphtrail_core::HttpMethod::Get, &r("/${API_URL}signin"));
         check!(key.path == "/v2/signin");
+        // When the global map has no unambiguous value, the base stays verbatim.
+        let empty = HashMap::new();
+        let r2 =
+            |p: &str| resolve_path_constants(p, "svc.ts", &symbol_file, &strings, &refs, &empty);
+        check!(r2("/${API_URL}signin") == "/${API_URL}signin");
     }
 
     fn temp_repo(tag: &str) -> std::path::PathBuf {

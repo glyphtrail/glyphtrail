@@ -18,6 +18,8 @@ pub use build::{
     build_grpc_graph, build_rest_graph, build_ws_client_graph, build_ws_server_graph,
     enclosing_call_edges,
 };
+#[allow(deprecated)]
+pub use client::module_string_constants;
 pub use client::{ModuleConsts, RawClientCall, extract_client_calls, module_constants};
 pub use dynamic::{DynamicGrammar, load_dynamic};
 pub use extract::{ParsedFile, parse_source, parse_with};
