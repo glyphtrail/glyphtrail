@@ -59,7 +59,15 @@ const AGENT_SECTION_BODY: &str = include_str!("../../assets/agent-section.md");
 /// `path`. Otherwise, when `path` is not inside a git repository, this errors
 /// unless `force` is set — so the files don't land in a random directory by
 /// mistake.
-pub fn run(path: &Path, force: bool, home: bool) -> Result<()> {
+///
+/// `gitignore` keeps glyphtrail local-only: the skill is still written but
+/// gitignored, the `CLAUDE.md`/`AGENTS.md` patch is skipped, and any section a
+/// previous `setup` added is stripped back out.
+pub fn run(path: &Path, force: bool, home: bool, gitignore: bool) -> Result<()> {
+    if home && gitignore {
+        bail!("--gitignore edits a repository .gitignore and cannot be combined with --home");
+    }
+
     let target = if home {
         home_dir()
             .ok_or_else(|| anyhow!("cannot locate home directory (set HOME or USERPROFILE)"))?
@@ -89,20 +97,35 @@ pub fn run(path: &Path, force: bool, home: bool) -> Result<()> {
     );
 
     for name in ["CLAUDE.md", "AGENTS.md"] {
-        let created = upsert_section(&target.join(name))?;
-        println!(
-            "{} {}",
-            if created { "created" } else { "updated" },
-            target.join(name).display()
-        );
+        let file = target.join(name);
+        if gitignore {
+            // Local-only: strip a previously-installed section, leave the rest.
+            if remove_section(&file)? {
+                println!("removed glyphtrail section from {}", file.display());
+            }
+        } else {
+            let created = upsert_section(&file)?;
+            println!(
+                "{} {}",
+                if created { "created" } else { "updated" },
+                file.display()
+            );
+        }
     }
 
     // `.gitignore` only makes sense inside a repository.
-    if in_repo && ensure_gitignore(&target)? {
-        println!("added .glyphtrail/ to .gitignore");
+    if in_repo {
+        if add_ignore(&target, ".glyphtrail/")? {
+            println!("added .glyphtrail/ to .gitignore");
+        }
+        if gitignore && add_ignore(&target, ".claude/skills/glyphtrail/")? {
+            println!("added .claude/skills/glyphtrail/ to .gitignore");
+        }
     }
 
-    if let Some(v) = prior
+    // A version transition only makes sense when we (re)wrote the section.
+    if !gitignore
+        && let Some(v) = prior
         && v < SKILL_VERSION
     {
         println!("updated glyphtrail agent files (v{v} -> v{SKILL_VERSION})");
@@ -170,22 +193,60 @@ fn upsert_section(path: &Path) -> Result<bool> {
     Ok(created)
 }
 
-/// Add `.glyphtrail/` to `.gitignore` if not already ignored. Returns whether
-/// a line was added.
-fn ensure_gitignore(root: &Path) -> Result<bool> {
+/// Remove the managed section (markers, body, and the blank line `upsert_section`
+/// inserted before it) from `path`, preserving everything else. Returns whether
+/// a section was removed; a no-op (returning `false`) when the file is absent or
+/// has no section. The inverse of [`upsert_section`].
+fn remove_section(path: &Path) -> Result<bool> {
+    let Ok(existing) = fs::read_to_string(path) else {
+        return Ok(false);
+    };
+    // Match `upsert_section`: locate the end marker after the begin marker.
+    let Some(b) = existing.find(BEGIN_PREFIX) else {
+        return Ok(false);
+    };
+    let Some(rel) = existing[b..].find(END) else {
+        return Ok(false);
+    };
+    let end = b + rel + END.len();
+
+    // The block ends with a newline; drop it so it doesn't linger as a blank
+    // line. Trim the blank-line separator we added before the block, too.
+    let after = existing[end..]
+        .strip_prefix('\n')
+        .unwrap_or(&existing[end..]);
+    let before = existing[..b].trim_end_matches('\n');
+
+    let mut out = String::from(before);
+    if !before.is_empty() && !after.is_empty() {
+        out.push('\n'); // single separator between preserved halves
+    }
+    out.push_str(after);
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    fs::write(path, &out).with_context(|| format!("writing {}", path.display()))?;
+    Ok(true)
+}
+
+/// Add `line` to `.gitignore` if not already ignored (matching with or without a
+/// trailing slash). Returns whether a line was added.
+fn add_ignore(root: &Path, line: &str) -> Result<bool> {
     let path = root.join(".gitignore");
     let existing = fs::read_to_string(&path).unwrap_or_default();
-    if existing
-        .lines()
-        .any(|l| matches!(l.trim(), ".glyphtrail" | ".glyphtrail/"))
-    {
+    let bare = line.trim_end_matches('/');
+    if existing.lines().any(|l| {
+        let t = l.trim();
+        t == line || t == bare
+    }) {
         return Ok(false);
     }
     let mut s = existing;
     if !s.is_empty() && !s.ends_with('\n') {
         s.push('\n');
     }
-    s.push_str(".glyphtrail/\n");
+    s.push_str(line);
+    s.push('\n');
     fs::write(&path, s).with_context(|| format!("writing {}", path.display()))?;
     Ok(true)
 }
@@ -279,7 +340,7 @@ mod tests {
         std::fs::write(dir.join("CLAUDE.md"), "# My project\n\nNotes.\n").unwrap();
         std::fs::write(dir.join(".gitignore"), "target/\n").unwrap();
 
-        run(&dir, false, false).unwrap();
+        run(&dir, false, false, false).unwrap();
         let claude1 = std::fs::read_to_string(dir.join("CLAUDE.md")).unwrap();
         check!(claude1.starts_with("# My project")); // preserved existing content
         check!(claude1.contains(BEGIN_PREFIX) && claude1.contains("Code graph (glyphtrail)"));
@@ -297,7 +358,7 @@ mod tests {
         check!(gi.contains("target/") && gi.contains(".glyphtrail/"));
 
         // Re-run: no duplication.
-        run(&dir, false, false).unwrap();
+        run(&dir, false, false, false).unwrap();
         let claude2 = std::fs::read_to_string(dir.join("CLAUDE.md")).unwrap();
         check!(claude2 == claude1);
         check!(claude2.matches(BEGIN_PREFIX).count() == 1);
@@ -312,10 +373,10 @@ mod tests {
     #[test]
     fn setup_outside_repo_errors_unless_forced() {
         let dir = temp_dir("no-repo"); // no .git
-        check!(run(&dir, false, false).is_err());
+        check!(run(&dir, false, false, false).is_err());
         check!(!dir.join("CLAUDE.md").exists()); // nothing written on error
 
-        run(&dir, true, false).unwrap(); // --force
+        run(&dir, true, false, false).unwrap(); // --force
         check!(dir.join(".claude/skills/glyphtrail/SKILL.md").exists());
         check!(dir.join("CLAUDE.md").exists());
         check!(!dir.join(".gitignore").exists()); // not a repo -> no gitignore
@@ -335,12 +396,12 @@ mod tests {
         )
         .unwrap();
 
-        run(&dir, false, false).unwrap();
+        run(&dir, false, false, false).unwrap();
         let c1 = std::fs::read_to_string(dir.join("CLAUDE.md")).unwrap();
         check!(c1.matches(BEGIN_PREFIX).count() == 1);
 
         // Re-run: the section is found and replaced in place, not duplicated.
-        run(&dir, false, false).unwrap();
+        run(&dir, false, false, false).unwrap();
         let c2 = std::fs::read_to_string(dir.join("CLAUDE.md")).unwrap();
         check!(c2 == c1);
         check!(c2.matches(BEGIN_PREFIX).count() == 1);
@@ -356,7 +417,7 @@ mod tests {
         let root = repo_root();
         let dir = temp_dir("dogfood");
         std::fs::create_dir_all(dir.join(".git")).unwrap();
-        run(&dir, false, false).unwrap();
+        run(&dir, false, false, false).unwrap();
 
         let got_skill =
             std::fs::read_to_string(dir.join(".claude/skills/glyphtrail/SKILL.md")).unwrap();
@@ -376,7 +437,7 @@ mod tests {
     fn staleness_hint_fires_only_when_older() {
         let dir = temp_dir("stale");
         std::fs::create_dir_all(dir.join(".git")).unwrap();
-        run(&dir, false, false).unwrap();
+        run(&dir, false, false, false).unwrap();
         check!(installed_version(&dir) == Some(SKILL_VERSION));
         check!(staleness_hint(&dir).is_none());
 
@@ -392,6 +453,51 @@ mod tests {
         check!(installed_version(&dir) == Some(0));
         check!(staleness_hint(&dir).unwrap().contains("out of date"));
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --gitignore (#391): keep glyphtrail local-only — write the skill but
+    // gitignore it, skip the CLAUDE.md/AGENTS.md patch, and strip a section a
+    // prior run added, restoring the surrounding content exactly.
+    #[test]
+    fn gitignore_mode_is_local_only_and_strips_section() {
+        let dir = temp_dir("gitignore");
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join("CLAUDE.md"), "# My project\n\nNotes.\n").unwrap();
+
+        // A normal setup first, which appends the managed section.
+        run(&dir, false, false, false).unwrap();
+        check!(
+            std::fs::read_to_string(dir.join("CLAUDE.md"))
+                .unwrap()
+                .contains(BEGIN_PREFIX)
+        );
+
+        // --gitignore: section stripped (content restored byte-for-byte), skill
+        // still present, both glyphtrail paths gitignored.
+        run(&dir, false, false, true).unwrap();
+        let claude = std::fs::read_to_string(dir.join("CLAUDE.md")).unwrap();
+        check!(claude == "# My project\n\nNotes.\n");
+        check!(!claude.contains(BEGIN_PREFIX));
+        check!(dir.join(".claude/skills/glyphtrail/SKILL.md").exists());
+        let gi = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
+        check!(gi.contains(".glyphtrail/"));
+        check!(gi.contains(".claude/skills/glyphtrail/"));
+
+        // Idempotent: re-running adds no duplicate ignore lines.
+        run(&dir, false, false, true).unwrap();
+        let gi2 = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
+        check!(gi2.matches(".claude/skills/glyphtrail/").count() == 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --home and --gitignore are mutually exclusive (the latter edits a repo
+    // .gitignore). Rejected before any path resolution, so it never touches HOME.
+    #[test]
+    fn gitignore_conflicts_with_home() {
+        let dir = temp_dir("conflict");
+        check!(run(&dir, false, true, true).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

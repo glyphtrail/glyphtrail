@@ -88,6 +88,9 @@ glyphtrail mcp                         # MCP server over stdio (query/endpoints/
 glyphtrail setup                       # onboard agents: write .claude/skills + a
 #   managed CLAUDE.md/AGENTS.md section pointing them at the MCP/CLI, and gitignore
 #   the index. Idempotent and stats-free (won't dirty the files on every commit).
+glyphtrail setup --gitignore           # keep it local-only: write the skill but
+#   gitignore it, skip the CLAUDE.md/AGENTS.md patch, and strip a section a prior
+#   run added (so nothing glyphtrail-related is committed).
 
 # Generate a docs wiki from the graph via an LLM
 glyphtrail wiki --provider claude        # or openai / openrouter (reads *_API_KEY)

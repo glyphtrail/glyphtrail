@@ -139,6 +139,10 @@ enum Command {
         /// Write global agent files to the user's home directory instead of `path`.
         #[arg(long)]
         home: bool,
+        /// Keep glyphtrail local-only: gitignore the skill, skip the
+        /// CLAUDE.md/AGENTS.md patch, and strip any section a prior run added.
+        #[arg(long, conflicts_with = "home")]
+        gitignore: bool,
     },
     /// Manage the global repository registry (~/.glyphtrail/registry.json).
     Repo {
@@ -338,7 +342,12 @@ fn main() -> anyhow::Result<()> {
         Command::Wiki(args) => commands::wiki::run(args),
         Command::Story(args) => commands::story::run(args),
         Command::Mcp { repo } => glyphtrail_mcp::serve_stdio(repo),
-        Command::Setup { path, force, home } => commands::setup::run(&path, force, home),
+        Command::Setup {
+            path,
+            force,
+            home,
+            gitignore,
+        } => commands::setup::run(&path, force, home, gitignore),
         Command::Repo { cmd } => commands::repo::run(cmd),
         Command::Remote { cmd } => commands::remote::run(cmd),
         Command::Config { cmd } => commands::config::run(cmd),
