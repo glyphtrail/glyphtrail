@@ -23,6 +23,7 @@ pub mod scrub;
 
 pub use api::{
     HttpMethod, OperationKey, Protocol, normalize_path, operations_matching, path_signature,
+    signature_has_literal_segment,
 };
 pub use atlas::{
     AtlasConfig, AtlasHeads, AtlasTimelineRow, CommitMeta, MeConfig, Timeline, TimelineQuery,

@@ -6,7 +6,7 @@ use glyphtrail_core::config::RepoPaths;
 use glyphtrail_core::operations_matching as match_operations;
 use glyphtrail_core::{
     EdgeKind, HttpMethod, Node, NodeKind, OperationKey, Protocol, Registry, RegistryEntry,
-    default_registry_path,
+    default_registry_path, signature_has_literal_segment,
 };
 use glyphtrail_store::GraphStore;
 use serde::Serialize;
@@ -308,33 +308,14 @@ fn collect_operations(
     Ok(out)
 }
 
-/// Whether a REST route signature has a concrete (non-parameter, non-empty) path
-/// segment, so a generic route like `/` or `/{}` isn't treated as matchable. A
-/// call with none is dynamic — its base/path didn't resolve to a literal. Mirrors
-/// the federated web-matcher's gate (#406) so the reason here agrees with it.
-fn has_literal_segment(signature: &str) -> bool {
-    signature
-        .rsplit('|')
-        .next()
-        .is_some_and(|path| path.split('/').any(|s| !s.is_empty() && s != "{}"))
-}
-
 /// REST client calls in `store` that link to no endpoint (no outgoing INVOKES),
 /// each with the reason it can't match — a candidate for a precise `[[links]]`
-/// endpoint hint (#421). Non-REST protocols are skipped (only REST routes match
-/// by signature); `protocol` further restricts when set.
-fn unmatched_clients(
-    store: &dyn GraphStore,
-    protocol: Option<Protocol>,
-) -> Result<Vec<UnmatchedClientOut>> {
+/// endpoint hint (#421). Only REST is supported (routes match by signature); a
+/// non-REST `protocol` is rejected by the caller rather than silently emptied.
+fn unmatched_clients(store: &dyn GraphStore) -> Result<Vec<UnmatchedClientOut>> {
     let mut out = Vec::new();
     for (id, key) in store.operations_by_kind(NodeKind::ClientCall)? {
         if key.protocol != Protocol::Rest {
-            continue;
-        }
-        if let Some(p) = protocol
-            && key.protocol != p
-        {
             continue;
         }
         // Matched calls carry an outgoing INVOKES edge to the endpoint they hit.
@@ -351,7 +332,7 @@ fn unmatched_clients(
             .into_iter()
             .next()
             .map(|(n, _, _)| n.qualified_name);
-        let reason = if has_literal_segment(&key.signature()) {
+        let reason = if signature_has_literal_segment(&key.signature()) {
             "no endpoint with this signature in scope".to_string()
         } else {
             "dynamic path (no literal segment to match)".to_string()
@@ -437,7 +418,14 @@ fn execute(store: &dyn GraphStore, cmd: &QueryCmd) -> Result<QueryResult> {
         } => {
             let proto = parse_protocol_filter(protocol.as_deref())?;
             if *unmatched {
-                QueryResult::UnmatchedClients(unmatched_clients(store, proto)?)
+                // Matching is REST-only; a non-REST protocol would silently empty
+                // the result, so reject it rather than mislead (#421 review).
+                if matches!(proto, Some(p) if p != Protocol::Rest) {
+                    bail!(
+                        "--unmatched applies to REST only; drop --protocol or use --protocol rest"
+                    );
+                }
+                QueryResult::UnmatchedClients(unmatched_clients(store)?)
             } else {
                 QueryResult::Operations(collect_operations(
                     store,
@@ -753,20 +741,5 @@ mod tests {
         check!(parse_method_opt(None).unwrap() == None);
         check!(parse_method_opt(Some("delete")).unwrap() == Some(HttpMethod::Delete));
         check!(parse_method_opt(Some("fetch")).is_err());
-    }
-
-    // #421: the literal-segment gate decides an unmatched call's reason — a
-    // concrete path is "no endpoint in scope", an all-dynamic one is "dynamic".
-    #[test]
-    fn literal_segment_distinguishes_concrete_from_dynamic_paths() {
-        let sig = |m, p| OperationKey::rest(m, p).signature();
-        check!(has_literal_segment(&sig(HttpMethod::Post, "/signin")));
-        check!(has_literal_segment(&sig(HttpMethod::Get, "/users/{id}"))); // /users is literal
-        // All-dynamic / empty paths have nothing to match on.
-        check!(!has_literal_segment(&sig(
-            HttpMethod::Get,
-            "/{base}/{rest}"
-        )));
-        check!(!has_literal_segment(&sig(HttpMethod::Get, "/")));
     }
 }

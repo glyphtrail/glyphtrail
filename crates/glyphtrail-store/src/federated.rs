@@ -19,7 +19,7 @@ use glyphtrail_core::{
     META_PACKAGES, NodeId, NodeKind, PackageIdentity, Protocol, Registry, RepoHealth, RepoIdentity,
     RepoImpact, SkippedRepo, classify, compute_impact, count_unresolved_links, default_groups_path,
     default_registry_path, is_cross_boundary_path, path_signature, qualify, resolve_links,
-    unqualify,
+    signature_has_literal_segment, unqualify,
 };
 
 use crate::{ChangeSpec, GraphStore, LadybugStore, changed_files, seed_nodes};
@@ -191,13 +191,13 @@ fn web_links(names: &[String], registry: &Registry) -> WebLinks {
         };
         for (id, key) in eps {
             let sig = key.signature();
-            if key.protocol == Protocol::Rest && has_literal_segment(&sig) {
+            if key.protocol == Protocol::Rest && signature_has_literal_segment(&sig) {
                 endpoints.entry(sig).or_default().push((name.clone(), id));
             }
         }
         for (id, key) in ccs {
             let sig = key.signature();
-            if key.protocol == Protocol::Rest && has_literal_segment(&sig) {
+            if key.protocol == Protocol::Rest && signature_has_literal_segment(&sig) {
                 calls.push((name.clone(), sig, id));
             }
         }
@@ -225,16 +225,6 @@ fn web_match(endpoints: &EndpointsBySig, calls: &[(String, String, NodeId)]) -> 
         }
     }
     (repo_edges, node_edges)
-}
-
-/// Whether a REST operation signature (`rest|METHOD|/seg/seg`) has a concrete
-/// (non-parameter, non-empty) path segment, so a generic route like `GET /` or
-/// `/{}` is not treated as matching every call.
-fn has_literal_segment(signature: &str) -> bool {
-    signature
-        .rsplit('|')
-        .next()
-        .is_some_and(|path| path.split('/').any(|s| !s.is_empty() && s != "{}"))
 }
 
 /// Compute the cross-repo blast radius: seed in the repo at `current_root` and
@@ -830,15 +820,6 @@ mod tests {
         check!(r(Some("./sub")) == "subrepo"); // a path -> the registered name
         check!(r(Some("./nope")) == "./nope"); // unresolvable path kept verbatim
         std::fs::remove_dir_all(&base).ok();
-    }
-
-    #[test]
-    fn has_literal_segment_rejects_generic_routes() {
-        check!(has_literal_segment("rest|GET|/users/{}"));
-        check!(has_literal_segment("rest|POST|/signin"));
-        // All-dynamic / root routes don't anchor a match.
-        check!(!has_literal_segment("rest|GET|/{}"));
-        check!(!has_literal_segment("rest|GET|/"));
     }
 
     #[test]

@@ -9,7 +9,7 @@ use glyphtrail_core::{
     Confidence, Detail, EdgeKind, Groups, HttpMethod, ImpactPolicy, ImpactReport, Node, NodeId,
     NodeKind, OperationKey, Protocol, Registry, RepoHealth, count_unresolved_links,
     default_groups_path, default_registry_path, is_outline_kind, operations_matching,
-    outline_symbol,
+    outline_symbol, signature_has_literal_segment,
 };
 use glyphtrail_store::{
     ChangeSpec, FederationScope, GraphStore, LadybugStore, SeedSpec, changed_files,
@@ -605,31 +605,24 @@ fn operations_list(
     Ok(Value::Array(out))
 }
 
-/// Whether a REST route signature has a concrete (non-parameter, non-empty) path
-/// segment; a call with none has a dynamic/unresolved path. Mirrors the federated
-/// web-matcher gate (#406) so the unmatched reason agrees with the matcher.
-fn has_literal_segment(signature: &str) -> bool {
-    signature
-        .rsplit('|')
-        .next()
-        .is_some_and(|path| path.split('/').any(|s| !s.is_empty() && s != "{}"))
-}
-
 /// REST client calls that link to no endpoint, with the reason (#421) — each a
 /// candidate for a precise `[[links]]` endpoint hint. `unmatched` = no outgoing
 /// INVOKES edge; the reason distinguishes a dynamic path from a simply-unmatched
-/// one. Honours the optional `protocol` filter.
+/// one. Matching is REST-only, so a non-REST `protocol` is rejected (it would
+/// otherwise silently return an empty list, misread as "none unmatched").
 fn unmatched_clients_json(store: &dyn GraphStore, args: &Value) -> Result<Value, String> {
-    let proto = match opt_str(args, "protocol") {
-        Some(p) => Some(Protocol::parse(p).ok_or_else(|| format!("unknown protocol '{p}'"))?),
-        None => None,
-    };
+    if let Some(p) = opt_str(args, "protocol") {
+        let proto = Protocol::parse(p).ok_or_else(|| format!("unknown protocol '{p}'"))?;
+        if proto != Protocol::Rest {
+            return Err("unmatched applies to REST only; omit protocol or set it to rest".into());
+        }
+    }
     let mut out = Vec::new();
     for (id, key) in store
         .operations_by_kind(NodeKind::ClientCall)
         .map_err(err)?
     {
-        if key.protocol != Protocol::Rest || proto.is_some_and(|p| key.protocol != p) {
+        if key.protocol != Protocol::Rest {
             continue;
         }
         if !store
@@ -646,7 +639,7 @@ fn unmatched_clients_json(store: &dyn GraphStore, args: &Value) -> Result<Value,
             .into_iter()
             .next()
             .map(|(n, _, _)| n.qualified_name);
-        let reason = if has_literal_segment(&key.signature()) {
+        let reason = if signature_has_literal_segment(&key.signature()) {
             "no endpoint with this signature in scope"
         } else {
             "dynamic path (no literal segment to match)"
