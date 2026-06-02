@@ -128,6 +128,85 @@ fn parse_endpoint_spec(spec: &str) -> Option<(Option<HttpMethod>, String)> {
     }
 }
 
+/// Repo-level cross edges (`producer repo`, `consumer repo`) + node-level cross
+/// edges (`producer node`, `consumer node`) from web-API matching (#406).
+type WebLinks = (Vec<(String, String)>, Vec<(NodeId, NodeId)>);
+/// Endpoints grouped by route signature: `signature -> [(repo, node id)]`.
+type EndpointsBySig = HashMap<String, Vec<(String, NodeId)>>;
+
+/// Automatic cross-repo web-API links (#406): a REST client call in one in-scope
+/// repo whose route signature (method + normalized path) matches an `Endpoint`
+/// in another repo. Returns repo-level edges (producer endpoint repo → consumer
+/// call repo, so impact flows from a changed endpoint to the calls that hit it)
+/// and the node-level cross-edges (qualified endpoint id → qualified call id).
+/// Opens each in-scope repo's index to read its operations; one that won't open
+/// is skipped. Trivial routes (`GET /`, all-dynamic paths) are ignored so a
+/// generic path doesn't link everything to everything.
+fn web_links(names: &[String], registry: &Registry) -> WebLinks {
+    let mut endpoints: EndpointsBySig = HashMap::new();
+    let mut calls: Vec<(String, String, NodeId)> = Vec::new();
+    for name in names {
+        let Some(entry) = registry.get(name) else {
+            continue;
+        };
+        if entry.health() != RepoHealth::Indexed {
+            continue;
+        }
+        let ladybug = RepoPaths::new(entry.active_root())
+            .index_dir
+            .join("ladybug");
+        let Ok(store) = LadybugStore::open(&ladybug) else {
+            continue;
+        };
+        for (id, key) in store
+            .operations_by_kind(NodeKind::Endpoint)
+            .unwrap_or_default()
+        {
+            let sig = key.signature();
+            if key.protocol == Protocol::Rest && has_literal_segment(&sig) {
+                endpoints.entry(sig).or_default().push((name.clone(), id));
+            }
+        }
+        for (id, key) in store
+            .operations_by_kind(NodeKind::ClientCall)
+            .unwrap_or_default()
+        {
+            let sig = key.signature();
+            if key.protocol == Protocol::Rest && has_literal_segment(&sig) {
+                calls.push((name.clone(), sig, id));
+            }
+        }
+    }
+    web_match(&endpoints, &calls)
+}
+
+/// Join client calls to endpoints by route signature across repos (the pure core
+/// of [`web_links`]): a call in one repo and an endpoint in another sharing a
+/// signature yield a producer-endpoint → consumer-call edge.
+fn web_match(endpoints: &EndpointsBySig, calls: &[(String, String, NodeId)]) -> WebLinks {
+    let mut repo_edges = Vec::new();
+    let mut node_edges = Vec::new();
+    for (call_repo, sig, call_id) in calls {
+        for (ep_repo, ep_id) in endpoints.get(sig).into_iter().flatten() {
+            if ep_repo != call_repo {
+                repo_edges.push((ep_repo.clone(), call_repo.clone()));
+                node_edges.push((qualify(ep_repo, ep_id), qualify(call_repo, call_id)));
+            }
+        }
+    }
+    (repo_edges, node_edges)
+}
+
+/// Whether a REST operation signature (`rest|METHOD|/seg/seg`) has a concrete
+/// (non-parameter, non-empty) path segment, so a generic route like `GET /` or
+/// `/{}` is not treated as matching every call.
+fn has_literal_segment(signature: &str) -> bool {
+    signature
+        .rsplit('|')
+        .next()
+        .is_some_and(|path| path.split('/').any(|s| !s.is_empty() && s != "{}"))
+}
+
 /// Compute the cross-repo blast radius: seed in the repo at `current_root` and
 /// traverse into downstream repos across the link table, scoped to the whole
 /// registry or a named group. The current repo must be registered and indexed.
@@ -317,6 +396,13 @@ pub fn federated_impact(
     // can receive impact from its seeds, so only those need their store opened —
     // not the whole registry. BFS the repo-level link graph from the current repo;
     // manual hints contribute their `to_repo -> from_repo` edges too.
+    // Automatic cross-repo web links (#406): match each in-scope repo's REST
+    // client calls to endpoints in other repos by route signature, so a backend
+    // route change reaches the frontends that call it without a shared package or
+    // a manual hint. Opens the in-scope indexes; scoped by the query (a group
+    // bounds it; the whole registry opens every member).
+    let (web_repo_edges, web_node_edges) = web_links(&names, &registry);
+
     let mut consumers_of: HashMap<&str, Vec<&str>> = HashMap::new();
     for l in &links {
         consumers_of
@@ -329,6 +415,12 @@ pub fn federated_impact(
             .entry(h.to_repo.as_str())
             .or_default()
             .push(h.from_repo.as_str());
+    }
+    for (producer, consumer) in &web_repo_edges {
+        consumers_of
+            .entry(producer.as_str())
+            .or_default()
+            .push(consumer.as_str());
     }
     let mut reachable: HashSet<String> = HashSet::from([current.clone()]);
     let mut queue = vec![current.clone()];
@@ -445,6 +537,16 @@ pub fn federated_impact(
                 }
             }
         }
+    }
+
+    // Automatic web links (#406): a cross-edge from each matched backend endpoint
+    // node to the frontend client-call node that hits it, so impact flows along
+    // the HTTP boundary like a resolved package link.
+    for (producer, consumer) in &web_node_edges {
+        cross
+            .entry(producer.clone())
+            .or_default()
+            .push((consumer.clone(), Confidence::Inferred));
     }
 
     // Manual hints (#281): a precise symbol↔symbol hint adds a cross-edge from the
@@ -612,5 +714,48 @@ mod tests {
         check!(ids == vec![NodeId("ep".into())]);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn has_literal_segment_rejects_generic_routes() {
+        check!(has_literal_segment("rest|GET|/users/{}"));
+        check!(has_literal_segment("rest|POST|/signin"));
+        // All-dynamic / root routes don't anchor a match.
+        check!(!has_literal_segment("rest|GET|/{}"));
+        check!(!has_literal_segment("rest|GET|/"));
+    }
+
+    #[test]
+    fn web_match_links_calls_to_endpoints_across_repos() {
+        let id = |s: &str| NodeId(s.into());
+        let endpoints = HashMap::from([
+            (
+                "rest|POST|/signin".to_string(),
+                vec![("backend".to_string(), id("ep"))],
+            ),
+            (
+                "rest|GET|/health".to_string(),
+                vec![("backend".to_string(), id("hp"))],
+            ),
+        ]);
+        let calls = vec![
+            // web -> backend's /signin: a cross-repo match.
+            (
+                "web".to_string(),
+                "rest|POST|/signin".to_string(),
+                id("call"),
+            ),
+            // a call with no matching endpoint anywhere.
+            ("web".to_string(), "rest|PUT|/other".to_string(), id("c2")),
+            // a same-repo match must NOT produce a cross edge.
+            (
+                "backend".to_string(),
+                "rest|GET|/health".to_string(),
+                id("self"),
+            ),
+        ];
+        let (repo_edges, node_edges) = web_match(&endpoints, &calls);
+        check!(repo_edges == vec![("backend".to_string(), "web".to_string())]);
+        check!(node_edges == vec![(qualify("backend", &id("ep")), qualify("web", &id("call")))]);
     }
 }
