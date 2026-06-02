@@ -572,6 +572,20 @@ impl Registry {
     pub fn get(&self, name: &str) -> Option<&RegistryEntry> {
         self.repos.iter().find(|e| e.name == name)
     }
+
+    /// The name of the registered repo rooted at `root` (any of its roots, by
+    /// canonical path), if any — the inverse of [`Self::get`], for mapping a
+    /// directory back to its registry name.
+    pub fn name_at_root(&self, root: &Path) -> Option<&str> {
+        let canon = root.canonicalize().ok()?;
+        self.repos
+            .iter()
+            .find(|e| {
+                e.roots()
+                    .any(|r| r.canonicalize().map(|c| c == canon).unwrap_or(false))
+            })
+            .map(|e| e.name.as_str())
+    }
 }
 
 /// Merge any spillover files (`registry.spill.*.json`) beside `registry_path`

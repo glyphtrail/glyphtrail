@@ -61,6 +61,26 @@ pub fn resolved_link_repo(
     }
 }
 
+/// How many of `links` have a side whose `repo` names no registered repo (#418)
+/// — the "dead link" count for `status` / the link tooling. `owner_name`/
+/// `owner_root` are the declaring repo (for resolving `.`/relative paths).
+pub fn count_unresolved_links(
+    links: &[LinkHint],
+    owner_name: &str,
+    owner_root: &Path,
+    registry: &Registry,
+) -> usize {
+    links
+        .iter()
+        .filter(|h| {
+            [&h.from, &h.to].into_iter().any(|end| {
+                end.repo.is_some()
+                    && resolved_link_repo(&end.repo, owner_name, owner_root, registry).is_none()
+            })
+        })
+        .count()
+}
+
 /// Pre-unification standalone hints file at the repo root, still read for
 /// back-compat and folded into `glyphtrail.toml` on the next `link`/`config` edit.
 pub const HINTS_FILE: &str = "glyphtrail.links.toml";
