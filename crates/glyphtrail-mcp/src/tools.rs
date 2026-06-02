@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use glyphtrail_core::config::{INDEX_DIR, RepoPaths};
 use glyphtrail_core::{
@@ -254,7 +255,10 @@ fn dispatch(
         if !file_issue_enabled() {
             return Err("file_issue is disabled; set GLYPHTRAIL_MCP_FILE_ISSUE=1 to enable".into());
         }
-        return Ok(file_issue_guidance(args));
+        // Best-effort repo context: drives which tracker the guidance points at
+        // (#378). Absent (no repo selected/launched), it falls back to upstream.
+        let root = file_issue_repo_root(default_db, args);
+        return Ok(file_issue_guidance(args, root.as_deref()));
     }
     // Resolve the per-call repo selector (#240): a registered name or a path
     // overrides the server's launch repo; absent, the launch repo is used — and
@@ -988,22 +992,24 @@ fn file_issue_enabled() -> bool {
         .unwrap_or(false)
 }
 
-/// The `file_issue` tool definition (#370): guidance for reporting a glyphtrail
-/// bug/idea, deliberately doing nothing itself. Built directly (not via `tool()`)
-/// because it is project-level, not repo-scoped, so it carries no `repo` arg.
+/// The `file_issue` tool definition (#370): guidance for reporting a bug/idea,
+/// deliberately doing nothing itself. The tracker is derived from the target
+/// repo (#378), so `repo` selects which repo's tracker — useful for forks.
 fn file_issue_tool() -> Value {
     json!({
         "name": "file_issue",
-        "description": "Guidance for reporting a glyphtrail bug or idea to its \
-             GitHub project. It does NOT file anything — it returns instructions \
-             and a provenance line; you act with your own tools. ALWAYS search \
-             existing OPEN and CLOSED issues first and prefer commenting on a \
-             match over opening a duplicate.",
+        "description": "Guidance for reporting a bug or idea to a repository's \
+             issue tracker. It does NOT file anything — it returns instructions \
+             and a provenance line; you act with your own tools. The tracker is \
+             taken from the repo's git remote, then its Cargo manifest, so forks \
+             get their own tracker. ALWAYS search existing OPEN and CLOSED issues \
+             first and prefer commenting on a match over opening a duplicate.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "title": { "type": "string", "description": "Proposed issue title." },
-                "body": { "type": "string", "description": "Proposed issue body (Markdown)." }
+                "body": { "type": "string", "description": "Proposed issue body (Markdown)." },
+                "repo": { "type": "string", "description": "Which repo's tracker to target: a registered repo name or an absolute path. Defaults to the server's launch repo." }
             },
             "required": ["title"],
         },
@@ -1014,23 +1020,29 @@ fn file_issue_tool() -> Value {
 
 /// Build the `file_issue` response: where and how to report, plus the proposed
 /// title/body with an agent-provenance footer. Performs no network action (#370).
-fn file_issue_guidance(args: &Value) -> Value {
-    const REPO: &str = env!("CARGO_PKG_REPOSITORY");
+///
+/// The tracker base is derived from `repo_root` (#378) — its git remote, then
+/// its Cargo manifest — so a fork files against itself; it falls back to the
+/// upstream glyphtrail project when no repo is in context or it declares none.
+fn file_issue_guidance(args: &Value, repo_root: Option<&Path>) -> Value {
+    let base = repo_root
+        .and_then(issue_tracker_base)
+        .unwrap_or_else(|| env!("CARGO_PKG_REPOSITORY").to_string());
     let title = opt_str(args, "title").unwrap_or_default();
     let body = opt_str(args, "body").unwrap_or_default();
     let provenance = "_Reported via `glyphtrail-mcp` by an automated agent (not a human); review before acting._";
     let q = url_query(title);
     json!({
-        "project": REPO,
+        "project": base,
         "files_nothing": true,
         "steps": [
             "This returns guidance only — use your own tools (e.g. the `gh` CLI) to act.",
-            format!("Search existing issues, OPEN and CLOSED: {REPO}/issues?q=is%3Aissue+{q}"),
+            format!("Search existing issues, OPEN and CLOSED: {base}/issues?q=is%3Aissue+{q}"),
             "If a matching issue exists, add a comment there instead of opening a duplicate.",
             "Only file when the information is accurate and not already covered.",
             "Include the `provenance` line so the report is identifiable as agent-filed.",
         ],
-        "new_issue_url": format!("{REPO}/issues/new"),
+        "new_issue_url": format!("{base}/issues/new"),
         "provenance": provenance,
         "title": title,
         "body": if body.is_empty() {
@@ -1039,6 +1051,74 @@ fn file_issue_guidance(args: &Value) -> Value {
             format!("{body}\n\n{provenance}")
         },
     })
+}
+
+/// The issue-tracker base URL for `root` (#378): its `origin` git remote first
+/// (the most fork-accurate), then the `repository` in its Cargo manifest. `None`
+/// when neither is present, so the caller falls back to the upstream project.
+fn issue_tracker_base(root: &Path) -> Option<String> {
+    git_origin_url(root)
+        .and_then(|url| remote_to_https(&url))
+        .or_else(|| {
+            std::fs::read_to_string(root.join("Cargo.toml"))
+                .ok()
+                .and_then(|t| glyphtrail_core::manifest_repository(&t))
+                .map(|url| trim_repo_url(&url))
+        })
+}
+
+/// `git -C <root> remote get-url origin`, trimmed. Best-effort: any failure
+/// (not a repo, no `origin`) yields `None`.
+fn git_origin_url(root: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!url.is_empty()).then_some(url)
+}
+
+/// Normalize a git remote URL to a browsable `https://host/owner/repo` base.
+/// Handles `https://`, scp-style `git@host:owner/repo`, and `ssh://` forms.
+fn remote_to_https(url: &str) -> Option<String> {
+    let url = url.trim();
+    let rest = if let Some(r) = url.strip_prefix("https://") {
+        r.to_string()
+    } else if let Some(r) = url.strip_prefix("http://") {
+        r.to_string()
+    } else if let Some(r) = url.strip_prefix("ssh://") {
+        // ssh://git@host/owner/repo
+        r.split_once('@').map(|(_, h)| h).unwrap_or(r).to_string()
+    } else if let Some(r) = url.strip_prefix("git@") {
+        // scp-style: git@host:owner/repo
+        r.replacen(':', "/", 1)
+    } else {
+        return None;
+    };
+    // `rest` is scheme-less (`host/owner/repo[.git]`); re-attach https.
+    Some(format!("https://{}", trim_repo_url(&rest)))
+}
+
+/// Strip a trailing `.git` and surrounding slashes; the scheme (if any) is kept.
+fn trim_repo_url(s: &str) -> String {
+    let s = s.trim().trim_end_matches('/');
+    s.strip_suffix(".git")
+        .unwrap_or(s)
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// The repository root a `file_issue` call targets, for tracker derivation
+/// (#378): the `repo` arg (registered name or path) or the launch repo. `None`
+/// when no repo is in context — guidance then points at the upstream project.
+fn file_issue_repo_root(default_db: Option<&Path>, args: &Value) -> Option<PathBuf> {
+    let db = target_db(default_db, args).ok()?;
+    db.parent()?.parent().map(Path::to_path_buf)
 }
 
 /// Minimal percent-encoding for a GitHub issue-search query string (#370).
@@ -1303,10 +1383,14 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // #370: the opt-in file_issue tool returns guidance and files nothing.
+    // #370: the opt-in file_issue tool returns guidance and files nothing. With
+    // no repo context it falls back to the upstream glyphtrail project (#378).
     #[test]
     fn file_issue_guidance_reports_without_acting() {
-        let g = file_issue_guidance(&json!({ "title": "outline is slow", "body": "Repro: ..." }));
+        let g = file_issue_guidance(
+            &json!({ "title": "outline is slow", "body": "Repro: ..." }),
+            None,
+        );
         check!(g["files_nothing"] == json!(true));
         check!(g["project"].as_str().unwrap().contains("glyphtrail"));
         check!(
@@ -1319,6 +1403,38 @@ mod tests {
         check!(g["body"].as_str().unwrap().contains("glyphtrail-mcp"));
         let steps = g["steps"].as_array().unwrap();
         check!(steps.iter().any(|s| s.as_str().unwrap().contains("CLOSED")));
+    }
+
+    // #378: git remote URLs normalize to a browsable https base.
+    #[test]
+    fn remote_urls_normalize_to_https_base() {
+        let want = Some("https://github.com/o/r".to_string());
+        check!(remote_to_https("https://github.com/o/r.git") == want);
+        check!(remote_to_https("https://github.com/o/r/") == want);
+        check!(remote_to_https("git@github.com:o/r.git") == want);
+        check!(remote_to_https("ssh://git@github.com/o/r.git") == want);
+        check!(remote_to_https("not a url") == None);
+    }
+
+    // #378: with a repo in context, the tracker comes from its Cargo manifest
+    // `repository` (here there's no git remote), so a fork targets itself.
+    #[test]
+    fn file_issue_uses_repo_manifest_repository() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("gt-file-issue-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"forked\"\nrepository = \"https://example.com/fork/forked\"\n",
+        )
+        .unwrap();
+        let g = file_issue_guidance(&json!({ "title": "bug" }), Some(dir.as_path()));
+        check!(g["project"] == json!("https://example.com/fork/forked"));
+        check!(g["new_issue_url"] == json!("https://example.com/fork/forked/issues/new"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // file_issue is advertised exactly when enabled (off by default). Asserting

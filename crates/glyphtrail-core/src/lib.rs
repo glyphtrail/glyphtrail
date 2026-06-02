@@ -51,7 +51,8 @@ pub use lang::Language;
 pub use link_hints::{LinkEnd, LinkHint, LinkHints};
 pub use links::{CrossRepoLink, LinkKind, RepoIdentity, imported_symbols, resolve_links};
 pub use manifest::{
-    CargoDependency, CargoPackage, DepKind, DepSource, parse_cargo_manifest, workspace_members,
+    CargoDependency, CargoPackage, DepKind, DepSource, manifest_repository, parse_cargo_manifest,
+    workspace_members,
 };
 pub use matcher::{ClientCall, Endpoint, Match, Matcher};
 pub use model::{CodeGraph, Confidence, Edge, EdgeKind, Node, NodeId, NodeKind, PendingLink, Span};
