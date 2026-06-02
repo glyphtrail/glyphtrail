@@ -24,7 +24,10 @@ pub mod scrub;
 pub use api::{
     HttpMethod, OperationKey, Protocol, normalize_path, operations_matching, path_signature,
 };
-pub use atlas::{AtlasConfig, AtlasHeads, CommitMeta, MeConfig, Window, default_atlas_path};
+pub use atlas::{
+    AtlasConfig, AtlasHeads, AtlasTimelineRow, CommitMeta, MeConfig, Window, default_atlas_path,
+    format_date,
+};
 pub use config::{ApiConfig, Config, DynamicLanguage, SchemaFormat, SchemaSource};
 pub use dotnet::{CsprojProject, parse_csproj};
 pub use error::{CoreError, Result};

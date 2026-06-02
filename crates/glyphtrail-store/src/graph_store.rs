@@ -80,6 +80,15 @@ pub trait GraphStore: Adjacency {
     fn commits_in_range(&self, since: Option<i64>, until: Option<i64>) -> Result<Vec<CommitMeta>>;
     /// Total atlas commits in the side-table (cheap `COUNT`, no materialization).
     fn commit_count(&self) -> Result<usize>;
+    /// In-bounds atlas commits in `[since, until]` (unix seconds, inclusive;
+    /// `None` = unbounded), each joined to its repo name and touched-file count,
+    /// ordered by `committed_at` ascending (#333). Visibility/author filtering is
+    /// the caller's.
+    fn atlas_timeline(
+        &self,
+        since: Option<i64>,
+        until: Option<i64>,
+    ) -> Result<Vec<glyphtrail_core::AtlasTimelineRow>>;
     fn all_pending(&self) -> Result<Vec<PendingLink>>;
     fn all_imports(&self) -> Result<Vec<(String, String, String)>>;
     fn node_files(&self) -> Result<Vec<(String, String)>>;

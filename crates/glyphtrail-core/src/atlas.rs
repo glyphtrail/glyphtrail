@@ -42,6 +42,36 @@ pub struct CommitMeta {
     pub in_bounds: bool,
 }
 
+/// One row of the atlas timeline (#333): a commit joined to its repo name and
+/// touched-file count for chronological display. Built by the store; visibility
+/// / author filtering is the caller's job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtlasTimelineRow {
+    pub commit: CommitMeta,
+    /// Registry name of the repo this commit belongs to.
+    pub repo: String,
+    /// How many files the commit touched.
+    pub touched: u32,
+}
+
+/// Format a unix-second timestamp as a `YYYY-MM-DD` UTC calendar date — the
+/// inverse of [`date_to_epoch`] (Howard Hinnant's `civil_from_days`), so the
+/// timeline reads dates back without a time-crate dependency.
+pub fn format_date(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let z = days + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 /// The atlas config file (`~/.glyphtrail/atlas/atlas.toml`). #330 reads
 /// `[window]`; commit ingestion (#331) adds `[me]`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -307,6 +337,22 @@ mod tests {
         check!(date_to_epoch("2015-02-31", false).is_none());
         check!(date_to_epoch("2015-02-29", false).is_none()); // 2015 is not a leap year
         check!(date_to_epoch("2016-02-29", false).is_some()); // 2016 is
+    }
+
+    #[test]
+    fn format_date_inverts_date_to_epoch() {
+        for date in [
+            "1970-01-01",
+            "2015-01-01",
+            "2016-02-29",
+            "2026-06-02",
+            "1999-12-31",
+        ] {
+            let epoch = date_to_epoch(date, false).unwrap();
+            check!(format_date(epoch) == date);
+        }
+        // End-of-day still reads back as the same calendar date.
+        check!(format_date(date_to_epoch("2020-07-15", true).unwrap()) == "2020-07-15");
     }
 
     #[test]
