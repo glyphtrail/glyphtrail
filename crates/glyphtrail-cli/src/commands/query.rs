@@ -100,12 +100,47 @@ struct NeighborOut {
     confidence: String,
 }
 
-fn resolve_one(store: &dyn GraphStore, name: &str) -> Result<Node> {
+/// Every definition matching `name`. A name can resolve to more than one node —
+/// most notably a table declared across several migrations (#447), but also
+/// same-named symbols — so neighbour/impact queries union over all of them
+/// rather than silently picking one arbitrarily.
+fn resolve_all(store: &dyn GraphStore, name: &str) -> Result<Vec<Node>> {
     let matches = store.find_by_name(name)?;
-    match matches.into_iter().next() {
-        Some(n) => Ok(n),
-        None => bail!("no symbol named '{name}' in the index"),
+    if matches.is_empty() {
+        bail!("no symbol named '{name}' in the index");
     }
+    Ok(matches)
+}
+
+/// Note on stderr when `name` resolved to multiple definitions, so a unioned
+/// result isn't read as one symbol's (#447). stderr keeps stdout/JSON clean.
+fn note_multi(name: &str, nodes: &[Node]) {
+    if nodes.len() > 1 {
+        eprintln!(
+            "note: '{name}' matched {} definitions (e.g. a table declared in several \
+             migrations); showing the union",
+            nodes.len()
+        );
+    }
+}
+
+/// Union neighbour rows, dropping repeats of the same target+edge that arise
+/// when several same-named source nodes share an edge.
+fn dedupe_neighbors(items: Vec<NeighborOut>) -> Vec<NeighborOut> {
+    let mut seen = std::collections::HashSet::new();
+    items
+        .into_iter()
+        .filter(|n| seen.insert((n.node.id.0.clone(), n.edge.clone())))
+        .collect()
+}
+
+/// Union nodes, deduped by id.
+fn dedupe_nodes(nodes: Vec<Node>) -> Vec<Node> {
+    let mut seen = std::collections::HashSet::new();
+    nodes
+        .into_iter()
+        .filter(|n| seen.insert(n.id.0.clone()))
+        .collect()
 }
 
 /// A computed query answer, decoupled from rendering. One variant per verb
@@ -429,35 +464,46 @@ fn execute(store: &dyn GraphStore, root: &Path, cmd: &QueryCmd) -> Result<QueryR
     Ok(match cmd {
         QueryCmd::Def { name } => QueryResult::Nodes(store.find_by_name(name)?),
         QueryCmd::Callers { name } => {
-            let n = resolve_one(store, name)?;
-            QueryResult::Neighbors(neighbor_out(store.neighbors(
-                &n.id.0,
-                Some(EdgeKind::Calls),
-                false,
-            )?))
+            let nodes = resolve_all(store, name)?;
+            note_multi(name, &nodes);
+            let mut items = Vec::new();
+            for n in &nodes {
+                items.extend(store.neighbors(&n.id.0, Some(EdgeKind::Calls), false)?);
+            }
+            QueryResult::Neighbors(dedupe_neighbors(neighbor_out(items)))
         }
         QueryCmd::Callees { name } => {
-            let n = resolve_one(store, name)?;
-            QueryResult::Neighbors(neighbor_out(store.neighbors(
-                &n.id.0,
-                Some(EdgeKind::Calls),
-                true,
-            )?))
+            let nodes = resolve_all(store, name)?;
+            note_multi(name, &nodes);
+            let mut items = Vec::new();
+            for n in &nodes {
+                items.extend(store.neighbors(&n.id.0, Some(EdgeKind::Calls), true)?);
+            }
+            QueryResult::Neighbors(dedupe_neighbors(neighbor_out(items)))
         }
         QueryCmd::Neighbors { name } => {
-            let n = resolve_one(store, name)?;
-            let mut items = store.neighbors(&n.id.0, None, true)?;
-            items.extend(store.neighbors(&n.id.0, None, false)?);
-            QueryResult::Neighbors(neighbor_out(items))
+            let nodes = resolve_all(store, name)?;
+            note_multi(name, &nodes);
+            let mut items = Vec::new();
+            for n in &nodes {
+                items.extend(store.neighbors(&n.id.0, None, true)?);
+                items.extend(store.neighbors(&n.id.0, None, false)?);
+            }
+            QueryResult::Neighbors(dedupe_neighbors(neighbor_out(items)))
         }
         QueryCmd::Search {
             text,
             case_sensitive,
         } => QueryResult::Nodes(store.search(text, 50, *case_sensitive)?),
         QueryCmd::Impact { name, depth } => {
-            let n = resolve_one(store, name)?;
+            let nodes = resolve_all(store, name)?;
+            note_multi(name, &nodes);
             // Callers (transitively) are what breaks if this symbol changes.
-            QueryResult::Nodes(store.reachable(&n.id.0, EdgeKind::Calls, false, *depth)?)
+            let mut items = Vec::new();
+            for n in &nodes {
+                items.extend(store.reachable(&n.id.0, EdgeKind::Calls, false, *depth)?);
+            }
+            QueryResult::Nodes(dedupe_nodes(items))
         }
         QueryCmd::Endpoints { protocol } => {
             let proto = parse_protocol_filter(protocol.as_deref())?;
@@ -820,5 +866,78 @@ mod tests {
         check!(parse_method_opt(None).unwrap() == None);
         check!(parse_method_opt(Some("delete")).unwrap() == Some(HttpMethod::Delete));
         check!(parse_method_opt(Some("fetch")).is_err());
+    }
+
+    // #447: a table declared in two migrations is two nodes with the same
+    // qualified name; `neighbors` must union their edges, not pick one. Here the
+    // code reader hangs off one node and a reference off the other — a single
+    // resolution would miss one; the union shows both.
+    #[test]
+    fn neighbors_unions_across_duplicate_definitions() {
+        use glyphtrail_core::{Confidence, Edge, NodeId};
+        use glyphtrail_store::LadybugStore;
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("gt-q-dup-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut store = LadybugStore::open(&dir.join("ladybug")).unwrap();
+
+        let node = |id: &str, kind: NodeKind, qn: &str, file: &str| Node {
+            id: NodeId(id.into()),
+            kind,
+            name: qn.rsplit('.').next().unwrap().to_string(),
+            qualified_name: qn.into(),
+            file: file.into(),
+            language: Some("sql".into()),
+            span: None,
+            doc: None,
+            signature: None,
+        };
+        let t1 = node("t1", NodeKind::Table, "app.items_segments", "m1.sql");
+        let t2 = node("t2", NodeKind::Table, "app.items_segments", "m2.sql");
+        let reader = node("reader", NodeKind::Function, "report", "src/lib.rs");
+        let dep = node("dep", NodeKind::Table, "app.other", "m1.sql");
+        store
+            .insert_nodes(&[t1.clone(), t2.clone(), reader.clone(), dep.clone()], true)
+            .unwrap();
+        store
+            .insert_edges(
+                &[
+                    Edge {
+                        src: reader.id.clone(),
+                        dst: t1.id.clone(),
+                        kind: EdgeKind::Reads,
+                        confidence: Confidence::Inferred,
+                    },
+                    Edge {
+                        src: t2.id.clone(),
+                        dst: dep.id.clone(),
+                        kind: EdgeKind::References,
+                        confidence: Confidence::Extracted,
+                    },
+                ],
+                true,
+            )
+            .unwrap();
+
+        let res = execute(
+            &store,
+            &dir,
+            &QueryCmd::Neighbors {
+                name: "app.items_segments".into(),
+            },
+        )
+        .unwrap();
+        let names: Vec<String> = match res {
+            QueryResult::Neighbors(v) => v.into_iter().map(|n| n.node.name).collect(),
+            _ => panic!("expected neighbours"),
+        };
+        check!(names.contains(&"report".to_string())); // reader, via t1
+        check!(names.contains(&"other".to_string())); // reference, via t2
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
