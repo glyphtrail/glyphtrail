@@ -296,21 +296,30 @@ fn dispatch(
     if name == "impact" && is_federated(args) {
         return federated_impact_tool(&db, args);
     }
-    // #455: when auto-update is enabled, refresh the index before answering, so a
-    // stale-index read doesn't need a manual `analyze` round-trip (every saved
-    // call is agent context budget). Incremental, so it's a no-op fast-path when
-    // the working tree is unchanged; best-effort (a failure leaves the stale
-    // warning to do its job). Only the single-store read path — `analyze`,
-    // `file_issue`, `list_repos`, and federated impact returned earlier.
-    if auto_update_enabled()
-        && let Ok(root) = resolve_analyze_root(&db)
-    {
-        let _ = glyphtrail_analyze::run(&root, true);
-    }
-    let store = open(&db)?;
+    let mut store = open(&db)?;
     // Whatever the tool returns, flag a stale index so the agent re-analyzes
     // before trusting results (#345). Computed once here, for every store tool.
     *warn = stale_warning_for(&db, &*store);
+    // #455: when auto-update is enabled and the index is actually stale, refresh
+    // it before answering, so a stale-index read doesn't need a manual `analyze`
+    // round-trip (every saved call is agent context budget). Only when stale (no
+    // overhead on the common fresh case); serialized by a process-level lock so
+    // concurrent HTTP requests don't write/read the same store at once; best-effort
+    // (a logged failure leaves the stale warning to do its job). Only the
+    // single-store read path — `analyze`, `file_issue`, `list_repos`, and federated
+    // impact returned earlier.
+    if warn.is_some()
+        && auto_update_enabled()
+        && let Ok(root) = resolve_analyze_root(&db)
+    {
+        let _guard = index_write_lock();
+        drop(store); // release the read handle before the update writes
+        if let Err(e) = glyphtrail_analyze::run(&root, true) {
+            tracing::warn!("auto-update of {} failed: {e:#}", root.display());
+        }
+        store = open(&db)?;
+        *warn = stale_warning_for(&db, &*store);
+    }
     match name {
         "search" => {
             let limit = opt_usize(args, "limit").unwrap_or(30);
@@ -1152,11 +1161,21 @@ fn file_issue_enabled() -> bool {
 
 /// Whether the server refreshes a stale index before a read tool answers (#455),
 /// set via `GLYPHTRAIL_MCP_AUTO_UPDATE`. Off by default — a read never writes
-/// unless the operator opts in.
+/// unless the operator opts in. When on, a single-store read tool may write the
+/// index (relaxing the `readOnlyHint` those tools otherwise advertise), which the
+/// operator accepts by enabling it.
 fn auto_update_enabled() -> bool {
     std::env::var("GLYPHTRAIL_MCP_AUTO_UPDATE")
         .map(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
         .unwrap_or(false)
+}
+
+/// Process-wide lock serializing an auto-update index write and the store re-open
+/// around it, so concurrent HTTP MCP requests don't write (and read) the same
+/// `.glyphtrail` store at once (#455 review).
+fn index_write_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The `file_issue` tool definition (#370): guidance for reporting a bug/idea,
