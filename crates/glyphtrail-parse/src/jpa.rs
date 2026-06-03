@@ -137,10 +137,13 @@ fn extract_entity(class: Node, src: &[u8]) -> Option<Entity> {
     let class_name = text(name_node, src);
     // Entity name (what JPQL/repos reference): @Entity(name="…") overrides the class.
     let entity_name = anno_string(entity_anno, "name", src).unwrap_or_else(|| class_name.clone());
-    // Table name: @Table(name="…") wins, else the entity name (Hibernate default).
+    // Table name: an explicit @Table(name="…") wins; otherwise apply the default
+    // Spring Boot physical naming strategy (snake_case of the entity name), so a
+    // `@Table`-less `OrderLine` resolves to the `order_line` table that a native
+    // query or a `.sql` migration names (#432).
     let table_name = find_annotation(mods, "Table", src)
         .and_then(|t| anno_string(t, "name", src))
-        .unwrap_or_else(|| entity_name.clone());
+        .unwrap_or_else(|| snake_case(&entity_name));
     let mut columns = Vec::new();
     if let Some(body) = class.child_by_field_name("body") {
         let mut cur = body.walk();
@@ -287,6 +290,27 @@ fn find_annotation<'a>(modifiers: Node<'a>, name: &str, src: &[u8]) -> Option<No
 /// The last `.`-separated segment of a (possibly-qualified) type/annotation name.
 fn type_last_segment(name: &str) -> String {
     name.rsplit('.').next().unwrap_or(name).trim().to_string()
+}
+
+/// `CamelCase` → `snake_case`, the default Spring Boot physical naming strategy:
+/// a `_` is inserted before an uppercase letter that starts a new word (after a
+/// lowercase/digit, or at the end of an acronym run before a lowercase letter),
+/// then everything is lowercased. `OrderLine` → `order_line`, `HTTPRequest` →
+/// `http_request`, `User` → `user`.
+fn snake_case(name: &str) -> String {
+    let chars: Vec<char> = name.chars().collect();
+    let mut out = String::with_capacity(name.len() + 4);
+    for (i, &c) in chars.iter().enumerate() {
+        if c.is_uppercase() && i > 0 {
+            let prev = chars[i - 1];
+            let next_lower = chars.get(i + 1).is_some_and(|n| n.is_lowercase());
+            if prev.is_lowercase() || prev.is_ascii_digit() || (prev.is_uppercase() && next_lower) {
+                out.push('_');
+            }
+        }
+        out.extend(c.to_lowercase());
+    }
+    out
 }
 
 /// The string value of `key` in `@X(key = "…")`.
@@ -491,6 +515,23 @@ mod tests {
         // @Entity(name="Acct") sets the JPQL entity name; the table defaults to it.
         let e = extract("@Entity(name = \"Acct\") class AccountEntity { Long id; }");
         check!(e.entity_tables == vec![("acct".to_string(), "acct".to_string())]);
+    }
+
+    #[test]
+    fn multiword_entity_without_table_defaults_to_snake_case() {
+        // `OrderLine` (no @Table) → `order_line`, so it lines up with a native
+        // query / `.sql` migration table of that name (#432).
+        let e = extract("@Entity class OrderLine { Long id; }");
+        check!(e.entity_tables == vec![("orderline".to_string(), "order_line".to_string())]);
+    }
+
+    #[test]
+    fn snake_case_handles_words_acronyms_and_digits() {
+        check!(snake_case("OrderLine") == "order_line");
+        check!(snake_case("User") == "user");
+        check!(snake_case("HTTPRequest") == "http_request");
+        check!(snake_case("Oauth2Client") == "oauth2_client");
+        check!(snake_case("already_snake") == "already_snake");
     }
 
     fn refs(e: &JpaExtract) -> Vec<(DbAccess, String)> {
