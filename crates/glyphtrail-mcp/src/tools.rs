@@ -12,8 +12,8 @@ use glyphtrail_core::{
     outline_symbol, signature_has_literal_segment,
 };
 use glyphtrail_store::{
-    ChangeSpec, FederationScope, GraphStore, LadybugStore, SeedSpec, changed_files,
-    federated_impact, seed_nodes,
+    ChangeSpec, FederationScope, GraphStore, HistoryOpts, LadybugStore, SeedSpec, SymbolCommit,
+    changed_files, federated_impact, seed_nodes, symbol_history,
 };
 use serde_json::{Value, json};
 
@@ -66,6 +66,19 @@ pub fn definitions(has_default_repo: bool) -> Vec<Value> {
             "neighbors",
             "Direct graph neighbours of the named symbol, any direction.",
             name_arg.clone(),
+            &["name"],
+        ),
+        tool(
+            "history",
+            "Git history of a symbol: commits that touched its definition across \
+             all branches, each flagged `in_head` (already on the current branch) \
+             with the branches containing it — answers 'I fixed this, where did \
+             the fix go?' by surfacing commits parked on unmerged branches. With \
+             `prs: true`, off-HEAD commits are matched to an open PR via `gh`.",
+            json!({
+                "name": { "type": "string", "description": "Symbol name." },
+                "prs": { "type": "boolean", "description": "Map off-HEAD commits' branches to an open PR via gh (best-effort; needs gh + auth)." }
+            }),
             &["name"],
         ),
         tool(
@@ -310,6 +323,7 @@ fn dispatch(
             items.extend(store.neighbors(&node.id.0, None, false).map_err(err)?);
             Ok(neighbors_json(&items))
         }
+        "history" => history_tool(&db, &*store, args),
         "endpoints" => operations_list(&*store, NodeKind::Endpoint, args, true),
         "clients" if args.get("unmatched").and_then(Value::as_bool) == Some(true) => {
             unmatched_clients_json(&*store, args)
@@ -706,6 +720,37 @@ fn outline_tool(db: &Path, store: &dyn GraphStore, args: &Value) -> Result<Value
         }
     }
     Ok(Value::Array(out))
+}
+
+/// `history` tool: resolve a symbol to its file+span and list the commits that
+/// touched it across all branches, flagged by HEAD-containment (#449).
+fn history_tool(db: &Path, store: &dyn GraphStore, args: &Value) -> Result<Value, String> {
+    // The DB lives at <repo>/.glyphtrail/graph.db; git needs the repo root.
+    let root = db
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or_else(|| Path::new("."));
+    let name = req_str(args, "name")?;
+    let nodes = store.find_by_name(name).map_err(err)?;
+    if nodes.is_empty() {
+        return Err(format!("no symbol named '{name}' in the index"));
+    }
+    let opts = HistoryOpts {
+        prs: args.get("prs").and_then(Value::as_bool).unwrap_or(false),
+        limit: opt_usize(args, "limit").unwrap_or(50),
+    };
+    let mut commits: Vec<SymbolCommit> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for n in &nodes {
+        let span = n.span.map(|s| (s.start_line, s.end_line));
+        for c in symbol_history(root, &n.file, span, &n.name, &opts) {
+            if seen.insert(c.hash.clone()) {
+                commits.push(c);
+            }
+        }
+    }
+    commits.sort_by_key(|c| std::cmp::Reverse(c.date.clone()));
+    serde_json::to_value(&commits).map_err(err)
 }
 
 fn impact_tool(db: &Path, store: &dyn GraphStore, args: &Value) -> Result<Value, String> {
