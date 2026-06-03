@@ -363,6 +363,20 @@ fn parse_file(
             }
         }
     }
+    // Embedded Cypher (#416 Phase C, Rust): kuzu DDL `CREATE NODE/REL TABLE`
+    // declares a label (a `Table` node); `MATCH`/`MERGE`/`CREATE (n:Label)` reads
+    // or writes it, attributed to the enclosing function.
+    if *language == Language::Rust {
+        let cyp = glyphtrail_parse::extract_cypher(&f.rel_path, &file_id, &source, language);
+        out.graph.extend(cyp.graph);
+        for q in cyp.accesses {
+            if let Some(fn_id) = enclosing_fn(&out.graph.nodes, q.byte) {
+                for (access, label) in q.accesses {
+                    out.db_accesses.push((fn_id.clone(), access, label));
+                }
+            }
+        }
+    }
     // JPA/Hibernate (#416 Phase B, Java): `@Entity` classes become tables, and
     // repository methods / `@Query` annotations read/write them. Entity refs are
     // mapped to their tables in the global resolution below.
@@ -1160,7 +1174,9 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// query extraction (#434).
 /// 14: EntityManager/JDBC query calls (`createQuery`/`createNativeQuery`/
 /// `prepareStatement`) extracted from Java method bodies (#434).
-const ANALYSIS_REVISION: u32 = 14;
+/// 15: embedded Cypher (kuzu DDL labels + MATCH/MERGE access) in Rust strings
+/// linked to graph-label tables (#416 Phase C, #428).
+const ANALYSIS_REVISION: u32 = 15;
 
 /// Fingerprint of everything that determines analysis output: the crate
 /// version, the manual revision counter, and the built-in tree-sitter query

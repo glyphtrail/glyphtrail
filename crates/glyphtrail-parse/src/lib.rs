@@ -2,6 +2,7 @@
 
 pub mod build;
 pub mod client;
+pub mod cypher;
 pub mod db_client;
 pub mod dynamic;
 pub mod extract;
@@ -24,6 +25,7 @@ pub use build::{
 #[allow(deprecated)]
 pub use client::module_string_constants;
 pub use client::{ModuleConsts, RawClientCall, extract_client_calls, module_constants};
+pub use cypher::{CypherAccess, CypherExtract, extract_cypher};
 pub use db_client::{RawDbQuery, extract_db_queries};
 pub use dynamic::{DynamicGrammar, load_dynamic};
 pub use extract::{ParsedFile, parse_source, parse_with};
