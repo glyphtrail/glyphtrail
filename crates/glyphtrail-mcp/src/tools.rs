@@ -77,7 +77,8 @@ pub fn definitions(has_default_repo: bool) -> Vec<Value> {
              `prs: true`, off-HEAD commits are matched to an open PR via `gh`.",
             json!({
                 "name": { "type": "string", "description": "Symbol name." },
-                "prs": { "type": "boolean", "description": "Map off-HEAD commits' branches to an open PR via gh (best-effort; needs gh + auth)." }
+                "prs": { "type": "boolean", "description": "Map off-HEAD commits' branches to an open PR via gh (best-effort; needs gh + auth)." },
+                "limit": { "type": "integer", "description": "Max commits per git pass (default 50)." }
             }),
             &["name"],
         ),
@@ -749,7 +750,7 @@ fn history_tool(db: &Path, store: &dyn GraphStore, args: &Value) -> Result<Value
             }
         }
     }
-    commits.sort_by_key(|c| std::cmp::Reverse(c.date.clone()));
+    commits.sort_by_key(|c| std::cmp::Reverse(c.committed_at));
     serde_json::to_value(&commits).map_err(err)
 }
 

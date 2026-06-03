@@ -32,6 +32,9 @@ pub struct SymbolCommit {
     pub short: String,
     /// Commit date (`%ad`, `--date=short`).
     pub date: String,
+    /// Committer timestamp (`%ct`, unix seconds) — the precise sort key, since
+    /// `date` is day-granular.
+    pub committed_at: i64,
     pub author: String,
     pub subject: String,
     /// Whether the commit is an ancestor of HEAD (already on the current branch).
@@ -111,6 +114,7 @@ pub fn symbol_history(
                 hash: r.hash,
                 short: r.short,
                 date: r.date,
+                committed_at: r.committed_at,
                 author: r.author,
                 subject: r.subject,
                 in_head,
@@ -207,7 +211,9 @@ fn is_ancestor(root: &Path, commit: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Short refnames of branches (local + remote) containing `commit`.
+/// Branch names containing `commit`. Full refnames are parsed so a slashed
+/// branch (`fix/use-square`) survives intact: `refs/heads/<b>` -> `<b>`,
+/// `refs/remotes/<remote>/<b>` -> `<b>` (only the remote segment is dropped).
 fn branches_containing(root: &Path, commit: &str) -> Vec<String> {
     let out = Command::new("git")
         .arg("-C")
@@ -217,7 +223,7 @@ fn branches_containing(root: &Path, commit: &str) -> Vec<String> {
             "--all",
             "--contains",
             commit,
-            "--format=%(refname:short)",
+            "--format=%(refname)",
         ])
         .output();
     let Ok(out) = out else {
@@ -226,26 +232,38 @@ fn branches_containing(root: &Path, commit: &str) -> Vec<String> {
     if !out.status.success() {
         return Vec::new();
     }
+    let mut seen = std::collections::HashSet::new();
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.contains("HEAD")) // drop `origin/HEAD`
-        .map(str::to_string)
+        .filter_map(branch_from_refname)
+        .filter(|b| !b.ends_with("HEAD")) // drop `origin/HEAD` and a detached HEAD
+        .filter(|b| seen.insert(b.clone())) // a local + its remote dedupe to one
         .collect()
 }
 
+/// The branch name from a full refname: `refs/heads/x/y` -> `x/y`,
+/// `refs/remotes/origin/x/y` -> `x/y`. `None` for other ref shapes.
+fn branch_from_refname(refname: &str) -> Option<String> {
+    if let Some(local) = refname.strip_prefix("refs/heads/") {
+        return Some(local.to_string());
+    }
+    // refs/remotes/<remote>/<branch...> — drop the two-segment prefix.
+    let rest = refname.strip_prefix("refs/remotes/")?;
+    rest.split_once('/').map(|(_, b)| b.to_string())
+}
+
 /// The first open PR whose head is `branch`, via `gh`. Best-effort: missing
-/// `gh`, no auth, or no match all yield `None`.
+/// `gh`, no auth, or no match all yield `None`. `branch` is the plain branch
+/// name (slashes intact), which is exactly what `gh pr list --head` expects.
 fn open_pr_for_branch(root: &Path, branch: &str) -> Option<PrRef> {
-    // `gh` wants the local branch name, not a remote-qualified refname.
-    let head = branch.rsplit_once('/').map(|(_, b)| b).unwrap_or(branch);
     let out = Command::new("gh")
         .current_dir(root)
         .args([
             "pr",
             "list",
             "--head",
-            head,
+            branch,
             "--state",
             "open",
             "--json",
@@ -279,6 +297,17 @@ mod tests {
         check!(got[0].committed_at == 1_700_000_000);
         check!(got[0].subject == "fix items_segments");
         check!(got[1].author == "Bob");
+    }
+
+    #[test]
+    fn branch_from_refname_keeps_slashes() {
+        check!(branch_from_refname("refs/heads/fix/use-square") == Some("fix/use-square".into()));
+        check!(
+            branch_from_refname("refs/remotes/origin/fix/use-square")
+                == Some("fix/use-square".into())
+        );
+        check!(branch_from_refname("refs/heads/main") == Some("main".into()));
+        check!(branch_from_refname("refs/tags/v1") == None);
     }
 
     #[test]

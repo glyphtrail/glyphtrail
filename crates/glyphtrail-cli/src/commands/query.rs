@@ -594,8 +594,8 @@ fn execute(store: &dyn GraphStore, root: &Path, cmd: &QueryCmd) -> Result<QueryR
                     }
                 }
             }
-            // `--date=short` is YYYY-MM-DD, so a string sort is chronological.
-            commits.sort_by_key(|c| std::cmp::Reverse(c.date.clone()));
+            // Newest first by committer timestamp (precise; `date` is day-granular).
+            commits.sort_by_key(|c| std::cmp::Reverse(c.committed_at));
             QueryResult::History(commits)
         }
     })
