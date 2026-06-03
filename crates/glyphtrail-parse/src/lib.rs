@@ -25,7 +25,9 @@ pub use build::{
 #[allow(deprecated)]
 pub use client::module_string_constants;
 pub use client::{ModuleConsts, RawClientCall, extract_client_calls, module_constants};
-pub use cypher::{CypherAccess, CypherExtract, extract_cypher};
+pub use cypher::{
+    CypherAccess, CypherExtract, cypher_pattern_labels, extract_cypher, extract_cypher_file,
+};
 pub use db_client::{RawDbQuery, extract_db_queries};
 pub use dynamic::{DynamicGrammar, load_dynamic};
 pub use extract::{ParsedFile, parse_source, parse_with};
