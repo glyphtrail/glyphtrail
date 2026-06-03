@@ -34,18 +34,68 @@ pub struct RepoPaths {
     pub db_path: PathBuf,
 }
 
+/// Where to keep the index for a submodule or linked worktree, so it stays out of
+/// the (often immutable) working tree (#394): inside the repo's real git directory
+/// (`.git/modules/<name>` for a submodule, `.git/worktrees/<name>` for a worktree),
+/// which git already keeps outside the checkout. `None` for a normal repo (`.git`
+/// is a directory) or when the `.git` file can't be resolved.
+pub fn detached_index_dir(root: &Path) -> Option<PathBuf> {
+    let dotgit = root.join(".git");
+    // A submodule / linked worktree has `.git` as a *file* (`gitdir: <path>`); a
+    // normal repo has it as a directory.
+    if !dotgit.is_file() {
+        return None;
+    }
+    let content = std::fs::read_to_string(&dotgit).ok()?;
+    let gitdir = content
+        .lines()
+        .find_map(|l| l.strip_prefix("gitdir:"))?
+        .trim();
+    let resolved = if Path::new(gitdir).is_absolute() {
+        PathBuf::from(gitdir)
+    } else {
+        root.join(gitdir)
+    };
+    let resolved = resolved.canonicalize().unwrap_or(resolved);
+    Some(resolved.join(INDEX_DIR.trim_start_matches('.')))
+}
+
 impl RepoPaths {
     pub fn new(root: impl AsRef<Path>) -> Self {
         let root = root.as_ref().to_path_buf();
-        let index_dir = root.join(INDEX_DIR);
-        // Silently upgrade a pre-rename index dir (#293): rename `.stratograph`
-        // to `.glyphtrail` when the old one exists and the new one doesn't, so an
-        // index built before the rename keeps working without a reanalyze. Best
-        // effort — a failure just means it gets rebuilt under the new name.
-        let legacy = root.join(LEGACY_INDEX_DIR);
-        if legacy.is_dir() && !index_dir.exists() {
-            let _ = std::fs::rename(&legacy, &index_dir);
-        }
+        let in_tree = root.join(INDEX_DIR);
+        let index_dir = match detached_index_dir(&root) {
+            // A submodule (or linked worktree): keep the index out of its working
+            // tree by placing it in the repo's git dir (`.git/modules/<name>/…`),
+            // so `analyze` doesn't pollute an immutable submodule checkout (#394).
+            // Migrate a previously in-tree (or legacy) index there once, so a
+            // submodule indexed before this stops dirtying its tree.
+            Some(detached) => {
+                if !detached.exists() {
+                    for old in [in_tree.clone(), root.join(LEGACY_INDEX_DIR)] {
+                        if old.is_dir() {
+                            if let Some(parent) = detached.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            let _ = std::fs::rename(&old, &detached);
+                            break;
+                        }
+                    }
+                }
+                detached
+            }
+            None => {
+                // Silently upgrade a pre-rename index dir (#293): rename
+                // `.stratograph` to `.glyphtrail` when the old one exists and the
+                // new one doesn't, so an index built before the rename keeps
+                // working without a reanalyze. Best effort.
+                let legacy = root.join(LEGACY_INDEX_DIR);
+                if legacy.is_dir() && !in_tree.exists() {
+                    let _ = std::fs::rename(&legacy, &in_tree);
+                }
+                in_tree
+            }
+        };
         let db_path = index_dir.join(DB_FILE);
         Self {
             root,
@@ -343,6 +393,61 @@ fn default_protocol() -> Protocol {
 mod tests {
     use super::*;
     use assert2::check;
+
+    // #394: a normal repo keeps its index in-tree; a submodule (`.git` is a file
+    // pointing at the parent's `.git/modules/<name>`) puts it in that git dir,
+    // out of the working tree.
+    #[test]
+    fn submodule_index_is_detached_into_the_git_dir() {
+        let base = std::env::temp_dir().join(format!(
+            "gt-detach-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // A normal repo: `.git` is a directory -> index stays at root/.glyphtrail.
+        let normal = base.join("normal");
+        std::fs::create_dir_all(normal.join(".git")).unwrap();
+        check!(RepoPaths::new(&normal).index_dir == normal.join(".glyphtrail"));
+
+        // A submodule: `.git` is a file -> index lives in the resolved git dir.
+        let parent_gitdir = base.join("parent/.git/modules/sub");
+        std::fs::create_dir_all(&parent_gitdir).unwrap();
+        let sub = base.join("parent/sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join(".git"), "gitdir: ../.git/modules/sub\n").unwrap();
+        let detached = RepoPaths::new(&sub).index_dir;
+        check!(detached.ends_with("modules/sub/glyphtrail"));
+        check!(!detached.starts_with(&sub)); // not inside the submodule tree
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    // #394: a submodule indexed before this (in-tree `.glyphtrail`) is migrated
+    // into the detached git-dir location on the next `RepoPaths::new`.
+    #[test]
+    fn existing_in_tree_submodule_index_is_migrated() {
+        let base = std::env::temp_dir().join(format!(
+            "gt-detach-mig-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(base.join("parent/.git/modules/sub")).unwrap();
+        let sub = base.join("parent/sub");
+        std::fs::create_dir_all(sub.join(".glyphtrail/ladybug")).unwrap();
+        std::fs::write(sub.join(".glyphtrail/ladybug/data"), b"old").unwrap();
+        std::fs::write(sub.join(".git"), "gitdir: ../.git/modules/sub\n").unwrap();
+
+        let detached = RepoPaths::new(&sub).index_dir;
+        check!(detached.join("ladybug/data").exists()); // moved into the git dir
+        check!(!sub.join(".glyphtrail").exists()); // gone from the submodule tree
+        std::fs::remove_dir_all(&base).ok();
+    }
 
     #[test]
     fn empty_config_uses_defaults() {
