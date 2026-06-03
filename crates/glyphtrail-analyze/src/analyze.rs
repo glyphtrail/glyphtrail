@@ -414,6 +414,16 @@ fn parse_file(
                 }
             }
         }
+        // Diesel ORM (#440): `table!` macros declare `Table`/`Column` nodes; the
+        // query DSL (`<t>::table.load(…)`, `insert_into(<t>::table)`, …) reads or
+        // writes them, attributed to the enclosing function.
+        let dsl = glyphtrail_parse::extract_diesel(&f.rel_path, &file_id, &source);
+        out.graph.extend(dsl.graph);
+        for (byte, access, table) in dsl.accesses {
+            if let Some(fn_id) = enclosing_fn(&out.graph.nodes, byte) {
+                out.db_accesses.push((fn_id.clone(), access, table));
+            }
+        }
     }
     // JPA/Hibernate (#416 Phase B, Java): `@Entity` classes become tables, and
     // repository methods / `@Query` annotations read/write them. Entity refs are
@@ -1242,7 +1252,10 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// (Neo4j) labels (#444), so graph-DB schema + access surface more fully.
 /// 19: JS/TS (`pg`/`mysql2`/knex) and Python (DB-API/SQLAlchemy `text`) raw-driver
 /// SQL queries are extracted, so those repos link functions to their tables (#440).
-const ANALYSIS_REVISION: u32 = 19;
+/// 20: Diesel ORM (Rust) — `table!` macros yield `Table`/`Column` nodes and the
+/// query DSL (`<t>::table.load`, `insert_into`/`update`/`delete`) links code to
+/// those tables (#440), so Diesel repos rebuild to gain the schema + access edges.
+const ANALYSIS_REVISION: u32 = 20;
 
 /// Fingerprint of everything that determines analysis output: the crate
 /// version, the manual revision counter, and the built-in tree-sitter query
@@ -3361,6 +3374,45 @@ mod tests {
         let store = LadybugStore::open(&RepoPaths::new(&dir).index_dir.join("ladybug")).unwrap();
         let f = store
             .find_by_name("loadUser")
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("function indexed");
+        let reads = store
+            .neighbors(&f.id.0, Some(EdgeKind::Reads), true)
+            .unwrap();
+        check!(
+            reads
+                .iter()
+                .any(|(n, _, _)| n.kind == NodeKind::Table && n.name == "users"),
+            "expected a Reads edge to the users table, got {:?}",
+            reads.iter().map(|(n, _, _)| &n.name).collect::<Vec<_>>()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // #440: a Diesel query DSL links its function to the `table!` schema, across
+    // files (schema in one file, query in another).
+    #[test]
+    fn analyze_links_diesel_query_to_its_table() {
+        let dir = temp_repo("diesel-link");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("src/schema.rs"),
+            "diesel::table! { users (id) { id -> Int4, email -> Text, } }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/repo.rs"),
+            "pub fn load_user(conn: &mut PgConnection) -> Vec<User> { \
+             users::table.filter(users::id.eq(1)).load(conn).unwrap() }\n",
+        )
+        .unwrap();
+        run(&dir, false).unwrap();
+
+        let store = LadybugStore::open(&RepoPaths::new(&dir).index_dir.join("ladybug")).unwrap();
+        let f = store
+            .find_by_name("load_user")
             .unwrap()
             .into_iter()
             .next()
