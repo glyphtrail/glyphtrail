@@ -1767,8 +1767,12 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
                 .or_insert(Some(table));
         }
         let mut tables_by_name: HashMap<String, Vec<NodeId>> = HashMap::new();
+        // Owning-table name per node id, so a self-relation is recognised by name
+        // even across file-scoped duplicate table nodes (JPA + .sql), #433 review.
+        let mut table_name_by_id: HashMap<NodeId, String> = HashMap::new();
         for n in &graph.nodes {
             if n.kind == NodeKind::Table {
+                table_name_by_id.insert(n.id.clone(), n.qualified_name.clone());
                 tables_by_name
                     .entry(n.qualified_name.clone())
                     .or_default()
@@ -1815,6 +1819,11 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
                 Some(Some(t)) => t,
                 _ => ref_name,
             };
+            // A self-relation (target resolves to the owning table's own name) is
+            // not a cross-table reference, even across duplicate table nodes.
+            if table_name_by_id.get(src_table).map(String::as_str) == Some(table.as_str()) {
+                continue;
+            }
             let targets = tables_by_name
                 .get(table)
                 .or_else(|| table.rsplit('.').next().and_then(|b| tables_by_name.get(b)));
