@@ -73,6 +73,7 @@ pub fn extract_cypher(
             // array, not an inline query call), so scan every string literal.
             "string_content" => {
                 let s = text(n, src);
+                let cypher_like = looks_like_cypher(&s);
                 add_cypher_labels(
                     &mut graph,
                     file_id,
@@ -80,6 +81,7 @@ pub fn extract_cypher(
                     source,
                     n.start_byte(),
                     &s,
+                    cypher_like,
                     &mut seen_label,
                 );
             }
@@ -132,6 +134,10 @@ pub fn extract_cypher(
 pub fn extract_cypher_file(rel_path: &str, file_id: &NodeId, source: &str) -> CypherExtract {
     let mut graph = CodeGraph::new();
     let mut seen_label: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+    // A `.cypher`/`.cql` file is Cypher by definition, so extract pattern labels
+    // unconditionally (don't gate on `looks_like_cypher`, which is tuned to avoid
+    // false positives in arbitrary Rust strings and rejects, e.g., a file that
+    // opens with `CREATE (n:Label)`).
     add_cypher_labels(
         &mut graph,
         file_id,
@@ -139,6 +145,7 @@ pub fn extract_cypher_file(rel_path: &str, file_id: &NodeId, source: &str) -> Cy
         source,
         0,
         source,
+        true,
         &mut seen_label,
     );
     let acc = extract_cypher_access(source);
@@ -154,9 +161,11 @@ pub fn extract_cypher_file(rel_path: &str, file_id: &NodeId, source: &str) -> Cy
 }
 
 /// Add `Table` nodes for the labels in `s`: kuzu DDL labels (scanned in any string,
-/// as the keywords are unambiguous) plus, when `s` looks like Cypher, the
-/// pattern-only labels a schema-free graph declares solely via `MERGE`/`CREATE`/
-/// `MATCH (n:Label)` (#444). Deduplicated by node id via `seen`.
+/// as the keywords are unambiguous) plus, when `cypher_like`, the pattern-only
+/// labels a schema-free graph declares solely via `MERGE`/`CREATE`/`MATCH (n:Label)`
+/// (#444). Deduplicated by node id via `seen`. Callers pass `looks_like_cypher(s)`
+/// for an arbitrary Rust string and `true` for a known `.cypher`/`.cql` file.
+#[allow(clippy::too_many_arguments)]
 fn add_cypher_labels(
     graph: &mut CodeGraph,
     file_id: &NodeId,
@@ -164,6 +173,7 @@ fn add_cypher_labels(
     source: &str,
     byte: usize,
     s: &str,
+    cypher_like: bool,
     seen: &mut std::collections::HashSet<NodeId>,
 ) {
     let mut add = |graph: &mut CodeGraph, display: &str, norm: &str| {
@@ -176,7 +186,7 @@ fn add_cypher_labels(
         let norm = normalize_name(&label);
         add(graph, &label, &norm);
     }
-    if looks_like_cypher(s) {
+    if cypher_like {
         for (display, norm) in cypher_pattern_labels(s) {
             add(graph, &display, &norm);
         }
@@ -658,5 +668,22 @@ mod tests {
         let acc = &e.accesses[0].accesses;
         check!(acc.contains(&(DbAccess::Read, "account".to_string())));
         check!(acc.contains(&(DbAccess::Write, "owns".to_string())));
+    }
+
+    // #444: a `.cypher` file is Cypher by definition, so a named-node `CREATE
+    // (n:Label)` — which `looks_like_cypher` does not flag (no `-[`/`(:`) — still
+    // yields its label, unlike an arbitrary Rust string.
+    #[test]
+    fn cypher_file_extracts_create_named_node_labels() {
+        let file = "seed.cypher";
+        let e = extract_cypher_file(file, &NodeId::derive(&["file", file]), "CREATE (n:Seed)");
+        check!(!looks_like_cypher("CREATE (n:Seed)")); // the gate would have skipped it
+        check!(
+            e.graph
+                .nodes
+                .iter()
+                .any(|n| n.kind == NodeKind::Table && n.name == "Seed")
+        );
+        check!(e.accesses[0].accesses == vec![(DbAccess::Write, "seed".to_string())]);
     }
 }
