@@ -970,6 +970,17 @@ impl GraphStore for LadybugStore {
             .collect())
     }
 
+    fn tables_by_name(&self) -> Result<Vec<(NodeId, String)>> {
+        Ok(self
+            .run(
+                "MATCH (n:Node {kind:'table'}) RETURN n.id, n.qualified_name",
+                vec![],
+            )?
+            .iter()
+            .map(|r| (NodeId(get_str(r, 0)), get_str(r, 1)))
+            .collect())
+    }
+
     fn get_node(&self, id: &str) -> Result<Option<Node>> {
         Ok(self
             .run_nodes(

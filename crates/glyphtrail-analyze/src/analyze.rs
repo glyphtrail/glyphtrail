@@ -1800,6 +1800,27 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
                 }
             }
         }
+        // Tables already persisted whose `.sql`/entity file wasn't re-parsed this
+        // pass, so an incremental update still resolves edges to them (#435). Skip
+        // ids already added above (a table re-parsed this pass).
+        for (id, qname) in store.tables_by_name().unwrap_or_default() {
+            if table_name_by_id.contains_key(&id) {
+                continue;
+            }
+            table_name_by_id.insert(id.clone(), qname.clone());
+            tables_by_name
+                .entry(qname.clone())
+                .or_default()
+                .push(id.clone());
+            if let Some(bare) = qname.rsplit('.').next()
+                && bare != qname
+            {
+                tables_by_name
+                    .entry(bare.to_string())
+                    .or_default()
+                    .push(id.clone());
+            }
+        }
         for (fn_id, access, ref_name) in &db_accesses {
             // Map an entity ref to its table (unique mappings only), else use the
             // name as-is (a native/sqlx table, or an ambiguous entity name).
@@ -3086,6 +3107,48 @@ mod tests {
                 .any(|(n, _, _)| n.kind == NodeKind::Table && n.name == "users"),
             "expected a Writes edge to the users table, got {:?}",
             writes.iter().map(|(n, _, _)| &n.name).collect::<Vec<_>>()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // #435: an incremental `--update` that re-parses only a code file still links
+    // it to a table whose `.sql` file wasn't re-parsed (resolved from the store).
+    #[test]
+    fn incremental_update_relinks_code_to_unchanged_table() {
+        let dir = temp_repo("incr-db-relink");
+        std::fs::create_dir_all(dir.join("db")).unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("db/schema.sql"), "CREATE TABLE users (id int);\n").unwrap();
+        std::fs::write(
+            dir.join("src/repo.rs"),
+            "pub async fn load(db: &Pool) { sqlx::query(\"SELECT id FROM users\").fetch_one(db).await.ok(); }\n",
+        )
+        .unwrap();
+        run(&dir, false).unwrap(); // full build
+
+        // Edit only the code file (the .sql is untouched), then incrementally update.
+        std::fs::write(
+            dir.join("src/repo.rs"),
+            "pub fn other() {}\npub async fn load(db: &Pool) { sqlx::query(\"SELECT id FROM users\").fetch_one(db).await.ok(); }\n",
+        )
+        .unwrap();
+        let outcome = run(&dir, true).unwrap();
+        check!(!outcome.up_to_date); // the code file changed, so it re-parsed
+
+        let store = LadybugStore::open(&RepoPaths::new(&dir).index_dir.join("ladybug")).unwrap();
+        let f = store
+            .find_by_name("load")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let reads = store
+            .neighbors(&f.id.0, Some(EdgeKind::Reads), true)
+            .unwrap();
+        check!(
+            reads.iter().any(|(n, _, _)| n.name == "users"),
+            "incremental update should keep the code→table link, got {:?}",
+            reads.iter().map(|(n, _, _)| &n.name).collect::<Vec<_>>()
         );
         std::fs::remove_dir_all(&dir).ok();
     }
