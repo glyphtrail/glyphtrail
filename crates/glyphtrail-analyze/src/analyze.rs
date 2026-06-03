@@ -1800,25 +1800,28 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
                 }
             }
         }
-        // Tables already persisted whose `.sql`/entity file wasn't re-parsed this
-        // pass, so an incremental update still resolves edges to them (#435). Skip
-        // ids already added above (a table re-parsed this pass).
-        for (id, qname) in store.tables_by_name().unwrap_or_default() {
-            if table_name_by_id.contains_key(&id) {
-                continue;
-            }
-            table_name_by_id.insert(id.clone(), qname.clone());
-            tables_by_name
-                .entry(qname.clone())
-                .or_default()
-                .push(id.clone());
-            if let Some(bare) = qname.rsplit('.').next()
-                && bare != qname
-            {
+        // On an incremental update, also seed from tables already persisted whose
+        // `.sql`/entity file wasn't re-parsed this pass, so edges still resolve to
+        // them (#435). A full build cleared the store, so this only runs on update.
+        // Ids already added above (a table re-parsed this pass) are skipped.
+        if update {
+            for (id, qname) in store.tables_by_name()? {
+                if table_name_by_id.contains_key(&id) {
+                    continue;
+                }
+                table_name_by_id.insert(id.clone(), qname.clone());
                 tables_by_name
-                    .entry(bare.to_string())
+                    .entry(qname.clone())
                     .or_default()
                     .push(id.clone());
+                if let Some(bare) = qname.rsplit('.').next()
+                    && bare != qname
+                {
+                    tables_by_name
+                        .entry(bare.to_string())
+                        .or_default()
+                        .push(id.clone());
+                }
             }
         }
         for (fn_id, access, ref_name) in &db_accesses {
