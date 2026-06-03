@@ -205,6 +205,20 @@ enum Command {
         #[arg(long)]
         yaml: bool,
     },
+    /// Remove the local index database (and, with --all, the whole `.glyphtrail`
+    /// directory). Optionally deregister the repo from the global registry.
+    Clean {
+        /// Repository root.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Remove the entire `.glyphtrail` directory, including any personal
+        /// config/link hints, not just the index database.
+        #[arg(long)]
+        all: bool,
+        /// Also remove the repo from the global registry.
+        #[arg(long)]
+        deregister: bool,
+    },
     /// Generate a shell completion script for the given shell.
     Completions {
         /// Target shell (bash, zsh, fish, powershell, elvish).
@@ -397,6 +411,11 @@ fn main() -> anyhow::Result<()> {
                 commands::status::run(&repo, commands::query::Emit::from_flags(json, yaml))
             }
         }
+        Command::Clean {
+            path,
+            all,
+            deregister,
+        } => commands::clean::run(&path, all, deregister),
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
             let name = cmd.get_name().to_string();
