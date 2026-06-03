@@ -124,14 +124,28 @@ fn note_multi(name: &str, nodes: &[Node]) {
     }
 }
 
-/// Union neighbour rows, dropping repeats of the same target+edge that arise
-/// when several same-named source nodes share an edge.
-fn dedupe_neighbors(items: Vec<NeighborOut>) -> Vec<NeighborOut> {
-    let mut seen = std::collections::HashSet::new();
-    items
-        .into_iter()
-        .filter(|n| seen.insert((n.node.id.0.clone(), n.edge.clone())))
-        .collect()
+/// Union neighbour rows, collapsing repeats of the same target+edge-kind (which
+/// arise when several same-named source nodes share an edge) and keeping the
+/// strongest [`Confidence`](glyphtrail_core::Confidence) — so a duplicate's
+/// weaker `inferred` doesn't mask another's `extracted`. First-seen order kept.
+fn dedupe_neighbors(
+    items: Vec<(Node, EdgeKind, glyphtrail_core::Confidence)>,
+) -> Vec<(Node, EdgeKind, glyphtrail_core::Confidence)> {
+    let mut out: Vec<(Node, EdgeKind, glyphtrail_core::Confidence)> = Vec::new();
+    let mut idx = std::collections::HashMap::new();
+    for it in items {
+        let key = (it.0.id.0.clone(), it.1);
+        if let Some(&i) = idx.get(&key) {
+            let existing: &(Node, EdgeKind, glyphtrail_core::Confidence) = &out[i];
+            if it.2.rank() > existing.2.rank() {
+                out[i] = it;
+            }
+        } else {
+            idx.insert(key, out.len());
+            out.push(it);
+        }
+    }
+    out
 }
 
 /// Union nodes, deduped by id.
@@ -470,7 +484,7 @@ fn execute(store: &dyn GraphStore, root: &Path, cmd: &QueryCmd) -> Result<QueryR
             for n in &nodes {
                 items.extend(store.neighbors(&n.id.0, Some(EdgeKind::Calls), false)?);
             }
-            QueryResult::Neighbors(dedupe_neighbors(neighbor_out(items)))
+            QueryResult::Neighbors(neighbor_out(dedupe_neighbors(items)))
         }
         QueryCmd::Callees { name } => {
             let nodes = resolve_all(store, name)?;
@@ -479,7 +493,7 @@ fn execute(store: &dyn GraphStore, root: &Path, cmd: &QueryCmd) -> Result<QueryR
             for n in &nodes {
                 items.extend(store.neighbors(&n.id.0, Some(EdgeKind::Calls), true)?);
             }
-            QueryResult::Neighbors(dedupe_neighbors(neighbor_out(items)))
+            QueryResult::Neighbors(neighbor_out(dedupe_neighbors(items)))
         }
         QueryCmd::Neighbors { name } => {
             let nodes = resolve_all(store, name)?;
@@ -489,7 +503,7 @@ fn execute(store: &dyn GraphStore, root: &Path, cmd: &QueryCmd) -> Result<QueryR
                 items.extend(store.neighbors(&n.id.0, None, true)?);
                 items.extend(store.neighbors(&n.id.0, None, false)?);
             }
-            QueryResult::Neighbors(dedupe_neighbors(neighbor_out(items)))
+            QueryResult::Neighbors(neighbor_out(dedupe_neighbors(items)))
         }
         QueryCmd::Search {
             text,

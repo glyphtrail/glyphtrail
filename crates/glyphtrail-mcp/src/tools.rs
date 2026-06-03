@@ -1062,13 +1062,25 @@ fn resolve_all(store: &dyn GraphStore, name: &str) -> Result<Vec<Node>, String> 
     Ok(matches)
 }
 
-/// Drop repeated (target, edge-kind) rows from a unioned neighbour set.
-fn dedup_neighbors<C>(items: Vec<(Node, EdgeKind, C)>) -> Vec<(Node, EdgeKind, C)> {
-    let mut seen = std::collections::HashSet::new();
-    items
-        .into_iter()
-        .filter(|(n, k, _)| seen.insert((n.id.0.clone(), *k)))
-        .collect()
+/// Collapse repeated (target, edge-kind) rows from a unioned neighbour set,
+/// keeping the strongest `Confidence` (so a duplicate's `inferred` doesn't mask
+/// another's `extracted`). First-seen order is preserved.
+fn dedup_neighbors(items: Vec<(Node, EdgeKind, Confidence)>) -> Vec<(Node, EdgeKind, Confidence)> {
+    let mut out: Vec<(Node, EdgeKind, Confidence)> = Vec::new();
+    let mut idx: std::collections::HashMap<(String, EdgeKind), usize> =
+        std::collections::HashMap::new();
+    for it in items {
+        let key = (it.0.id.0.clone(), it.1);
+        if let Some(&i) = idx.get(&key) {
+            if it.2.rank() > out[i].2.rank() {
+                out[i] = it;
+            }
+        } else {
+            idx.insert(key, out.len());
+            out.push(it);
+        }
+    }
+    out
 }
 
 fn tool(name: &str, description: &str, mut properties: Value, required: &[&str]) -> Value {
