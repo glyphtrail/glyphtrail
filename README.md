@@ -69,6 +69,9 @@ glyphtrail query callees <name>        # what it calls
 glyphtrail query neighbors <name>      # direct graph neighbours
 glyphtrail query search <text>         # full-text search (names + doc comments)
 glyphtrail query impact <name>         # transitive blast radius if it changes
+glyphtrail query history <name>        # commits that touched the symbol across
+#   all branches, each flagged in HEAD or not — finds a fix parked on an
+#   unmerged branch ("where did that fix go?"); add --prs to map it to an open PR
 #   add --json (or --yaml, compact for agents) for machine-readable output
 
 # Impact analysis (blast radius from a symbol, file, or change set)

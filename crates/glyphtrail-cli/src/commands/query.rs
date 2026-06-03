@@ -8,7 +8,7 @@ use glyphtrail_core::{
     EdgeKind, HttpMethod, Node, NodeKind, OperationKey, Protocol, Registry, RegistryEntry,
     default_registry_path, signature_has_literal_segment,
 };
-use glyphtrail_store::GraphStore;
+use glyphtrail_store::{GraphStore, HistoryOpts, SymbolCommit, symbol_history};
 use serde::Serialize;
 
 use crate::commands::backend;
@@ -79,6 +79,18 @@ pub enum QueryCmd {
     /// Reconcile code endpoints against ingested schema operations and report
     /// drift: endpoints absent from the schema, and schema ops with no handler.
     Drift,
+    /// Git history of a symbol: commits that touched it across all branches,
+    /// each flagged for whether it is already in HEAD — answers "where did the
+    /// fix go?" by surfacing commits parked on unmerged branches.
+    History {
+        name: String,
+        /// Map off-HEAD commits' branches to an open PR via `gh` (best-effort).
+        #[arg(long)]
+        prs: bool,
+        /// Max commits per git pass.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
 }
 
 #[derive(Serialize)]
@@ -106,6 +118,7 @@ enum QueryResult {
     ApiImpact(Vec<ApiImpactOut>),
     Drift(DriftReport),
     UnmatchedClients(Vec<UnmatchedClientOut>),
+    History(Vec<SymbolCommit>),
 }
 
 impl QueryResult {
@@ -117,6 +130,7 @@ impl QueryResult {
             QueryResult::ApiImpact(v) => serde_json::to_value(v),
             QueryResult::Drift(v) => serde_json::to_value(v),
             QueryResult::UnmatchedClients(v) => serde_json::to_value(v),
+            QueryResult::History(v) => serde_json::to_value(v),
         }
         .unwrap_or(serde_json::Value::Null)
     }
@@ -129,6 +143,7 @@ impl QueryResult {
             QueryResult::ApiImpact(v) => api_impact_text(v),
             QueryResult::Drift(v) => drift_text(v),
             QueryResult::UnmatchedClients(v) => unmatched_clients_text(v),
+            QueryResult::History(v) => history_text(v),
         }
     }
 }
@@ -157,6 +172,41 @@ fn nodes_text(nodes: &[Node]) {
         if let Some(doc) = &n.doc {
             let first = doc.lines().next().unwrap_or("");
             println!("    {}", first);
+        }
+    }
+}
+
+fn history_text(commits: &[SymbolCommit]) {
+    if commits.is_empty() {
+        println!("(no history)");
+        return;
+    }
+    for c in commits {
+        let flag = if c.in_head { "in HEAD" } else { "NOT in HEAD" };
+        print!("{}  {}  [{}]  {}", c.short, c.date, flag, c.subject);
+        if !c.branches.is_empty() {
+            print!("  ({})", c.branches.join(", "));
+        }
+        if let Some(pr) = &c.pr {
+            print!("  PR #{} ({}) {}", pr.number, pr.state, pr.url);
+        }
+        println!();
+    }
+    // Surface the "lost fix": commits that exist but aren't on the current branch.
+    let lost: Vec<&SymbolCommit> = commits.iter().filter(|c| !c.in_head).collect();
+    if !lost.is_empty() {
+        println!("\nnot in HEAD ({}):", lost.len());
+        for c in lost {
+            let where_ = if c.branches.is_empty() {
+                "(no branch)".to_string()
+            } else {
+                c.branches.join(", ")
+            };
+            print!("  {} {} — {}", c.short, c.subject, where_);
+            if let Some(pr) = &c.pr {
+                print!(" — PR #{} ({})", pr.number, pr.state);
+            }
+            println!();
         }
     }
 }
@@ -374,7 +424,8 @@ fn open_store(repo: &Path) -> Result<Box<dyn GraphStore + Send>> {
 
 /// Compute a query answer against one open store. Pure of output so the same
 /// arm serves single-repo text, single-repo JSON, and cross-repo aggregation.
-fn execute(store: &dyn GraphStore, cmd: &QueryCmd) -> Result<QueryResult> {
+/// `root` is the repo working directory (git history needs it).
+fn execute(store: &dyn GraphStore, root: &Path, cmd: &QueryCmd) -> Result<QueryResult> {
     Ok(match cmd {
         QueryCmd::Def { name } => QueryResult::Nodes(store.find_by_name(name)?),
         QueryCmd::Callers { name } => {
@@ -523,6 +574,30 @@ fn execute(store: &dyn GraphStore, cmd: &QueryCmd) -> Result<QueryResult> {
                 unimplemented_schema_ops,
             })
         }
+        QueryCmd::History { name, prs, limit } => {
+            let nodes = store.find_by_name(name)?;
+            if nodes.is_empty() {
+                bail!("no symbol named '{name}' in the index");
+            }
+            let opts = HistoryOpts {
+                prs: *prs,
+                limit: *limit,
+            };
+            // Union the history of every same-named definition, deduped by hash.
+            let mut commits: Vec<SymbolCommit> = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for n in &nodes {
+                let span = n.span.map(|s| (s.start_line, s.end_line));
+                for c in symbol_history(root, &n.file, span, &n.name, &opts) {
+                    if seen.insert(c.hash.clone()) {
+                        commits.push(c);
+                    }
+                }
+            }
+            // Newest first by committer timestamp (precise; `date` is day-granular).
+            commits.sort_by_key(|c| std::cmp::Reverse(c.committed_at));
+            QueryResult::History(commits)
+        }
     })
 }
 
@@ -562,7 +637,7 @@ pub fn print_value(value: &serde_json::Value, emit: Emit) -> Result<()> {
 pub fn run(repo: &Path, cmd: QueryCmd, emit: Emit) -> Result<()> {
     let store = open_store(repo)?;
     crate::commands::note_staleness(repo, store.as_ref());
-    let result = execute(&*store, &cmd)?;
+    let result = execute(&*store, repo, &cmd)?;
     match emit {
         Emit::Text => result.print_text(),
         _ => print_value(&result.to_value(), emit)?,
@@ -606,7 +681,9 @@ pub fn run_registry(
     if emit == Emit::Text {
         for e in &selected {
             println!("== {} ({}) ==", e.name, e.root.display());
-            match open_store(e.active_root()).and_then(|s| execute(s.as_ref(), &cmd)) {
+            match open_store(e.active_root())
+                .and_then(|s| execute(s.as_ref(), e.active_root(), &cmd))
+            {
                 Ok(r) => r.print_text(),
                 Err(err) => println!("  error: {err:#}"),
             }
@@ -616,7 +693,9 @@ pub fn run_registry(
 
     let mut arr = Vec::new();
     for e in &selected {
-        let value = match open_store(e.active_root()).and_then(|s| execute(s.as_ref(), &cmd)) {
+        let value = match open_store(e.active_root())
+            .and_then(|s| execute(s.as_ref(), e.active_root(), &cmd))
+        {
             Ok(r) => r.to_value(),
             Err(err) => serde_json::json!({ "error": format!("{err:#}") }),
         };

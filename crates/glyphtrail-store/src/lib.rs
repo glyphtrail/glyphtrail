@@ -3,11 +3,13 @@
 pub mod changeset;
 pub mod federated;
 pub mod graph_store;
+pub mod history;
 pub mod ladybug;
 
 pub use changeset::{ChangeSpec, ChangedFile, SeedSet, changed_files, seed_nodes};
 pub use federated::{FederationScope, SeedSpec, federated_impact};
 pub use graph_store::{GraphStore, Stats};
+pub use history::{HistoryOpts, PrRef, SymbolCommit, symbol_history};
 pub use ladybug::LadybugStore;
 
 #[cfg(test)]

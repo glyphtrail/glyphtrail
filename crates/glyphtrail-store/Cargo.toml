@@ -12,6 +12,8 @@ description = "Glyphtrail storage: the LadybugDB-backed code graph store."
 [dependencies]
 glyphtrail-core.workspace = true
 anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 # LadybugDB (Cypher) is the sole storage backend (#8). Pulls a prebuilt liblbug
 # (or builds it via cmake), so a C++ toolchain is required to build this crate.
 lbug = "0.17.0"
