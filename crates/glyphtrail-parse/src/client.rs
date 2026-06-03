@@ -274,10 +274,14 @@ fn js_client_calls(source: &str, lang: &Language) -> Vec<RawClientCall> {
     let clients = axios_clients(root, src);
     let http_fields = http_client_fields(root, src);
     let consts = string_constants(root, src);
+    // Local variable bindings resolved to URL strings (#443), kept *separate* from
+    // `consts`: a binding is only followed when the variable is the whole URL
+    // argument, never folded into a `${}` substitution (which stays module-scoped).
+    let bindings = local_string_bindings(root, src, &consts);
     let mut out = Vec::new();
     walk(root, &mut |n| {
         if n.kind() == "call_expression"
-            && let Some(call) = client_call(n, src, &clients, &http_fields, &consts)
+            && let Some(call) = client_call(n, src, &clients, &http_fields, &consts, &bindings)
         {
             out.push(call);
         }
@@ -638,6 +642,7 @@ fn client_call(
     clients: &[AxiosBinding],
     http_fields: &[HttpClientField],
     consts: &HashMap<String, String>,
+    bindings: &HashMap<String, String>,
 ) -> Option<RawClientCall> {
     let func = call.child_by_field_name("function")?;
     let args = call.child_by_field_name("arguments");
@@ -645,14 +650,14 @@ fn client_call(
         "identifier" => {
             let name = text(func, src);
             if name == "fetch" {
-                let path = resolve_url(named_arg(args, 0)?, src, consts)?;
+                let path = resolve_url(named_arg(args, 0)?, src, consts, bindings)?;
                 let method = named_arg(args, 1)
                     .map(|o| object_method(o, src))
                     .unwrap_or(HttpMethod::Get);
                 (method, path)
             } else if is_axios_client(clients, &name, func.start_byte()) {
                 // `axios(config)` / `instance(config)`.
-                config_call(named_arg(args, 0)?, src, consts)?
+                config_call(named_arg(args, 0)?, src, consts, bindings)?
             } else {
                 return None;
             }
@@ -674,19 +679,28 @@ fn client_call(
                     // string arg, URL the second.
                     let method =
                         js_string(named_arg(args, 0)?, src).and_then(|s| HttpMethod::parse(&s))?;
-                    (method, resolve_url(named_arg(args, 1)?, src, consts)?)
+                    (
+                        method,
+                        resolve_url(named_arg(args, 1)?, src, consts, bindings)?,
+                    )
                 } else {
                     let method = HttpMethod::parse(&prop)?;
-                    (method, resolve_url(named_arg(args, 0)?, src, consts)?)
+                    (
+                        method,
+                        resolve_url(named_arg(args, 0)?, src, consts, bindings)?,
+                    )
                 }
             } else if is_axios_client(clients, &text(obj, src), obj.start_byte()) {
                 if prop == "request" {
                     // `axios.request(config)` / `instance.request(config)`.
-                    config_call(named_arg(args, 0)?, src, consts)?
+                    config_call(named_arg(args, 0)?, src, consts, bindings)?
                 } else {
                     // `axios.get(url)` / `instance.post(url, ...)`.
                     let method = HttpMethod::parse(&prop)?;
-                    (method, resolve_url(named_arg(args, 0)?, src, consts)?)
+                    (
+                        method,
+                        resolve_url(named_arg(args, 0)?, src, consts, bindings)?,
+                    )
                 }
             } else {
                 return None;
@@ -808,8 +822,9 @@ fn config_call(
     config: Node,
     src: &[u8],
     consts: &HashMap<String, String>,
+    bindings: &HashMap<String, String>,
 ) -> Option<(HttpMethod, String)> {
-    let url = resolve_url(object_field(config, "url", src)?, src, consts)?;
+    let url = resolve_url(object_field(config, "url", src)?, src, consts, bindings)?;
     Some((object_method(config, src), url))
 }
 
@@ -887,13 +902,22 @@ fn string_constants(root: Node, src: &[u8]) -> HashMap<String, String> {
 
 /// URL string from a literal, template, `+`-concatenation, or bare constant,
 /// folding known same-file string constants; `None` for a fully dynamic URL.
-fn resolve_url(node: Node, src: &[u8], consts: &HashMap<String, String>) -> Option<String> {
+fn resolve_url(
+    node: Node,
+    src: &[u8],
+    consts: &HashMap<String, String>,
+    bindings: &HashMap<String, String>,
+) -> Option<String> {
     match node.kind() {
         "string" => js_string(node, src),
         "template_string" => Some(resolve_template(node, src, consts)),
         "binary_expression" => resolve_concat(node, src, consts),
-        // A bare constant identifier used directly as the URL.
-        "identifier" => consts.get(&text(node, src)).cloned(),
+        // A bare identifier used directly as the whole URL: a module const, or a
+        // local variable bound to a URL (#443). `${}` folding stays module-scoped.
+        "identifier" => {
+            let name = text(node, src);
+            consts.get(&name).or_else(|| bindings.get(&name)).cloned()
+        }
         _ => None,
     }
 }
@@ -930,6 +954,47 @@ fn resolve_concat(node: Node, src: &[u8], consts: &HashMap<String, String>) -> O
     let mut any_concrete = false;
     flatten_concat(node, src, consts, &mut parts, &mut any_concrete);
     any_concrete.then(|| parts.concat())
+}
+
+/// Every local `const`/`let`/`var X = <init>` binding whose initialiser resolves
+/// to a (possibly-dynamic) URL string (#443), so a bare identifier used as a whole
+/// URL argument can be followed. Walked in source order. The map is file-wide and
+/// scope-unaware, so to avoid resolving an identifier to a binding from a
+/// *different* function, a name bound to two different values is treated as
+/// ambiguous and dropped — only a name with one consistent value is followed.
+///
+/// An initialiser is resolved against the module consts (its `${}`/concat folding
+/// stays module-scoped, as in #405); a binding referencing an earlier local in a
+/// `+` concatenation is not folded — a known limitation of the separate maps.
+fn local_string_bindings(
+    root: Node,
+    src: &[u8],
+    module_consts: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut resolved: HashMap<String, Option<String>> = HashMap::new();
+    walk(root, &mut |n| {
+        if n.kind() != "variable_declarator" {
+            return;
+        }
+        if let Some(name) = n.child_by_field_name("name")
+            && name.kind() == "identifier"
+            && let Some(value) = n.child_by_field_name("value")
+            && let Some(url) = resolve_url(value, src, module_consts, &HashMap::new())
+        {
+            resolved
+                .entry(text(name, src))
+                .and_modify(|v| {
+                    if v.as_deref() != Some(url.as_str()) {
+                        *v = None; // same name, different value across scopes -> ambiguous
+                    }
+                })
+                .or_insert(Some(url));
+        }
+    });
+    resolved
+        .into_iter()
+        .filter_map(|(k, v)| v.map(|s| (k, s)))
+        .collect()
 }
 
 fn flatten_concat(
@@ -1376,6 +1441,33 @@ func f(m map[string]int) {
                    f() { const BASE = '/local'; return this.http.get(`${BASE}/x`); } }";
         let calls = extract_client_calls(src, &Language::TypeScript);
         check!(call(&calls, HttpMethod::Get, "${BASE}/x").is_some());
+    }
+
+    // #443: when the whole URL argument is a local variable, its `const`/`let`
+    // binding is followed (and the existing folding then runs on the initialiser).
+    #[test]
+    fn local_variable_url_binding_is_followed() {
+        let src = "const API = '/api/';\n\
+                   class S {\n  constructor(private http: HttpClient) {}\n  \
+                   inline() { return this.http.get(API + 'things'); }\n  \
+                   viaVar() { const url = API + 'widgets'; return this.http.get(url); } }";
+        let calls = extract_client_calls(src, &Language::TypeScript);
+        // The inline case already worked; the variable-bound case now does too.
+        check!(call(&calls, HttpMethod::Get, "/api/things").is_some());
+        check!(call(&calls, HttpMethod::Get, "/api/widgets").is_some());
+    }
+
+    // #443 review: the same variable name bound to different values in different
+    // functions is ambiguous (the map is scope-unaware), so it isn't resolved to
+    // either — better a dropped call than a wrong link.
+    #[test]
+    fn ambiguous_local_binding_is_not_resolved() {
+        let src = "class S {\n  constructor(private http: HttpClient) {}\n  \
+                   a() { const url = '/api/a'; return this.http.get(url); }\n  \
+                   b() { const url = '/api/b'; return this.http.get(url); } }";
+        let calls = extract_client_calls(src, &Language::TypeScript);
+        check!(call(&calls, HttpMethod::Get, "/api/a").is_none());
+        check!(call(&calls, HttpMethod::Get, "/api/b").is_none());
     }
 
     // #405: module_constants collects string consts, object string properties

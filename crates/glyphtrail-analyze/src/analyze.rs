@@ -1177,7 +1177,9 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 15: embedded Cypher (kuzu DDL labels + MATCH/MERGE access) in Rust strings
 /// linked to graph-label tables (#416 Phase C, #428).
 /// 16: `format!`-built sqlx query templates are read for table accesses (#446).
-const ANALYSIS_REVISION: u32 = 16;
+/// 17: client URL extraction follows a whole-argument local variable binding
+/// (`const url = …; http.get(url)`), so those calls are linked (#443).
+const ANALYSIS_REVISION: u32 = 17;
 
 /// Fingerprint of everything that determines analysis output: the crate
 /// version, the manual revision counter, and the built-in tree-sitter query
