@@ -193,8 +193,10 @@ pub fn extract_cypher_access(cypher: &str) -> Vec<(DbAccess, String)> {
         match t.as_str() {
             "(" | "[" => pattern_depth += 1,
             ")" | "]" => pattern_depth = (pattern_depth - 1).max(0),
-            "{" => map_depth += 1,
-            "}" => map_depth = (map_depth - 1).max(0),
+            // A `{` is a property map only inside a node/rel pattern; at the top
+            // level it opens a subquery block (`CALL { … }`), whose labels count.
+            "{" if pattern_depth > 0 => map_depth += 1,
+            "}" if pattern_depth > 0 && map_depth > 0 => map_depth -= 1,
             ":" => {
                 if pattern_depth > 0
                     && map_depth == 0
@@ -370,6 +372,12 @@ mod tests {
         // A `{}` map's `:` (property key) is not a label.
         check!(
             acc("CREATE (n:User {name: 'x', role: 'y'})") == vec![(DbAccess::Write, "user".into())]
+        );
+        // A label inside a `CALL { … }` subquery block is still found — that `{}`
+        // is a block, not a property map.
+        check!(
+            acc("CALL { MATCH (w:Widget {id: 1}) RETURN w }")
+                == vec![(DbAccess::Read, "widget".into())]
         );
     }
 
