@@ -335,6 +335,10 @@ fn rank_search_hits(nodes: &mut [Node], terms: &[String], case_sensitive: bool) 
         scored[&b.id.0]
             .cmp(&scored[&a.id.0])
             .then(a.name.len().cmp(&b.name.len()))
+            // Fully deterministic order on ties (name, then id), since sort_by
+            // is not stable.
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.id.0.cmp(&b.id.0))
     });
 }
 
@@ -1064,7 +1068,7 @@ impl GraphStore for LadybugStore {
                 }
             })
             .collect();
-        if terms.is_empty() {
+        if terms.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
         let col = |c: &str| {
@@ -1336,6 +1340,48 @@ mod tests {
             doc: None,
             signature: None,
         }
+    }
+
+    // #456/#454: a multi-word query ANDs its terms across name/qualified/doc/file,
+    // and bare external-module import nodes are excluded.
+    #[test]
+    fn search_ands_terms_and_drops_bare_imports() {
+        let dir = tmp_dir("search-and");
+        let mut lb = LadybugStore::open(&dir).unwrap();
+        let mut cache = node("c", "UserCache");
+        cache.kind = NodeKind::Struct;
+        cache.file = "datastorage/users.rs".into();
+        cache.qualified_name = "datastorage::UserCache".into();
+        let mut import = node("m", "moka::Cache"); // bare external-module import
+        import.kind = NodeKind::Module;
+        import.file = String::new();
+        import.qualified_name = "moka::Cache".into();
+        let mut other = node("o", "Widget");
+        other.file = "widget.rs".into();
+        other.qualified_name = "Widget".into();
+        lb.insert_nodes(&[cache, import, other], true).unwrap();
+
+        // `user cache`: both terms must match — `cache` in the name, `user` in the
+        // file path / qualified name → only UserCache (Widget and the import miss).
+        let multi: Vec<String> = lb
+            .search("user cache", 10, false)
+            .unwrap()
+            .into_iter()
+            .map(|n| n.name)
+            .collect();
+        check!(multi == vec!["UserCache".to_string()]);
+
+        // `cache` alone matches the struct and the import, but the bare import node
+        // (module, empty file) is dropped.
+        let single: Vec<String> = lb
+            .search("cache", 10, false)
+            .unwrap()
+            .into_iter()
+            .map(|n| n.name)
+            .collect();
+        check!(single.contains(&"UserCache".to_string()));
+        check!(!single.iter().any(|n| n == "moka::Cache"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // #454: a name hit outranks a doc/file hit, so the relevant symbol surfaces
