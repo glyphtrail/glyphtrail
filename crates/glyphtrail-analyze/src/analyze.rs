@@ -168,6 +168,9 @@ struct FileOutput {
     /// classes (#416 B, Java), so an entity ref in a repo/`@Query` resolves to
     /// its table.
     entity_tables: Vec<(String, String)>,
+    /// `(owning table id, related entity-or-table name)` JPA relationship FKs
+    /// (#433), resolved to table→table `References` edges after the parse.
+    db_references: Vec<(NodeId, String)>,
 }
 
 /// The innermost function/method node whose span contains `byte`, for attributing
@@ -205,6 +208,7 @@ fn parse_file(
         const_refs: Vec::new(),
         db_accesses: Vec::new(),
         entity_tables: Vec::new(),
+        db_references: Vec::new(),
     };
 
     // SQL schema/migration file (#416): the DDL extractor produces table/column
@@ -366,6 +370,7 @@ fn parse_file(
         let jpa = glyphtrail_parse::extract_jpa(&f.rel_path, &file_id, &source, language);
         out.graph.extend(jpa.graph);
         out.entity_tables.extend(jpa.entity_tables);
+        out.db_references.extend(jpa.references);
         for q in jpa.accesses {
             if let Some(fn_id) = enclosing_fn(&out.graph.nodes, q.byte) {
                 for (access, table) in q.accesses {
@@ -1142,7 +1147,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 7: constant resolution follows the Angular `environment` chain — a member
 /// alias of an imported config object's string property (#405) — so those
 /// frontend indexes rebuild to fold the common environment-base URL pattern.
-const ANALYSIS_REVISION: u32 = 11;
+const ANALYSIS_REVISION: u32 = 12;
 
 /// Fingerprint of everything that determines analysis output: the crate
 /// version, the manual revision counter, and the built-in tree-sitter query
@@ -1685,6 +1690,8 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
     let mut db_accesses: Vec<(NodeId, glyphtrail_parse::DbAccess, String)> = Vec::new();
     // (entity name, table name) JPA mappings, so an entity ref resolves to its table.
     let mut entity_tables: Vec<(String, String)> = Vec::new();
+    // (owning table id, related entity/table name) JPA relationship FKs (#433).
+    let mut db_references: Vec<(NodeId, String)> = Vec::new();
 
     // Pre-resolve dynamic-language grammars once (sequential; warns once per
     // missing grammar) so the parallel parse can read them immutably.
@@ -1733,6 +1740,7 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
         const_refs.extend(out.const_refs);
         db_accesses.extend(out.db_accesses);
         entity_tables.extend(out.entity_tables);
+        db_references.extend(out.db_references);
     }
 
     // Resolve embedded-query accesses (#416 Phase B): match each query's table
@@ -1741,7 +1749,7 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
     // or bare (`users` matches `public.users`). A reference with no matching table
     // in this pass is dropped (best-effort; cross-pass resolution is a follow-up).
     let mut db_edges: Vec<Edge> = Vec::new();
-    if !db_accesses.is_empty() {
+    if !db_accesses.is_empty() || !db_references.is_empty() {
         // A JPA repository/JPQL access names an entity; map it to that entity's
         // table before matching (a native query / sqlx already names the table).
         // Two entities with the same simple name (different packages) mapping to
@@ -1797,6 +1805,29 @@ pub fn run(path: &Path, update: bool) -> Result<AnalyzeOutcome> {
                         kind,
                         confidence: Confidence::Inferred,
                     });
+                }
+            }
+        }
+        // JPA relationship FKs (#433): the owning entity's table references the
+        // related entity's table (mapped from its entity name like an access).
+        for (src_table, ref_name) in &db_references {
+            let table = match entity_to_table.get(ref_name) {
+                Some(Some(t)) => t,
+                _ => ref_name,
+            };
+            let targets = tables_by_name
+                .get(table)
+                .or_else(|| table.rsplit('.').next().and_then(|b| tables_by_name.get(b)));
+            if let Some(ids) = targets {
+                for tid in ids {
+                    if tid != src_table {
+                        db_edges.push(Edge {
+                            src: src_table.clone(),
+                            dst: tid.clone(),
+                            kind: EdgeKind::References,
+                            confidence: Confidence::Inferred,
+                        });
+                    }
                 }
             }
         }

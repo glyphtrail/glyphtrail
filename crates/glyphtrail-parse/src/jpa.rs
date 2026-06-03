@@ -44,6 +44,9 @@ pub struct JpaExtract {
     pub entity_tables: Vec<(String, String)>,
     /// Repository/`@Query` access sites.
     pub accesses: Vec<JpaAccess>,
+    /// `(owning table node id, normalized related entity name)` from relationship
+    /// fields, resolved to a `References` edge between tables in analyze (#433).
+    pub references: Vec<(NodeId, String)>,
 }
 
 /// Spring Data repository base interfaces whose first type argument is the entity.
@@ -70,11 +73,13 @@ pub fn extract_jpa(rel_path: &str, file_id: &NodeId, source: &str, lang: &Langua
     let mut graph = CodeGraph::new();
     let mut entity_tables = Vec::new();
     let mut accesses = Vec::new();
+    let mut references = Vec::new();
     if *lang != Language::Java {
         return JpaExtract {
             graph,
             entity_tables,
             accesses,
+            references,
         };
     }
     let Some(tree) = parse(source) else {
@@ -82,6 +87,7 @@ pub fn extract_jpa(rel_path: &str, file_id: &NodeId, source: &str, lang: &Langua
             graph,
             entity_tables,
             accesses,
+            references,
         };
     };
     let src = source.as_bytes();
@@ -105,6 +111,11 @@ pub fn extract_jpa(rel_path: &str, file_id: &NodeId, source: &str, lang: &Langua
                 for col in &entity.columns {
                     add_column(&mut graph, rel_path, &table_id, &table_norm, col);
                 }
+                // Relationship fields (@ManyToOne, @JoinColumn, …) reference another
+                // entity's table; resolved in analyze via the entity→table map (#433).
+                for related in &entity.relations {
+                    references.push((table_id.clone(), normalize_name(related)));
+                }
             }
         }
         "interface_declaration" => {
@@ -118,6 +129,7 @@ pub fn extract_jpa(rel_path: &str, file_id: &NodeId, source: &str, lang: &Langua
         graph,
         entity_tables,
         accesses,
+        references,
     }
 }
 
@@ -126,6 +138,8 @@ struct Entity {
     entity_name: String,
     table_name: String,
     columns: Vec<String>,
+    /// Related entity names from relationship fields (@ManyToOne, @OneToMany, …).
+    relations: Vec<String>,
     byte: usize,
 }
 
@@ -145,6 +159,7 @@ fn extract_entity(class: Node, src: &[u8]) -> Option<Entity> {
         .and_then(|t| anno_string(t, "name", src))
         .unwrap_or_else(|| snake_case(&entity_name));
     let mut columns = Vec::new();
+    let mut relations = Vec::new();
     if let Some(body) = class.child_by_field_name("body") {
         let mut cur = body.walk();
         for field in body.named_children(&mut cur) {
@@ -156,6 +171,11 @@ fn extract_entity(class: Node, src: &[u8]) -> Option<Entity> {
                 && (find_annotation(m, "Transient", src).is_some() || has_static(m, src))
             {
                 continue;
+            }
+            // A relationship field (@ManyToOne, @OneToMany, …) references another
+            // entity's table; its field type (or collection element) is the entity.
+            if let Some(related) = related_entity(field, src) {
+                relations.push(related);
             }
             // Column name: @Column(name=…) / @JoinColumn(name=…) override the field.
             let col_override = modifiers_of(field)
@@ -175,8 +195,45 @@ fn extract_entity(class: Node, src: &[u8]) -> Option<Entity> {
         entity_name,
         table_name,
         columns,
+        relations,
         byte: class.start_byte(),
     })
+}
+
+/// Relationship annotations whose field type is the related entity.
+const RELATION_ANNOTATIONS: &[&str] = &["ManyToOne", "OneToOne", "OneToMany", "ManyToMany"];
+
+/// The related entity a relationship field points to: the field's type
+/// (`@ManyToOne Org org` → `Org`) or, for a collection, its element type
+/// (`@OneToMany List<Line> lines` → `Line`). `None` for a non-relationship field.
+fn related_entity(field: Node, src: &[u8]) -> Option<String> {
+    let m = modifiers_of(field)?;
+    if !RELATION_ANNOTATIONS
+        .iter()
+        .any(|a| find_annotation(m, a, src).is_some())
+    {
+        return None;
+    }
+    let ty = field.child_by_field_name("type")?;
+    let entity = match ty.kind() {
+        "type_identifier" => text(ty, src),
+        "scoped_type_identifier" => type_last_segment(&text(ty, src)),
+        // A collection type: take the (last) type argument's name.
+        "generic_type" => {
+            let mut tycur = ty.walk();
+            let args = ty
+                .named_children(&mut tycur)
+                .find(|c| c.kind() == "type_arguments")?;
+            let mut argcur = args.walk();
+            let type_args: Vec<Node> = args
+                .named_children(&mut argcur)
+                .filter(|c| matches!(c.kind(), "type_identifier" | "scoped_type_identifier"))
+                .collect();
+            type_last_segment(&text(*type_args.last()?, src))
+        }
+        _ => return None,
+    };
+    Some(entity)
 }
 
 /// The entity type a repository interface manages: the first type argument of an
@@ -523,6 +580,24 @@ mod tests {
         // query / `.sql` migration table of that name (#432).
         let e = extract("@Entity class OrderLine { Long id; }");
         check!(e.entity_tables == vec![("orderline".to_string(), "order_line".to_string())]);
+    }
+
+    #[test]
+    fn relationship_fields_yield_references_to_related_entities() {
+        let src = r#"
+            @Entity class Order {
+                @Id Long id;
+                @ManyToOne @JoinColumn(name = "customer_id") Customer customer;
+                @OneToMany java.util.List<LineItem> lines;
+                String note;
+            }
+        "#;
+        // The owning table references both related entities (collection element too).
+        let e = extract(src);
+        let refs: Vec<&str> = e.references.iter().map(|(_, e)| e.as_str()).collect();
+        check!(refs.contains(&"customer"));
+        check!(refs.contains(&"lineitem"));
+        check!(!refs.contains(&"note")); // a plain field is not a relation
     }
 
     #[test]
