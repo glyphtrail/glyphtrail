@@ -958,16 +958,20 @@ fn resolve_concat(node: Node, src: &[u8], consts: &HashMap<String, String>) -> O
 
 /// Every local `const`/`let`/`var X = <init>` binding whose initialiser resolves
 /// to a (possibly-dynamic) URL string (#443), so a bare identifier used as a whole
-/// URL argument can be followed. Walked in source order, resolving each init
-/// against the module consts plus the bindings collected so far (so a binding can
-/// reference a module const or an earlier local). Kept separate from the module
-/// consts that feed `${}` folding. File-wide (last-wins on a name collision).
+/// URL argument can be followed. Walked in source order. The map is file-wide and
+/// scope-unaware, so to avoid resolving an identifier to a binding from a
+/// *different* function, a name bound to two different values is treated as
+/// ambiguous and dropped — only a name with one consistent value is followed.
+///
+/// An initialiser is resolved against the module consts (its `${}`/concat folding
+/// stays module-scoped, as in #405); a binding referencing an earlier local in a
+/// `+` concatenation is not folded — a known limitation of the separate maps.
 fn local_string_bindings(
     root: Node,
     src: &[u8],
     module_consts: &HashMap<String, String>,
 ) -> HashMap<String, String> {
-    let mut bindings: HashMap<String, String> = HashMap::new();
+    let mut resolved: HashMap<String, Option<String>> = HashMap::new();
     walk(root, &mut |n| {
         if n.kind() != "variable_declarator" {
             return;
@@ -975,12 +979,22 @@ fn local_string_bindings(
         if let Some(name) = n.child_by_field_name("name")
             && name.kind() == "identifier"
             && let Some(value) = n.child_by_field_name("value")
-            && let Some(resolved) = resolve_url(value, src, module_consts, &bindings)
+            && let Some(url) = resolve_url(value, src, module_consts, &HashMap::new())
         {
-            bindings.insert(text(name, src), resolved);
+            resolved
+                .entry(text(name, src))
+                .and_modify(|v| {
+                    if v.as_deref() != Some(url.as_str()) {
+                        *v = None; // same name, different value across scopes -> ambiguous
+                    }
+                })
+                .or_insert(Some(url));
         }
     });
-    bindings
+    resolved
+        .into_iter()
+        .filter_map(|(k, v)| v.map(|s| (k, s)))
+        .collect()
 }
 
 fn flatten_concat(
@@ -1441,6 +1455,19 @@ func f(m map[string]int) {
         // The inline case already worked; the variable-bound case now does too.
         check!(call(&calls, HttpMethod::Get, "/api/things").is_some());
         check!(call(&calls, HttpMethod::Get, "/api/widgets").is_some());
+    }
+
+    // #443 review: the same variable name bound to different values in different
+    // functions is ambiguous (the map is scope-unaware), so it isn't resolved to
+    // either — better a dropped call than a wrong link.
+    #[test]
+    fn ambiguous_local_binding_is_not_resolved() {
+        let src = "class S {\n  constructor(private http: HttpClient) {}\n  \
+                   a() { const url = '/api/a'; return this.http.get(url); }\n  \
+                   b() { const url = '/api/b'; return this.http.get(url); } }";
+        let calls = extract_client_calls(src, &Language::TypeScript);
+        check!(call(&calls, HttpMethod::Get, "/api/a").is_none());
+        check!(call(&calls, HttpMethod::Get, "/api/b").is_none());
     }
 
     // #405: module_constants collects string consts, object string properties
