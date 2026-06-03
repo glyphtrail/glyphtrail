@@ -4,6 +4,7 @@ pub mod build;
 pub mod client;
 pub mod cypher;
 pub mod db_client;
+pub mod diesel;
 pub mod dynamic;
 pub mod extract;
 pub mod graphql;
@@ -29,6 +30,7 @@ pub use cypher::{
     CypherAccess, CypherExtract, cypher_pattern_labels, extract_cypher, extract_cypher_file,
 };
 pub use db_client::{RawDbQuery, extract_db_queries};
+pub use diesel::{DieselExtract, extract_diesel};
 pub use dynamic::{DynamicGrammar, load_dynamic};
 pub use extract::{ParsedFile, parse_source, parse_with};
 pub use import_symbols::extract_import_symbols;
