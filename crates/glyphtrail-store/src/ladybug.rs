@@ -14,9 +14,9 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use glyphtrail_core::{
-    Adjacency, ClassifiedItem, CommitMeta, Confidence, Direction, Edge, EdgeKind, ImpactPolicy,
-    Node, NodeId, NodeKind, OperationKey, PendingLink, Span, classify, compute_impact,
-    is_cross_boundary_path,
+    Adjacency, ClassifiedItem, CommitMeta, Confidence, Direction, Edge, EdgeKind, Embedding,
+    ImpactPolicy, Node, NodeId, NodeKind, OperationKey, PendingLink, Span, classify,
+    compute_impact, is_cross_boundary_path,
 };
 use lbug::{Connection, Database, LogicalType, SystemConfig, Value};
 
@@ -46,6 +46,11 @@ const SCHEMA: &[&str] = &[
     "CREATE NODE TABLE IF NOT EXISTS Commit(node_id STRING, hash STRING, author_email STRING, committed_at INT64, subject STRING, in_bounds INT64, PRIMARY KEY(node_id))",
     "CREATE NODE TABLE IF NOT EXISTS Pending(pk STRING, anchor STRING, name STRING, kind STRING, name_is_src INT64, PRIMARY KEY(pk))",
     "CREATE NODE TABLE IF NOT EXISTS Import(pk STRING, importer STRING, raw STRING, language STRING, PRIMARY KEY(pk))",
+    // Atlas (#338): a dense embedding vector keyed by node id (a `Repo` today),
+    // mirroring the `Commit` side-table. `vec` is the comma-joined floats; `model`
+    // is the producing embedder's id, so a re-embed under a different model is
+    // detectable.
+    "CREATE NODE TABLE IF NOT EXISTS Embedding(node_id STRING, model STRING, dim INT64, vec STRING, PRIMARY KEY(node_id))",
     "CREATE NODE TABLE IF NOT EXISTS Meta(key STRING, value STRING, PRIMARY KEY(key))",
 ];
 
@@ -104,7 +109,15 @@ impl LadybugStore {
             // Drop the rel table before its node tables. Ignore "missing table"
             // on a partial DB; the schema is recreated immediately after.
             for tbl in [
-                "Edge", "Node", "File", "ApiOp", "Commit", "Pending", "Import", "Meta",
+                "Edge",
+                "Node",
+                "File",
+                "ApiOp",
+                "Commit",
+                "Embedding",
+                "Pending",
+                "Import",
+                "Meta",
             ] {
                 let _ = conn.query(&format!("DROP TABLE {tbl}"));
             }
@@ -340,6 +353,23 @@ fn rank_search_hits(nodes: &mut [Node], terms: &[String], case_sensitive: bool) 
             .then_with(|| a.name.cmp(&b.name))
             .then_with(|| a.id.0.cmp(&b.id.0))
     });
+}
+
+/// Encode an embedding vector as comma-joined floats. Rust's float formatting is
+/// shortest-round-trip, so `decode_vec` recovers the same `f32`s.
+fn encode_vec(v: &[f32]) -> String {
+    v.iter()
+        .map(|x| x.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Decode a comma-joined embedding vector; unparseable entries become `0.0`.
+fn decode_vec(s: &str) -> Vec<f32> {
+    if s.is_empty() {
+        return Vec::new();
+    }
+    s.split(',').map(|t| t.parse().unwrap_or(0.0)).collect()
 }
 
 fn get_str(row: &[Value], idx: usize) -> String {
@@ -703,6 +733,27 @@ impl GraphStore for LadybugStore {
         )
     }
 
+    fn set_embeddings(&mut self, embeddings: &[Embedding], model: &str) -> Result<()> {
+        let conn = self.conn()?;
+        let rows: Vec<Vec<(&str, Value)>> = embeddings
+            .iter()
+            .map(|e| {
+                vec![
+                    ("id", s(&e.node_id.0)),
+                    ("m", s(model)),
+                    ("d", Value::Int64(e.vector.len() as i64)),
+                    ("v", s(&encode_vec(&e.vector))),
+                ]
+            })
+            .collect();
+        self.exec_unwind(
+            &conn,
+            "UNWIND $rows AS r MERGE (e:Embedding {node_id:r.id}) \
+             SET e.model=r.m, e.dim=r.d, e.vec=r.v",
+            rows,
+        )
+    }
+
     fn remark_commit_bounds(&mut self, since: Option<i64>, until: Option<i64>) -> Result<()> {
         // Inline the bounds (lbug caches a bound param's type by name across
         // statements, so an INT64 param here would clash with STRING params
@@ -891,6 +942,17 @@ impl GraphStore for LadybugStore {
             .first()
             .map(|r| get_i64(r, 0).max(0) as usize)
             .unwrap_or(0))
+    }
+
+    fn embeddings(&self) -> Result<Vec<Embedding>> {
+        Ok(self
+            .run("MATCH (e:Embedding) RETURN e.node_id, e.vec", vec![])?
+            .iter()
+            .map(|r| Embedding {
+                node_id: NodeId(get_str(r, 0)),
+                vector: decode_vec(&get_str(r, 1)),
+            })
+            .collect())
     }
 
     fn atlas_topics(&self) -> Result<Vec<(String, usize)>> {
@@ -1527,6 +1589,30 @@ mod tests {
         // commit_count still sees the row — out-of-bounds is marked, not deleted.
         check!(lb.commit_count().unwrap() == 1);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Atlas (#338): embedding vectors round-trip through the side table, keyed by
+    // node id, and an upsert replaces the prior vector.
+    #[test]
+    fn atlas_embedding_side_table_roundtrips() {
+        let dir = tmp_dir("atlas-embed");
+        let mut lb = LadybugStore::open(&dir).unwrap();
+        let e = Embedding {
+            node_id: NodeId("repo:demo".into()),
+            vector: vec![0.5, -0.25, 0.0, 1.0],
+        };
+        lb.set_embeddings(std::slice::from_ref(&e), "lexical-hash-v1")
+            .unwrap();
+        check!(lb.embeddings().unwrap() == vec![e.clone()]);
+        // Upsert by node id replaces, doesn't duplicate.
+        let e2 = Embedding {
+            node_id: NodeId("repo:demo".into()),
+            vector: vec![1.0, 2.0],
+        };
+        lb.set_embeddings(std::slice::from_ref(&e2), "lexical-hash-v1")
+            .unwrap();
+        check!(lb.embeddings().unwrap() == vec![e2]);
         std::fs::remove_dir_all(&dir).ok();
     }
 
