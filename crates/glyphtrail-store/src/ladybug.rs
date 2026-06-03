@@ -297,6 +297,47 @@ fn str_list(items: &[String]) -> Value {
     Value::List(child, vals)
 }
 
+/// Rank `search` candidates by where each term hits, most relevant first (#454):
+/// a term in the name scores highest, then qualified name, then doc/file. Ties
+/// break toward the shorter name (the more specific symbol). `terms` are already
+/// lowercased when `case_sensitive` is false.
+fn rank_search_hits(nodes: &mut [Node], terms: &[String], case_sensitive: bool) {
+    let fold = |s: &str| {
+        if case_sensitive {
+            s.to_string()
+        } else {
+            s.to_lowercase()
+        }
+    };
+    let score = |n: &Node| -> i32 {
+        let name = fold(&n.name);
+        let qname = fold(&n.qualified_name);
+        let doc = n.doc.as_deref().map(fold).unwrap_or_default();
+        let file = fold(&n.file);
+        terms
+            .iter()
+            .map(|t| {
+                if name.contains(t.as_str()) {
+                    3
+                } else if qname.contains(t.as_str()) {
+                    2
+                } else if doc.contains(t.as_str()) || file.contains(t.as_str()) {
+                    1
+                } else {
+                    0
+                }
+            })
+            .sum()
+    };
+    let scored: std::collections::HashMap<String, i32> =
+        nodes.iter().map(|n| (n.id.0.clone(), score(n))).collect();
+    nodes.sort_by(|a, b| {
+        scored[&b.id.0]
+            .cmp(&scored[&a.id.0])
+            .then(a.name.len().cmp(&b.name.len()))
+    });
+}
+
 fn get_str(row: &[Value], idx: usize) -> String {
     match row.get(idx) {
         Some(Value::String(s)) => s.clone(),
@@ -1008,23 +1049,61 @@ impl GraphStore for LadybugStore {
     }
 
     fn search(&self, query: &str, limit: usize, case_sensitive: bool) -> Result<Vec<Node>> {
-        // No native FTS; approximate with substring CONTAINS over name/qname/doc.
-        // Case-insensitive by default (#367): lower() both the columns and the
-        // query; `case_sensitive` keeps an exact-case CONTAINS.
-        let where_clause = if case_sensitive {
-            "n.name CONTAINS $q OR n.qualified_name CONTAINS $q OR n.doc CONTAINS $q"
-        } else {
-            "lower(n.name) CONTAINS $q OR lower(n.qualified_name) CONTAINS $q OR lower(n.doc) CONTAINS $q"
+        // No native FTS; approximate with substring CONTAINS. A multi-word query is
+        // AND-ed over its terms (#456): a node matches when *every* term occurs in
+        // its name, qualified name, doc, or file path. Bare external-module import
+        // nodes (kind=module, no file) are dropped — they aren't actionable (#454).
+        // Case-insensitive by default (#367). Candidates are then ranked in Rust.
+        let terms: Vec<String> = query
+            .split_whitespace()
+            .map(|t| {
+                if case_sensitive {
+                    t.to_string()
+                } else {
+                    t.to_lowercase()
+                }
+            })
+            .collect();
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let col = |c: &str| {
+            if case_sensitive {
+                c.to_string()
+            } else {
+                format!("lower({c})")
+            }
         };
-        let q = if case_sensitive {
-            query.to_string()
-        } else {
-            query.to_lowercase()
-        };
-        self.run_nodes(
-            &format!("MATCH (n:Node) WHERE {where_clause} RETURN {NODE_COLS} LIMIT {limit}"),
-            vec![("q", s(&q))],
-        )
+        let names: Vec<String> = (0..terms.len()).map(|i| format!("t{i}")).collect();
+        let per_term: Vec<String> = names
+            .iter()
+            .map(|p| {
+                format!(
+                    "({} CONTAINS ${p} OR {} CONTAINS ${p} OR {} CONTAINS ${p} OR {} CONTAINS ${p})",
+                    col("n.name"),
+                    col("n.qualified_name"),
+                    col("n.doc"),
+                    col("n.file"),
+                )
+            })
+            .collect();
+        let params: Vec<(&str, Value)> = names
+            .iter()
+            .zip(&terms)
+            .map(|(n, t)| (n.as_str(), s(t)))
+            .collect();
+        // Fetch a generous candidate set, then rank/truncate in Rust (no FTS
+        // scoring). 500 covers the vast majority of real queries.
+        let cap = limit.max(500);
+        let cypher = format!(
+            "MATCH (n:Node) WHERE {} AND NOT (n.kind = 'module' AND n.file = '') \
+             RETURN {NODE_COLS} LIMIT {cap}",
+            per_term.join(" AND "),
+        );
+        let mut nodes = self.run_nodes(&cypher, params)?;
+        rank_search_hits(&mut nodes, &terms, case_sensitive);
+        nodes.truncate(limit);
+        Ok(nodes)
     }
 
     fn neighbors(
@@ -1257,6 +1336,19 @@ mod tests {
             doc: None,
             signature: None,
         }
+    }
+
+    // #454: a name hit outranks a doc/file hit, so the relevant symbol surfaces
+    // first instead of behind TODO comments.
+    #[test]
+    fn rank_search_hits_prefers_name_matches() {
+        let mut by_doc = node("d", "Helper");
+        by_doc.doc = Some("clears the cache on logout".into());
+        let by_name = node("n", "UserCache");
+        let mut nodes = vec![by_doc, by_name];
+        rank_search_hits(&mut nodes, &["cache".to_string()], false);
+        check!(nodes[0].name == "UserCache");
+        check!(nodes[1].name == "Helper");
     }
 
     fn tmp_dir(tag: &str) -> std::path::PathBuf {
