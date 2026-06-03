@@ -667,6 +667,10 @@ fn embed(dir: &Path, args: EmbedArgs) -> Result<()> {
         })
         .collect();
     let mut store = store;
+    // Replace the whole set, so a repo that has left the active date window (no
+    // in-bounds commits) doesn't keep a stale vector from an older window, and a
+    // changed --dim never leaves mixed-width rows behind.
+    store.clear_embeddings()?;
     store.set_embeddings(&embeddings, embedder.id())?;
     println!(
         "embedded {} repo{} ({}, dim {})",
@@ -702,10 +706,17 @@ fn similar(dir: &Path, args: SimilarArgs) -> Result<()> {
         .map(|e| (repo_node_id(&e.name).0, e))
         .collect();
 
+    // All stored vectors must share a width, else cosine silently scores mismatches
+    // as 0 and the ranking is misleading. `atlas embed` clears before writing, so
+    // this only trips on a hand-tampered store — fail loudly and tell the user.
+    let dim = embeddings[0].vector.len();
+    if embeddings.iter().any(|e| e.vector.len() != dim) {
+        bail!("stored embeddings have inconsistent dimensions; re-run `glyphtrail atlas embed`");
+    }
+
     // Resolve the query vector: a known repo name uses its stored embedding (and is
     // excluded from its own results); anything else is embedded as free text.
     let self_id = repo_node_id(&args.query).0;
-    let dim = embeddings[0].vector.len();
     let (qvec, self_id, mode) = if let Some(e) = embeddings.iter().find(|e| e.node_id.0 == self_id)
     {
         (
@@ -730,9 +741,12 @@ fn similar(dir: &Path, args: SimilarArgs) -> Result<()> {
             excluded += 1;
             continue;
         }
-        let name = entry
-            .map(|x| x.name.clone())
-            .unwrap_or_else(|| "(unregistered)".to_string());
+        // The repo name can't be recovered from the one-way node id, so tag an
+        // unregistered row with a short id prefix to keep multiple ones distinct.
+        let name = entry.map(|x| x.name.clone()).unwrap_or_else(|| {
+            let short: String = e.node_id.0.chars().take(8).collect();
+            format!("(unregistered {short})")
+        });
         let vis = match entry.map(|x| x.visibility) {
             Some(v) => v.as_str(),
             None => "unregistered",

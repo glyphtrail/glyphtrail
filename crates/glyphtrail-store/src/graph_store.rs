@@ -68,6 +68,11 @@ pub trait GraphStore: Adjacency {
         let _ = (embeddings, model);
         Ok(())
     }
+    /// Remove every stored embedding (#338), so a re-embed starts clean and a repo
+    /// that left the active date window doesn't keep a stale vector. Default no-op.
+    fn clear_embeddings(&mut self) -> Result<()> {
+        Ok(())
+    }
     fn insert_pending(&mut self, links: &[PendingLink]) -> Result<()>;
     fn insert_imports(&mut self, imports: &[(String, String, String)]) -> Result<()>;
     fn delete_edges_by_confidence(&mut self, confidence: Confidence) -> Result<usize>;

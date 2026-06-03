@@ -754,6 +754,11 @@ impl GraphStore for LadybugStore {
         )
     }
 
+    fn clear_embeddings(&mut self) -> Result<()> {
+        self.run("MATCH (e:Embedding) DELETE e", vec![])?;
+        Ok(())
+    }
+
     fn remark_commit_bounds(&mut self, since: Option<i64>, until: Option<i64>) -> Result<()> {
         // Inline the bounds (lbug caches a bound param's type by name across
         // statements, so an INT64 param here would clash with STRING params
@@ -946,7 +951,10 @@ impl GraphStore for LadybugStore {
 
     fn embeddings(&self) -> Result<Vec<Embedding>> {
         Ok(self
-            .run("MATCH (e:Embedding) RETURN e.node_id, e.vec", vec![])?
+            .run(
+                "MATCH (e:Embedding) RETURN e.node_id, e.vec ORDER BY e.node_id",
+                vec![],
+            )?
             .iter()
             .map(|r| Embedding {
                 node_id: NodeId(get_str(r, 0)),
@@ -1613,6 +1621,9 @@ mod tests {
         lb.set_embeddings(std::slice::from_ref(&e2), "lexical-hash-v1")
             .unwrap();
         check!(lb.embeddings().unwrap() == vec![e2]);
+        // clear_embeddings drops every row, so a re-embed starts clean.
+        lb.clear_embeddings().unwrap();
+        check!(lb.embeddings().unwrap().is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 
