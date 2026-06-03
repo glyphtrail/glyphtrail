@@ -69,16 +69,18 @@ fn deregister_repo(path: &Path) -> Result<()> {
         return Ok(());
     };
     let root = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let name = Registry::load(&reg_path)
-        .ok()
-        .and_then(|r| r.name_at_root(&root).map(str::to_string));
-    match name {
-        Some(name) => {
-            Registry::mutate(&reg_path, |r| {
-                r.remove(&name);
-            })?;
-            println!("deregistered '{name}'");
+    // Resolve the name and remove it in one locked `mutate`, so a load error
+    // surfaces (not swallowed) and we only report success when the repo was found
+    // and removed under the lock (no unlocked-lookup-then-mutate race).
+    let removed = Registry::mutate(&reg_path, |r| {
+        let name = r.name_at_root(&root).map(str::to_string);
+        if let Some(name) = &name {
+            r.remove(name);
         }
+        name
+    })?;
+    match removed {
+        Some(name) => println!("deregistered '{name}'"),
         None => println!("repo not in the registry (nothing to deregister)"),
     }
     Ok(())
