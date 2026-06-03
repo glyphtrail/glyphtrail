@@ -1147,7 +1147,18 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 7: constant resolution follows the Angular `environment` chain — a member
 /// alias of an imported config object's string property (#405) — so those
 /// frontend indexes rebuild to fold the common environment-base URL pattern.
-const ANALYSIS_REVISION: u32 = 12;
+/// 8: SQL DDL extraction (#416 Phase A) — `.sql` files yield `Table`/`Column`
+/// nodes, so existing indexes rebuild to surface the database schema.
+/// 9: code↔DB `Reads`/`Writes` from sqlx queries (#416 Phase B), so indexes
+/// rebuild to link functions to the tables they query.
+/// 10: JPA/Hibernate — `@Entity` tables + repository/`@Query` access linking
+/// (#416 Phase B, Java).
+/// 11: JPA `@Table`-less entities default to the snake_case naming strategy
+/// (#432), so an entity merges with the `.sql`/native table of that name.
+/// 12: JPA relationship fields (@ManyToOne/…) → table `References` edges (#433).
+/// 13: Rust raw DB drivers (rusqlite/tokio-postgres) `conn.execute`/`query_row`/…
+/// query extraction (#434).
+const ANALYSIS_REVISION: u32 = 13;
 
 /// Fingerprint of everything that determines analysis output: the crate
 /// version, the manual revision counter, and the built-in tree-sitter query

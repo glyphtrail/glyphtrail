@@ -8,8 +8,10 @@
 //! then ties each query site to its enclosing function and to the `Table` nodes
 //! by name, producing `Reads`/`Writes` edges.
 //!
-//! A dynamically-built query (no string literal) is skipped, and other drivers
-//! (rusqlite, JDBC, ORMs) are a follow-up.
+//! Raw drivers (rusqlite, tokio-postgres) are also handled: a method call like
+//! `conn.execute("…")` / `query_row` / `prepare` whose string argument looks like
+//! SQL. A dynamically-built query (no string literal) is skipped; JDBC, the JS/
+//! Python drivers, and ORMs are a follow-up.
 
 use tree_sitter::{Node, Parser, Tree};
 
@@ -50,26 +52,28 @@ pub fn extract_db_queries(source: &str, lang: &Language) -> Vec<RawDbQuery> {
     let src = source.as_bytes();
     let mut out = Vec::new();
     walk(tree.root_node(), &mut |n| {
-        // A sqlx query is either the macro form (`query!("…")`) or the function
-        // form (`sqlx::query("…")`, `query_as::<_, T>("…")`). Both carry the SQL
-        // as the first string-literal argument.
-        let is_query = match n.kind() {
-            "macro_invocation" => n
-                .child_by_field_name("macro")
-                .map(|m| last_segment(&text(m, src)))
-                .is_some_and(|name| SQLX_QUERY_MACROS.contains(&name.as_str())),
-            "call_expression" => n
-                .child_by_field_name("function")
-                .and_then(|f| callee_path(f, src))
-                .is_some_and(|p| is_sqlx_query_call(&p)),
-            _ => false,
-        };
-        if !is_query {
+        // A query is the sqlx macro/function form (definitely SQL), or a raw-driver
+        // method call (`conn.execute("…")`, `query_row`, …) — the latter is gated
+        // on the string actually looking like SQL, since the method names are common.
+        let Some(needs_sql_gate) = query_form(n, src) else {
             return;
-        }
-        let Some(sql) = first_string(n, src) else {
+        };
+        // Search only the call's own arguments for the SQL string, not the whole
+        // expression — otherwise `sqlx::query("…").execute(db)` would read the
+        // string out of its receiver and double-count it.
+        let search = match n.kind() {
+            "call_expression" => match n.child_by_field_name("arguments") {
+                Some(a) => a,
+                None => return,
+            },
+            _ => n,
+        };
+        let Some(sql) = first_string(search, src) else {
             return; // a non-literal (dynamically built) query — nothing to match
         };
+        if needs_sql_gate && !looks_like_sql(&sql) {
+            return;
+        }
         let accesses = extract_query_access(&sql);
         if !accesses.is_empty() {
             out.push(RawDbQuery {
@@ -79,6 +83,77 @@ pub fn extract_db_queries(source: &str, lang: &Language) -> Vec<RawDbQuery> {
         }
     });
     out
+}
+
+/// Raw-driver methods (rusqlite, tokio-postgres, …) whose first string argument is
+/// SQL. Names are common, so a match is only treated as a query when the string
+/// also `looks_like_sql`.
+const RAW_QUERY_METHODS: &[&str] = &[
+    "execute",
+    "execute_batch",
+    "batch_execute",
+    "query",
+    "query_row",
+    "query_map",
+    "query_one",
+    "query_opt",
+    "query_raw",
+    "prepare",
+    "prepare_cached",
+];
+
+/// Whether `n` is a recognised query call, and whether the SQL string needs the
+/// `looks_like_sql` gate (raw-driver method calls do; the namespaced sqlx forms
+/// don't). `None` if `n` isn't a query call.
+fn query_form(n: Node, src: &[u8]) -> Option<bool> {
+    match n.kind() {
+        "macro_invocation" => {
+            let name = last_segment(&text(n.child_by_field_name("macro")?, src));
+            SQLX_QUERY_MACROS.contains(&name.as_str()).then_some(false)
+        }
+        "call_expression" => {
+            let func = n.child_by_field_name("function")?;
+            if func.kind() == "field_expression" {
+                // A method call `recv.<method>(…)` — a raw driver, gated.
+                let method = text(func.child_by_field_name("field")?, src);
+                RAW_QUERY_METHODS.contains(&method.as_str()).then_some(true)
+            } else {
+                // A free function — the sqlx forms, not gated.
+                is_sqlx_query_call(&callee_path(func, src)?).then_some(false)
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Whether a string begins with a SQL DML keyword (`SELECT`/`INSERT`/`UPDATE`/
+/// `DELETE`/`WITH`), the gate that keeps a generic `.execute("…")` from matching a
+/// non-SQL string. Leading SQL comments are skipped first, so a query that opens
+/// with `-- …` or `/* … */` is still recognised.
+fn looks_like_sql(s: &str) -> bool {
+    let first = strip_leading_sql_comments(s)
+        .split(|c: char| c.is_whitespace() || c == '(')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(
+        first.as_str(),
+        "select" | "insert" | "update" | "delete" | "with"
+    )
+}
+
+/// Skip leading whitespace and `--`/`/* */` comments at the start of a SQL string.
+fn strip_leading_sql_comments(s: &str) -> &str {
+    let mut s = s.trim_start();
+    loop {
+        if let Some(rest) = s.strip_prefix("--") {
+            s = rest.find('\n').map_or("", |i| &rest[i + 1..]).trim_start();
+        } else if let Some(rest) = s.strip_prefix("/*") {
+            s = rest.find("*/").map_or("", |i| &rest[i + 2..]).trim_start();
+        } else {
+            return s;
+        }
+    }
 }
 
 /// The callable path of a `call_expression`'s `function`, unwrapping a turbofish
@@ -209,6 +284,50 @@ mod tests {
                     (DbAccess::Write, "sessions".to_string()),
                 ]
         );
+    }
+
+    #[test]
+    fn handles_raw_driver_method_calls() {
+        // rusqlite / tokio-postgres: SQL in a `.execute`/`.query_row`/`.prepare` arg.
+        let src = r#"
+            fn f(conn: &Connection) {
+                conn.execute("INSERT INTO logs (msg) VALUES (?1)", params![m]).unwrap();
+                let _ = conn.query_row("SELECT id FROM users WHERE id = ?1", [id], row);
+                let mut stmt = conn.prepare("SELECT * FROM accounts").unwrap();
+            }
+        "#;
+        check!(
+            tables(src)
+                == vec![
+                    (DbAccess::Read, "accounts".to_string()),
+                    (DbAccess::Write, "logs".to_string()),
+                    (DbAccess::Read, "users".to_string()),
+                ]
+        );
+    }
+
+    #[test]
+    fn raw_query_with_leading_comment_is_recognised() {
+        // A SQL string opening with a comment still passes the looks_like_sql gate.
+        let src = r#"
+            fn f(conn: &Connection) {
+                conn.query_row("/* pick the row */ SELECT id FROM widgets WHERE id = ?1", [], r);
+            }
+        "#;
+        check!(tables(src) == vec![(DbAccess::Read, "widgets".to_string())]);
+    }
+
+    #[test]
+    fn raw_method_calls_are_gated_on_looking_like_sql() {
+        // A generic `.execute`/`.query` whose string isn't SQL is not a query —
+        // even though the string mentions `from`.
+        let src = r#"
+            fn f(x: &Runner, log: &Log) {
+                x.execute("do the thing");
+                log.query("loaded from the cache");
+            }
+        "#;
+        check!(extract_db_queries(src, &Language::Rust).is_empty());
     }
 
     #[test]
