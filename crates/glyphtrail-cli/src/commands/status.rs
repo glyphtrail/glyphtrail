@@ -96,8 +96,9 @@ fn print_text(
         // Indeterminate freshness must not read as "fine": say so and steer
         // toward re-analyzing rather than silently trusting the index (#448).
         Staleness::Unknown => println!(
-            "status: freshness UNKNOWN — can't verify against git (index built from a \
-             dirty/non-git tree or an older glyphtrail); re-analyze before trusting"
+            "status: freshness UNKNOWN — can't verify against git (no clean HEAD recorded \
+             at index time, git unavailable or no commits, or an older glyphtrail); \
+             re-analyze in a clean git checkout before trusting"
         ),
     }
     match skill {

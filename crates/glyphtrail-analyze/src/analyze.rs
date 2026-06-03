@@ -1398,8 +1398,9 @@ pub fn index_staleness(root: &Path, store: &dyn glyphtrail_store::GraphStore) ->
 }
 
 /// The name of a git operation in progress at `root` (merge / rebase /
-/// cherry-pick / revert), if any — the working tree is then a transient mix any
-/// index predates (#448). Best-effort: non-git or any git failure yields `None`.
+/// cherry-pick / revert), if any — the working tree is then a transient mix that
+/// any index predates (#448). Best-effort: non-git or any git failure yields
+/// `None`.
 fn git_op_in_progress(root: &Path) -> Option<&'static str> {
     for (refname, label) in [
         ("MERGE_HEAD", "merge"),
