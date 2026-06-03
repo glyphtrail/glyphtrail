@@ -163,7 +163,15 @@ fn extract_driver_calls(source: &str, lang: &Language, d: &DriverDialect) -> Vec
         let Some(args) = n.child_by_field_name("arguments") else {
             return;
         };
-        let Some(sql) = sql_literal(args, src) else {
+        // The query is the FIRST positional argument (`pool.query(sql, params)`),
+        // so scan only within it — not later args like the params array, where a
+        // SQL-looking string would be a false positive. Scanning *within* the first
+        // argument still reaches a wrapper such as SQLAlchemy's `text("…")`.
+        let mut cursor = args.walk();
+        let Some(first_arg) = args.named_children(&mut cursor).next() else {
+            return;
+        };
+        let Some(sql) = sql_literal(first_arg, src) else {
             return; // a dynamically-built query (no string literal) — nothing to match
         };
         if !looks_like_sql(&sql) {
@@ -537,6 +545,23 @@ mod tests {
             }
         "#;
         check!(extract_db_queries(src, &Language::JavaScript).is_empty());
+    }
+
+    #[test]
+    fn driver_query_ignores_sql_in_a_later_argument() {
+        // The query is the first argument; a SQL-looking string in a later argument
+        // (here the params) must not be mistaken for the query (#440 review).
+        let js = r#"
+            function f(pool, opts) {
+                pool.query(opts, ["SELECT id FROM users"]);
+            }
+        "#;
+        check!(extract_db_queries(js, &Language::JavaScript).is_empty());
+        let py = "\
+def f(cur, opts):
+    cur.execute(opts, [\"SELECT id FROM users\"])
+";
+        check!(extract_db_queries(py, &Language::Python).is_empty());
     }
 
     #[test]
