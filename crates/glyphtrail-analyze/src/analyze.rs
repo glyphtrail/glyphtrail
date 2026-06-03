@@ -1142,7 +1142,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 7: constant resolution follows the Angular `environment` chain — a member
 /// alias of an imported config object's string property (#405) — so those
 /// frontend indexes rebuild to fold the common environment-base URL pattern.
-const ANALYSIS_REVISION: u32 = 10;
+const ANALYSIS_REVISION: u32 = 11;
 
 /// Fingerprint of everything that determines analysis output: the crate
 /// version, the manual revision counter, and the built-in tree-sitter query
