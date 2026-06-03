@@ -123,6 +123,12 @@ pub fn extract_jpa(rel_path: &str, file_id: &NodeId, source: &str, lang: &Langua
                 collect_repo_accesses(n, src, &entity, &mut accesses);
             }
         }
+        // EntityManager / JDBC query calls anywhere in a method body (#434).
+        "method_invocation" => {
+            if let Some(a) = jdbc_query_access(n, src) {
+                accesses.push(a);
+            }
+        }
         _ => {}
     });
     JpaExtract {
@@ -202,6 +208,33 @@ fn extract_entity(class: Node, src: &[u8]) -> Option<Entity> {
 
 /// Relationship annotations whose field type is the related entity.
 const RELATION_ANNOTATIONS: &[&str] = &["ManyToOne", "OneToOne", "OneToMany", "ManyToMany"];
+
+/// EntityManager / Hibernate / JDBC methods whose first string argument is a
+/// query: `createQuery` is JPQL (entity refs), the rest are SQL (table refs).
+/// All are DB-specific enough to need no "looks like SQL" gate.
+const JDBC_QUERY_METHODS: &[&str] = &[
+    "createQuery",
+    "createNativeQuery",
+    "createSQLQuery",
+    "prepareStatement",
+    "prepareCall",
+];
+
+/// An `EntityManager`/JDBC query method call (`em.createNativeQuery("…")`) → the
+/// tables/entities it touches, attributed to the enclosing method in analyze (#434).
+fn jdbc_query_access(call: Node, src: &[u8]) -> Option<JpaAccess> {
+    let name = text(call.child_by_field_name("name")?, src);
+    if !JDBC_QUERY_METHODS.contains(&name.as_str()) {
+        return None;
+    }
+    let args = call.child_by_field_name("arguments")?;
+    let sql = string_value(args, src)?;
+    let accesses = extract_query_access(&sql);
+    (!accesses.is_empty()).then(|| JpaAccess {
+        byte: call.start_byte(),
+        accesses,
+    })
+}
 
 /// The related entity a relationship field points to: the field's type
 /// (`@ManyToOne Org org` → `Org`) or, for a collection, its element type
@@ -580,6 +613,31 @@ mod tests {
         // query / `.sql` migration table of that name (#432).
         let e = extract("@Entity class OrderLine { Long id; }");
         check!(e.entity_tables == vec![("orderline".to_string(), "order_line".to_string())]);
+    }
+
+    #[test]
+    fn entity_manager_and_jdbc_queries_are_extracted() {
+        let src = r#"
+            class Service {
+                void run() {
+                    em.createNativeQuery("SELECT * FROM widgets WHERE id = ?1");
+                    em.createQuery("SELECT a FROM Account a WHERE a.active = true");
+                    conn.prepareStatement("UPDATE orders SET status = 'x' WHERE id = ?");
+                }
+            }
+        "#;
+        let e = extract(src);
+        let r: Vec<(DbAccess, String)> = {
+            let mut v: Vec<_> = e.accesses.iter().flat_map(|x| x.accesses.clone()).collect();
+            v.sort_by(|a, b| {
+                (a.1.clone(), format!("{:?}", a.0)).cmp(&(b.1.clone(), format!("{:?}", b.0)))
+            });
+            v
+        };
+        // native SQL → table; JPQL → entity (mapped later); prepareStatement → table.
+        check!(r.contains(&(DbAccess::Read, "widgets".to_string())));
+        check!(r.contains(&(DbAccess::Read, "account".to_string())));
+        check!(r.contains(&(DbAccess::Write, "orders".to_string())));
     }
 
     #[test]

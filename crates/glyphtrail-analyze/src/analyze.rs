@@ -1158,7 +1158,9 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 12: JPA relationship fields (@ManyToOne/…) → table `References` edges (#433).
 /// 13: Rust raw DB drivers (rusqlite/tokio-postgres) `conn.execute`/`query_row`/…
 /// query extraction (#434).
-const ANALYSIS_REVISION: u32 = 13;
+/// 14: EntityManager/JDBC query calls (`createQuery`/`createNativeQuery`/
+/// `prepareStatement`) extracted from Java method bodies (#434).
+const ANALYSIS_REVISION: u32 = 14;
 
 /// Fingerprint of everything that determines analysis output: the crate
 /// version, the manual revision counter, and the built-in tree-sitter query
