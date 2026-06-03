@@ -128,10 +128,10 @@ fn query_form(n: Node, src: &[u8]) -> Option<bool> {
 
 /// Whether a string begins with a SQL DML keyword (`SELECT`/`INSERT`/`UPDATE`/
 /// `DELETE`/`WITH`), the gate that keeps a generic `.execute("…")` from matching a
-/// non-SQL string.
+/// non-SQL string. Leading SQL comments are skipped first, so a query that opens
+/// with `-- …` or `/* … */` is still recognised.
 fn looks_like_sql(s: &str) -> bool {
-    let first = s
-        .trim_start()
+    let first = strip_leading_sql_comments(s)
         .split(|c: char| c.is_whitespace() || c == '(')
         .next()
         .unwrap_or("")
@@ -140,6 +140,20 @@ fn looks_like_sql(s: &str) -> bool {
         first.as_str(),
         "select" | "insert" | "update" | "delete" | "with"
     )
+}
+
+/// Skip leading whitespace and `--`/`/* */` comments at the start of a SQL string.
+fn strip_leading_sql_comments(s: &str) -> &str {
+    let mut s = s.trim_start();
+    loop {
+        if let Some(rest) = s.strip_prefix("--") {
+            s = rest.find('\n').map_or("", |i| &rest[i + 1..]).trim_start();
+        } else if let Some(rest) = s.strip_prefix("/*") {
+            s = rest.find("*/").map_or("", |i| &rest[i + 2..]).trim_start();
+        } else {
+            return s;
+        }
+    }
 }
 
 /// The callable path of a `call_expression`'s `function`, unwrapping a turbofish
@@ -290,6 +304,17 @@ mod tests {
                     (DbAccess::Read, "users".to_string()),
                 ]
         );
+    }
+
+    #[test]
+    fn raw_query_with_leading_comment_is_recognised() {
+        // A SQL string opening with a comment still passes the looks_like_sql gate.
+        let src = r#"
+            fn f(conn: &Connection) {
+                conn.query_row("/* pick the row */ SELECT id FROM widgets WHERE id = ?1", [], r);
+            }
+        "#;
+        check!(tables(src) == vec![(DbAccess::Read, "widgets".to_string())]);
     }
 
     #[test]
