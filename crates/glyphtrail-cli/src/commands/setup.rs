@@ -59,7 +59,14 @@ const AGENT_SECTION_BODY: &str = include_str!("../../assets/agent-section.md");
 /// `force` lets `--local` write outside a git repository. `gitignore` keeps the
 /// local install out of VCS (skill written but gitignored, no `CLAUDE.md` patch,
 /// any prior section stripped); it applies to the local target only.
-pub fn run(path: &Path, local: bool, user: bool, force: bool, gitignore: bool) -> Result<()> {
+pub fn run(
+    path: &Path,
+    local: bool,
+    user: bool,
+    force: bool,
+    gitignore: bool,
+    mcp: bool,
+) -> Result<()> {
     if !local && !user {
         bail!(
             "choose where to write agent files: --local (this repository) and/or \
@@ -84,6 +91,11 @@ pub fn run(path: &Path, local: bool, user: bool, force: bool, gitignore: bool) -
             );
         }
         apply_to(&target, in_repo, gitignore)?;
+        if mcp {
+            // Register the project-scoped MCP server (#403) in the repo's
+            // `.mcp.json` — the cross-client project MCP config.
+            write_mcp_json(&target)?;
+        }
     }
 
     if user {
@@ -92,8 +104,58 @@ pub fn run(path: &Path, local: bool, user: bool, force: bool, gitignore: bool) -
         // Home is not a repository, so there is no `.gitignore` to touch and
         // `--gitignore` (local-only) does not apply here.
         apply_to(&target, false, false)?;
+        if mcp {
+            print_user_mcp_guidance();
+        }
     }
     Ok(())
+}
+
+/// Register glyphtrail as the project-scoped MCP server by merging a `glyphtrail`
+/// entry into `<root>/.mcp.json`, preserving any other servers (#403).
+fn write_mcp_json(root: &Path) -> Result<()> {
+    use serde_json::{Value, json};
+    let path = root.join(".mcp.json");
+    let mut doc: Value = if path.exists() {
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        serde_json::from_str(&text)
+            .with_context(|| format!("{} is not valid JSON; not overwriting", path.display()))?
+    } else {
+        json!({})
+    };
+    let obj = doc
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("{} is not a JSON object", path.display()))?;
+    let servers = obj
+        .entry("mcpServers")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("\"mcpServers\" in {} is not an object", path.display()))?;
+    let existed = servers.contains_key("glyphtrail");
+    servers.insert(
+        "glyphtrail".to_string(),
+        json!({ "command": "glyphtrail", "args": ["mcp", "--repo", "."] }),
+    );
+    std::fs::write(&path, format!("{}\n", serde_json::to_string_pretty(&doc)?))
+        .with_context(|| format!("writing {}", path.display()))?;
+    println!(
+        "{} glyphtrail MCP server in {}",
+        if existed { "updated" } else { "registered" },
+        path.display()
+    );
+    Ok(())
+}
+
+/// Print the snippet for adding glyphtrail to a user-wide MCP client config,
+/// since the location varies by client (#403).
+fn print_user_mcp_guidance() {
+    println!(
+        "\nTo register glyphtrail user-wide, add this server to your MCP client's \
+         config (e.g. Claude Code `~/.claude.json`, or Claude Desktop's config):\n\
+         \n  \"glyphtrail\": {{ \"command\": \"glyphtrail\", \"args\": [\"mcp\"] }}\n\
+         \n(No `--repo`, so every tool call names the repo by registered name or path.)"
+    );
 }
 
 /// Install (or, with `gitignore`, un-install) the agent files under `target`.
@@ -346,6 +408,25 @@ mod tests {
             .to_path_buf()
     }
 
+    // #403: `setup --mcp` registers the project MCP server in `.mcp.json`,
+    // preserving any other servers already there.
+    #[test]
+    fn write_mcp_json_merges_and_preserves_other_servers() {
+        let dir = temp_dir("mcp-json");
+        std::fs::write(
+            dir.join(".mcp.json"),
+            r#"{"mcpServers":{"other":{"command":"x"}}}"#,
+        )
+        .unwrap();
+        write_mcp_json(&dir).unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join(".mcp.json")).unwrap()).unwrap();
+        check!(doc["mcpServers"]["glyphtrail"]["command"] == serde_json::json!("glyphtrail"));
+        check!(doc["mcpServers"]["glyphtrail"]["args"][0] == serde_json::json!("mcp"));
+        check!(doc["mcpServers"]["other"]["command"] == serde_json::json!("x")); // preserved
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn setup_writes_files_and_is_idempotent() {
         let dir = temp_dir("idem");
@@ -353,7 +434,7 @@ mod tests {
         std::fs::write(dir.join("CLAUDE.md"), "# My project\n\nNotes.\n").unwrap();
         std::fs::write(dir.join(".gitignore"), "target/\n").unwrap();
 
-        run(&dir, true, false, false, false).unwrap();
+        run(&dir, true, false, false, false, false).unwrap();
         let claude1 = std::fs::read_to_string(dir.join("CLAUDE.md")).unwrap();
         check!(claude1.starts_with("# My project")); // preserved existing content
         check!(claude1.contains(BEGIN_PREFIX) && claude1.contains("Code graph (glyphtrail)"));
@@ -371,7 +452,7 @@ mod tests {
         check!(gi.contains("target/") && gi.contains(".glyphtrail/"));
 
         // Re-run: no duplication.
-        run(&dir, true, false, false, false).unwrap();
+        run(&dir, true, false, false, false, false).unwrap();
         let claude2 = std::fs::read_to_string(dir.join("CLAUDE.md")).unwrap();
         check!(claude2 == claude1);
         check!(claude2.matches(BEGIN_PREFIX).count() == 1);
@@ -386,10 +467,10 @@ mod tests {
     #[test]
     fn setup_outside_repo_errors_unless_forced() {
         let dir = temp_dir("no-repo"); // no .git
-        check!(run(&dir, true, false, false, false).is_err());
+        check!(run(&dir, true, false, false, false, false).is_err());
         check!(!dir.join("CLAUDE.md").exists()); // nothing written on error
 
-        run(&dir, true, false, true, false).unwrap(); // --force
+        run(&dir, true, false, true, false, false).unwrap(); // --force
         check!(dir.join(".claude/skills/glyphtrail/SKILL.md").exists());
         check!(dir.join("CLAUDE.md").exists());
         check!(!dir.join(".gitignore").exists()); // not a repo -> no gitignore
@@ -409,12 +490,12 @@ mod tests {
         )
         .unwrap();
 
-        run(&dir, true, false, false, false).unwrap();
+        run(&dir, true, false, false, false, false).unwrap();
         let c1 = std::fs::read_to_string(dir.join("CLAUDE.md")).unwrap();
         check!(c1.matches(BEGIN_PREFIX).count() == 1);
 
         // Re-run: the section is found and replaced in place, not duplicated.
-        run(&dir, true, false, false, false).unwrap();
+        run(&dir, true, false, false, false, false).unwrap();
         let c2 = std::fs::read_to_string(dir.join("CLAUDE.md")).unwrap();
         check!(c2 == c1);
         check!(c2.matches(BEGIN_PREFIX).count() == 1);
@@ -430,7 +511,7 @@ mod tests {
         let root = repo_root();
         let dir = temp_dir("dogfood");
         std::fs::create_dir_all(dir.join(".git")).unwrap();
-        run(&dir, true, false, false, false).unwrap();
+        run(&dir, true, false, false, false, false).unwrap();
 
         let got_skill =
             std::fs::read_to_string(dir.join(".claude/skills/glyphtrail/SKILL.md")).unwrap();
@@ -450,7 +531,7 @@ mod tests {
     fn staleness_hint_fires_only_when_older() {
         let dir = temp_dir("stale");
         std::fs::create_dir_all(dir.join(".git")).unwrap();
-        run(&dir, true, false, false, false).unwrap();
+        run(&dir, true, false, false, false, false).unwrap();
         check!(installed_version(&dir) == Some(SKILL_VERSION));
         check!(staleness_hint(&dir).is_none());
 
@@ -479,7 +560,7 @@ mod tests {
         std::fs::write(dir.join("CLAUDE.md"), "# My project\n\nNotes.\n").unwrap();
 
         // A normal setup first, which appends the managed section.
-        run(&dir, true, false, false, false).unwrap();
+        run(&dir, true, false, false, false, false).unwrap();
         check!(
             std::fs::read_to_string(dir.join("CLAUDE.md"))
                 .unwrap()
@@ -488,7 +569,7 @@ mod tests {
 
         // --gitignore: section stripped (content restored byte-for-byte), skill
         // still present, both glyphtrail paths gitignored.
-        run(&dir, true, false, false, true).unwrap();
+        run(&dir, true, false, false, true, false).unwrap();
         let claude = std::fs::read_to_string(dir.join("CLAUDE.md")).unwrap();
         check!(claude == "# My project\n\nNotes.\n");
         check!(!claude.contains(BEGIN_PREFIX));
@@ -498,7 +579,7 @@ mod tests {
         check!(gi.contains(".claude/skills/glyphtrail/"));
 
         // Idempotent: re-running adds no duplicate ignore lines.
-        run(&dir, true, false, false, true).unwrap();
+        run(&dir, true, false, false, true, false).unwrap();
         let gi2 = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
         check!(gi2.matches(".claude/skills/glyphtrail/").count() == 1);
 
@@ -511,7 +592,7 @@ mod tests {
     fn setup_requires_a_target() {
         let dir = temp_dir("no-target");
         std::fs::create_dir_all(dir.join(".git")).unwrap();
-        check!(run(&dir, false, false, false, false).is_err());
+        check!(run(&dir, false, false, false, false, false).is_err());
         check!(!dir.join("CLAUDE.md").exists()); // nothing written
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -521,7 +602,7 @@ mod tests {
     #[test]
     fn gitignore_requires_local() {
         let dir = temp_dir("conflict");
-        check!(run(&dir, false, true, false, true).is_err());
+        check!(run(&dir, false, true, false, true, false).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

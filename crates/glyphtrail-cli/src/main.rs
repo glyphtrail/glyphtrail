@@ -160,6 +160,11 @@ enum Command {
         /// CLAUDE.md/AGENTS.md patch, and strip any section a prior run added.
         #[arg(long, requires = "local")]
         gitignore: bool,
+        /// Also register glyphtrail as an MCP server: with --local, write/merge
+        /// the repo's `.mcp.json`; with --user, print the snippet to add to your
+        /// MCP client's user config.
+        #[arg(long)]
+        mcp: bool,
     },
     /// Manage the global repository registry (~/.glyphtrail/registry.json).
     Repo {
@@ -373,7 +378,8 @@ fn main() -> anyhow::Result<()> {
             user,
             force,
             gitignore,
-        } => commands::setup::run(&path, local, user, force, gitignore),
+            mcp,
+        } => commands::setup::run(&path, local, user, force, gitignore, mcp),
         Command::Repo { cmd } => commands::repo::run(cmd),
         Command::Remote { cmd } => commands::remote::run(cmd),
         Command::Config { cmd } => commands::config::run(cmd),
