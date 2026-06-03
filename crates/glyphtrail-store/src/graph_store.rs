@@ -99,6 +99,13 @@ pub trait GraphStore: Adjacency {
     /// `(node id, qualified name)` for every node, so cross-file resolution can
     /// match a call's receiver against a candidate's enclosing scope (#5).
     fn node_qualified_names(&self) -> Result<Vec<(String, String)>>;
+    /// `(node id, qualified name)` for every `Table` node already persisted, so an
+    /// incremental analyze can resolve a code↔table edge to a table whose `.sql`/
+    /// entity file wasn't re-parsed this pass (#435). Defaults to empty so a
+    /// backend that doesn't index tables stays source-compatible.
+    fn tables_by_name(&self) -> Result<Vec<(NodeId, String)>> {
+        Ok(Vec::new())
+    }
     fn definition_index(&self) -> Result<Vec<(String, NodeId)>>;
     fn get_node(&self, id: &str) -> Result<Option<Node>>;
     fn nodes_in_file(&self, file: &str) -> Result<Vec<Node>>;
