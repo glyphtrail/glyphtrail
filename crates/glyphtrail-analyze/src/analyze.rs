@@ -1238,7 +1238,11 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 16: `format!`-built sqlx query templates are read for table accesses (#446).
 /// 17: client URL extraction follows a whole-argument local variable binding
 /// (`const url = …; http.get(url)`), so those calls are linked (#443).
-const ANALYSIS_REVISION: u32 = 18;
+/// 18: Cypher `.cypher`/`.cql` files, const-named queries, and pattern-only
+/// (Neo4j) labels (#444), so graph-DB schema + access surface more fully.
+/// 19: JS/TS (`pg`/`mysql2`/knex) and Python (DB-API/SQLAlchemy `text`) raw-driver
+/// SQL queries are extracted, so those repos link functions to their tables (#440).
+const ANALYSIS_REVISION: u32 = 19;
 
 /// Fingerprint of everything that determines analysis output: the crate
 /// version, the manual revision counter, and the built-in tree-sitter query
@@ -3331,6 +3335,45 @@ mod tests {
                 .any(|(n, _, _)| n.kind == NodeKind::Table && n.name == "OWNS"),
             "expected a Writes edge to the OWNS label, got {:?}",
             writes.iter().map(|(n, _, _)| &n.name).collect::<Vec<_>>()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // #440: a JS `pg` driver query (`pool.query("SELECT … FROM users")`) links its
+    // enclosing function to the `.sql` `users` table, like the Rust sqlx path.
+    #[test]
+    fn analyze_links_js_driver_query_to_its_table() {
+        let dir = temp_repo("js-driver-link");
+        std::fs::create_dir_all(dir.join("db")).unwrap();
+        std::fs::write(
+            dir.join("db/schema.sql"),
+            "CREATE TABLE users (id int, email text);\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("src/repo.js"),
+            "async function loadUser(pool) { return pool.query('SELECT id FROM users WHERE id = $1', [id]); }\n",
+        )
+        .unwrap();
+        run(&dir, false).unwrap();
+
+        let store = LadybugStore::open(&RepoPaths::new(&dir).index_dir.join("ladybug")).unwrap();
+        let f = store
+            .find_by_name("loadUser")
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("function indexed");
+        let reads = store
+            .neighbors(&f.id.0, Some(EdgeKind::Reads), true)
+            .unwrap();
+        check!(
+            reads
+                .iter()
+                .any(|(n, _, _)| n.kind == NodeKind::Table && n.name == "users"),
+            "expected a Reads edge to the users table, got {:?}",
+            reads.iter().map(|(n, _, _)| &n.name).collect::<Vec<_>>()
         );
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -1,4 +1,4 @@
-//! Embedded database-query extraction (#416, Phase B) — Rust / sqlx first.
+//! Embedded database-query extraction (#416, Phase B).
 //!
 //! sqlx carries the SQL as a string-literal argument in both its macro form
 //! (`sqlx::query!("SELECT … FROM users")`, `query_as!(Row, "…")`) and its
@@ -8,10 +8,13 @@
 //! then ties each query site to its enclosing function and to the `Table` nodes
 //! by name, producing `Reads`/`Writes` edges.
 //!
-//! Raw drivers (rusqlite, tokio-postgres) are also handled: a method call like
-//! `conn.execute("…")` / `query_row` / `prepare` whose string argument looks like
-//! SQL. A dynamically-built query (no string literal) is skipped; JDBC, the JS/
-//! Python drivers, and ORMs are a follow-up.
+//! Raw drivers are also handled by a method-call whose string argument looks like
+//! SQL: Rust (rusqlite, tokio-postgres — `conn.execute("…")` / `query_row` /
+//! `prepare`), JS/TS (`pg`/`mysql2` `pool.query("…")`, knex `db.raw("…")`), and
+//! Python (DB-API `cursor.execute("…")` / `executemany`, and SQLAlchemy core's
+//! `text("…")` argument incidentally) (#440). A dynamically-built query with no
+//! string literal is skipped; the schema-aware ORMs (Diesel/ActiveRecord/
+//! SQLAlchemy-models/Prisma) are a follow-up.
 
 use tree_sitter::{Node, Parser, Tree};
 
@@ -40,12 +43,23 @@ const SQLX_QUERY_MACROS: &[&str] = &[
     "query_scalar_unchecked",
 ];
 
-/// Extract embedded DB queries from `source`. Rust/sqlx only for now; other
-/// languages yield nothing.
+/// Extract embedded DB queries from `source`, dispatched by language: Rust (sqlx,
+/// raw drivers, `format!` templates), JS/TS, and Python raw drivers. Any other
+/// language yields nothing.
 pub fn extract_db_queries(source: &str, lang: &Language) -> Vec<RawDbQuery> {
-    if *lang != Language::Rust {
-        return Vec::new();
+    match lang {
+        Language::Rust => extract_rust(source),
+        Language::JavaScript | Language::TypeScript | Language::Tsx => {
+            extract_driver_calls(source, lang, &JS_DIALECT)
+        }
+        Language::Python => extract_driver_calls(source, lang, &PYTHON_DIALECT),
+        _ => Vec::new(),
     }
+}
+
+/// Rust: sqlx macro/function forms, raw-driver method calls, and `format!`
+/// templates (see [`query_form`]).
+fn extract_rust(source: &str) -> Vec<RawDbQuery> {
     let Some(tree) = parse(source) else {
         return Vec::new();
     };
@@ -83,6 +97,128 @@ pub fn extract_db_queries(source: &str, lang: &Language) -> Vec<RawDbQuery> {
         }
     });
     out
+}
+
+/// Per-language node kinds + driver method names for the JS/Python member-call
+/// extractor, so one walk serves both grammars.
+struct DriverDialect {
+    /// The call node kind (`call_expression` JS, `call` Python).
+    call_kind: &'static str,
+    /// The member/attribute access node kind for the callee.
+    member_kind: &'static str,
+    /// The field on the member node holding the method name.
+    method_field: &'static str,
+    /// Method names whose first SQL-looking string argument is a query.
+    methods: &'static [&'static str],
+}
+
+/// JS/TS: `pg`/`mysql2` `pool.query("…")` / `.execute("…")`, knex `db.raw("…")`.
+/// The names are common, so each is gated on the string looking like SQL.
+const JS_DIALECT: DriverDialect = DriverDialect {
+    call_kind: "call_expression",
+    member_kind: "member_expression",
+    method_field: "property",
+    methods: &["query", "execute", "raw"],
+};
+
+/// Python: DB-API 2.0 cursor/connection methods (psycopg, sqlite3, mysql-connector,
+/// …). SQLAlchemy core's `connection.execute(text("…"))` is also caught — the SQL
+/// string sits inside the `text(...)` argument and is found by the same scan.
+const PYTHON_DIALECT: DriverDialect = DriverDialect {
+    call_kind: "call",
+    member_kind: "attribute",
+    method_field: "attribute",
+    methods: &["execute", "executemany", "executescript"],
+};
+
+/// JS/Python raw drivers (#440): a method call `recv.<method>("SQL …")` whose
+/// method is a known driver entry point and whose first string/template argument
+/// looks like SQL. The string is taken only from the call's own arguments (not its
+/// receiver), so a chained `pool.query("…").then(…)` isn't double-counted.
+fn extract_driver_calls(source: &str, lang: &Language, d: &DriverDialect) -> Vec<RawDbQuery> {
+    let Some(tree) = parse_with(source, lang) else {
+        return Vec::new();
+    };
+    let src = source.as_bytes();
+    let mut out = Vec::new();
+    walk(tree.root_node(), &mut |n| {
+        if n.kind() != d.call_kind {
+            return;
+        }
+        let Some(func) = n.child_by_field_name("function") else {
+            return;
+        };
+        if func.kind() != d.member_kind {
+            return;
+        }
+        let Some(method) = func
+            .child_by_field_name(d.method_field)
+            .map(|m| text(m, src))
+        else {
+            return;
+        };
+        if !d.methods.contains(&method.as_str()) {
+            return;
+        }
+        let Some(args) = n.child_by_field_name("arguments") else {
+            return;
+        };
+        // The query is the FIRST positional argument (`pool.query(sql, params)`),
+        // so scan only within it — not later args like the params array, where a
+        // SQL-looking string would be a false positive. Scanning *within* the first
+        // argument still reaches a wrapper such as SQLAlchemy's `text("…")`.
+        let mut cursor = args.walk();
+        let Some(first_arg) = args.named_children(&mut cursor).next() else {
+            return;
+        };
+        let Some(sql) = sql_literal(first_arg, src) else {
+            return; // a dynamically-built query (no string literal) — nothing to match
+        };
+        if !looks_like_sql(&sql) {
+            return;
+        }
+        let accesses = extract_query_access(&sql);
+        if !accesses.is_empty() {
+            out.push(RawDbQuery {
+                byte: n.start_byte(),
+                accesses,
+            });
+        }
+    });
+    out
+}
+
+/// The first string/template literal under `node`, fragment chunks concatenated
+/// with spaces so an interpolation (`${…}` / f-string `{…}`) or placeholder gap
+/// can't fuse two SQL tokens. Covers JS `string`/`template_string` (`string_fragment`
+/// chunks) and Python `string` (`string_content` chunks).
+fn sql_literal(node: Node, src: &[u8]) -> Option<String> {
+    let str_node = find_first(node, &["string", "template_string"])?;
+    let mut parts = Vec::new();
+    walk(str_node, &mut |n| {
+        if matches!(n.kind(), "string_fragment" | "string_content") {
+            parts.push(text(n, src));
+        }
+    });
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+/// The first node under `node` (pre-order, so outermost) whose kind is in `kinds`.
+fn find_first<'a>(node: Node<'a>, kinds: &[&str]) -> Option<Node<'a>> {
+    let mut found = None;
+    walk(node, &mut |n| {
+        if found.is_none() && kinds.contains(&n.kind()) {
+            found = Some(n);
+        }
+    });
+    found
+}
+
+/// Parse `source` with the built-in grammar for `lang`.
+fn parse_with(source: &str, lang: &Language) -> Option<Tree> {
+    let mut parser = Parser::new();
+    parser.set_language(&registry::grammar(lang)?).ok()?;
+    parser.parse(source, None)
 }
 
 /// Raw-driver methods (rusqlite, tokio-postgres, …) whose first string argument is
@@ -234,8 +370,8 @@ mod tests {
     use super::*;
     use assert2::check;
 
-    fn tables(src: &str) -> Vec<(DbAccess, String)> {
-        let mut q: Vec<(DbAccess, String)> = extract_db_queries(src, &Language::Rust)
+    fn tables_in(src: &str, lang: &Language) -> Vec<(DbAccess, String)> {
+        let mut q: Vec<(DbAccess, String)> = extract_db_queries(src, lang)
             .into_iter()
             .flat_map(|r| r.accesses)
             .collect();
@@ -243,6 +379,10 @@ mod tests {
             (a.1.clone(), format!("{:?}", a.0)).cmp(&(b.1.clone(), format!("{:?}", b.0)))
         });
         q
+    }
+
+    fn tables(src: &str) -> Vec<(DbAccess, String)> {
+        tables_in(src, &Language::Rust)
     }
 
     #[test]
@@ -371,6 +511,121 @@ mod tests {
             }
         "#;
         check!(extract_db_queries(src, &Language::Rust).is_empty());
+    }
+
+    #[test]
+    fn extracts_js_driver_queries() {
+        // pg/mysql2 `.query`/`.execute` + knex `.raw`, across string and template
+        // forms. #440
+        let src = r#"
+            async function load(pool) {
+                await pool.query('SELECT id, email FROM users WHERE id = $1', [id]);
+                await db.execute("INSERT INTO audit_log (msg) VALUES (?)", [m]);
+                await knex.raw(`UPDATE accounts SET balance = balance - 1`);
+            }
+        "#;
+        check!(
+            tables_in(src, &Language::JavaScript)
+                == vec![
+                    (DbAccess::Write, "accounts".to_string()),
+                    (DbAccess::Write, "audit_log".to_string()),
+                    (DbAccess::Read, "users".to_string()),
+                ]
+        );
+    }
+
+    #[test]
+    fn js_driver_methods_are_gated_on_looking_like_sql() {
+        // A generic `.query`/`.execute`/`.raw` whose string isn't SQL is ignored,
+        // even when it mentions `from`.
+        let src = r#"
+            function f(logger, el) {
+                logger.query("loaded from the cache");
+                el.execute("do the thing");
+            }
+        "#;
+        check!(extract_db_queries(src, &Language::JavaScript).is_empty());
+    }
+
+    #[test]
+    fn driver_query_ignores_sql_in_a_later_argument() {
+        // The query is the first argument; a SQL-looking string in a later argument
+        // (here the params) must not be mistaken for the query (#440 review).
+        let js = r#"
+            function f(pool, opts) {
+                pool.query(opts, ["SELECT id FROM users"]);
+            }
+        "#;
+        check!(extract_db_queries(js, &Language::JavaScript).is_empty());
+        let py = "\
+def f(cur, opts):
+    cur.execute(opts, [\"SELECT id FROM users\"])
+";
+        check!(extract_db_queries(py, &Language::Python).is_empty());
+    }
+
+    #[test]
+    fn ts_driver_queries_extract_too() {
+        // The TypeScript grammar uses the same member-call shape.
+        let src = r#"
+            async function f(pool: Pool): Promise<void> {
+                await pool.query("DELETE FROM sessions WHERE expired");
+            }
+        "#;
+        check!(
+            tables_in(src, &Language::TypeScript)
+                == vec![(DbAccess::Write, "sessions".to_string())]
+        );
+    }
+
+    #[test]
+    fn extracts_python_dbapi_queries() {
+        // DB-API 2.0 cursor methods (psycopg/sqlite3/…). #440
+        let src = "\
+def load(cur):
+    cur.execute(\"SELECT id FROM users WHERE id = %s\", (uid,))
+    cur.executemany(\"INSERT INTO logs (msg) VALUES (%s)\", rows)
+";
+        check!(
+            tables_in(src, &Language::Python)
+                == vec![
+                    (DbAccess::Write, "logs".to_string()),
+                    (DbAccess::Read, "users".to_string()),
+                ]
+        );
+    }
+
+    #[test]
+    fn python_fstring_query_collapses_interpolation() {
+        // An f-string query keeps its static tables; the `{unit}` interpolation
+        // collapses rather than fusing tokens.
+        let src = "\
+def report(cur, unit):
+    cur.execute(f\"SELECT * FROM items WHERE g = {unit}\")
+";
+        check!(tables_in(src, &Language::Python) == vec![(DbAccess::Read, "items".to_string())]);
+    }
+
+    #[test]
+    fn python_sqlalchemy_text_argument_is_found() {
+        // SQLAlchemy core: `conn.execute(text("…"))` — the SQL is inside the
+        // `text(...)` call argument and still resolves.
+        let src = "\
+def purge(conn):
+    conn.execute(text(\"DELETE FROM sessions WHERE expired\"))
+";
+        check!(
+            tables_in(src, &Language::Python) == vec![(DbAccess::Write, "sessions".to_string())]
+        );
+    }
+
+    #[test]
+    fn python_non_db_execute_is_ignored() {
+        let src = "\
+def f(job):
+    job.execute(\"run the task\")
+";
+        check!(extract_db_queries(src, &Language::Python).is_empty());
     }
 
     #[test]
