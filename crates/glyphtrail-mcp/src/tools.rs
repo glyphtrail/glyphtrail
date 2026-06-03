@@ -319,10 +319,13 @@ fn dispatch(
         "callers" => neighbors_of(&*store, args, EdgeKind::Calls, false),
         "callees" => neighbors_of(&*store, args, EdgeKind::Calls, true),
         "neighbors" => {
-            let node = resolve_one(&*store, req_str(args, "name")?)?;
-            let mut items = store.neighbors(&node.id.0, None, true).map_err(err)?;
-            items.extend(store.neighbors(&node.id.0, None, false).map_err(err)?);
-            Ok(neighbors_json(&items))
+            let nodes = resolve_all(&*store, req_str(args, "name")?)?;
+            let mut items = Vec::new();
+            for node in &nodes {
+                items.extend(store.neighbors(&node.id.0, None, true).map_err(err)?);
+                items.extend(store.neighbors(&node.id.0, None, false).map_err(err)?);
+            }
+            Ok(neighbors_json(&dedup_neighbors(items)))
         }
         "history" => history_tool(&db, &*store, args),
         "endpoints" => operations_list(&*store, NodeKind::Endpoint, args, true),
@@ -587,11 +590,18 @@ fn neighbors_of(
     kind: EdgeKind,
     outgoing: bool,
 ) -> Result<Value, String> {
-    let node = resolve_one(store, req_str(args, "name")?)?;
-    let items = store
-        .neighbors(&node.id.0, Some(kind), outgoing)
-        .map_err(err)?;
-    Ok(neighbors_json(&items))
+    // Union across every definition of the name — a table declared in several
+    // migrations resolves to multiple nodes, and picking one drops edges (#447).
+    let nodes = resolve_all(store, req_str(args, "name")?)?;
+    let mut items = Vec::new();
+    for n in &nodes {
+        items.extend(
+            store
+                .neighbors(&n.id.0, Some(kind), outgoing)
+                .map_err(err)?,
+        );
+    }
+    Ok(neighbors_json(&dedup_neighbors(items)))
 }
 
 fn operations_list(
@@ -1041,13 +1051,36 @@ fn neighbors_json(items: &[(Node, EdgeKind, Confidence)]) -> Value {
     )
 }
 
-fn resolve_one(store: &dyn GraphStore, name: &str) -> Result<Node, String> {
-    store
-        .find_by_name(name)
-        .map_err(err)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| format!("no symbol named '{name}' in the index"))
+/// Every definition matching `name` (errs if none). Neighbour queries union
+/// over all of them, so a name with duplicate nodes — a table declared across
+/// several migrations (#447) — isn't reduced to one arbitrarily.
+fn resolve_all(store: &dyn GraphStore, name: &str) -> Result<Vec<Node>, String> {
+    let matches = store.find_by_name(name).map_err(err)?;
+    if matches.is_empty() {
+        return Err(format!("no symbol named '{name}' in the index"));
+    }
+    Ok(matches)
+}
+
+/// Collapse repeated (target, edge-kind) rows from a unioned neighbour set,
+/// keeping the strongest `Confidence` (so a duplicate's `inferred` doesn't mask
+/// another's `extracted`). First-seen order is preserved.
+fn dedup_neighbors(items: Vec<(Node, EdgeKind, Confidence)>) -> Vec<(Node, EdgeKind, Confidence)> {
+    let mut out: Vec<(Node, EdgeKind, Confidence)> = Vec::new();
+    let mut idx: std::collections::HashMap<(String, EdgeKind), usize> =
+        std::collections::HashMap::new();
+    for it in items {
+        let key = (it.0.id.0.clone(), it.1);
+        if let Some(&i) = idx.get(&key) {
+            if it.2.rank() > out[i].2.rank() {
+                out[i] = it;
+            }
+        } else {
+            idx.insert(key, out.len());
+            out.push(it);
+        }
+    }
+    out
 }
 
 fn tool(name: &str, description: &str, mut properties: Value, required: &[&str]) -> Value {
