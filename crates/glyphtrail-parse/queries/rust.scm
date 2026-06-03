@@ -4,6 +4,10 @@
 (enum_item name: (type_identifier) @name) @def.enum
 (trait_item name: (type_identifier) @name) @def.trait
 (mod_item name: (identifier) @name) @def.module
+; `const`/`static` items are value definitions, so `definition`/`search` resolve
+; them and `neighbors` reaches them via file containment (#453).
+(const_item name: (identifier) @name) @def.constant
+(static_item name: (identifier) @name) @def.constant
 
 ; Calls
 (call_expression function: (identifier) @call)
