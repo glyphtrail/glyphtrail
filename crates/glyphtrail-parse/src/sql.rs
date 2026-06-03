@@ -304,6 +304,39 @@ fn view_references(toks: &[Tok], lc: &[String], start: usize) -> Vec<String> {
     refs
 }
 
+/// Whether a token is a SQL keyword that can't be a real table/entity name —
+/// guards against a placeholder-collapsed `FROM`/`INTO`/`UPDATE` target picking
+/// up the next clause keyword.
+fn is_sql_keyword(name: &str) -> bool {
+    matches!(
+        name,
+        "select"
+            | "from"
+            | "where"
+            | "set"
+            | "values"
+            | "join"
+            | "into"
+            | "on"
+            | "group"
+            | "order"
+            | "having"
+            | "limit"
+            | "offset"
+            | "union"
+            | "returning"
+            | "as"
+            | "and"
+            | "or"
+            | "using"
+            | "left"
+            | "right"
+            | "inner"
+            | "outer"
+            | "cross"
+    )
+}
+
 /// The tables a SQL query (a DML statement, e.g. an embedded `sqlx::query!`
 /// string) reads or writes, as `(access, normalized table name)` (#416 Phase B).
 /// Best-effort over possibly-many statements: a statement's leading verb sets the
@@ -318,8 +351,10 @@ pub fn extract_query_access(sql: &str) -> Vec<(DbAccess, String)> {
     let mut seen: HashSet<(bool, String)> = HashSet::new();
     let mut push = |acc: DbAccess, name: &str, out: &mut Vec<(DbAccess, String)>| {
         let n = normalize(name);
-        // A bare identifier; skip a subquery open-paren or an empty token.
-        if n.is_empty() || n == "(" {
+        // Skip an empty token, a subquery open-paren, or a SQL keyword — the last
+        // guards against an interpolated table position (`FROM {}` in a `format!`)
+        // collapsing onto the following keyword as a bogus table name (#446 review).
+        if n.is_empty() || n == "(" || is_sql_keyword(&n) {
             return;
         }
         if seen.insert((matches!(acc, DbAccess::Write), n.clone())) {
