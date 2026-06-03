@@ -181,6 +181,26 @@ mod tests {
         check!(parsed.calls.iter().any(|c| c.name == "println"));
     }
 
+    // #453: Rust `const`/`static` items are indexed as Constant definitions, so
+    // they're visible to definition/search/neighbors.
+    #[test]
+    fn extracts_rust_const_and_static_items() {
+        use glyphtrail_core::{NodeId, NodeKind};
+        let src = "pub const MAX_RETRIES: usize = 5;\nstatic ID_CACHE: u32 = 0;\n";
+        let parsed = parse_source(&Language::Rust, src).unwrap();
+        let fid = NodeId::derive(&["file", "x"]);
+        let fg = build_file_graph("x", &Language::Rust, &fid, &parsed, src);
+        let consts: Vec<&str> = fg
+            .graph
+            .nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Constant)
+            .map(|n| n.name.as_str())
+            .collect();
+        check!(consts.contains(&"MAX_RETRIES"), "got {consts:?}");
+        check!(consts.contains(&"ID_CACHE"), "got {consts:?}");
+    }
+
     // #5: a definition inside a macro body (e.g. a proc-macro `quote!`) is not
     // mistaken for a call by the raw-token heuristic; real calls in the body
     // still are.

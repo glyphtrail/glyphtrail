@@ -4,6 +4,10 @@
 (enum_item name: (type_identifier) @name) @def.enum
 (trait_item name: (type_identifier) @name) @def.trait
 (mod_item name: (identifier) @name) @def.module
+; `const`/`static` items are value definitions, so downstream tools (definition,
+; search, neighbors, who_calls) can reach them like any symbol (#453).
+(const_item name: (identifier) @name) @def.constant
+(static_item name: (identifier) @name) @def.constant
 
 ; Calls
 (call_expression function: (identifier) @call)
