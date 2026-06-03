@@ -141,6 +141,9 @@ struct DiscoveredFile {
     /// A `.sql` schema/migration file (#416): parsed by the DDL extractor rather
     /// than a tree-sitter grammar, so it carries no `Language`.
     sql: bool,
+    /// A `.cypher`/`.cql` graph-query file (#444): parsed by the Cypher extractor
+    /// (labels + access), so it likewise carries no `Language`.
+    cypher: bool,
     hash: String,
 }
 
@@ -237,6 +240,38 @@ fn parse_file(
             &file_id,
             &source,
         ));
+        return Some(out);
+    }
+
+    // Cypher graph-query file (#444): the Cypher extractor produces label `Table`
+    // nodes; the file's `MATCH`/`MERGE`/`CREATE` access is attributed to the file
+    // itself (no enclosing function), resolved to those tables after the parse.
+    if f.cypher {
+        let source = std::fs::read_to_string(&f.abs_path).ok()?;
+        out.graph.add_node(Node {
+            id: file_id.clone(),
+            kind: NodeKind::File,
+            name: f.rel_path.clone(),
+            qualified_name: f.rel_path.clone(),
+            file: f.rel_path.clone(),
+            language: Some("cypher".to_string()),
+            span: None,
+            doc: None,
+            signature: None,
+        });
+        out.graph.add_edge(
+            repo_id.clone(),
+            file_id.clone(),
+            EdgeKind::Contains,
+            Confidence::Extracted,
+        );
+        let cyp = glyphtrail_parse::extract_cypher_file(&f.rel_path, &file_id, &source);
+        out.graph.extend(cyp.graph);
+        for q in cyp.accesses {
+            for (access, label) in q.accesses {
+                out.db_accesses.push((file_id.clone(), access, label));
+            }
+        }
         return Some(out);
     }
 
@@ -538,6 +573,7 @@ fn discover(
                 abs_path: path.to_path_buf(),
                 language: None,
                 sql: false,
+                cypher: false,
             });
             continue;
         }
@@ -555,6 +591,25 @@ fn discover(
                 abs_path: path.to_path_buf(),
                 language: None,
                 sql: true,
+                cypher: false,
+                hash,
+            });
+            continue;
+        }
+
+        // Cypher graph-query files (#444): handled by the Cypher extractor (labels
+        // + access), not a tree-sitter grammar, so they carry no `Language`.
+        if ext.eq_ignore_ascii_case("cypher") || ext.eq_ignore_ascii_case("cql") {
+            let Ok(bytes) = std::fs::read(path) else {
+                continue;
+            };
+            let hash = blake3::hash(&bytes).to_hex().to_string();
+            out.push(DiscoveredFile {
+                rel_path: rel,
+                abs_path: path.to_path_buf(),
+                language: None,
+                sql: false,
+                cypher: true,
                 hash,
             });
             continue;
@@ -580,6 +635,7 @@ fn discover(
             abs_path: path.to_path_buf(),
             language: Some(language),
             sql: false,
+            cypher: false,
             hash,
         });
     }
@@ -1179,7 +1235,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 16: `format!`-built sqlx query templates are read for table accesses (#446).
 /// 17: client URL extraction follows a whole-argument local variable binding
 /// (`const url = …; http.get(url)`), so those calls are linked (#443).
-const ANALYSIS_REVISION: u32 = 17;
+const ANALYSIS_REVISION: u32 = 18;
 
 /// Fingerprint of everything that determines analysis output: the crate
 /// version, the manual revision counter, and the built-in tree-sitter query
@@ -2958,6 +3014,22 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // #444: a `.cypher` file is discovered as a Cypher artifact (no `Language`, the
+    // `cypher` flag set) so the Cypher extractor handles it.
+    #[test]
+    fn discovery_flags_cypher_files() {
+        let dir = temp_repo("cypher-discovery");
+        std::fs::write(dir.join("links.cypher"), "MATCH (n:Node) RETURN n\n").unwrap();
+        std::fs::write(dir.join("schema.cql"), "MERGE (a:Account)\n").unwrap();
+        let found = discover(&dir, &[], &[], false, None).unwrap();
+        for rel in ["links.cypher", "schema.cql"] {
+            let f = found.iter().find(|f| f.rel_path == rel).unwrap();
+            check!(f.cypher);
+            check!(f.language.is_none());
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // #269: a user-wide ignore file (gitignore-format) excludes matching files
     // across any repo.
     #[test]
@@ -3213,6 +3285,49 @@ mod tests {
                 .any(|(n, _, _)| n.kind == NodeKind::Table && n.name == "users"),
             "expected a Reads edge to the users table, got {:?}",
             reads.iter().map(|(n, _, _)| &n.name).collect::<Vec<_>>()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // #444: a `.cypher` query file links to the label tables it reads/writes, so a
+    // schema-free graph's labels and their file-level access are in the graph.
+    #[test]
+    fn analyze_links_cypher_file_to_its_labels() {
+        let dir = temp_repo("cypher-file-link");
+        std::fs::create_dir_all(dir.join("queries")).unwrap();
+        std::fs::write(
+            dir.join("queries/links.cypher"),
+            "MATCH (a:Account) MERGE (a)-[:OWNS]->(c:Card);\n",
+        )
+        .unwrap();
+        run(&dir, false).unwrap();
+
+        let store = LadybugStore::open(&RepoPaths::new(&dir).index_dir.join("ladybug")).unwrap();
+        let file = store
+            .find_by_name("queries/links.cypher")
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("cypher file indexed");
+        let reads = store
+            .neighbors(&file.id.0, Some(EdgeKind::Reads), true)
+            .unwrap();
+        check!(
+            reads
+                .iter()
+                .any(|(n, _, _)| n.kind == NodeKind::Table && n.name == "Account"),
+            "expected a Reads edge to the Account label, got {:?}",
+            reads.iter().map(|(n, _, _)| &n.name).collect::<Vec<_>>()
+        );
+        let writes = store
+            .neighbors(&file.id.0, Some(EdgeKind::Writes), true)
+            .unwrap();
+        check!(
+            writes
+                .iter()
+                .any(|(n, _, _)| n.kind == NodeKind::Table && n.name == "OWNS"),
+            "expected a Writes edge to the OWNS label, got {:?}",
+            writes.iter().map(|(n, _, _)| &n.name).collect::<Vec<_>>()
         );
         std::fs::remove_dir_all(&dir).ok();
     }

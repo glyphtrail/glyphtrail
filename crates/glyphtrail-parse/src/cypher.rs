@@ -63,6 +63,9 @@ pub fn extract_cypher(
         return CypherExtract { graph, accesses };
     };
     let src = source.as_bytes();
+    // Same-file `const`/`static` string values, so a query passed by name
+    // (`self.run(MERGE_EDGES, …)`) resolves to its literal (#444, cf. #405).
+    let consts = rust_str_consts(tree.root_node(), src);
     let mut seen_label: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
     walk(tree.root_node(), &mut |n| {
         match n.kind() {
@@ -70,25 +73,19 @@ pub fn extract_cypher(
             // array, not an inline query call), so scan every string literal.
             "string_content" => {
                 let s = text(n, src);
-                for label in cypher_ddl_labels(&s) {
-                    let norm = normalize_name(&label);
-                    let id = table_node_id(rel_path, &norm);
-                    if seen_label.insert(id.clone()) {
-                        add_label(
-                            &mut graph,
-                            file_id,
-                            &id,
-                            &label,
-                            &norm,
-                            rel_path,
-                            n.start_byte(),
-                            source,
-                        );
-                    }
-                }
+                add_cypher_labels(
+                    &mut graph,
+                    file_id,
+                    rel_path,
+                    source,
+                    n.start_byte(),
+                    &s,
+                    &mut seen_label,
+                );
             }
-            // Access: a graph method call (`conn.query("MATCH …")`) whose string
-            // literal is Cypher, attributed to the enclosing function.
+            // Access: a graph method call (`conn.query("MATCH …")`) whose first
+            // argument is Cypher — an inline string or a same-file `const` name —
+            // attributed to the enclosing function.
             "call_expression" => {
                 let Some(func) = n.child_by_field_name("function") else {
                     return;
@@ -105,12 +102,15 @@ pub fn extract_cypher(
                 let Some(args) = n.child_by_field_name("arguments") else {
                     return;
                 };
-                let Some(cypher) = first_string(args, src) else {
+                // Prefer an inline Cypher string; otherwise resolve a `const`-named
+                // query (the query isn't always the first argument, e.g.
+                // `exec_unwind(&conn, MERGE_EDGES, rows)`).
+                let Some(cypher) = first_string(args, src)
+                    .filter(|s| looks_like_cypher(s))
+                    .or_else(|| const_query_arg(args, src, &consts))
+                else {
                     return;
                 };
-                if !looks_like_cypher(&cypher) {
-                    return;
-                }
                 let acc = extract_cypher_access(&cypher);
                 if !acc.is_empty() {
                     accesses.push(CypherAccess {
@@ -123,6 +123,117 @@ pub fn extract_cypher(
         }
     });
     CypherExtract { graph, accesses }
+}
+
+/// Extract a standalone `.cypher`/`.cql` file (#444): its DDL/pattern labels become
+/// `Table` nodes and the whole file's `MATCH`/`MERGE`/`CREATE` access is attributed
+/// to the file itself (there's no enclosing function). The caller turns each
+/// `(access, label)` into a `File`→`Reads`/`Writes`→`Table` edge.
+pub fn extract_cypher_file(rel_path: &str, file_id: &NodeId, source: &str) -> CypherExtract {
+    let mut graph = CodeGraph::new();
+    let mut seen_label: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+    add_cypher_labels(
+        &mut graph,
+        file_id,
+        rel_path,
+        source,
+        0,
+        source,
+        &mut seen_label,
+    );
+    let acc = extract_cypher_access(source);
+    let accesses = if acc.is_empty() {
+        Vec::new()
+    } else {
+        vec![CypherAccess {
+            byte: 0,
+            accesses: acc,
+        }]
+    };
+    CypherExtract { graph, accesses }
+}
+
+/// Add `Table` nodes for the labels in `s`: kuzu DDL labels (scanned in any string,
+/// as the keywords are unambiguous) plus, when `s` looks like Cypher, the
+/// pattern-only labels a schema-free graph declares solely via `MERGE`/`CREATE`/
+/// `MATCH (n:Label)` (#444). Deduplicated by node id via `seen`.
+fn add_cypher_labels(
+    graph: &mut CodeGraph,
+    file_id: &NodeId,
+    rel_path: &str,
+    source: &str,
+    byte: usize,
+    s: &str,
+    seen: &mut std::collections::HashSet<NodeId>,
+) {
+    let mut add = |graph: &mut CodeGraph, display: &str, norm: &str| {
+        let id = table_node_id(rel_path, norm);
+        if seen.insert(id.clone()) {
+            add_label(graph, file_id, &id, display, norm, rel_path, byte, source);
+        }
+    };
+    for label in cypher_ddl_labels(s) {
+        let norm = normalize_name(&label);
+        add(graph, &label, &norm);
+    }
+    if looks_like_cypher(s) {
+        for (display, norm) in cypher_pattern_labels(s) {
+            add(graph, &display, &norm);
+        }
+    }
+}
+
+/// Same-file `const NAME: &str = "…"` / `static NAME: &str = "…"` string values, so
+/// a query referenced by name resolves to its literal (#444). Best-effort: only
+/// plain string-literal initializers are captured.
+fn rust_str_consts(root: Node, src: &[u8]) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    walk(root, &mut |n| {
+        if !matches!(n.kind(), "const_item" | "static_item") {
+            return;
+        }
+        let Some(name) = n.child_by_field_name("name").map(|x| text(x, src)) else {
+            return;
+        };
+        let Some(value) = n.child_by_field_name("value") else {
+            return;
+        };
+        if value.kind() == "string_literal" {
+            out.insert(name, literal_text(value, src));
+        }
+    });
+    out
+}
+
+/// The full text of a string literal: all `string_content` chunks concatenated.
+/// A multi-line query split by a `\`-newline continuation parses as several
+/// `string_content` nodes around `escape_sequence`s, so unlike `first_string` this
+/// reassembles the whole query (the continuation's dropped whitespace collapses,
+/// matching Rust's own semantics).
+fn literal_text(value: Node, src: &[u8]) -> String {
+    let mut out = String::new();
+    walk(value, &mut |n| {
+        if n.kind() == "string_content" {
+            out.push_str(&text(n, src));
+        }
+    });
+    out
+}
+
+/// Resolve a `const`-named query: the first argument that is a bare identifier
+/// whose same-file `const` value looks like Cypher. Scans all arguments (not just
+/// the first) so `exec_unwind(&conn, MERGE_EDGES, rows)` resolves even though the
+/// query sits after the connection handle.
+fn const_query_arg(
+    args: Node,
+    src: &[u8],
+    consts: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    let mut cursor = args.walk();
+    args.named_children(&mut cursor)
+        .filter(|a| a.kind() == "identifier")
+        .find_map(|a| consts.get(&text(a, src)).filter(|q| looks_like_cypher(q)))
+        .cloned()
 }
 
 /// Whether a string is Cypher rather than SQL: a Cypher-only leading keyword, or a
@@ -181,9 +292,45 @@ pub fn cypher_ddl_labels(cypher: &str) -> Vec<String> {
 /// A label is `:Name` inside a node `(...)` or relationship `[...]` pattern (not
 /// inside a `{}` map, where `:` is a property key).
 pub fn extract_cypher_access(cypher: &str) -> Vec<(DbAccess, String)> {
-    let toks = tokenize(cypher);
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    for (writes, _display, norm) in label_occurrences(cypher) {
+        let access = if writes {
+            DbAccess::Write
+        } else {
+            DbAccess::Read
+        };
+        if seen.insert((writes, norm.clone())) {
+            out.push((access, norm));
+        }
+    }
+    out
+}
+
+/// Labels named in node/relationship patterns (`(n:Label)`, `[r:REL]`), regardless
+/// of read/write, as `(display, normalized)` deduped by normalized name. For a
+/// schema-free graph (e.g. Neo4j) that declares no kuzu DDL, this is the only
+/// source of label nodes (#444): the labels exist solely in `MERGE`/`CREATE`/
+/// `MATCH` patterns.
+pub fn cypher_pattern_labels(cypher: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (_writes, display, norm) in label_occurrences(cypher) {
+        if seen.insert(norm.clone()) {
+            out.push((display, norm));
+        }
+    }
+    out
+}
+
+/// Every label occurrence in node/relationship patterns, in source order, as
+/// `(writes, display, normalized)`. `writes` reflects the enclosing clause
+/// (`CREATE`/`MERGE` write; `MATCH` and friends read). A label is `:Name` inside a
+/// node `(...)` or relationship `[...]` pattern, not inside a `{}` property map
+/// (where `:` is a key). Shared by both the access and the label extractors.
+fn label_occurrences(cypher: &str) -> Vec<(bool, String, String)> {
+    let toks = tokenize(cypher);
+    let mut out = Vec::new();
     let mut clause_write = false; // current clause writes (CREATE/MERGE)?
     let mut pattern_depth = 0i32; // inside ( or [
     let mut map_depth = 0i32; // inside {
@@ -203,15 +350,7 @@ pub fn extract_cypher_access(cypher: &str) -> Vec<(DbAccess, String)> {
                     && let Some(label) = toks.get(i + 1)
                     && is_ident(label)
                 {
-                    let norm = normalize_name(label);
-                    let access = if clause_write {
-                        DbAccess::Write
-                    } else {
-                        DbAccess::Read
-                    };
-                    if seen.insert((matches!(access, DbAccess::Write), norm.clone())) {
-                        out.push((access, norm));
-                    }
+                    out.push((clause_write, label.clone(), normalize_name(label)));
                     i += 1;
                 }
             }
@@ -426,5 +565,98 @@ mod tests {
             .flat_map(|a| a.accesses.iter().map(|(_, l)| l.as_str()))
             .collect();
         check!(labels.contains(&"widget"));
+    }
+
+    // #444: a schema-free graph declares no DDL, so labels come only from the
+    // node/rel patterns of MERGE/CREATE/MATCH.
+    #[test]
+    fn pattern_labels_from_schema_free_queries() {
+        let mut got = cypher_pattern_labels("MATCH (a:Account)-[:OWNS]->(c:Card) RETURN c");
+        got.sort();
+        check!(
+            got == vec![
+                ("Account".to_string(), "account".to_string()),
+                ("Card".to_string(), "card".to_string()),
+                ("OWNS".to_string(), "owns".to_string()),
+            ]
+        );
+    }
+
+    // #444: a pattern-only label (no kuzu DDL) still becomes a `Table` node, so the
+    // MERGE/MATCH access has something to resolve to.
+    #[test]
+    fn pattern_only_label_becomes_a_table_node() {
+        let src = r#"
+            fn upsert(conn: &Conn) {
+                conn.query("MERGE (a:Account {id: 1})").unwrap();
+            }
+        "#;
+        let e = extract_cypher(
+            "store.rs",
+            &NodeId::derive(&["file", "store.rs"]),
+            src,
+            &Language::Rust,
+        );
+        check!(
+            e.graph
+                .nodes
+                .iter()
+                .any(|n| n.kind == NodeKind::Table && n.name == "Account")
+        );
+        let labels: Vec<&str> = e
+            .accesses
+            .iter()
+            .flat_map(|a| a.accesses.iter().map(|(_, l)| l.as_str()))
+            .collect();
+        check!(labels == vec!["account"]);
+    }
+
+    // #444: a query passed by `const` name resolves to its literal, so the access
+    // is attributed even though the call site has no inline string.
+    #[test]
+    fn const_named_query_access_is_resolved() {
+        // The query const is the *second* argument (after the connection), as in
+        // this repo's own `exec_unwind(&conn, MERGE_EDGES, rows)`.
+        let src = r#"
+            const MERGE_EDGES: &str = "MERGE (a:Node)-[e:Edge]->(b:Node)";
+            fn link(&self, conn: &Conn) {
+                self.exec_unwind(&conn, MERGE_EDGES, rows).unwrap();
+            }
+        "#;
+        let e = extract_cypher(
+            "store.rs",
+            &NodeId::derive(&["file", "store.rs"]),
+            src,
+            &Language::Rust,
+        );
+        let mut labels: Vec<&str> = e
+            .accesses
+            .iter()
+            .flat_map(|a| a.accesses.iter().map(|(_, l)| l.as_str()))
+            .collect();
+        labels.sort();
+        labels.dedup();
+        check!(labels == vec!["edge", "node"]);
+    }
+
+    // #444: a standalone `.cypher` file yields label nodes and file-level access.
+    #[test]
+    fn cypher_file_yields_labels_and_file_access() {
+        let file = "queries/links.cypher";
+        let src = "MATCH (a:Account) MERGE (a)-[:OWNS]->(c:Card);";
+        let e = extract_cypher_file(file, &NodeId::derive(&["file", file]), src);
+        let mut tables: Vec<&str> = e
+            .graph
+            .nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Table)
+            .map(|n| n.name.as_str())
+            .collect();
+        tables.sort();
+        check!(tables == vec!["Account", "Card", "OWNS"]);
+        // MATCH reads Account; MERGE writes the OWNS relationship.
+        let acc = &e.accesses[0].accesses;
+        check!(acc.contains(&(DbAccess::Read, "account".to_string())));
+        check!(acc.contains(&(DbAccess::Write, "owns".to_string())));
     }
 }
