@@ -337,6 +337,19 @@ mod tests {
     }
 
     #[test]
+    fn format_with_interpolated_table_does_not_emit_a_keyword_table() {
+        // `FROM {}` (an interpolated table) must not collapse onto `WHERE` as a
+        // bogus table; the real JOINed table is still read (#446 review).
+        let src = r#"
+            fn f(db: &Pool, t: &str) {
+                let q = format!("SELECT * FROM {} JOIN real_table r WHERE x = 1", t);
+                let _ = sqlx::query(&q).fetch_all(db);
+            }
+        "#;
+        check!(tables(src) == vec![(DbAccess::Read, "real_table".to_string())]);
+    }
+
+    #[test]
     fn raw_query_with_leading_comment_is_recognised() {
         // A SQL string opening with a comment still passes the looks_like_sql gate.
         let src = r#"
