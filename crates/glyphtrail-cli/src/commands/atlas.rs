@@ -11,10 +11,10 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand};
 use glyphtrail_core::{
-    AtlasConfig, AtlasHeads, CodeGraph, CommitMeta, Confidence, EdgeKind, MeConfig, Node, NodeId,
-    NodeKind, Registry, RegistryEntry, TimelineQuery, Window, author_scope_label,
-    default_atlas_path, default_registry_path, filter_timeline, format_date, scrub_secrets,
-    timeline_value,
+    AtlasConfig, AtlasHeads, CodeGraph, CommitMeta, Confidence, EdgeKind, Embedder, Embedding,
+    HashingEmbedder, MeConfig, Node, NodeId, NodeKind, Registry, RegistryEntry, TimelineQuery,
+    Window, author_scope_label, cosine, default_atlas_path, default_registry_path, filter_timeline,
+    format_date, scrub_secrets, timeline_value,
 };
 use glyphtrail_store::{GraphStore, LadybugStore};
 
@@ -38,8 +38,38 @@ pub enum AtlasCmd {
     Story(StoryArgs),
     /// Export the gated atlas timeline as structured data (public-only).
     Export(ExportArgs),
+    /// Compute repo embeddings from the synced history (local lexical model, #338).
+    Embed(EmbedArgs),
+    /// Find repos similar to a repo name or free-text query (visibility-gated).
+    Similar(SimilarArgs),
     /// Serve the atlas over MCP (stdio): timeline, status, and the repo+file bridge.
     Mcp,
+}
+
+#[derive(Args)]
+pub struct EmbedArgs {
+    /// Embedding vector width (the hashing-trick bucket count).
+    #[arg(long, default_value_t = glyphtrail_core::DEFAULT_DIM)]
+    pub dim: usize,
+}
+
+#[derive(Args)]
+pub struct SimilarArgs {
+    /// A registered repo name (repo↔repo similarity) or free text (query↔repo).
+    pub query: String,
+    /// How many matches to show (most similar first).
+    #[arg(long, default_value_t = 10)]
+    pub limit: usize,
+    /// Include restricted repos — private, proprietary, or unregistered (excluded
+    /// by default).
+    #[arg(long)]
+    pub include_restricted: bool,
+    /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
+    /// Emit YAML.
+    #[arg(long)]
+    pub yaml: bool,
 }
 
 #[derive(Args)]
@@ -187,6 +217,8 @@ pub fn run(cmd: AtlasCmd) -> Result<()> {
         AtlasCmd::Topics(args) => topics(&dir, args)?,
         AtlasCmd::Story(args) => story(&dir, args)?,
         AtlasCmd::Export(args) => export(&dir, args)?,
+        AtlasCmd::Embed(args) => embed(&dir, args)?,
+        AtlasCmd::Similar(args) => similar(&dir, args)?,
         AtlasCmd::Mcp => glyphtrail_mcp::serve_atlas_stdio(dir)?,
     }
     Ok(())
@@ -593,6 +625,181 @@ fn timeline(dir: &Path, args: TimelineArgs) -> Result<()> {
         }
     } else {
         print_value(&timeline_value(&tl, &window_str, &scope), emit)?;
+    }
+    Ok(())
+}
+
+/// The atlas `Repo` node id for a registry name (mirrors `sync`'s id scheme).
+fn repo_node_id(name: &str) -> NodeId {
+    NodeId::derive(&["repo", name])
+}
+
+/// `glyphtrail atlas embed` — compute a lexical embedding per repo from the synced
+/// commit history and store it in the side table (#338). Local-only: this reads
+/// the atlas store and writes vectors back; nothing leaves the machine, so it
+/// embeds every repo regardless of visibility (gating is at `similar` output).
+fn embed(dir: &Path, args: EmbedArgs) -> Result<()> {
+    let lb = ladybug_dir(dir);
+    if !lb.exists() {
+        bail!("atlas is disabled; run `glyphtrail atlas init` first");
+    }
+    let store = LadybugStore::open(&lb)?;
+    // Every in-bounds commit, joined to its repo; build one document per repo from
+    // the repo name plus its commit subjects (already secret-scrubbed at sync).
+    let rows = store.atlas_timeline(None, None, None)?;
+    let mut docs: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for row in rows {
+        let doc = docs
+            .entry(row.repo.clone())
+            .or_insert_with(|| row.repo.clone());
+        doc.push(' ');
+        doc.push_str(&row.commit.subject);
+    }
+    if docs.is_empty() {
+        bail!("no commits to embed; run `glyphtrail atlas sync` first");
+    }
+    let embedder = HashingEmbedder::new(args.dim);
+    let embeddings: Vec<Embedding> = docs
+        .iter()
+        .map(|(name, doc)| Embedding {
+            node_id: repo_node_id(name),
+            vector: embedder.embed(doc),
+        })
+        .collect();
+    let mut store = store;
+    // Replace the whole set, so a repo that has left the active date window (no
+    // in-bounds commits) doesn't keep a stale vector from an older window, and a
+    // changed --dim never leaves mixed-width rows behind.
+    store.clear_embeddings()?;
+    store.set_embeddings(&embeddings, embedder.id())?;
+    println!(
+        "embedded {} repo{} ({}, dim {})",
+        embeddings.len(),
+        if embeddings.len() == 1 { "" } else { "s" },
+        embedder.id(),
+        embedder.dim(),
+    );
+    Ok(())
+}
+
+/// `glyphtrail atlas similar` — rank repos by lexical similarity to a repo name or
+/// free-text query, gating restricted repos out of the output (#338).
+fn similar(dir: &Path, args: SimilarArgs) -> Result<()> {
+    let lb = ladybug_dir(dir);
+    if !lb.exists() {
+        bail!("atlas is disabled; run `glyphtrail atlas init` first");
+    }
+    let store = LadybugStore::open(&lb)?;
+    let embeddings = store.embeddings()?;
+    if embeddings.is_empty() {
+        bail!("no embeddings yet; run `glyphtrail atlas embed` first");
+    }
+    let registry = match default_registry_path() {
+        Some(p) => Registry::load(&p)?,
+        None => Registry::default(),
+    };
+    // Map each embedding's node id back to a registry repo (for the display name
+    // and visibility). Built from the registry, since the node id is a one-way hash.
+    let by_id: std::collections::HashMap<String, &RegistryEntry> = registry
+        .repos
+        .iter()
+        .map(|e| (repo_node_id(&e.name).0, e))
+        .collect();
+
+    // All stored vectors must share a width, else cosine silently scores mismatches
+    // as 0 and the ranking is misleading. `atlas embed` clears before writing, so
+    // this only trips on a hand-tampered store — fail loudly and tell the user.
+    let dim = embeddings[0].vector.len();
+    if embeddings.iter().any(|e| e.vector.len() != dim) {
+        bail!("stored embeddings have inconsistent dimensions; re-run `glyphtrail atlas embed`");
+    }
+
+    // Resolve the query vector: a known repo name uses its stored embedding (and is
+    // excluded from its own results); anything else is embedded as free text.
+    let self_id = repo_node_id(&args.query).0;
+    let (qvec, self_id, mode) = if let Some(e) = embeddings.iter().find(|e| e.node_id.0 == self_id)
+    {
+        (
+            e.vector.clone(),
+            Some(self_id),
+            format!("repo '{}'", args.query),
+        )
+    } else {
+        let v = HashingEmbedder::new(dim).embed(&args.query);
+        (v, None, format!("query \"{}\"", args.query))
+    };
+
+    let mut excluded = 0usize;
+    let mut scored: Vec<(f32, String, &'static str)> = Vec::new();
+    for e in &embeddings {
+        if Some(&e.node_id.0) == self_id.as_ref() {
+            continue;
+        }
+        let entry = by_id.get(&e.node_id.0);
+        let restricted = entry.map(|x| x.visibility.is_restricted()).unwrap_or(true);
+        if restricted && !args.include_restricted {
+            excluded += 1;
+            continue;
+        }
+        // The repo name can't be recovered from the one-way node id, so tag an
+        // unregistered row with a short id prefix to keep multiple ones distinct.
+        let name = entry.map(|x| x.name.clone()).unwrap_or_else(|| {
+            let short: String = e.node_id.0.chars().take(8).collect();
+            format!("(unregistered {short})")
+        });
+        let vis = match entry.map(|x| x.visibility) {
+            Some(v) => v.as_str(),
+            None => "unregistered",
+        };
+        scored.push((cosine(&qvec, &e.vector), name, vis));
+    }
+    scored.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.1.cmp(&b.1))
+    });
+    scored.truncate(args.limit);
+
+    let emit = Emit::from_flags(args.json, args.yaml);
+    if emit == Emit::Text {
+        println!("atlas similar — {mode}");
+        println!("  model:   lexical-hash-v1");
+        if excluded > 0 {
+            println!(
+                "  hidden:  {excluded} restricted (private/proprietary/unregistered; use --include-restricted)"
+            );
+        }
+        println!("  showing: {}", scored.len());
+        println!();
+        for (i, (score, name, vis)) in scored.iter().enumerate() {
+            println!(
+                "  {:>2}. {:6.3}  {:<24}  [{}]",
+                i + 1,
+                score,
+                truncate(name, 24),
+                vis
+            );
+        }
+        if scored.is_empty() {
+            println!("  (no matches)");
+        }
+    } else {
+        let matches: Vec<serde_json::Value> = scored
+            .iter()
+            .map(|(score, name, vis)| {
+                serde_json::json!({ "repo": name, "score": score, "visibility": vis })
+            })
+            .collect();
+        print_value(
+            &serde_json::json!({
+                "query": args.query,
+                "mode": mode,
+                "model": "lexical-hash-v1",
+                "hidden_restricted": excluded,
+                "matches": matches,
+            }),
+            emit,
+        )?;
     }
     Ok(())
 }

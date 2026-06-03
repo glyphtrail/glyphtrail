@@ -4,6 +4,7 @@ pub mod api;
 pub mod atlas;
 pub mod config;
 pub mod dotnet;
+pub mod embed;
 pub mod error;
 pub mod federated;
 pub mod filelock;
@@ -32,6 +33,7 @@ pub use atlas::{
 };
 pub use config::{ApiConfig, Config, DynamicLanguage, SchemaFormat, SchemaSource};
 pub use dotnet::{CsprojProject, parse_csproj};
+pub use embed::{DEFAULT_DIM, Embedder, Embedding, HashingEmbedder, cosine};
 pub use error::{CoreError, Result};
 pub use federated::{FederatedAdjacency, qualify, unqualify};
 pub use glyphtrail_forge_id::{

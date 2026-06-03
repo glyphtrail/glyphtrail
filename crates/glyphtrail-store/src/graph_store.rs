@@ -7,8 +7,8 @@
 
 use anyhow::Result;
 use glyphtrail_core::{
-    Adjacency, ClassifiedItem, CommitMeta, Confidence, Edge, EdgeKind, ImpactPolicy, Node, NodeId,
-    NodeKind, OperationKey, PendingLink,
+    Adjacency, ClassifiedItem, CommitMeta, Confidence, Edge, EdgeKind, Embedding, ImpactPolicy,
+    Node, NodeId, NodeKind, OperationKey, PendingLink,
 };
 
 /// Aggregate counts for an index, returned by [`GraphStore::stats`].
@@ -61,6 +61,18 @@ pub trait GraphStore: Adjacency {
     /// (unix seconds, inclusive; `None` = unbounded), so narrowing the window
     /// re-marks rows out of bounds rather than deleting them (#331).
     fn remark_commit_bounds(&mut self, since: Option<i64>, until: Option<i64>) -> Result<()>;
+    /// Upsert atlas embedding rows keyed by node id, tagged with the producing
+    /// `model` id (#338). The default is a no-op for backends without the side
+    /// table; the atlas-bearing store overrides it.
+    fn set_embeddings(&mut self, embeddings: &[Embedding], model: &str) -> Result<()> {
+        let _ = (embeddings, model);
+        Ok(())
+    }
+    /// Remove every stored embedding (#338), so a re-embed starts clean and a repo
+    /// that left the active date window doesn't keep a stale vector. Default no-op.
+    fn clear_embeddings(&mut self) -> Result<()> {
+        Ok(())
+    }
     fn insert_pending(&mut self, links: &[PendingLink]) -> Result<()>;
     fn insert_imports(&mut self, imports: &[(String, String, String)]) -> Result<()>;
     fn delete_edges_by_confidence(&mut self, confidence: Confidence) -> Result<usize>;
@@ -80,6 +92,11 @@ pub trait GraphStore: Adjacency {
     fn commits_in_range(&self, since: Option<i64>, until: Option<i64>) -> Result<Vec<CommitMeta>>;
     /// Total atlas commits in the side-table (cheap `COUNT`, no materialization).
     fn commit_count(&self) -> Result<usize>;
+    /// All stored atlas embeddings (#338). The default is empty for backends
+    /// without the side table; the atlas-bearing store overrides it.
+    fn embeddings(&self) -> Result<Vec<Embedding>> {
+        Ok(Vec::new())
+    }
     /// In-bounds atlas commits in `[since, until]` (unix seconds, inclusive;
     /// `None` = unbounded), each joined to its repo name and touched-file count,
     /// ordered by `committed_at` ascending (#333). `topic`, when set, keeps only
