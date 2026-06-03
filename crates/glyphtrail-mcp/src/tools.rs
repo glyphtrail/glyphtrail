@@ -296,6 +296,17 @@ fn dispatch(
     if name == "impact" && is_federated(args) {
         return federated_impact_tool(&db, args);
     }
+    // #455: when auto-update is enabled, refresh the index before answering, so a
+    // stale-index read doesn't need a manual `analyze` round-trip (every saved
+    // call is agent context budget). Incremental, so it's a no-op fast-path when
+    // the working tree is unchanged; best-effort (a failure leaves the stale
+    // warning to do its job). Only the single-store read path — `analyze`,
+    // `file_issue`, `list_repos`, and federated impact returned earlier.
+    if auto_update_enabled()
+        && let Ok(root) = resolve_analyze_root(&db)
+    {
+        let _ = glyphtrail_analyze::run(&root, true);
+    }
     let store = open(&db)?;
     // Whatever the tool returns, flag a stale index so the agent re-analyzes
     // before trusting results (#345). Computed once here, for every store tool.
@@ -1135,6 +1146,15 @@ pub(crate) fn text_result(value: &Value, is_error: bool) -> Value {
 /// by default; set `GLYPHTRAIL_MCP_FILE_ISSUE` to a truthy value to enable.
 fn file_issue_enabled() -> bool {
     std::env::var("GLYPHTRAIL_MCP_FILE_ISSUE")
+        .map(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(false)
+}
+
+/// Whether the server refreshes a stale index before a read tool answers (#455),
+/// set via `GLYPHTRAIL_MCP_AUTO_UPDATE`. Off by default — a read never writes
+/// unless the operator opts in.
+fn auto_update_enabled() -> bool {
+    std::env::var("GLYPHTRAIL_MCP_AUTO_UPDATE")
         .map(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
         .unwrap_or(false)
 }
