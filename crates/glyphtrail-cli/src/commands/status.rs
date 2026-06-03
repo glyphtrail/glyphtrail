@@ -93,8 +93,12 @@ fn print_text(
         Staleness::Stale(why) => {
             println!("status: STALE — {why}; run `glyphtrail analyze` to refresh")
         }
-        // Indeterminate (dirty/non-git index): say nothing rather than guess.
-        Staleness::Unknown => {}
+        // Indeterminate freshness must not read as "fine": say so and steer
+        // toward re-analyzing rather than silently trusting the index (#448).
+        Staleness::Unknown => println!(
+            "status: freshness UNKNOWN — can't verify against git (index built from a \
+             dirty/non-git tree or an older glyphtrail); re-analyze before trusting"
+        ),
     }
     match skill {
         Some(v) if v < setup::SKILL_VERSION => println!(

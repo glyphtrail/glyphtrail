@@ -1391,9 +1391,65 @@ pub fn index_staleness(root: &Path, store: &dyn glyphtrail_store::GraphStore) ->
             .as_deref(),
         &analysis_revision(),
         store.get_meta("head_commit").ok().flatten().as_deref(),
+        || git_op_in_progress(root),
         || git_head_commit(root),
         || git_tree_clean(root),
     )
+}
+
+/// The name of a git operation in progress at `root` (merge / rebase /
+/// cherry-pick / revert), if any — the working tree is then a transient mix any
+/// index predates (#448). Best-effort: non-git or any git failure yields `None`.
+fn git_op_in_progress(root: &Path) -> Option<&'static str> {
+    for (refname, label) in [
+        ("MERGE_HEAD", "merge"),
+        ("CHERRY_PICK_HEAD", "cherry-pick"),
+        ("REVERT_HEAD", "revert"),
+    ] {
+        if git_ref_exists(root, refname) {
+            return Some(label);
+        }
+    }
+    if git_path_exists(root, "rebase-merge") || git_path_exists(root, "rebase-apply") {
+        return Some("rebase");
+    }
+    None
+}
+
+/// Whether a pseudo-ref like `MERGE_HEAD` resolves (the operation is in flight).
+fn git_ref_exists(root: &Path, refname: &str) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "-q", "--verify", refname])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Whether a git-dir path (e.g. `rebase-merge`) exists — used for in-progress
+/// rebases, which leave a state directory rather than a pseudo-ref.
+fn git_path_exists(root: &Path, name: &str) -> bool {
+    let Some(out) = std::process::Command::new("git")
+        .current_dir(root)
+        .args(["rev-parse", "--git-path", name])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+    else {
+        return false;
+    };
+    let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if p.is_empty() {
+        return false;
+    }
+    let path = std::path::Path::new(&p);
+    // `--git-path` prints relative to `root` (our cwd) unless already absolute.
+    if path.is_absolute() {
+        path.exists()
+    } else {
+        root.join(path).exists()
+    }
 }
 
 /// The pure decision behind [`index_staleness`], with the store and git probed
@@ -1403,6 +1459,7 @@ fn decide_staleness(
     stored_revision: Option<&str>,
     current_revision: &str,
     stored_head: Option<&str>,
+    op_in_progress: impl FnOnce() -> Option<&'static str>,
     head_now: impl FnOnce() -> Option<String>,
     tree_clean: impl FnOnce() -> bool,
 ) -> Staleness {
@@ -1415,6 +1472,13 @@ fn decide_staleness(
         Some(_) => {}
         // Pre-revision index or an unreadable store: don't guess.
         None => return Staleness::Unknown,
+    }
+    // A git operation mid-flight (merge/rebase/cherry-pick/revert) leaves a
+    // transient working tree the index can't reflect — flag it loudly even when
+    // no clean HEAD was recorded at index time, since that's exactly when the
+    // HEAD-comparison below can't help (#448).
+    if let Some(op) = op_in_progress() {
+        return Staleness::Stale(format!("{op} in progress; index predates it"));
     }
     // The git signal is only trustworthy when the index was built from a clean
     // checkout — the write path records the HEAD then, else an empty string.
@@ -1436,12 +1500,14 @@ mod staleness_tests {
     use super::*;
     use assert2::check;
 
+    // No git operation in progress in these cases; `|| None` is the op probe.
     #[test]
     fn revision_mismatch_is_stale_regardless_of_git() {
         let s = decide_staleness(
             Some("old"),
             "new",
             Some("abc"),
+            || None,
             || Some("abc".into()),
             || true,
         );
@@ -1450,39 +1516,94 @@ mod staleness_tests {
 
     #[test]
     fn missing_revision_is_unknown() {
-        let s = decide_staleness(None, "rev", Some("abc"), || Some("abc".into()), || true);
+        let s = decide_staleness(
+            None,
+            "rev",
+            Some("abc"),
+            || None,
+            || Some("abc".into()),
+            || true,
+        );
         check!(s == Staleness::Unknown);
     }
 
     #[test]
     fn empty_or_missing_head_is_unknown() {
         // Indexed from a dirty/non-git tree: the write path stored "".
-        check!(decide_staleness(Some("r"), "r", Some(""), || None, || true) == Staleness::Unknown);
-        check!(decide_staleness(Some("r"), "r", None, || None, || true) == Staleness::Unknown);
+        check!(
+            decide_staleness(Some("r"), "r", Some(""), || None, || None, || true)
+                == Staleness::Unknown
+        );
+        check!(
+            decide_staleness(Some("r"), "r", None, || None, || None, || true) == Staleness::Unknown
+        );
     }
 
     #[test]
     fn moved_head_is_stale() {
-        let s = decide_staleness(Some("r"), "r", Some("aaa"), || Some("bbb".into()), || true);
+        let s = decide_staleness(
+            Some("r"),
+            "r",
+            Some("aaa"),
+            || None,
+            || Some("bbb".into()),
+            || true,
+        );
         check!(s == Staleness::Stale("repo is on a new commit".into()));
     }
 
     #[test]
     fn same_head_dirty_tree_is_stale() {
-        let s = decide_staleness(Some("r"), "r", Some("aaa"), || Some("aaa".into()), || false);
+        let s = decide_staleness(
+            Some("r"),
+            "r",
+            Some("aaa"),
+            || None,
+            || Some("aaa".into()),
+            || false,
+        );
         check!(s == Staleness::Stale("uncommitted changes since last index".into()));
     }
 
     #[test]
     fn same_head_clean_tree_is_fresh() {
-        let s = decide_staleness(Some("r"), "r", Some("aaa"), || Some("aaa".into()), || true);
+        let s = decide_staleness(
+            Some("r"),
+            "r",
+            Some("aaa"),
+            || None,
+            || Some("aaa".into()),
+            || true,
+        );
         check!(s == Staleness::Fresh);
     }
 
     #[test]
     fn no_longer_git_is_unknown() {
-        let s = decide_staleness(Some("r"), "r", Some("aaa"), || None, || true);
+        let s = decide_staleness(Some("r"), "r", Some("aaa"), || None, || None, || true);
         check!(s == Staleness::Unknown);
+    }
+
+    // #448: a merge in progress is loudly stale even when no clean HEAD was
+    // recorded at index time (the case that previously fell through to Unknown).
+    #[test]
+    fn merge_in_progress_is_stale_even_without_recorded_head() {
+        let s = decide_staleness(Some("r"), "r", Some(""), || Some("merge"), || None, || true);
+        check!(s == Staleness::Stale("merge in progress; index predates it".into()));
+    }
+
+    // The op probe short-circuits before the HEAD comparison.
+    #[test]
+    fn rebase_in_progress_outranks_a_matching_head() {
+        let s = decide_staleness(
+            Some("r"),
+            "r",
+            Some("aaa"),
+            || Some("rebase"),
+            || Some("aaa".into()),
+            || true,
+        );
+        check!(s == Staleness::Stale("rebase in progress; index predates it".into()));
     }
 
     // #364: analyze from a subdir resolves to the enclosing git root, and a stray
