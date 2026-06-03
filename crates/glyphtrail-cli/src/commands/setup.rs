@@ -95,6 +95,11 @@ pub fn run(
             // Register the project-scoped MCP server (#403) in the repo's
             // `.mcp.json` — the cross-client project MCP config.
             write_mcp_json(&target)?;
+            // With --gitignore (keep the install out of VCS), gitignore the new
+            // `.mcp.json` too, so the combination stays consistently local.
+            if gitignore && in_repo && add_ignore(&target, ".mcp.json")? {
+                println!("added .mcp.json to .gitignore");
+            }
         }
     }
 
@@ -151,9 +156,10 @@ fn write_mcp_json(root: &Path) -> Result<()> {
 /// since the location varies by client (#403).
 fn print_user_mcp_guidance() {
     println!(
-        "\nTo register glyphtrail user-wide, add this server to your MCP client's \
+        "\nTo register glyphtrail user-wide, merge this into your MCP client's \
          config (e.g. Claude Code `~/.claude.json`, or Claude Desktop's config):\n\
-         \n  \"glyphtrail\": {{ \"command\": \"glyphtrail\", \"args\": [\"mcp\"] }}\n\
+         \n  {{\n    \"mcpServers\": {{\n      \
+         \"glyphtrail\": {{ \"command\": \"glyphtrail\", \"args\": [\"mcp\"] }}\n    }}\n  }}\n\
          \n(No `--repo`, so every tool call names the repo by registered name or path.)"
     );
 }
