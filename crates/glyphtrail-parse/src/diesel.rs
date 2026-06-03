@@ -242,7 +242,10 @@ fn query_access(n: Node, src: &[u8]) -> Option<(DbAccess, String)> {
             }
             let args = n.child_by_field_name("arguments")?;
             let first = args.named_children(&mut args.walk()).next()?;
-            scoped_table_name(first, src).map(|t| (DbAccess::Write, t))
+            // The target may be a bare `users::table` or a query expression like
+            // `users::table.filter(…)` / `users::table.find(1)`, so take the first
+            // `<t>::table` anywhere in the first argument.
+            first_table_path(first, src).map(|t| (DbAccess::Write, t))
         }
         // A method terminal: `<chain>.load(conn)`.
         "field_expression" => {
@@ -320,9 +323,12 @@ fn parse(source: &str) -> Option<Tree> {
 }
 
 fn line_of(source: &str, byte: usize) -> usize {
-    source[..byte.min(source.len())]
-        .bytes()
-        .filter(|&b| b == b'\n')
+    // Count newlines over the byte slice, not `source[..byte]`, since a tree-sitter
+    // byte offset can land inside a multibyte char and slicing the `&str` would
+    // panic (same fix as sql.rs/jpa.rs).
+    source.as_bytes()[..byte.min(source.len())]
+        .iter()
+        .filter(|&&b| b == b'\n')
         .count()
         + 1
 }
@@ -442,6 +448,25 @@ mod tests {
             accesses(src)
                 == vec![
                     (DbAccess::Write, "accounts".to_string()),
+                    (DbAccess::Write, "posts".to_string()),
+                    (DbAccess::Write, "users".to_string()),
+                ]
+        );
+    }
+
+    #[test]
+    fn update_delete_on_a_filtered_query_target_still_writes() {
+        // The target is a query expression, not a bare `<t>::table` — the `::table`
+        // is still found inside the first argument (#440 review).
+        let src = r#"
+            fn mutate(conn: &mut PgConnection) {
+                diesel::update(users::table.find(1)).set(email.eq("x")).execute(conn).ok();
+                let _ = diesel::delete(posts::table.filter(posts::draft.eq(true))).execute(conn);
+            }
+        "#;
+        check!(
+            accesses(src)
+                == vec![
                     (DbAccess::Write, "posts".to_string()),
                     (DbAccess::Write, "users".to_string()),
                 ]
