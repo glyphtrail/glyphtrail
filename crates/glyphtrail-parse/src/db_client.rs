@@ -52,9 +52,9 @@ pub fn extract_db_queries(source: &str, lang: &Language) -> Vec<RawDbQuery> {
     let src = source.as_bytes();
     let mut out = Vec::new();
     walk(tree.root_node(), &mut |n| {
-        // A query is the sqlx macro/function form (definitely SQL), or a raw-driver
-        // method call (`conn.execute("…")`, `query_row`, …) — the latter is gated
-        // on the string actually looking like SQL, since the method names are common.
+        // The sqlx macro/function form (definitely SQL), a raw-driver method call
+        // (`conn.execute("…")`), or a `format!`-built query template — the last two
+        // gated on the string looking like SQL, since those forms are common.
         let Some(needs_sql_gate) = query_form(n, src) else {
             return;
         };
@@ -109,7 +109,15 @@ fn query_form(n: Node, src: &[u8]) -> Option<bool> {
     match n.kind() {
         "macro_invocation" => {
             let name = last_segment(&text(n.child_by_field_name("macro")?, src));
-            SQLX_QUERY_MACROS.contains(&name.as_str()).then_some(false)
+            if SQLX_QUERY_MACROS.contains(&name.as_str()) {
+                Some(false)
+            } else if matches!(name.as_str(), "format" | "format_args") {
+                // A `format!`-built query template (#446): scan the literal part,
+                // gated on it looking like SQL so a non-query `format!` is ignored.
+                Some(true)
+            } else {
+                None
+            }
         }
         "call_expression" => {
             let func = n.child_by_field_name("function")?;
@@ -304,6 +312,41 @@ mod tests {
                     (DbAccess::Read, "users".to_string()),
                 ]
         );
+    }
+
+    #[test]
+    fn format_built_query_template_is_caught() {
+        // A query assembled with `format!` (missed by the precise call detection,
+        // since the call gets a non-literal) is read from its template (#446); the
+        // `{unit}` interpolation collapses to a dynamic path-segment, the static
+        // `FROM` table survives.
+        let src = r#"
+            fn report(db: &Pool, unit: &str) {
+                let q = format!("SELECT * FROM public.items_segments seg WHERE g = {unit}");
+                let _ = sqlx::query(&q).fetch_all(db);
+            }
+        "#;
+        check!(tables(src) == vec![(DbAccess::Read, "public.items_segments".to_string())]);
+    }
+
+    #[test]
+    fn non_query_format_is_not_matched() {
+        // A `format!` that isn't a query (no SQL leading keyword) is ignored.
+        let src = r#"fn f() { let _ = format!("loaded {} rows from cache", n); }"#;
+        check!(extract_db_queries(src, &Language::Rust).is_empty());
+    }
+
+    #[test]
+    fn format_with_interpolated_table_does_not_emit_a_keyword_table() {
+        // `FROM {}` (an interpolated table) must not collapse onto `WHERE` as a
+        // bogus table; the real JOINed table is still read (#446 review).
+        let src = r#"
+            fn f(db: &Pool, t: &str) {
+                let q = format!("SELECT * FROM {} JOIN real_table r WHERE x = 1", t);
+                let _ = sqlx::query(&q).fetch_all(db);
+            }
+        "#;
+        check!(tables(src) == vec![(DbAccess::Read, "real_table".to_string())]);
     }
 
     #[test]

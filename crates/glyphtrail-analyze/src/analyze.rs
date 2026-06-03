@@ -1176,7 +1176,8 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// `prepareStatement`) extracted from Java method bodies (#434).
 /// 15: embedded Cypher (kuzu DDL labels + MATCH/MERGE access) in Rust strings
 /// linked to graph-label tables (#416 Phase C, #428).
-const ANALYSIS_REVISION: u32 = 15;
+/// 16: `format!`-built sqlx query templates are read for table accesses (#446).
+const ANALYSIS_REVISION: u32 = 16;
 
 /// Fingerprint of everything that determines analysis output: the crate
 /// version, the manual revision counter, and the built-in tree-sitter query
