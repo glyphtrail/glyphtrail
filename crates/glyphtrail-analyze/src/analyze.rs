@@ -135,8 +135,11 @@ use glyphtrail_store::LadybugStore;
 struct DiscoveredFile {
     rel_path: String,
     abs_path: std::path::PathBuf,
-    /// `None` marks a sensitive record-only file (#136): its existence is
-    /// recorded as a `File` node but its contents are never read or parsed.
+    /// The tree-sitter language, or `None`. `None` does not by itself mean
+    /// "sensitive": it also marks the `sql`/`cypher` artifacts below, which a
+    /// dedicated DDL/Cypher extractor handles instead of a grammar. A sensitive
+    /// record-only file (#136) is the `None` case with neither flag set: its
+    /// existence is recorded as a `File` node but its contents are never read.
     language: Option<Language>,
     /// A `.sql` schema/migration file (#416): parsed by the DDL extractor rather
     /// than a tree-sitter grammar, so it carries no `Language`.

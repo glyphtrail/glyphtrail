@@ -85,9 +85,9 @@ pub fn extract_cypher(
                     &mut seen_label,
                 );
             }
-            // Access: a graph method call (`conn.query("MATCH …")`) whose first
-            // argument is Cypher — an inline string or a same-file `const` name —
-            // attributed to the enclosing function.
+            // Access: a graph method call (`conn.query("MATCH …")`) whose Cypher
+            // argument — an inline string or a same-file `const` name, in any
+            // position — is attributed to the enclosing function.
             "call_expression" => {
                 let Some(func) = n.child_by_field_name("function") else {
                     return;
@@ -194,8 +194,9 @@ fn add_cypher_labels(
 }
 
 /// Same-file `const NAME: &str = "…"` / `static NAME: &str = "…"` string values, so
-/// a query referenced by name resolves to its literal (#444). Best-effort: only
-/// plain string-literal initializers are captured.
+/// a query referenced by name resolves to its literal (#444). Both plain
+/// (`"…"`) and raw (`r#"…"#`, common for multi-line Cypher) string initializers
+/// are captured.
 fn rust_str_consts(root: Node, src: &[u8]) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
     walk(root, &mut |n| {
@@ -208,26 +209,50 @@ fn rust_str_consts(root: Node, src: &[u8]) -> std::collections::HashMap<String, 
         let Some(value) = n.child_by_field_name("value") else {
             return;
         };
-        if value.kind() == "string_literal" {
+        if matches!(value.kind(), "string_literal" | "raw_string_literal") {
             out.insert(name, literal_text(value, src));
         }
     });
     out
 }
 
-/// The full text of a string literal: all `string_content` chunks concatenated.
-/// A multi-line query split by a `\`-newline continuation parses as several
-/// `string_content` nodes around `escape_sequence`s, so unlike `first_string` this
-/// reassembles the whole query (the continuation's dropped whitespace collapses,
-/// matching Rust's own semantics).
+/// The decoded text of a string literal: `string_content` chunks concatenated with
+/// each `escape_sequence` unescaped. A multi-line query split by a `\`-newline
+/// continuation parses as several `string_content` nodes around the continuation
+/// escape, so unlike `first_string` this reassembles the whole query; the
+/// continuation collapses to nothing while `\n`/`\t`/`\"`/`\\` become their real
+/// characters (so tokens stay separated and `looks_like_cypher` sees the true
+/// string). A raw string (`r"…"`) has no escapes — its content passes through.
 fn literal_text(value: Node, src: &[u8]) -> String {
     let mut out = String::new();
-    walk(value, &mut |n| {
-        if n.kind() == "string_content" {
-            out.push_str(&text(n, src));
-        }
+    walk(value, &mut |n| match n.kind() {
+        "string_content" => out.push_str(&text(n, src)),
+        "escape_sequence" => out.push_str(&unescape(&text(n, src))),
+        _ => {}
     });
     out
+}
+
+/// Decode one Rust `escape_sequence` (text including the leading `\`). A `\`
+/// immediately followed by a newline is a line continuation (the following
+/// indentation is consumed by Rust) → empty. Common single-char escapes map to
+/// their character; anything else (e.g. `\xHH`, `\u{…}`) keeps the post-backslash
+/// text, which is enough for label/keyword extraction.
+fn unescape(esc: &str) -> String {
+    // The escape always starts with an ASCII `\` (one byte), so slicing past it is
+    // a valid char boundary.
+    let rest = esc.strip_prefix('\\').unwrap_or(esc);
+    match rest.chars().next() {
+        Some('\n') | Some('\r') => String::new(),
+        Some('n') => "\n".to_string(),
+        Some('t') => "\t".to_string(),
+        Some('r') => "\r".to_string(),
+        Some('0') => "\0".to_string(),
+        Some('\\') => "\\".to_string(),
+        Some('"') => "\"".to_string(),
+        Some('\'') => "'".to_string(),
+        _ => rest.to_string(),
+    }
 }
 
 /// Resolve a `const`-named query: the first argument that is a bare identifier
@@ -664,10 +689,57 @@ mod tests {
             .collect();
         tables.sort();
         check!(tables == vec!["Account", "Card", "OWNS"]);
-        // MATCH reads Account; MERGE writes the OWNS relationship.
+        // MATCH reads Account; the MERGE writes both the OWNS relationship and the
+        // Card node it creates.
         let acc = &e.accesses[0].accesses;
         check!(acc.contains(&(DbAccess::Read, "account".to_string())));
         check!(acc.contains(&(DbAccess::Write, "owns".to_string())));
+        check!(acc.contains(&(DbAccess::Write, "card".to_string())));
+    }
+
+    // #444: a raw-string `const` query (`r#"…"#`, common for multi-line Cypher)
+    // resolves like a plain one.
+    #[test]
+    fn raw_string_const_query_resolves() {
+        let src = r##"
+            const FIND: &str = r#"MATCH (w:Widget) RETURN w"#;
+            fn load(conn: &Conn) {
+                let _ = conn.query(FIND);
+            }
+        "##;
+        let e = extract_cypher(
+            "store.rs",
+            &NodeId::derive(&["file", "store.rs"]),
+            src,
+            &Language::Rust,
+        );
+        let labels: Vec<&str> = e
+            .accesses
+            .iter()
+            .flat_map(|a| a.accesses.iter().map(|(_, l)| l.as_str()))
+            .collect();
+        check!(labels == vec!["widget"]);
+    }
+
+    // #444: escapes in a `const` query are decoded — a `\n` becomes a real newline
+    // (keeping tokens apart) rather than vanishing and merging `)MERGE`.
+    #[test]
+    fn escaped_newline_in_const_query_is_decoded() {
+        let src = r#"
+            const Q: &str = "MATCH (a:Account)\nMERGE (b:Card)";
+            fn run(conn: &Conn) {
+                let _ = conn.query(Q);
+            }
+        "#;
+        let e = extract_cypher(
+            "store.rs",
+            &NodeId::derive(&["file", "store.rs"]),
+            src,
+            &Language::Rust,
+        );
+        let acc = &e.accesses[0].accesses;
+        check!(acc.contains(&(DbAccess::Read, "account".to_string())));
+        check!(acc.contains(&(DbAccess::Write, "card".to_string())));
     }
 
     // #444: a `.cypher` file is Cypher by definition, so a named-node `CREATE
