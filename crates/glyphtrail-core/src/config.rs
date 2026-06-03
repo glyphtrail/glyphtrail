@@ -37,9 +37,11 @@ pub struct RepoPaths {
 /// Where to keep the index for a submodule or linked worktree, so it stays out of
 /// the (often immutable) working tree (#394): inside the repo's real git directory
 /// (`.git/modules/<name>` for a submodule, `.git/worktrees/<name>` for a worktree),
-/// which git already keeps outside the checkout. `None` for a normal repo (`.git`
-/// is a directory) or when the `.git` file can't be resolved.
-pub fn detached_index_dir(root: &Path) -> Option<PathBuf> {
+/// which git already keeps outside the checkout. Detection keys off `.git` being a
+/// *file* with a `gitdir:` pointer (submodule/worktree/separate-git-dir layout);
+/// returns `None` for the common case where `.git` is a directory, when the pointer
+/// can't be read, or when it doesn't resolve to a real git directory.
+pub(crate) fn detached_index_dir(root: &Path) -> Option<PathBuf> {
     let dotgit = root.join(".git");
     // A submodule / linked worktree has `.git` as a *file* (`gitdir: <path>`); a
     // normal repo has it as a directory.
@@ -57,6 +59,14 @@ pub fn detached_index_dir(root: &Path) -> Option<PathBuf> {
         root.join(gitdir)
     };
     let resolved = resolved.canonicalize().unwrap_or(resolved);
+    // `RepoPaths::new` runs on user-selected paths, so a crafted `.git` file could
+    // otherwise point the index at an arbitrary directory. Only detach into a path
+    // that is itself a real git directory (has a `HEAD`), as a submodule's
+    // `.git/modules/<name>` and a worktree's `.git/worktrees/<name>` both do;
+    // anything else falls back to the in-tree default.
+    if !resolved.join("HEAD").is_file() {
+        return None;
+    }
     Some(resolved.join(INDEX_DIR.trim_start_matches('.')))
 }
 
@@ -77,8 +87,11 @@ impl RepoPaths {
                             if let Some(parent) = detached.parent() {
                                 let _ = std::fs::create_dir_all(parent);
                             }
-                            let _ = std::fs::rename(&old, &detached);
-                            break;
+                            // Stop only once a move succeeds; a failed rename of the
+                            // in-tree dir shouldn't skip trying the legacy one.
+                            if std::fs::rename(&old, &detached).is_ok() {
+                                break;
+                            }
                         }
                     }
                 }
@@ -415,6 +428,7 @@ mod tests {
         // A submodule: `.git` is a file -> index lives in the resolved git dir.
         let parent_gitdir = base.join("parent/.git/modules/sub");
         std::fs::create_dir_all(&parent_gitdir).unwrap();
+        std::fs::write(parent_gitdir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
         let sub = base.join("parent/sub");
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(sub.join(".git"), "gitdir: ../.git/modules/sub\n").unwrap();
@@ -437,7 +451,9 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        std::fs::create_dir_all(base.join("parent/.git/modules/sub")).unwrap();
+        let parent_gitdir = base.join("parent/.git/modules/sub");
+        std::fs::create_dir_all(&parent_gitdir).unwrap();
+        std::fs::write(parent_gitdir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
         let sub = base.join("parent/sub");
         std::fs::create_dir_all(sub.join(".glyphtrail/ladybug")).unwrap();
         std::fs::write(sub.join(".glyphtrail/ladybug/data"), b"old").unwrap();
