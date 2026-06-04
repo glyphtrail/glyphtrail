@@ -401,13 +401,6 @@ fn get_i64(row: &[Value], idx: usize) -> i64 {
         _ => -1,
     }
 }
-fn get_f64(row: &[Value], idx: usize) -> f64 {
-    match row.get(idx) {
-        Some(Value::Double(x)) => *x,
-        Some(Value::Float(x)) => *x as f64,
-        _ => 0.0,
-    }
-}
 /// A `FLOAT[n]` array parameter value for the lbug vector extension (#338): the
 /// first field is the *child* type (`Float`); the array length is the vec length.
 fn float_array(v: &[f32]) -> Value {
@@ -570,16 +563,23 @@ impl LadybugStore {
     }
 
     /// (Re)build a `FLOAT[dim]` table + HNSW vector index named `table`/`<table>_idx`
-    /// from `embeddings` (all the same dimension), for fast cosine ANN. Drops any
-    /// prior table first. Requires the vector extension to be loaded
-    /// ([`Self::install_vector_ext`]); no-op for an empty input.
+    /// from `embeddings` (which must all share one non-zero dimension), for fast
+    /// cosine ANN. Drops any prior table first — so an empty input just clears the
+    /// (now-stale) index. Requires the vector extension to be loaded
+    /// ([`Self::install_vector_ext`]).
     pub fn rebuild_vector_index(&self, table: &str, embeddings: &[Embedding]) -> Result<()> {
         // Drop the old table (and its index); ignore "missing table" on first build.
         let _ = self.run(&format!("DROP TABLE {table}"), vec![]);
         let Some(first) = embeddings.first() else {
-            return Ok(());
+            return Ok(()); // empty: the index is now cleared, nothing to build
         };
         let dim = first.vector.len();
+        if dim == 0 {
+            anyhow::bail!("cannot build a vector index over zero-length embeddings");
+        }
+        if embeddings.iter().any(|e| e.vector.len() != dim) {
+            anyhow::bail!("cannot build a vector index over mixed-dimension embeddings");
+        }
         self.run(
             &format!(
                 "CREATE NODE TABLE {table}(node_id STRING, vec FLOAT[{dim}], PRIMARY KEY(node_id))"
@@ -613,7 +613,16 @@ impl LadybugStore {
         )?;
         Ok(rows
             .iter()
-            .map(|r| (NodeId(get_str(r, 0)), 1.0 - get_f64(r, 1) as f32))
+            .map(|r| {
+                // A missing/garbled distance becomes +∞ → similarity -∞, so a
+                // malformed row sorts last rather than masquerading as a match.
+                let distance = match r.get(1) {
+                    Some(Value::Double(x)) => *x as f32,
+                    Some(Value::Float(x)) => *x,
+                    _ => f32::INFINITY,
+                };
+                (NodeId(get_str(r, 0)), 1.0 - distance)
+            })
             .collect())
     }
 
@@ -1659,8 +1668,10 @@ mod tests {
     fn vector_index_knn_round_trips() {
         let dir = tmp_dir("vec-knn");
         let lb = LadybugStore::open(&dir).unwrap();
-        if !lb.install_vector_ext() {
-            eprintln!("skip: lbug vector extension unavailable");
+        // Load-only (no network INSTALL): skip unless the extension is already
+        // installed, so offline CI stays green and fast.
+        if !lb.load_vector_ext() {
+            eprintln!("skip: lbug vector extension not installed");
             std::fs::remove_dir_all(&dir).ok();
             return;
         }
