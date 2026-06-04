@@ -9,8 +9,9 @@ use std::path::Path;
 
 use glyphtrail_core::config::RepoPaths;
 use glyphtrail_core::{
-    AtlasConfig, Registry, TimelineQuery, Window, author_scope_label, default_registry_path,
-    filter_timeline, timeline_value,
+    AtlasConfig, Embedder, Embedding, HashingEmbedder, NodeId, Registry, RegistryEntry,
+    TimelineQuery, Window, author_scope_label, cosine, default_registry_path, filter_timeline,
+    timeline_value,
 };
 use glyphtrail_store::{GraphStore, LadybugStore};
 use serde_json::{Value, json};
@@ -23,6 +24,7 @@ pub fn definitions() -> Vec<Value> {
         status_tool(),
         timeline_tool(),
         topics_tool(),
+        similar_tool(),
         resolve_tool(),
     ]
 }
@@ -41,6 +43,7 @@ fn dispatch(atlas_dir: &Path, name: &str, args: &Value) -> Result<Value, String>
         "atlas_status" => status(atlas_dir),
         "atlas_timeline" => timeline(atlas_dir, args),
         "atlas_topics" => topics(atlas_dir),
+        "atlas_similar" => similar(atlas_dir, args),
         "atlas_resolve" => resolve(args),
         other => Err(format!("unknown atlas tool: {other}")),
     }
@@ -123,6 +126,106 @@ fn topics(atlas_dir: &Path) -> Result<Value, String> {
     ))
 }
 
+/// Rank repos similar to a repo name (or, for text, a free-text query) by cosine
+/// over the stored embeddings, gating restricted repos out of the result. The MCP
+/// server makes no network calls, so a free-text query only works over a locally
+/// (lexical) embedded index; repo↔repo similarity always works.
+fn similar(atlas_dir: &Path, args: &Value) -> Result<Value, String> {
+    let store = atlas_store(atlas_dir)?;
+    let query = req_str(args, "query")?;
+    let graph = args.get("graph").and_then(Value::as_bool).unwrap_or(false);
+    let limit = opt_usize(args, "limit").unwrap_or(10);
+    let include_restricted = args
+        .get("include_restricted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    // Each embedding space (text / graph) has its own key scheme; keep only rows in
+    // the active mode's registry-derived id set, so the two never mix.
+    let reg = registry();
+    let id_of = |name: &str| -> NodeId {
+        if graph {
+            NodeId::derive(&["repo_graph", name])
+        } else {
+            NodeId::derive(&["repo", name])
+        }
+    };
+    let by_id: std::collections::HashMap<String, &RegistryEntry> =
+        reg.repos.iter().map(|e| (id_of(&e.name).0, e)).collect();
+    let all = store.embeddings().map_err(|e| e.to_string())?;
+    let space: Vec<&Embedding> = all
+        .iter()
+        .filter(|e| by_id.contains_key(&e.node_id.0))
+        .collect();
+    if space.is_empty() {
+        let cmd = if graph { "graph-embed" } else { "embed" };
+        return Err(format!(
+            "no {cmd} embeddings yet; run `glyphtrail atlas {cmd}` first"
+        ));
+    }
+    let dim = space[0].vector.len();
+    if space.iter().any(|e| e.vector.len() != dim) {
+        return Err(
+            "stored embeddings have inconsistent dimensions; re-run the embed command".into(),
+        );
+    }
+
+    let self_id = id_of(query).0;
+    let (qvec, self_id) = if let Some(e) = space.iter().find(|e| e.node_id.0 == self_id) {
+        (e.vector.clone(), Some(self_id))
+    } else if graph {
+        return Err("graph similarity compares repositories; pass a registered repo name".into());
+    } else {
+        let model = store
+            .get_meta("embedding_model")
+            .map_err(|e| e.to_string())?
+            .unwrap_or_else(|| "lexical-hash-v1".to_string());
+        if model != "lexical-hash-v1" {
+            return Err(
+                "free-text similarity isn't available over an API-embedded index here (the MCP \
+                 server makes no network calls); pass a registered repo name instead"
+                    .into(),
+            );
+        }
+        (HashingEmbedder::new(dim).embed(query), None)
+    };
+
+    let mut hidden = 0usize;
+    let mut scored: Vec<(f32, String, &'static str)> = Vec::new();
+    for e in &space {
+        if Some(&e.node_id.0) == self_id.as_ref() {
+            continue;
+        }
+        let entry = by_id.get(&e.node_id.0);
+        let restricted = entry.map(|x| x.visibility.is_restricted()).unwrap_or(true);
+        if restricted && !include_restricted {
+            hidden += 1;
+            continue;
+        }
+        let name = entry.map(|x| x.name.clone()).unwrap_or_default();
+        let vis = entry
+            .map(|x| x.visibility.as_str())
+            .unwrap_or("unregistered");
+        scored.push((cosine(&qvec, &e.vector), name, vis));
+    }
+    scored.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.1.cmp(&b.1))
+    });
+    scored.truncate(limit);
+
+    Ok(json!({
+        "query": query,
+        "mode": if graph { "graph" } else { "text" },
+        "hidden_restricted": hidden,
+        "matches": scored
+            .iter()
+            .map(|(score, name, vis)| json!({ "repo": name, "score": score, "visibility": vis }))
+            .collect::<Vec<_>>(),
+    }))
+}
+
 /// Bridge an atlas hit (repo + file) into that repo's own graph: resolve the
 /// registry name to its active root, open its index, and return the file's
 /// symbols so the agent can chain straight into per-repo detail.
@@ -190,6 +293,26 @@ fn topics_tool() -> Value {
          topic name as the `topic` argument to `atlas_timeline`.",
         json!({}),
         &[],
+    )
+}
+
+fn similar_tool() -> Value {
+    atlas_tool(
+        "atlas_similar",
+        "Find repos similar to a given one (or, for text, a free-text query). \
+         Default mode compares commit-text embeddings; set graph=true to compare \
+         code-graph structure instead (repo name required). Returns repos ranked by \
+         similarity with a score and visibility; private/proprietary/unregistered \
+         repos are hidden unless include_restricted. Run `glyphtrail atlas embed` / \
+         `graph-embed` first. The server makes no network calls, so a free-text \
+         query needs a locally (lexical) embedded index; repo↔repo always works.",
+        json!({
+            "query": { "type": "string", "description": "A registered repo name, or free text (text mode only)." },
+            "graph": { "type": "boolean", "description": "Compare code-graph structure instead of commit text (default false)." },
+            "include_restricted": { "type": "boolean", "description": "Include private/proprietary/unregistered repos (default false)." },
+            "limit": { "type": "integer", "description": "How many matches to return (default 10)." }
+        }),
+        &["query"],
     )
 }
 
@@ -275,7 +398,7 @@ mod tests {
     #[test]
     fn definitions_are_read_only_atlas_tools() {
         let defs = definitions();
-        check!(defs.len() == 4);
+        check!(defs.len() == 5);
         for d in &defs {
             let name = d["name"].as_str().unwrap();
             check!(name.starts_with("atlas_"));
@@ -292,6 +415,20 @@ mod tests {
         check!(r["isError"] == json!(true));
         // Unknown tool name.
         let r = call(&missing, "nope", &json!({}));
+        check!(r["isError"] == json!(true));
+    }
+
+    #[test]
+    fn atlas_similar_is_advertised_and_fails_gracefully() {
+        // Advertised with a required `query`.
+        let def = definitions()
+            .into_iter()
+            .find(|d| d["name"] == json!("atlas_similar"))
+            .expect("atlas_similar tool");
+        check!(def["inputSchema"]["required"] == json!(["query"]));
+        // On a disabled atlas it errors (no panic), like the other tools.
+        let missing = std::env::temp_dir().join("glyphtrail-atlas-mcp-absent");
+        let r = call(&missing, "atlas_similar", &json!({ "query": "x" }));
         check!(r["isError"] == json!(true));
     }
 }
