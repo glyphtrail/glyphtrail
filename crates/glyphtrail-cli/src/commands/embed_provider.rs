@@ -134,9 +134,13 @@ pub fn embed_one(cfg: &EmbedConfig, text: &str) -> Result<Vec<f32>> {
         .unwrap_or_default())
 }
 
-/// POST a batch to an OpenAI-compatible `/v1/embeddings` endpoint. The API key is
-/// `OPENAI_API_KEY`; it's optional for a local endpoint (Ollama needs none) but
-/// required for a remote one.
+/// Max inputs per OpenAI-compatible embeddings request, so a large corpus (e.g.
+/// every commit) is sent in chunks rather than one oversized request.
+const OPENAI_BATCH: usize = 256;
+
+/// Embed `docs` via an OpenAI-compatible endpoint, chunked into [`OPENAI_BATCH`]-
+/// sized requests. The key is `OPENAI_API_KEY` (optional for a local endpoint,
+/// required for a remote one).
 fn openai_embed(cfg: &EmbedConfig, docs: &[String]) -> Result<Vec<Vec<f32>>> {
     if docs.is_empty() {
         return Ok(Vec::new());
@@ -148,9 +152,23 @@ fn openai_embed(cfg: &EmbedConfig, docs: &[String]) -> Result<Vec<Vec<f32>>> {
     if key.is_none() && !is_local_url(&url) {
         bail!("set OPENAI_API_KEY to use a remote embeddings provider (or use --provider local)");
     }
+    let mut out = Vec::with_capacity(docs.len());
+    for chunk in docs.chunks(OPENAI_BATCH) {
+        out.extend(openai_embed_batch(cfg, &url, key.as_deref(), chunk)?);
+    }
+    Ok(out)
+}
+
+/// POST a single batch (≤ [`OPENAI_BATCH`]) to the endpoint.
+fn openai_embed_batch(
+    cfg: &EmbedConfig,
+    url: &str,
+    key: Option<&str>,
+    docs: &[String],
+) -> Result<Vec<Vec<f32>>> {
     let body = json!({ "model": cfg.openai_model(), "input": docs });
-    let mut req = ureq::post(&url).header("content-type", "application/json");
-    if let Some(k) = &key {
+    let mut req = ureq::post(url).header("content-type", "application/json");
+    if let Some(k) = key {
         req = req.header("Authorization", format!("Bearer {k}"));
     }
     let resp: Value = req.send_json(body)?.into_body().read_json()?;
@@ -279,6 +297,22 @@ mod tests {
         );
         check!(api.provider == EmbedProvider::Openai);
         check!(api.model.as_deref() == Some("text-embedding-3-small"));
+    }
+
+    #[test]
+    fn local_embed_docs_returns_one_vector_per_doc() {
+        // The local path must scale to a large corpus (every commit) and preserve
+        // order/count — the contract `embed-commits` relies on.
+        let cfg = EmbedConfig {
+            provider: EmbedProvider::Local,
+            model: None,
+            base_url: None,
+            dim: 64,
+        };
+        let docs: Vec<String> = (0..600).map(|i| format!("fix thing number {i}")).collect();
+        let vecs = embed_docs(&cfg, &docs).unwrap();
+        check!(vecs.len() == 600);
+        check!(vecs.iter().all(|v| v.len() == 64));
     }
 
     #[test]
