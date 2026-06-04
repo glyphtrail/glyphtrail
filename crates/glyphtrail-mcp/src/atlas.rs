@@ -9,9 +9,8 @@ use std::path::Path;
 
 use glyphtrail_core::config::RepoPaths;
 use glyphtrail_core::{
-    AtlasConfig, Embedder, Embedding, HashingEmbedder, NodeId, Registry, RegistryEntry,
-    TimelineQuery, Window, author_scope_label, cosine, default_registry_path, filter_timeline,
-    timeline_value,
+    AtlasConfig, Embedder, HashingEmbedder, NodeId, Registry, RegistryEntry, TimelineQuery, Window,
+    author_scope_label, cosine, default_registry_path, filter_timeline, timeline_value, vec_table,
 };
 use glyphtrail_store::{GraphStore, LadybugStore};
 use serde_json::{Value, json};
@@ -69,7 +68,7 @@ fn status(atlas_dir: &Path) -> Result<Value, String> {
     let store = atlas_store(atlas_dir)?;
     let stats = store.stats().map_err(|e| e.to_string())?;
     let commits = store.commit_count().map_err(|e| e.to_string())?;
-    let embeds = store.embedding_counts().map_err(|e| e.to_string())?;
+    let embeds = store.embedding_index().map_err(|e| e.to_string())?;
     let cfg = AtlasConfig::load(atlas_dir).map_err(|e| e.to_string())?;
     Ok(json!({
         "enabled": true,
@@ -78,7 +77,9 @@ fn status(atlas_dir: &Path) -> Result<Value, String> {
         "commits": commits,
         "embeddings": embeds
             .iter()
-            .map(|(model, count)| json!({ "model": model, "count": count }))
+            .map(|(space, model, count, dim)| {
+                json!({ "space": space, "model": model, "count": count, "dim": dim })
+            })
             .collect::<Vec<_>>(),
         "window": cfg.window.label(),
     }))
@@ -145,9 +146,11 @@ fn similar(atlas_dir: &Path, args: &Value) -> Result<Value, String> {
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    // Each embedding space (text / graph) has its own key scheme; keep only rows in
-    // the active mode's registry-derived id set, so the two never mix.
+    // Pick the (space, model) namespace: graph vs text, model from `model` arg else
+    // the active/default one. Read just that namespace — models never mix.
     let reg = registry();
+    let space = if graph { "graph" } else { "text" };
+    let model = resolve_model(&store, space, args.get("model").and_then(Value::as_str))?;
     let id_of = |name: &str| -> NodeId {
         if graph {
             NodeId::derive(&["repo_graph", name])
@@ -157,55 +160,39 @@ fn similar(atlas_dir: &Path, args: &Value) -> Result<Value, String> {
     };
     let by_id: std::collections::HashMap<String, &RegistryEntry> =
         reg.repos.iter().map(|e| (id_of(&e.name).0, e)).collect();
-    let all = store.embeddings().map_err(|e| e.to_string())?;
-    let space: Vec<&Embedding> = all
-        .iter()
-        .filter(|e| by_id.contains_key(&e.node_id.0))
-        .collect();
-    if space.is_empty() {
-        let cmd = if graph { "graph-embed" } else { "embed" };
-        return Err(format!(
-            "no {cmd} embeddings yet; run `glyphtrail atlas {cmd}` first"
-        ));
+    let space_vecs = store
+        .embeddings_for(space, &model)
+        .map_err(|e| e.to_string())?;
+    if space_vecs.is_empty() {
+        return Err(format!("no {space} embeddings for model '{model}'"));
     }
-    let dim = space[0].vector.len();
-    if space.iter().any(|e| e.vector.len() != dim) {
-        return Err(
-            "stored embeddings have inconsistent dimensions; re-run the embed command".into(),
-        );
-    }
+    let dim = space_vecs[0].vector.len();
 
     let self_id = id_of(query).0;
-    let (qvec, self_id) = if let Some(e) = space.iter().find(|e| e.node_id.0 == self_id) {
+    let (qvec, self_id) = if let Some(e) = space_vecs.iter().find(|e| e.node_id.0 == self_id) {
         (e.vector.clone(), Some(self_id))
     } else if graph {
         return Err("graph similarity compares repositories; pass a registered repo name".into());
-    } else {
-        let model = store
-            .get_meta("embedding_model")
-            .map_err(|e| e.to_string())?
-            .unwrap_or_else(|| "lexical-hash-v1".to_string());
-        if model != "lexical-hash-v1" {
-            return Err(
-                "free-text similarity isn't available over an API-embedded index here (the MCP \
-                 server makes no network calls); pass a registered repo name instead"
-                    .into(),
-            );
-        }
+    } else if model == "lexical-hash-v1" {
         (HashingEmbedder::new(dim).embed(query), None)
+    } else {
+        return Err(
+            "free-text similarity isn't available over an API-embedded index here (the MCP \
+             server makes no network calls); pass a registered repo name instead"
+                .into(),
+        );
     };
 
-    // Prefer the HNSW index (built by `atlas embed`/`graph-embed`); fall back to an
-    // exact in-Rust cosine scan. The index table holds only this space's rows.
-    let table = if graph { "GraphVec" } else { "TextVec" };
+    // Prefer this (space,model)'s HNSW index; fall back to an exact in-Rust scan.
+    let table = vec_table(space, &model);
     let candidates: Vec<(String, f32)> = store
         .load_vector_ext()
-        .then(|| store.vector_knn(table, &qvec, space.len()).ok())
+        .then(|| store.vector_knn(&table, &qvec, space_vecs.len()).ok())
         .flatten()
         .filter(|h| !h.is_empty())
         .map(|h| h.into_iter().map(|(id, sim)| (id.0, sim)).collect())
         .unwrap_or_else(|| {
-            space
+            space_vecs
                 .iter()
                 .map(|e| (e.node_id.0.clone(), cosine(&qvec, &e.vector)))
                 .collect()
@@ -217,17 +204,16 @@ fn similar(atlas_dir: &Path, args: &Value) -> Result<Value, String> {
         if Some(id) == self_id.as_ref() {
             continue;
         }
-        let entry = by_id.get(id);
-        let restricted = entry.map(|x| x.visibility.is_restricted()).unwrap_or(true);
-        if restricted && !include_restricted {
+        // Only return repos the registry can name — the MCP server can't recover a
+        // name from the one-way node id, so a deregistered/stray row is skipped.
+        let Some(entry) = by_id.get(id) else {
+            continue;
+        };
+        if entry.visibility.is_restricted() && !include_restricted {
             hidden += 1;
             continue;
         }
-        let name = entry.map(|x| x.name.clone()).unwrap_or_default();
-        let vis = entry
-            .map(|x| x.visibility.as_str())
-            .unwrap_or("unregistered");
-        scored.push((*sim, name, vis));
+        scored.push((*sim, entry.name.clone(), entry.visibility.as_str()));
     }
     scored.sort_by(|a, b| {
         b.0.partial_cmp(&a.0)
@@ -238,13 +224,59 @@ fn similar(atlas_dir: &Path, args: &Value) -> Result<Value, String> {
 
     Ok(json!({
         "query": query,
-        "mode": if graph { "graph" } else { "text" },
+        "mode": space,
+        "model": model,
         "hidden_restricted": hidden,
         "matches": scored
             .iter()
             .map(|(score, name, vis)| json!({ "repo": name, "score": score, "visibility": vis }))
             .collect::<Vec<_>>(),
     }))
+}
+
+/// Resolve which embedding model to search in `space`: the explicit one, else the
+/// active (last-embedded) one, else the sole stored model — erroring with choices.
+fn resolve_model(
+    store: &LadybugStore,
+    space: &str,
+    explicit: Option<&str>,
+) -> Result<String, String> {
+    let models: Vec<String> = store
+        .embedding_index()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|(sp, ..)| sp == space)
+        .map(|(_, m, ..)| m)
+        .collect();
+    if models.is_empty() {
+        return Err(format!(
+            "no {space} embeddings yet; run the matching embed command"
+        ));
+    }
+    if let Some(m) = explicit {
+        return if models.iter().any(|x| x == m) {
+            Ok(m.to_string())
+        } else {
+            Err(format!(
+                "no {space} embeddings for model '{m}'; available: {}",
+                models.join(", ")
+            ))
+        };
+    }
+    if let Some(active) = store
+        .get_meta(&format!("active_model_{space}"))
+        .map_err(|e| e.to_string())?
+        && models.iter().any(|x| x == &active)
+    {
+        return Ok(active);
+    }
+    if models.len() == 1 {
+        return Ok(models[0].clone());
+    }
+    Err(format!(
+        "multiple {space} embedding models stored; choose one with `model`: {}",
+        models.join(", ")
+    ))
 }
 
 /// Bridge an atlas hit (repo + file) into that repo's own graph: resolve the
@@ -330,6 +362,7 @@ fn similar_tool() -> Value {
         json!({
             "query": { "type": "string", "description": "A registered repo name, or free text (text mode only)." },
             "graph": { "type": "boolean", "description": "Compare code-graph structure instead of commit text (default false)." },
+            "model": { "type": "string", "description": "Embedding model to search (default: the most-recently-embedded one for this space; see atlas_status)." },
             "include_restricted": { "type": "boolean", "description": "Include private/proprietary/unregistered repos (default false)." },
             "limit": { "type": "integer", "description": "How many matches to return (default 10)." }
         }),

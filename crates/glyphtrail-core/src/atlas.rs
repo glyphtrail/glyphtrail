@@ -179,6 +179,42 @@ const MAX_TOPICS_PER_COMMIT: usize = 12;
 /// (significant keywords), its touched directories (areas of the tree), and the
 /// languages of its touched files. Lower-cased, de-duplicated, stop-worded, and
 /// capped. No network, no LLM — enrichment is a later option.
+/// A bounded, order-stable digest of a commit's changed file paths — its top
+/// directory segments and file extensions by frequency — so a commit with a sparse
+/// message ("Initial commit" that adds 500 images) still embeds with meaning,
+/// without the path list blowing the embedding model's token budget (#338). Capped
+/// at 12 directories + 8 extensions, regardless of how many files changed.
+pub fn paths_digest(paths: &[String]) -> String {
+    use std::collections::HashMap;
+    let mut dirs: HashMap<String, usize> = HashMap::new();
+    let mut exts: HashMap<String, usize> = HashMap::new();
+    for p in paths {
+        let segs: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+        if let Some((file, dir_segs)) = segs.split_last() {
+            for d in dir_segs {
+                *dirs.entry(d.to_ascii_lowercase()).or_default() += 1;
+            }
+            // Extension: after the last dot, short, and not the whole name (so a
+            // dotfile like `.gitignore` doesn't count `gitignore` as an extension).
+            if let Some((stem, ext)) = file.rsplit_once('.')
+                && !stem.is_empty()
+                && !ext.is_empty()
+                && ext.len() <= 8
+            {
+                *exts.entry(ext.to_ascii_lowercase()).or_default() += 1;
+            }
+        }
+    }
+    let top = |m: HashMap<String, usize>, k: usize| -> Vec<String> {
+        let mut v: Vec<(String, usize)> = m.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        v.into_iter().take(k).map(|(name, _)| name).collect()
+    };
+    let mut tokens = top(dirs, 12);
+    tokens.extend(top(exts, 8));
+    tokens.join(" ")
+}
+
 pub fn derive_topics(subject: &str, files: &[String]) -> Vec<String> {
     use std::collections::BTreeSet;
     let mut topics: BTreeSet<String> = BTreeSet::new();
@@ -581,6 +617,31 @@ impl AtlasConfig {
 mod tests {
     use super::*;
     use assert2::check;
+
+    #[test]
+    fn paths_digest_is_bounded_and_meaningful() {
+        // A sparse-message commit adding hundreds of images: the digest captures the
+        // directory + image extension regardless of file count, and stays tiny.
+        let mut paths: Vec<String> = (0..500).map(|i| format!("data/IMG_{i:04}.jpg")).collect();
+        paths.push("README.md".to_string());
+        let d = paths_digest(&paths);
+        check!(d.split(' ').count() <= 20); // bounded
+        check!(d.contains("data")); // the dominant directory
+        check!(d.contains("jpg")); // the dominant extension
+        // Frequency ordering: the 500-file extension comes before the lone `md`.
+        let jpg = d.find("jpg").unwrap();
+        let md = d.find("md").unwrap();
+        check!(jpg < md);
+    }
+
+    #[test]
+    fn paths_digest_handles_dotfiles_and_empty() {
+        check!(paths_digest(&[]).is_empty());
+        // `.gitignore` has no real extension (empty stem), so it adds no ext token.
+        let d = paths_digest(&[".gitignore".to_string(), "src/main.rs".to_string()]);
+        check!(d.contains("src") && d.contains("rs"));
+        check!(!d.split(' ').any(|t| t == "gitignore"));
+    }
 
     #[test]
     fn config_load_reads_window_and_defaults_to_none() {
