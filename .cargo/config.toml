@@ -1,0 +1,8 @@
+# Export the binary's dynamic symbol table on Linux so the statically-linked lbug
+# (LadybugDB) symbols are resolvable by its dlopen-loaded extensions — notably the
+# `vector` extension's HNSW index, which links against `lbug::*` symbols at load
+# time. Without this, `LOAD EXTENSION VECTOR` fails with "Failed to load library"
+# even when the extension is present (#338 / #473). Linux-only: macOS/Windows use
+# different flags and lbug's prebuilt vector extension targets Linux.
+[target.'cfg(target_os = "linux")']
+rustflags = ["-C", "link-arg=-Wl,--export-dynamic"]

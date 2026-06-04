@@ -401,6 +401,14 @@ fn get_i64(row: &[Value], idx: usize) -> i64 {
         _ => -1,
     }
 }
+/// A `FLOAT[n]` array parameter value for the lbug vector extension (#338): the
+/// first field is the *child* type (`Float`); the array length is the vec length.
+fn float_array(v: &[f32]) -> Value {
+    Value::Array(
+        LogicalType::Float,
+        v.iter().map(|&x| Value::Float(x)).collect(),
+    )
+}
 fn opt(s: String) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
@@ -532,6 +540,90 @@ impl LadybugStore {
     pub fn cypher(&self, query: &str) -> Result<String> {
         let conn = self.conn()?;
         Ok(format!("{}", conn.query(query)?))
+    }
+
+    /// Load the lbug `vector` extension (HNSW ANN) if it's already installed, so
+    /// `vector_knn` can run. Cheap and offline; returns whether it loaded. A loaded
+    /// extension persists for the open `Database`, so one call per process suffices
+    /// (#338, #473).
+    pub fn load_vector_ext(&self) -> bool {
+        self.run("LOAD EXTENSION VECTOR", vec![]).is_ok()
+    }
+
+    /// Ensure the `vector` extension is available, installing it first if needed.
+    /// `INSTALL` performs a one-time download of the platform extension binary
+    /// (network) — used only on the write path (`atlas embed`/`graph-embed`), where
+    /// a documented, opt-in network fetch is acceptable. Returns whether it's usable.
+    pub fn install_vector_ext(&self) -> bool {
+        if self.load_vector_ext() {
+            return true;
+        }
+        let _ = self.run("INSTALL VECTOR", vec![]);
+        self.load_vector_ext()
+    }
+
+    /// (Re)build a `FLOAT[dim]` table + HNSW vector index named `table`/`<table>_idx`
+    /// from `embeddings` (which must all share one non-zero dimension), for fast
+    /// cosine ANN. Drops any prior table first — so an empty input just clears the
+    /// (now-stale) index. Requires the vector extension to be loaded
+    /// ([`Self::install_vector_ext`]).
+    pub fn rebuild_vector_index(&self, table: &str, embeddings: &[Embedding]) -> Result<()> {
+        // Drop the old table (and its index); ignore "missing table" on first build.
+        let _ = self.run(&format!("DROP TABLE {table}"), vec![]);
+        let Some(first) = embeddings.first() else {
+            return Ok(()); // empty: the index is now cleared, nothing to build
+        };
+        let dim = first.vector.len();
+        if dim == 0 {
+            anyhow::bail!("cannot build a vector index over zero-length embeddings");
+        }
+        if embeddings.iter().any(|e| e.vector.len() != dim) {
+            anyhow::bail!("cannot build a vector index over mixed-dimension embeddings");
+        }
+        self.run(
+            &format!(
+                "CREATE NODE TABLE {table}(node_id STRING, vec FLOAT[{dim}], PRIMARY KEY(node_id))"
+            ),
+            vec![],
+        )?;
+        for e in embeddings {
+            self.run(
+                &format!("CREATE (v:{table} {{node_id:$id, vec:$e}})"),
+                vec![("id", s(&e.node_id.0)), ("e", float_array(&e.vector))],
+            )?;
+        }
+        self.run(
+            &format!("CALL CREATE_VECTOR_INDEX('{table}','{table}_idx','vec', metric := 'cosine')"),
+            vec![],
+        )?;
+        Ok(())
+    }
+
+    /// Cosine-nearest `k` neighbours of `query` via the HNSW index on `table`, as
+    /// `(node_id, similarity)` where similarity is `1 - cosine_distance` (higher is
+    /// nearer), ordered nearest-first. Requires the index to exist and the extension
+    /// to be loaded.
+    pub fn vector_knn(&self, table: &str, query: &[f32], k: usize) -> Result<Vec<(NodeId, f32)>> {
+        let rows = self.run(
+            &format!(
+                "CALL QUERY_VECTOR_INDEX('{table}','{table}_idx',$q,{k}) \
+                 RETURN node.node_id AS id, distance ORDER BY distance"
+            ),
+            vec![("q", float_array(query))],
+        )?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                // A missing/garbled distance becomes +∞ → similarity -∞, so a
+                // malformed row sorts last rather than masquerading as a match.
+                let distance = match r.get(1) {
+                    Some(Value::Double(x)) => *x as f32,
+                    Some(Value::Float(x)) => *x,
+                    _ => f32::INFINITY,
+                };
+                (NodeId(get_str(r, 0)), 1.0 - distance)
+            })
+            .collect())
     }
 
     fn edge_step(
@@ -1566,6 +1658,43 @@ mod tests {
         let neighbors = lb.neighbors("a", None, true).unwrap();
         check!(neighbors.len() == 1);
         check!(neighbors[0].0.id == NodeId("b".into()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // #338/#473: FLOAT[] storage + HNSW vector index round-trips to a cosine k-NN.
+    // Skips when the lbug vector extension isn't installable (offline CI), so it
+    // only asserts where the extension is available.
+    #[test]
+    fn vector_index_knn_round_trips() {
+        let dir = tmp_dir("vec-knn");
+        let lb = LadybugStore::open(&dir).unwrap();
+        // Load-only (no network INSTALL): skip unless the extension is already
+        // installed, so offline CI stays green and fast.
+        if !lb.load_vector_ext() {
+            eprintln!("skip: lbug vector extension not installed");
+            std::fs::remove_dir_all(&dir).ok();
+            return;
+        }
+        let embs = vec![
+            Embedding {
+                node_id: NodeId("a".into()),
+                vector: vec![1.0, 0.0, 0.0],
+            },
+            Embedding {
+                node_id: NodeId("b".into()),
+                vector: vec![0.0, 1.0, 0.0],
+            },
+            Embedding {
+                node_id: NodeId("c".into()),
+                vector: vec![0.9, 0.1, 0.0],
+            },
+        ];
+        lb.rebuild_vector_index("TVec", &embs).unwrap();
+        let hits = lb.vector_knn("TVec", &[1.0, 0.05, 0.0], 2).unwrap();
+        check!(hits.len() == 2);
+        check!(hits[0].0 == NodeId("a".into())); // nearest to the query
+        check!(hits[0].1 > hits[1].1); // similarity descending (1 - cosine distance)
+        check!(hits[0].1 > 0.99); // a ≈ the query direction
         std::fs::remove_dir_all(&dir).ok();
     }
 
