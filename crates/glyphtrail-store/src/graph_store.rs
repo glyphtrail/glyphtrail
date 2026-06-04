@@ -61,29 +61,18 @@ pub trait GraphStore: Adjacency {
     /// (unix seconds, inclusive; `None` = unbounded), so narrowing the window
     /// re-marks rows out of bounds rather than deleting them (#331).
     fn remark_commit_bounds(&mut self, since: Option<i64>, until: Option<i64>) -> Result<()>;
-    /// Upsert atlas embedding rows keyed by node id, tagged with the producing
-    /// `model` id (#338). The default is a no-op for backends without the side
-    /// table; the atlas-bearing store overrides it.
-    fn set_embeddings(&mut self, embeddings: &[Embedding], model: &str) -> Result<()> {
-        let _ = (embeddings, model);
+    /// Upsert atlas embeddings for one `(space, model)` namespace (#338).
+    /// Embeddings are namespaced by what was embedded + how (`space`: text/graph/
+    /// commit) and the producing model id, so several models coexist without mixing
+    /// in search and each is independently re-embeddable/exportable. Default no-op.
+    fn set_embeddings(&mut self, space: &str, model: &str, embeddings: &[Embedding]) -> Result<()> {
+        let _ = (space, model, embeddings);
         Ok(())
     }
-    /// Remove every stored embedding (#338), so a re-embed starts clean and a repo
-    /// that left the active date window doesn't keep a stale vector. Default no-op.
-    fn clear_embeddings(&mut self) -> Result<()> {
-        Ok(())
-    }
-    /// Remove only the embeddings produced by `model` (#338), so a graph re-embed
-    /// replaces just the graph rows and leaves the text rows intact. Default no-op.
-    fn clear_embeddings_by_model(&mut self, model: &str) -> Result<()> {
-        let _ = model;
-        Ok(())
-    }
-    /// Remove every embedding *except* those produced by `model` (#338), so a text
-    /// re-embed replaces the text rows and leaves the graph rows intact. Default
-    /// no-op.
-    fn clear_embeddings_except_model(&mut self, model: &str) -> Result<()> {
-        let _ = model;
+    /// Remove the embeddings of one `(space, model)` namespace, so re-embedding it
+    /// starts clean without touching other namespaces (#338). Default no-op.
+    fn clear_embeddings_for(&mut self, space: &str, model: &str) -> Result<()> {
+        let _ = (space, model);
         Ok(())
     }
     fn insert_pending(&mut self, links: &[PendingLink]) -> Result<()>;
@@ -105,14 +94,15 @@ pub trait GraphStore: Adjacency {
     fn commits_in_range(&self, since: Option<i64>, until: Option<i64>) -> Result<Vec<CommitMeta>>;
     /// Total atlas commits in the side-table (cheap `COUNT`, no materialization).
     fn commit_count(&self) -> Result<usize>;
-    /// All stored atlas embeddings (#338). The default is empty for backends
-    /// without the side table; the atlas-bearing store overrides it.
-    fn embeddings(&self) -> Result<Vec<Embedding>> {
+    /// Stored embeddings for one `(space, model)` namespace (#338). Default empty.
+    fn embeddings_for(&self, space: &str, model: &str) -> Result<Vec<Embedding>> {
+        let _ = (space, model);
         Ok(Vec::new())
     }
-    /// `(model, count)` for stored embeddings, a cheap `COUNT` for `atlas status`
-    /// (#338). Default empty.
-    fn embedding_counts(&self) -> Result<Vec<(String, usize)>> {
+    /// `(space, model, count, dim)` for every stored embedding namespace — for
+    /// `atlas status` and resolving which model a query should search (#338).
+    /// Default empty.
+    fn embedding_index(&self) -> Result<Vec<(String, String, usize, usize)>> {
         Ok(Vec::new())
     }
     /// In-bounds atlas commits in `[since, until]` (unix seconds, inclusive;

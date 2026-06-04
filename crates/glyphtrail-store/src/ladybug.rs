@@ -46,11 +46,14 @@ const SCHEMA: &[&str] = &[
     "CREATE NODE TABLE IF NOT EXISTS Commit(node_id STRING, hash STRING, author_email STRING, committed_at INT64, subject STRING, in_bounds INT64, PRIMARY KEY(node_id))",
     "CREATE NODE TABLE IF NOT EXISTS Pending(pk STRING, anchor STRING, name STRING, kind STRING, name_is_src INT64, PRIMARY KEY(pk))",
     "CREATE NODE TABLE IF NOT EXISTS Import(pk STRING, importer STRING, raw STRING, language STRING, PRIMARY KEY(pk))",
-    // Atlas (#338): a dense embedding vector keyed by node id (a `Repo` today),
-    // mirroring the `Commit` side-table. `vec` is the comma-joined floats; `model`
-    // is the producing embedder's id, so a re-embed under a different model is
-    // detectable.
-    "CREATE NODE TABLE IF NOT EXISTS Embedding(node_id STRING, model STRING, dim INT64, vec STRING, PRIMARY KEY(node_id))",
+    // Atlas (#338): dense embedding vectors, namespaced by `(space, model)` so
+    // several models (e.g. a lexical default and a neural upgrade) coexist without
+    // mixing in search, and each can be exported independently. `space` is what was
+    // embedded + how (`text`/`graph`/`commit`); `model` is the producing embedder
+    // id. kuzu node tables take one primary key, so `pk = model \x1f node_id`.
+    // `vec` is the comma-joined floats. (A pre-namespacing `Embedding` table, if
+    // present, is dropped on open — those embeddings are regenerable.)
+    "CREATE NODE TABLE IF NOT EXISTS EmbeddingV2(pk STRING, node_id STRING, model STRING, space STRING, dim INT64, vec STRING, PRIMARY KEY(pk))",
     "CREATE NODE TABLE IF NOT EXISTS Meta(key STRING, value STRING, PRIMARY KEY(key))",
 ];
 
@@ -79,6 +82,9 @@ impl LadybugStore {
             for ddl in SCHEMA {
                 conn.query(ddl)?;
             }
+            // Drop the pre-namespacing embedding table if an older atlas left one;
+            // those embeddings are regenerable via `atlas embed*` (#338). Best-effort.
+            let _ = conn.query("DROP TABLE Embedding");
         }
         let mut store = Self { db };
         store.migrate_schema()?;
@@ -131,7 +137,8 @@ impl LadybugStore {
                 "File",
                 "ApiOp",
                 "Commit",
-                "Embedding",
+                "Embedding", // pre-namespacing table, dropped if present
+                "EmbeddingV2",
                 "Pending",
                 "Import",
                 "Meta",
@@ -842,14 +849,18 @@ impl GraphStore for LadybugStore {
         )
     }
 
-    fn set_embeddings(&mut self, embeddings: &[Embedding], model: &str) -> Result<()> {
+    fn set_embeddings(&mut self, space: &str, model: &str, embeddings: &[Embedding]) -> Result<()> {
         let conn = self.conn()?;
+        // PK is `model \x1f node_id`, so the same node embedded under several models
+        // coexists; `space`/`model` columns let queries filter to one namespace.
         let rows: Vec<Vec<(&str, Value)>> = embeddings
             .iter()
             .map(|e| {
                 vec![
+                    ("pk", s(&format!("{model}\u{1f}{}", e.node_id.0))),
                     ("id", s(&e.node_id.0)),
                     ("m", s(model)),
+                    ("sp", s(space)),
                     ("d", Value::Int64(e.vector.len() as i64)),
                     ("v", s(&encode_vec(&e.vector))),
                 ]
@@ -857,29 +868,16 @@ impl GraphStore for LadybugStore {
             .collect();
         self.exec_unwind(
             &conn,
-            "UNWIND $rows AS r MERGE (e:Embedding {node_id:r.id}) \
-             SET e.model=r.m, e.dim=r.d, e.vec=r.v",
+            "UNWIND $rows AS r MERGE (e:EmbeddingV2 {pk:r.pk}) \
+             SET e.node_id=r.id, e.model=r.m, e.space=r.sp, e.dim=r.d, e.vec=r.v",
             rows,
         )
     }
 
-    fn clear_embeddings(&mut self) -> Result<()> {
-        self.run("MATCH (e:Embedding) DELETE e", vec![])?;
-        Ok(())
-    }
-
-    fn clear_embeddings_by_model(&mut self, model: &str) -> Result<()> {
+    fn clear_embeddings_for(&mut self, space: &str, model: &str) -> Result<()> {
         self.run(
-            "MATCH (e:Embedding) WHERE e.model = $m DELETE e",
-            vec![("m", s(model))],
-        )?;
-        Ok(())
-    }
-
-    fn clear_embeddings_except_model(&mut self, model: &str) -> Result<()> {
-        self.run(
-            "MATCH (e:Embedding) WHERE e.model <> $m DELETE e",
-            vec![("m", s(model))],
+            "MATCH (e:EmbeddingV2) WHERE e.space = $sp AND e.model = $m DELETE e",
+            vec![("sp", s(space)), ("m", s(model))],
         )?;
         Ok(())
     }
@@ -1074,11 +1072,12 @@ impl GraphStore for LadybugStore {
             .unwrap_or(0))
     }
 
-    fn embeddings(&self) -> Result<Vec<Embedding>> {
+    fn embeddings_for(&self, space: &str, model: &str) -> Result<Vec<Embedding>> {
         Ok(self
             .run(
-                "MATCH (e:Embedding) RETURN e.node_id, e.vec ORDER BY e.node_id",
-                vec![],
+                "MATCH (e:EmbeddingV2) WHERE e.space = $sp AND e.model = $m \
+                 RETURN e.node_id, e.vec ORDER BY e.node_id",
+                vec![("sp", s(space)), ("m", s(model))],
             )?
             .iter()
             .map(|r| Embedding {
@@ -1088,14 +1087,22 @@ impl GraphStore for LadybugStore {
             .collect())
     }
 
-    fn embedding_counts(&self) -> Result<Vec<(String, usize)>> {
+    fn embedding_index(&self) -> Result<Vec<(String, String, usize, usize)>> {
         Ok(self
             .run(
-                "MATCH (e:Embedding) RETURN e.model, COUNT(*) ORDER BY e.model",
+                "MATCH (e:EmbeddingV2) \
+                 RETURN e.space, e.model, COUNT(*), MAX(e.dim) ORDER BY e.space, e.model",
                 vec![],
             )?
             .iter()
-            .map(|r| (get_str(r, 0), get_i64(r, 1).max(0) as usize))
+            .map(|r| {
+                (
+                    get_str(r, 0),
+                    get_str(r, 1),
+                    get_i64(r, 2).max(0) as usize,
+                    get_i64(r, 3).max(0) as usize,
+                )
+            })
             .collect())
     }
 
@@ -1848,8 +1855,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // Atlas (#338): embedding vectors round-trip through the side table, keyed by
-    // node id, and an upsert replaces the prior vector.
+    // Atlas (#338): embeddings round-trip through the side table per (space, model)
+    // namespace; an upsert replaces the prior vector for the same node+model.
     #[test]
     fn atlas_embedding_side_table_roundtrips() {
         let dir = tmp_dir("atlas-embed");
@@ -1858,50 +1865,72 @@ mod tests {
             node_id: NodeId("repo:demo".into()),
             vector: vec![0.5, -0.25, 0.0, 1.0],
         };
-        lb.set_embeddings(std::slice::from_ref(&e), "lexical-hash-v1")
+        lb.set_embeddings("text", "lexical-hash-v1", std::slice::from_ref(&e))
             .unwrap();
-        check!(lb.embeddings().unwrap() == vec![e.clone()]);
-        // Upsert by node id replaces, doesn't duplicate.
+        check!(lb.embeddings_for("text", "lexical-hash-v1").unwrap() == vec![e.clone()]);
+        // Upsert by (node, model) replaces, doesn't duplicate.
         let e2 = Embedding {
             node_id: NodeId("repo:demo".into()),
             vector: vec![1.0, 2.0],
         };
-        lb.set_embeddings(std::slice::from_ref(&e2), "lexical-hash-v1")
+        lb.set_embeddings("text", "lexical-hash-v1", std::slice::from_ref(&e2))
             .unwrap();
-        check!(lb.embeddings().unwrap() == vec![e2]);
-        // clear_embeddings drops every row, so a re-embed starts clean.
-        lb.clear_embeddings().unwrap();
-        check!(lb.embeddings().unwrap().is_empty());
+        check!(lb.embeddings_for("text", "lexical-hash-v1").unwrap() == vec![e2]);
+        // clear_embeddings_for drops just that namespace.
+        lb.clear_embeddings_for("text", "lexical-hash-v1").unwrap();
+        check!(
+            lb.embeddings_for("text", "lexical-hash-v1")
+                .unwrap()
+                .is_empty()
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // Atlas (#338): the text and graph embedding spaces share the side table; the
-    // model-scoped clears delete one without touching the other.
+    // Atlas (#338): several (space, model) namespaces coexist without mixing — the
+    // same repo embedded under two models is two rows; clearing one leaves the rest.
     #[test]
-    fn model_scoped_embedding_clears() {
-        let dir = tmp_dir("atlas-embed-scoped");
+    fn embedding_namespaces_coexist_without_mixing() {
+        let dir = tmp_dir("atlas-embed-ns");
         let mut lb = LadybugStore::open(&dir).unwrap();
-        let text = Embedding {
+        let lex = Embedding {
             node_id: NodeId("repo:a".into()),
             vector: vec![1.0, 0.0],
         };
+        let neural = Embedding {
+            node_id: NodeId("repo:a".into()), // SAME node, different model
+            vector: vec![0.0, 1.0, 0.5, 0.5],
+        };
         let graph = Embedding {
             node_id: NodeId("graph:a".into()),
-            vector: vec![0.0, 1.0],
+            vector: vec![0.2, 0.8],
         };
-        lb.set_embeddings(std::slice::from_ref(&text), "lexical-hash-v1")
+        lb.set_embeddings("text", "lexical-hash-v1", std::slice::from_ref(&lex))
             .unwrap();
-        lb.set_embeddings(std::slice::from_ref(&graph), "graph-struct-v1")
+        lb.set_embeddings("text", "openai:m", std::slice::from_ref(&neural))
             .unwrap();
-        check!(lb.embeddings().unwrap().len() == 2);
-        // Clearing graph leaves text.
-        lb.clear_embeddings_by_model("graph-struct-v1").unwrap();
-        check!(lb.embeddings().unwrap() == vec![text.clone()]);
-        // Re-add graph, then clear everything-except-graph leaves only graph.
-        lb.set_embeddings(std::slice::from_ref(&graph), "graph-struct-v1")
+        lb.set_embeddings("graph", "graph-struct-v1", std::slice::from_ref(&graph))
             .unwrap();
-        lb.clear_embeddings_except_model("graph-struct-v1").unwrap();
-        check!(lb.embeddings().unwrap() == vec![graph]);
+        // Three distinct namespaces, each isolated.
+        let mut idx = lb.embedding_index().unwrap();
+        idx.sort();
+        check!(
+            idx == vec![
+                ("graph".into(), "graph-struct-v1".into(), 1, 2),
+                ("text".into(), "lexical-hash-v1".into(), 1, 2),
+                ("text".into(), "openai:m".into(), 1, 4),
+            ]
+        );
+        check!(lb.embeddings_for("text", "lexical-hash-v1").unwrap() == vec![lex]);
+        check!(lb.embeddings_for("text", "openai:m").unwrap() == vec![neural]);
+        // Clearing one namespace leaves the others.
+        lb.clear_embeddings_for("text", "lexical-hash-v1").unwrap();
+        check!(
+            lb.embeddings_for("text", "lexical-hash-v1")
+                .unwrap()
+                .is_empty()
+        );
+        check!(lb.embeddings_for("text", "openai:m").unwrap().len() == 1);
+        check!(lb.embeddings_for("graph", "graph-struct-v1").unwrap().len() == 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 

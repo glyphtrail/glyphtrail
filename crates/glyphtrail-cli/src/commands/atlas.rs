@@ -15,7 +15,7 @@ use glyphtrail_core::{
     AtlasConfig, AtlasHeads, CodeGraph, CommitMeta, Confidence, EdgeKind, Embedding, GraphEmbedder,
     GraphProfile, MeConfig, Node, NodeId, NodeKind, Registry, RegistryEntry, StructuralEmbedder,
     TimelineQuery, Window, author_scope_label, cosine, default_atlas_path, default_registry_path,
-    embed::GRAPH_MODEL_ID, filter_timeline, format_date, scrub_secrets, timeline_value,
+    filter_timeline, format_date, scrub_secrets, timeline_value,
 };
 use glyphtrail_store::{GraphStore, LadybugStore};
 
@@ -102,6 +102,9 @@ pub struct SimilarCommitsArgs {
     /// Restrict to one registered repo.
     #[arg(long)]
     pub repo: Option<String>,
+    /// Which embedding model to search (default: the most-recently-embedded one).
+    #[arg(long)]
+    pub model: Option<String>,
     /// How many commits to show (most similar first).
     #[arg(long, default_value_t = 10)]
     pub limit: usize,
@@ -125,6 +128,10 @@ pub struct SimilarArgs {
     /// commit text. Free-text queries aren't structural, so a repo name is required.
     #[arg(long)]
     pub graph: bool,
+    /// Which embedding model to search (default: the most-recently-embedded one for
+    /// this space). Models never mix; see `atlas status` for what's stored.
+    #[arg(long)]
+    pub model: Option<String>,
     /// How many matches to show (most similar first).
     #[arg(long, default_value_t = 10)]
     pub limit: usize,
@@ -496,23 +503,20 @@ fn status(dir: &Path) -> Result<()> {
     let commits = store.commit_count()?;
     let cfg = AtlasConfig::load(dir)?;
 
-    let embeds = store.embedding_counts()?;
-    let embed_total: usize = embeds.iter().map(|(_, n)| n).sum();
+    let embeds = store.embedding_index()?;
 
     println!("atlas:   enabled");
     println!("path:    {}", lb.display());
     println!("nodes:   {}", stats.nodes);
     println!("edges:   {}", stats.edges);
     println!("commits: {commits}");
-    if embed_total == 0 {
-        println!("embeds:  none (run `glyphtrail atlas embed` / `graph-embed`)");
+    if embeds.is_empty() {
+        println!("embeds:  none (run `glyphtrail atlas embed` / `graph-embed` / `embed-commits`)");
     } else {
-        let detail = embeds
-            .iter()
-            .map(|(m, n)| format!("{m}: {n}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        println!("embeds:  {embed_total} ({detail})");
+        println!("embeds:");
+        for (space, model, count, dim) in &embeds {
+            println!("  {space:<7} {model:<32} {count} vec, dim {dim}");
+        }
     }
     println!("window:  {}", cfg.window.label());
     Ok(())
@@ -774,9 +778,16 @@ fn graph_embed(dir: &Path, args: GraphEmbedArgs) -> Result<()> {
         bail!("no indexed repos to embed; run `glyphtrail analyze` in your repos first");
     }
     let mut store = LadybugStore::open(&lb)?;
-    store.clear_embeddings_by_model(GRAPH_MODEL_ID)?;
-    store.set_embeddings(&embeddings, embedder.id())?;
-    let ann = build_vector_index(&store, GRAPH_VEC_TABLE, &embeddings);
+    store.clear_embeddings_for(SPACE_GRAPH, embedder.id())?;
+    store.set_embeddings(SPACE_GRAPH, embedder.id(), &embeddings)?;
+    set_active_model(
+        &mut store,
+        SPACE_GRAPH,
+        embedder.id(),
+        None,
+        embeddings[0].vector.len(),
+    )?;
+    let ann = build_vector_index(&store, &vec_table(SPACE_GRAPH, embedder.id()), &embeddings);
     println!(
         "graph-embedded {} repo{} ({} no index, {} empty) [{}{}]",
         embeddings.len(),
@@ -842,32 +853,99 @@ fn embed(dir: &Path, args: EmbedArgs) -> Result<()> {
         })
         .collect();
     let mut store = store;
-    // Replace the text rows, so a repo that left the active date window doesn't keep
-    // a stale vector and a changed model/width never leaves mismatched rows behind.
-    // Graph embeddings (a different model) are left untouched.
-    store.clear_embeddings_except_model(GRAPH_MODEL_ID)?;
-    store.set_embeddings(&embeddings, &cfg.model_id())?;
-    // Record the active provider so `similar` embeds a free-text query the same way.
-    store.set_meta("embedding_model", &cfg.model_id())?;
-    store.set_meta(
-        "embedding_base_url",
-        &cfg.base_url.clone().unwrap_or_default(),
+    let model = cfg.model_id();
+    // Replace just this (text, model) namespace — other models and the graph/commit
+    // spaces coexist untouched, so a model upgrade never mixes with the old set.
+    store.clear_embeddings_for(SPACE_TEXT, &model)?;
+    store.set_embeddings(SPACE_TEXT, &model, &embeddings)?;
+    set_active_model(
+        &mut store,
+        SPACE_TEXT,
+        &model,
+        cfg.base_url.as_deref(),
+        embeddings[0].vector.len(),
     )?;
-    let ann = build_vector_index(&store, TEXT_VEC_TABLE, &embeddings);
+    let ann = build_vector_index(&store, &vec_table(SPACE_TEXT, &model), &embeddings);
     println!(
-        "embedded {} repo{} ({}{})",
+        "embedded {} repo{} ({}) [model {}{}]",
         embeddings.len(),
         if embeddings.len() == 1 { "" } else { "s" },
         cfg.describe(),
+        model,
         if ann { ", HNSW ANN" } else { "" },
     );
     Ok(())
 }
 
-/// FLOAT[]/HNSW table names for the embedding spaces (#338).
-const TEXT_VEC_TABLE: &str = "TextVec";
-const GRAPH_VEC_TABLE: &str = "GraphVec";
-const COMMIT_VEC_TABLE: &str = "CommitVec";
+/// Embedding spaces (what + how was embedded) — the first half of an embedding
+/// namespace; the model id is the second (#338).
+const SPACE_TEXT: &str = "text";
+const SPACE_GRAPH: &str = "graph";
+const SPACE_COMMIT: &str = "commit";
+
+/// The per-`(space, model)` FLOAT[]/HNSW table name, sanitised to kuzu's
+/// `[A-Za-z0-9_]` identifier charset so each model gets its own index.
+fn vec_table(space: &str, model: &str) -> String {
+    let slug: String = model
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    format!("Vec_{space}_{slug}")
+}
+
+/// Record the most-recently-embedded model for a space (the `similar` default),
+/// plus the provider base URL + dim, so a free-text query re-embeds the same way.
+fn set_active_model(
+    store: &mut LadybugStore,
+    space: &str,
+    model: &str,
+    base_url: Option<&str>,
+    dim: usize,
+) -> Result<()> {
+    store.set_meta(&format!("active_model_{space}"), model)?;
+    store.set_meta(
+        &format!("active_base_url_{space}"),
+        base_url.unwrap_or_default(),
+    )?;
+    store.set_meta(&format!("active_dim_{space}"), &dim.to_string())?;
+    Ok(())
+}
+
+/// Resolve which model a query searches in `space`: the explicit `--model`, else the
+/// active (last-embedded) one, else the sole stored model — erroring with the list
+/// of choices when none/ambiguous.
+fn resolve_model(store: &LadybugStore, space: &str, explicit: Option<&str>) -> Result<String> {
+    let models: Vec<String> = store
+        .embedding_index()?
+        .into_iter()
+        .filter(|(sp, ..)| sp == space)
+        .map(|(_, m, ..)| m)
+        .collect();
+    if models.is_empty() {
+        bail!("no {space} embeddings yet; run the matching embed command first");
+    }
+    if let Some(m) = explicit {
+        if models.iter().any(|x| x == m) {
+            return Ok(m.to_string());
+        }
+        bail!(
+            "no {space} embeddings for model '{m}'; available: {}",
+            models.join(", ")
+        );
+    }
+    if let Some(active) = store.get_meta(&format!("active_model_{space}"))?
+        && models.iter().any(|x| x == &active)
+    {
+        return Ok(active);
+    }
+    if models.len() == 1 {
+        return Ok(models[0].clone());
+    }
+    bail!(
+        "multiple {space} embedding models stored; choose one with --model: {}",
+        models.join(", ")
+    );
+}
 
 /// `glyphtrail atlas embed-commits` — embed every in-bounds commit (by subject)
 /// into an HNSW index, so `atlas similar-commits` can find commits like a query
@@ -921,15 +999,21 @@ fn embed_commits(dir: &Path, args: EmbedCommitsArgs) -> Result<()> {
         bail!("no commit subjects produced a usable embedding");
     }
     let dim = embeddings[0].vector.len();
-    store.rebuild_vector_index(COMMIT_VEC_TABLE, &embeddings)?;
-    store.set_meta("commit_embedding_model", &cfg.model_id())?;
-    store.set_meta(
-        "commit_embedding_base_url",
-        &cfg.base_url.clone().unwrap_or_default(),
+    let model = cfg.model_id();
+    // Durable rows (offline + export) plus the per-model HNSW index, namespaced so
+    // a model upgrade coexists with the prior commit embeddings.
+    store.clear_embeddings_for(SPACE_COMMIT, &model)?;
+    store.set_embeddings(SPACE_COMMIT, &model, &embeddings)?;
+    store.rebuild_vector_index(&vec_table(SPACE_COMMIT, &model), &embeddings)?;
+    set_active_model(
+        &mut store,
+        SPACE_COMMIT,
+        &model,
+        cfg.base_url.as_deref(),
+        dim,
     )?;
-    store.set_meta("commit_embedding_dim", &dim.to_string())?;
     println!(
-        "embedded {} commits ({}) [HNSW ANN]",
+        "embedded {} commits ({}) [model {model}, HNSW ANN]",
         embeddings.len(),
         cfg.describe(),
     );
@@ -950,14 +1034,12 @@ fn similar_commits(dir: &Path, args: SimilarCommitsArgs) -> Result<()> {
             "commit similarity needs the lbug vector extension; run `glyphtrail atlas embed-commits` first"
         );
     }
-    let model = store.get_meta("commit_embedding_model")?.ok_or_else(|| {
-        anyhow!("no commit embeddings yet; run `glyphtrail atlas embed-commits` first")
-    })?;
+    let model = resolve_model(&store, SPACE_COMMIT, args.model.as_deref())?;
     let base_url = store
-        .get_meta("commit_embedding_base_url")?
+        .get_meta("active_base_url_commit")?
         .filter(|s| !s.is_empty());
     let dim = store
-        .get_meta("commit_embedding_dim")?
+        .get_meta("active_dim_commit")?
         .and_then(|s| s.parse().ok())
         .unwrap_or(glyphtrail_core::DEFAULT_DIM);
     let qcfg = config_from_stored(&model, base_url, dim);
@@ -973,10 +1055,10 @@ fn similar_commits(dir: &Path, args: SimilarCommitsArgs) -> Result<()> {
         bail!("the query has no searchable terms after tokenization; try different words");
     }
 
-    // Over-fetch from the HNSW index, then map *only those* commits back to their
-    // repo/date/subject (not the whole timeline) and gate by repo visibility before
-    // truncating to the requested limit.
-    let hits = store.vector_knn(COMMIT_VEC_TABLE, &qvec, args.limit * 4 + 32)?;
+    // Over-fetch from the chosen model's HNSW index, then map *only those* commits
+    // back to their repo/date/subject (not the whole timeline) and gate by repo
+    // visibility before truncating to the requested limit.
+    let hits = store.vector_knn(&vec_table(SPACE_COMMIT, &model), &qvec, args.limit * 4 + 32)?;
     let ids: Vec<String> = hits.iter().map(|(id, _)| id.0.clone()).collect();
     let rows = store.atlas_commit_rows(&ids)?;
     let by_id: std::collections::HashMap<String, &glyphtrail_core::AtlasTimelineRow> = rows
@@ -1088,17 +1170,21 @@ fn similar(dir: &Path, args: SimilarArgs) -> Result<()> {
         bail!("atlas is disabled; run `glyphtrail atlas init` first");
     }
     let store = LadybugStore::open(&lb)?;
-    let all = store.embeddings()?;
     let registry = match default_registry_path() {
         Some(p) => Registry::load(&p)?,
         None => Registry::default(),
     };
+    // Pick the (space, model) namespace: graph vs text, and the model (--model, else
+    // the active/default one). Read just that namespace — models never mix.
+    let space = if args.graph { SPACE_GRAPH } else { SPACE_TEXT };
+    let model = resolve_model(&store, space, args.model.as_deref())?;
+    let embeddings = store.embeddings_for(space, &model)?;
+    if embeddings.is_empty() {
+        bail!("no {space} embeddings for model '{model}'; run the matching embed command");
+    }
+    let dim = embeddings[0].vector.len();
 
-    // Two embedding spaces share the side-table: text (`atlas embed`) and graph
-    // (`atlas graph-embed`), each keyed by its own id scheme. Keep only rows whose
-    // id is in the *active mode's* registry-derived id set, so a stray row (a
-    // deregistered repo, or the other space) can't slip in and trip the dimension
-    // guard. The same map names rows + resolves visibility.
+    // Registry id→entry map in this space's id scheme, for naming + visibility.
     let id_of = |name: &str| -> NodeId {
         if args.graph {
             repo_graph_node_id(name)
@@ -1111,26 +1197,10 @@ fn similar(dir: &Path, args: SimilarArgs) -> Result<()> {
         .iter()
         .map(|e| (id_of(&e.name).0, e))
         .collect();
-    let embeddings: Vec<&Embedding> = all
-        .iter()
-        .filter(|e| by_id.contains_key(&e.node_id.0))
-        .collect();
-    if embeddings.is_empty() {
-        let cmd = if args.graph { "graph-embed" } else { "embed" };
-        bail!("no {cmd} embeddings yet; run `glyphtrail atlas {cmd}` first");
-    }
-
-    // All vectors in a space must share a width, else cosine silently scores
-    // mismatches as 0. Both embed commands clear before writing, so this only trips
-    // on a hand-tampered store — fail loudly.
-    let dim = embeddings[0].vector.len();
-    if embeddings.iter().any(|e| e.vector.len() != dim) {
-        bail!("stored embeddings have inconsistent dimensions; re-run the embed command");
-    }
 
     // Resolve the query vector: a known repo uses its stored embedding (excluded
     // from its own results). For text, anything else is embedded as a free-text
-    // query under the stored provider; structural similarity needs a repo, not text.
+    // query under this model's provider; structural similarity needs a repo.
     let self_id = id_of(&args.query).0;
     let (qvec, self_id, mode) = if let Some(e) = embeddings.iter().find(|e| e.node_id.0 == self_id)
     {
@@ -1145,11 +1215,8 @@ fn similar(dir: &Path, args: SimilarArgs) -> Result<()> {
              (run `glyphtrail atlas graph-embed` if it isn't embedded yet)"
         );
     } else {
-        let model = store
-            .get_meta("embedding_model")?
-            .unwrap_or_else(|| "lexical-hash-v1".to_string());
         let base_url = store
-            .get_meta("embedding_base_url")?
+            .get_meta(&format!("active_base_url_{space}"))?
             .filter(|s| !s.is_empty());
         let qcfg = crate::commands::embed_provider::config_from_stored(&model, base_url, dim);
         if qcfg.is_offmachine() {
@@ -1163,18 +1230,12 @@ fn similar(dir: &Path, args: SimilarArgs) -> Result<()> {
         (v, None, format!("query \"{}\"", args.query))
     };
 
-    // Candidate (node id, similarity) pairs: prefer the HNSW index built by
-    // `atlas embed`/`graph-embed`; fall back to an exact in-Rust cosine scan when
-    // the vector extension isn't available. The HNSW table holds only this space's
-    // rows, so candidates are already space-scoped.
-    let table = if args.graph {
-        GRAPH_VEC_TABLE
-    } else {
-        TEXT_VEC_TABLE
-    };
+    // Candidate (node id, similarity) pairs: prefer this (space,model)'s HNSW index;
+    // fall back to an exact in-Rust cosine scan when the extension isn't available.
+    let table = vec_table(space, &model);
     let candidates: Vec<(String, f32)> = store
         .load_vector_ext()
-        .then(|| store.vector_knn(table, &qvec, embeddings.len()).ok())
+        .then(|| store.vector_knn(&table, &qvec, embeddings.len()).ok())
         .flatten()
         .filter(|h| !h.is_empty())
         .map(|h| h.into_iter().map(|(id, sim)| (id.0, sim)).collect())
@@ -1216,13 +1277,7 @@ fn similar(dir: &Path, args: SimilarArgs) -> Result<()> {
     });
     scored.truncate(args.limit);
 
-    let model_label = if args.graph {
-        GRAPH_MODEL_ID.to_string()
-    } else {
-        store
-            .get_meta("embedding_model")?
-            .unwrap_or_else(|| "lexical-hash-v1".to_string())
-    };
+    let model_label = model;
     let emit = Emit::from_flags(args.json, args.yaml);
     if emit == Emit::Text {
         println!("atlas similar — {mode}");
