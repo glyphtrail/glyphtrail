@@ -191,7 +191,10 @@ impl StructuralEmbedder {
             if *count == 0 {
                 continue;
             }
-            let bucket = (fnv1a(format!("{facet}:{name}").as_bytes()) % self.dim as u64) as usize;
+            // Normalise the feature name so a source emitting "Function" lands in the
+            // same bucket as one emitting "function".
+            let feature = format!("{facet}:{}", name.trim().to_ascii_lowercase());
+            let bucket = (fnv1a(feature.as_bytes()) % self.dim as u64) as usize;
             v[bucket] += (*count as f32).sqrt();
         }
     }
@@ -301,5 +304,19 @@ mod tests {
         let e = StructuralEmbedder::default();
         let v = e.embed(&GraphProfile::default());
         check!(v.iter().all(|x| *x == 0.0));
+    }
+
+    #[test]
+    fn feature_casing_does_not_change_the_embedding() {
+        let e = StructuralEmbedder::default();
+        let upper = e.embed(&profile(
+            &[("Function", 100), ("Struct", 20)],
+            &[("Rust", 30)],
+        ));
+        let lower = e.embed(&profile(
+            &[("function", 100), ("struct", 20)],
+            &[("rust", 30)],
+        ));
+        check!((cosine(&upper, &lower) - 1.0).abs() < 1e-6);
     }
 }

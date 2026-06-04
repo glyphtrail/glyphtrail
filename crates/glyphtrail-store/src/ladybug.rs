@@ -85,6 +85,23 @@ impl LadybugStore {
         Ok(store)
     }
 
+    /// Open without the schema migration that `open` runs. The migration
+    /// drop+recreates the whole DB when `schema_version` differs, so a read-only
+    /// consumer (e.g. `atlas graph-embed` reading kind counts) must not trigger it
+    /// and silently wipe an out-of-date index. The idempotent `CREATE … IF NOT
+    /// EXISTS` schema is still applied (only adds missing tables, never drops), so
+    /// the read queries resolve.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        let db = Database::new(path, SystemConfig::default())?;
+        {
+            let conn = Connection::new(&db)?;
+            for ddl in SCHEMA {
+                conn.query(ddl)?;
+            }
+        }
+        Ok(Self { db })
+    }
+
     /// Open a fresh store in a unique temporary directory. LadybugDB has no
     /// in-memory mode, so tests (here and in dependent crates) get an isolated
     /// on-disk database instead; the caller removes the directory when done.
@@ -1587,6 +1604,24 @@ mod tests {
         // Reopen: the version mismatch drops + recreates, wiping stale data.
         let lb = LadybugStore::open(&dir).unwrap();
         check!(lb.find_by_name("stale").unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // #338: a read-only open must NOT migrate, so a reporting command (atlas
+    // graph-embed) reading an out-of-date index can't wipe it.
+    #[test]
+    fn open_read_only_does_not_wipe_an_outdated_index() {
+        let dir = tmp_dir("schema-readonly");
+        {
+            let mut lb = LadybugStore::open(&dir).unwrap();
+            lb.insert_graph(&[node("a", "keeper")], &[]).unwrap();
+            lb.set_meta("schema_version", "1").unwrap(); // a stale version
+        }
+        let lb = LadybugStore::open_read_only(&dir).unwrap();
+        check!(
+            !lb.find_by_name("keeper").unwrap().is_empty(),
+            "read-only open must not drop+recreate the stale index"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

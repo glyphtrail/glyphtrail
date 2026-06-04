@@ -681,17 +681,20 @@ fn graph_embed(dir: &Path, args: GraphEmbedArgs) -> Result<()> {
     };
     let embedder = StructuralEmbedder::new(args.dim);
     let mut embeddings: Vec<Embedding> = Vec::new();
-    let mut skipped = 0usize;
+    let mut no_index = 0usize; // missing dir or unreadable index
+    let mut empty = 0usize; // index present but no structure
     for entry in &registry.repos {
         let repo_lb = RepoPaths::new(entry.active_root())
             .index_dir
             .join("ladybug");
         if !repo_lb.exists() {
-            skipped += 1;
+            no_index += 1;
             continue;
         }
-        let Ok(repo_store) = LadybugStore::open(&repo_lb) else {
-            skipped += 1;
+        // Read-only open: never trigger the schema migration (a drop+recreate),
+        // which would wipe an out-of-date index just to read its kind counts.
+        let Ok(repo_store) = LadybugStore::open_read_only(&repo_lb) else {
+            no_index += 1;
             continue;
         };
         let profile = GraphProfile {
@@ -701,7 +704,7 @@ fn graph_embed(dir: &Path, args: GraphEmbedArgs) -> Result<()> {
         };
         let vector = embedder.embed(&profile);
         if vector.iter().all(|x| *x == 0.0) {
-            skipped += 1; // an empty / unanalyzed graph carries no structure
+            empty += 1; // an empty / unanalyzed graph carries no structure
             continue;
         }
         embeddings.push(Embedding {
@@ -716,10 +719,11 @@ fn graph_embed(dir: &Path, args: GraphEmbedArgs) -> Result<()> {
     store.clear_embeddings_by_model(GRAPH_MODEL_ID)?;
     store.set_embeddings(&embeddings, embedder.id())?;
     println!(
-        "graph-embedded {} repo{} ({} skipped, no index) [{}]",
+        "graph-embedded {} repo{} ({} no index, {} empty) [{}]",
         embeddings.len(),
         if embeddings.len() == 1 { "" } else { "s" },
-        skipped,
+        no_index,
+        empty,
         embedder.id(),
     );
     Ok(())
@@ -813,9 +817,10 @@ fn similar(dir: &Path, args: SimilarArgs) -> Result<()> {
     };
 
     // Two embedding spaces share the side-table: text (`atlas embed`) and graph
-    // (`atlas graph-embed`), each keyed by its own id scheme. A row is a graph row
-    // iff its id is in the registry-derived graph-id set; partition to the space the
-    // query is about so the two never mix.
+    // (`atlas graph-embed`), each keyed by its own id scheme. Keep only rows whose
+    // id is in the *active mode's* registry-derived id set, so a stray row (a
+    // deregistered repo, or the other space) can't slip in and trip the dimension
+    // guard. The same map names rows + resolves visibility.
     let id_of = |name: &str| -> NodeId {
         if args.graph {
             repo_graph_node_id(name)
@@ -823,28 +828,19 @@ fn similar(dir: &Path, args: SimilarArgs) -> Result<()> {
             repo_node_id(name)
         }
     };
-    let graph_ids: std::collections::HashSet<String> = registry
-        .repos
-        .iter()
-        .map(|e| repo_graph_node_id(&e.name).0)
-        .collect();
-    let embeddings: Vec<&Embedding> = all
-        .iter()
-        .filter(|e| args.graph == graph_ids.contains(&e.node_id.0))
-        .collect();
-    if embeddings.is_empty() {
-        let cmd = if args.graph { "graph-embed" } else { "embed" };
-        bail!(
-            "no {} embeddings yet; run `glyphtrail atlas {cmd}` first",
-            cmd
-        );
-    }
-    // Name + visibility per id, in the active space's key scheme.
     let by_id: std::collections::HashMap<String, &RegistryEntry> = registry
         .repos
         .iter()
         .map(|e| (id_of(&e.name).0, e))
         .collect();
+    let embeddings: Vec<&Embedding> = all
+        .iter()
+        .filter(|e| by_id.contains_key(&e.node_id.0))
+        .collect();
+    if embeddings.is_empty() {
+        let cmd = if args.graph { "graph-embed" } else { "embed" };
+        bail!("no {cmd} embeddings yet; run `glyphtrail atlas {cmd}` first");
+    }
 
     // All vectors in a space must share a width, else cosine silently scores
     // mismatches as 0. Both embed commands clear before writing, so this only trips
