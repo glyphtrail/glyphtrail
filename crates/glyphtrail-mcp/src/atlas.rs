@@ -69,12 +69,17 @@ fn status(atlas_dir: &Path) -> Result<Value, String> {
     let store = atlas_store(atlas_dir)?;
     let stats = store.stats().map_err(|e| e.to_string())?;
     let commits = store.commit_count().map_err(|e| e.to_string())?;
+    let embeds = store.embedding_counts().map_err(|e| e.to_string())?;
     let cfg = AtlasConfig::load(atlas_dir).map_err(|e| e.to_string())?;
     Ok(json!({
         "enabled": true,
         "nodes": stats.nodes,
         "edges": stats.edges,
         "commits": commits,
+        "embeddings": embeds
+            .iter()
+            .map(|(model, count)| json!({ "model": model, "count": count }))
+            .collect::<Vec<_>>(),
         "window": cfg.window.label(),
     }))
 }
