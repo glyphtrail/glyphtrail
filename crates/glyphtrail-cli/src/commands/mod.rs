@@ -21,6 +21,7 @@ pub mod config;
 pub mod config_file;
 pub mod cypher;
 pub mod drift;
+pub mod embed_provider;
 pub mod group;
 pub mod impact;
 pub mod link;
