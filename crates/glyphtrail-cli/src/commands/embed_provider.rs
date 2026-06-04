@@ -164,36 +164,66 @@ fn openai_embed(cfg: &EmbedConfig, docs: &[String]) -> Result<Vec<Vec<f32>>> {
             docs.len()
         );
     }
-    data.iter()
-        .map(|d| {
-            d["embedding"]
-                .as_array()
-                .map(|v| {
-                    v.iter()
-                        .filter_map(|x| x.as_f64().map(|f| f as f32))
-                        .collect()
-                })
-                .ok_or_else(|| anyhow!("embedding row missing `embedding`: {d}"))
-        })
+    // Place each row at its reported `index` (OpenAI-compatible responses may not
+    // preserve input order); fall back to position when no index is given. A
+    // non-numeric embedding component is an error, not a silently shortened vector.
+    let mut out: Vec<Option<Vec<f32>>> = vec![None; docs.len()];
+    for (pos, d) in data.iter().enumerate() {
+        let idx = d["index"].as_u64().map(|i| i as usize).unwrap_or(pos);
+        let arr = d["embedding"]
+            .as_array()
+            .ok_or_else(|| anyhow!("embedding row missing `embedding`: {d}"))?;
+        let vec = arr
+            .iter()
+            .map(|x| {
+                x.as_f64()
+                    .map(|f| f as f32)
+                    .ok_or_else(|| anyhow!("non-numeric embedding component: {x}"))
+            })
+            .collect::<Result<Vec<f32>>>()?;
+        let slot = out
+            .get_mut(idx)
+            .ok_or_else(|| anyhow!("embedding index {idx} out of range"))?;
+        *slot = Some(vec);
+    }
+    out.into_iter()
+        .enumerate()
+        .map(|(i, v)| v.ok_or_else(|| anyhow!("missing embedding for input {i}")))
         .collect()
 }
 
 /// Whether a URL targets the local machine (so an OpenAI-compatible server there
-/// keeps data on-machine).
+/// keeps data on-machine). Matches `localhost`, the IPv6 loopback `::1`, and the
+/// IPv4 loopback range `127.0.0.0/8` — but not a hostname that merely *starts*
+/// with `127.` (e.g. `127.evil.com`).
 fn is_local_url(url: &str) -> bool {
     let host = host_of(url);
-    host == "localhost" || host.starts_with("127.") || host == "::1" || host == "0.0.0.0"
+    host == "localhost" || host == "::1" || is_ipv4_loopback(&host)
 }
 
-/// The host portion of a URL, best-effort (no URL crate): strip scheme, take up to
-/// the first `/` or `:`. Used by the transparency banner.
+/// Whether `host` is a dotted IPv4 in `127.0.0.0/8` (four numeric octets, first
+/// `127`), as opposed to a domain that happens to begin `127.`.
+fn is_ipv4_loopback(host: &str) -> bool {
+    let octets: Vec<&str> = host.split('.').collect();
+    octets.len() == 4 && octets.iter().all(|o| o.parse::<u8>().is_ok()) && octets[0] == "127"
+}
+
+/// The host portion of a URL, best-effort (no URL crate): strip the scheme and
+/// path, then the port. Handles a bracketed IPv6 literal (`http://[::1]:11434` →
+/// `::1`). Used by the transparency banner and the localhost check.
 pub fn host_of(url: &str) -> String {
-    let after_scheme = url.split("://").nth(1).unwrap_or(url);
-    after_scheme
-        .split(['/', ':'])
+    let authority = url
+        .split("://")
+        .nth(1)
+        .unwrap_or(url)
+        .split('/')
         .next()
-        .unwrap_or(after_scheme)
-        .to_string()
+        .unwrap_or("");
+    if let Some(rest) = authority.strip_prefix('[') {
+        // IPv6 literal: the host is everything up to the closing bracket.
+        return rest.split(']').next().unwrap_or(rest).to_string();
+    }
+    authority.split(':').next().unwrap_or(authority).to_string()
 }
 
 #[cfg(test)]
@@ -255,5 +285,27 @@ mod tests {
     fn host_extraction() {
         check!(host_of("https://api.openai.com/v1/embeddings") == "api.openai.com");
         check!(host_of("http://localhost:11434/v1/embeddings") == "localhost");
+        // A bracketed IPv6 literal yields the address, not "[".
+        check!(host_of("http://[::1]:11434/v1/embeddings") == "::1");
+        check!(host_of("http://127.0.0.1:8080") == "127.0.0.1");
+    }
+
+    #[test]
+    fn loopback_detection_is_not_spoofable() {
+        let local = |u: &str| {
+            EmbedConfig {
+                provider: EmbedProvider::Openai,
+                model: None,
+                base_url: Some(u.to_string()),
+                dim: 256,
+            }
+            .is_offmachine()
+        };
+        // Real loopbacks stay on-machine.
+        check!(!local("http://localhost:11434/v1/embeddings"));
+        check!(!local("http://127.0.0.1:11434/v1/embeddings"));
+        check!(!local("http://[::1]:11434/v1/embeddings"));
+        // A domain that merely starts with 127. is NOT local.
+        check!(local("http://127.evil.com/v1/embeddings"));
     }
 }
