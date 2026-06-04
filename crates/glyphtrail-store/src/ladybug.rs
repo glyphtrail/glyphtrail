@@ -996,6 +996,17 @@ impl GraphStore for LadybugStore {
             .collect())
     }
 
+    fn embedding_counts(&self) -> Result<Vec<(String, usize)>> {
+        Ok(self
+            .run(
+                "MATCH (e:Embedding) RETURN e.model, COUNT(*) ORDER BY e.model",
+                vec![],
+            )?
+            .iter()
+            .map(|r| (get_str(r, 0), get_i64(r, 1).max(0) as usize))
+            .collect())
+    }
+
     fn atlas_topics(&self) -> Result<Vec<(String, usize)>> {
         Ok(self
             .run(

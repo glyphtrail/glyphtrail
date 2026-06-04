@@ -451,11 +451,24 @@ fn status(dir: &Path) -> Result<()> {
     let commits = store.commit_count()?;
     let cfg = AtlasConfig::load(dir)?;
 
+    let embeds = store.embedding_counts()?;
+    let embed_total: usize = embeds.iter().map(|(_, n)| n).sum();
+
     println!("atlas:   enabled");
     println!("path:    {}", lb.display());
     println!("nodes:   {}", stats.nodes);
     println!("edges:   {}", stats.edges);
     println!("commits: {commits}");
+    if embed_total == 0 {
+        println!("embeds:  none (run `glyphtrail atlas embed` / `graph-embed`)");
+    } else {
+        let detail = embeds
+            .iter()
+            .map(|(m, n)| format!("{m}: {n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("embeds:  {embed_total} ({detail})");
+    }
     println!("window:  {}", cfg.window.label());
     Ok(())
 }

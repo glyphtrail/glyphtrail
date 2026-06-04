@@ -110,6 +110,11 @@ pub trait GraphStore: Adjacency {
     fn embeddings(&self) -> Result<Vec<Embedding>> {
         Ok(Vec::new())
     }
+    /// `(model, count)` for stored embeddings, a cheap `COUNT` for `atlas status`
+    /// (#338). Default empty.
+    fn embedding_counts(&self) -> Result<Vec<(String, usize)>> {
+        Ok(Vec::new())
+    }
     /// In-bounds atlas commits in `[since, until]` (unix seconds, inclusive;
     /// `None` = unbounded), each joined to its repo name and touched-file count,
     /// ordered by `committed_at` ascending (#333). `topic`, when set, keeps only
