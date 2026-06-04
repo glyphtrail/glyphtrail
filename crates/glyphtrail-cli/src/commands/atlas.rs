@@ -731,13 +731,15 @@ fn graph_embed(dir: &Path, args: GraphEmbedArgs) -> Result<()> {
     let mut store = LadybugStore::open(&lb)?;
     store.clear_embeddings_by_model(GRAPH_MODEL_ID)?;
     store.set_embeddings(&embeddings, embedder.id())?;
+    let ann = build_vector_index(&store, GRAPH_VEC_TABLE, &embeddings);
     println!(
-        "graph-embedded {} repo{} ({} no index, {} empty) [{}]",
+        "graph-embedded {} repo{} ({} no index, {} empty) [{}{}]",
         embeddings.len(),
         if embeddings.len() == 1 { "" } else { "s" },
         no_index,
         empty,
         embedder.id(),
+        if ann { ", HNSW ANN" } else { "" },
     );
     Ok(())
 }
@@ -806,13 +808,36 @@ fn embed(dir: &Path, args: EmbedArgs) -> Result<()> {
         "embedding_base_url",
         &cfg.base_url.clone().unwrap_or_default(),
     )?;
+    let ann = build_vector_index(&store, TEXT_VEC_TABLE, &embeddings);
     println!(
-        "embedded {} repo{} ({})",
+        "embedded {} repo{} ({}{})",
         embeddings.len(),
         if embeddings.len() == 1 { "" } else { "s" },
         cfg.describe(),
+        if ann { ", HNSW ANN" } else { "" },
     );
     Ok(())
+}
+
+/// FLOAT[]/HNSW table names for the two embedding spaces (#338).
+const TEXT_VEC_TABLE: &str = "TextVec";
+const GRAPH_VEC_TABLE: &str = "GraphVec";
+
+/// Build the HNSW vector index for a space if the lbug vector extension is
+/// available (installing it on first use — a one-time, documented network fetch).
+/// Returns whether the index was built; a failure is non-fatal (the brute-force
+/// path in `similar` still works). #338/#473.
+fn build_vector_index(store: &LadybugStore, table: &str, embeddings: &[Embedding]) -> bool {
+    if !store.install_vector_ext() {
+        return false;
+    }
+    match store.rebuild_vector_index(table, embeddings) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("note: HNSW vector index not built ({e}); similarity falls back to a scan");
+            false
+        }
+    }
 }
 
 /// `glyphtrail atlas similar` — rank repos by lexical similarity to a repo name or
@@ -898,13 +923,35 @@ fn similar(dir: &Path, args: SimilarArgs) -> Result<()> {
         (v, None, format!("query \"{}\"", args.query))
     };
 
+    // Candidate (node id, similarity) pairs: prefer the HNSW index built by
+    // `atlas embed`/`graph-embed`; fall back to an exact in-Rust cosine scan when
+    // the vector extension isn't available. The HNSW table holds only this space's
+    // rows, so candidates are already space-scoped.
+    let table = if args.graph {
+        GRAPH_VEC_TABLE
+    } else {
+        TEXT_VEC_TABLE
+    };
+    let candidates: Vec<(String, f32)> = store
+        .load_vector_ext()
+        .then(|| store.vector_knn(table, &qvec, embeddings.len()).ok())
+        .flatten()
+        .filter(|h| !h.is_empty())
+        .map(|h| h.into_iter().map(|(id, sim)| (id.0, sim)).collect())
+        .unwrap_or_else(|| {
+            embeddings
+                .iter()
+                .map(|e| (e.node_id.0.clone(), cosine(&qvec, &e.vector)))
+                .collect()
+        });
+
     let mut excluded = 0usize;
     let mut scored: Vec<(f32, String, &'static str)> = Vec::new();
-    for e in &embeddings {
-        if Some(&e.node_id.0) == self_id.as_ref() {
+    for (id, sim) in &candidates {
+        if Some(id) == self_id.as_ref() {
             continue;
         }
-        let entry = by_id.get(&e.node_id.0);
+        let entry = by_id.get(id);
         let restricted = entry.map(|x| x.visibility.is_restricted()).unwrap_or(true);
         if restricted && !args.include_restricted {
             excluded += 1;
@@ -913,14 +960,14 @@ fn similar(dir: &Path, args: SimilarArgs) -> Result<()> {
         // The repo name can't be recovered from the one-way node id, so tag an
         // unregistered row with a short id prefix to keep multiple ones distinct.
         let name = entry.map(|x| x.name.clone()).unwrap_or_else(|| {
-            let short: String = e.node_id.0.chars().take(8).collect();
+            let short: String = id.chars().take(8).collect();
             format!("(unregistered {short})")
         });
         let vis = match entry.map(|x| x.visibility) {
             Some(v) => v.as_str(),
             None => "unregistered",
         };
-        scored.push((cosine(&qvec, &e.vector), name, vis));
+        scored.push((*sim, name, vis));
     }
     scored.sort_by(|a, b| {
         b.0.partial_cmp(&a.0)

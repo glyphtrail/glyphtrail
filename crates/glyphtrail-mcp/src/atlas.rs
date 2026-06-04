@@ -195,13 +195,29 @@ fn similar(atlas_dir: &Path, args: &Value) -> Result<Value, String> {
         (HashingEmbedder::new(dim).embed(query), None)
     };
 
+    // Prefer the HNSW index (built by `atlas embed`/`graph-embed`); fall back to an
+    // exact in-Rust cosine scan. The index table holds only this space's rows.
+    let table = if graph { "GraphVec" } else { "TextVec" };
+    let candidates: Vec<(String, f32)> = store
+        .load_vector_ext()
+        .then(|| store.vector_knn(table, &qvec, space.len()).ok())
+        .flatten()
+        .filter(|h| !h.is_empty())
+        .map(|h| h.into_iter().map(|(id, sim)| (id.0, sim)).collect())
+        .unwrap_or_else(|| {
+            space
+                .iter()
+                .map(|e| (e.node_id.0.clone(), cosine(&qvec, &e.vector)))
+                .collect()
+        });
+
     let mut hidden = 0usize;
     let mut scored: Vec<(f32, String, &'static str)> = Vec::new();
-    for e in &space {
-        if Some(&e.node_id.0) == self_id.as_ref() {
+    for (id, sim) in &candidates {
+        if Some(id) == self_id.as_ref() {
             continue;
         }
-        let entry = by_id.get(&e.node_id.0);
+        let entry = by_id.get(id);
         let restricted = entry.map(|x| x.visibility.is_restricted()).unwrap_or(true);
         if restricted && !include_restricted {
             hidden += 1;
@@ -211,7 +227,7 @@ fn similar(atlas_dir: &Path, args: &Value) -> Result<Value, String> {
         let vis = entry
             .map(|x| x.visibility.as_str())
             .unwrap_or("unregistered");
-        scored.push((cosine(&qvec, &e.vector), name, vis));
+        scored.push((*sim, name, vis));
     }
     scored.sort_by(|a, b| {
         b.0.partial_cmp(&a.0)
