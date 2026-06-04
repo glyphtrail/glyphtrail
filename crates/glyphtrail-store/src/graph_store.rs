@@ -73,6 +73,19 @@ pub trait GraphStore: Adjacency {
     fn clear_embeddings(&mut self) -> Result<()> {
         Ok(())
     }
+    /// Remove only the embeddings produced by `model` (#338), so a graph re-embed
+    /// replaces just the graph rows and leaves the text rows intact. Default no-op.
+    fn clear_embeddings_by_model(&mut self, model: &str) -> Result<()> {
+        let _ = model;
+        Ok(())
+    }
+    /// Remove every embedding *except* those produced by `model` (#338), so a text
+    /// re-embed replaces the text rows and leaves the graph rows intact. Default
+    /// no-op.
+    fn clear_embeddings_except_model(&mut self, model: &str) -> Result<()> {
+        let _ = model;
+        Ok(())
+    }
     fn insert_pending(&mut self, links: &[PendingLink]) -> Result<()>;
     fn insert_imports(&mut self, imports: &[(String, String, String)]) -> Result<()>;
     fn delete_edges_by_confidence(&mut self, confidence: Confidence) -> Result<usize>;
@@ -150,6 +163,16 @@ pub trait GraphStore: Adjacency {
         policy: &ImpactPolicy,
     ) -> Result<Vec<ClassifiedItem>>;
     fn stats(&self) -> Result<Stats>;
+    /// `(node kind, count)` over all nodes, for the structural graph embedding
+    /// (#338). Default empty for backends that don't implement it.
+    fn node_kind_counts(&self) -> Result<Vec<(String, usize)>> {
+        Ok(Vec::new())
+    }
+    /// `(edge kind, count)` over all edges, for the structural graph embedding
+    /// (#338). Default empty.
+    fn edge_kind_counts(&self) -> Result<Vec<(String, usize)>> {
+        Ok(Vec::new())
+    }
     fn export_graph(&self, limit: usize) -> Result<(Vec<Node>, Vec<Edge>)>;
     /// Export nodes/edges with kind filters pushed into the query, so a trimmed
     /// view doesn't transfer the whole graph (#194). `node_kinds`/`edge_kinds`

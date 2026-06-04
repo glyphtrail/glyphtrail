@@ -10,11 +10,12 @@ use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand};
+use glyphtrail_core::config::RepoPaths;
 use glyphtrail_core::{
-    AtlasConfig, AtlasHeads, CodeGraph, CommitMeta, Confidence, EdgeKind, Embedding, MeConfig,
-    Node, NodeId, NodeKind, Registry, RegistryEntry, TimelineQuery, Window, author_scope_label,
-    cosine, default_atlas_path, default_registry_path, filter_timeline, format_date, scrub_secrets,
-    timeline_value,
+    AtlasConfig, AtlasHeads, CodeGraph, CommitMeta, Confidence, EdgeKind, Embedding, GraphEmbedder,
+    GraphProfile, MeConfig, Node, NodeId, NodeKind, Registry, RegistryEntry, StructuralEmbedder,
+    TimelineQuery, Window, author_scope_label, cosine, default_atlas_path, default_registry_path,
+    embed::GRAPH_MODEL_ID, filter_timeline, format_date, scrub_secrets, timeline_value,
 };
 use glyphtrail_store::{GraphStore, LadybugStore};
 
@@ -40,6 +41,8 @@ pub enum AtlasCmd {
     Export(ExportArgs),
     /// Compute repo embeddings from the synced history (local lexical model, #338).
     Embed(EmbedArgs),
+    /// Compute structural embeddings from each repo's code graph (local, #338).
+    GraphEmbed(GraphEmbedArgs),
     /// Find repos similar to a repo name or free-text query (visibility-gated).
     Similar(SimilarArgs),
     /// Serve the atlas over MCP (stdio): timeline, status, and the repo+file bridge.
@@ -65,9 +68,20 @@ pub struct EmbedArgs {
 }
 
 #[derive(Args)]
+pub struct GraphEmbedArgs {
+    /// Embedding vector width (the hashing-trick bucket count).
+    #[arg(long, default_value_t = glyphtrail_core::DEFAULT_DIM)]
+    pub dim: usize,
+}
+
+#[derive(Args)]
 pub struct SimilarArgs {
     /// A registered repo name (repo↔repo similarity) or free text (query↔repo).
     pub query: String,
+    /// Compare repos by code-graph structure (from `atlas graph-embed`) instead of
+    /// commit text. Free-text queries aren't structural, so a repo name is required.
+    #[arg(long)]
+    pub graph: bool,
     /// How many matches to show (most similar first).
     #[arg(long, default_value_t = 10)]
     pub limit: usize,
@@ -229,6 +243,7 @@ pub fn run(cmd: AtlasCmd) -> Result<()> {
         AtlasCmd::Story(args) => story(&dir, args)?,
         AtlasCmd::Export(args) => export(&dir, args)?,
         AtlasCmd::Embed(args) => embed(&dir, args)?,
+        AtlasCmd::GraphEmbed(args) => graph_embed(&dir, args)?,
         AtlasCmd::Similar(args) => similar(&dir, args)?,
         AtlasCmd::Mcp => glyphtrail_mcp::serve_atlas_stdio(dir)?,
     }
@@ -645,6 +660,75 @@ fn repo_node_id(name: &str) -> NodeId {
     NodeId::derive(&["repo", name])
 }
 
+/// The key a repo's *structural* embedding is stored under — a separate id space
+/// from the text embedding, so both coexist in the one side-table (#338).
+fn repo_graph_node_id(name: &str) -> NodeId {
+    NodeId::derive(&["repo_graph", name])
+}
+
+/// `glyphtrail atlas graph-embed` — embed each registered repo's code-graph
+/// structure (node/edge-kind + language histograms) so `atlas similar --graph`
+/// ranks repos by architecture (#338). Fully local: reads each repo's own
+/// `.glyphtrail` index, no network. A repo with no index is skipped.
+fn graph_embed(dir: &Path, args: GraphEmbedArgs) -> Result<()> {
+    let lb = ladybug_dir(dir);
+    if !lb.exists() {
+        bail!("atlas is disabled; run `glyphtrail atlas init` first");
+    }
+    let registry = match default_registry_path() {
+        Some(p) => Registry::load(&p)?,
+        None => Registry::default(),
+    };
+    let embedder = StructuralEmbedder::new(args.dim);
+    let mut embeddings: Vec<Embedding> = Vec::new();
+    let mut no_index = 0usize; // missing dir or unreadable index
+    let mut empty = 0usize; // index present but no structure
+    for entry in &registry.repos {
+        let repo_lb = RepoPaths::new(entry.active_root())
+            .index_dir
+            .join("ladybug");
+        if !repo_lb.exists() {
+            no_index += 1;
+            continue;
+        }
+        // Read-only open: never trigger the schema migration (a drop+recreate),
+        // which would wipe an out-of-date index just to read its kind counts.
+        let Ok(repo_store) = LadybugStore::open_read_only(&repo_lb) else {
+            no_index += 1;
+            continue;
+        };
+        let profile = GraphProfile {
+            node_kinds: repo_store.node_kind_counts()?,
+            edge_kinds: repo_store.edge_kind_counts()?,
+            languages: repo_store.stats()?.languages,
+        };
+        let vector = embedder.embed(&profile);
+        if vector.iter().all(|x| *x == 0.0) {
+            empty += 1; // an empty / unanalyzed graph carries no structure
+            continue;
+        }
+        embeddings.push(Embedding {
+            node_id: repo_graph_node_id(&entry.name),
+            vector,
+        });
+    }
+    if embeddings.is_empty() {
+        bail!("no indexed repos to embed; run `glyphtrail analyze` in your repos first");
+    }
+    let mut store = LadybugStore::open(&lb)?;
+    store.clear_embeddings_by_model(GRAPH_MODEL_ID)?;
+    store.set_embeddings(&embeddings, embedder.id())?;
+    println!(
+        "graph-embedded {} repo{} ({} no index, {} empty) [{}]",
+        embeddings.len(),
+        if embeddings.len() == 1 { "" } else { "s" },
+        no_index,
+        empty,
+        embedder.id(),
+    );
+    Ok(())
+}
+
 /// `glyphtrail atlas embed` — compute an embedding per repo from the synced commit
 /// history and store it in the side table (#338). The default `local` provider
 /// never leaves the machine; an `openai` provider POSTs the per-repo commit-subject
@@ -698,10 +782,10 @@ fn embed(dir: &Path, args: EmbedArgs) -> Result<()> {
         })
         .collect();
     let mut store = store;
-    // Replace the whole set, so a repo that has left the active date window (no
-    // in-bounds commits) doesn't keep a stale vector from an older window, and a
-    // changed model/width never leaves mismatched rows behind.
-    store.clear_embeddings()?;
+    // Replace the text rows, so a repo that left the active date window doesn't keep
+    // a stale vector and a changed model/width never leaves mismatched rows behind.
+    // Graph embeddings (a different model) are left untouched.
+    store.clear_embeddings_except_model(GRAPH_MODEL_ID)?;
     store.set_embeddings(&embeddings, &cfg.model_id())?;
     // Record the active provider so `similar` embeds a free-text query the same way.
     store.set_meta("embedding_model", &cfg.model_id())?;
@@ -726,34 +810,50 @@ fn similar(dir: &Path, args: SimilarArgs) -> Result<()> {
         bail!("atlas is disabled; run `glyphtrail atlas init` first");
     }
     let store = LadybugStore::open(&lb)?;
-    let embeddings = store.embeddings()?;
-    if embeddings.is_empty() {
-        bail!("no embeddings yet; run `glyphtrail atlas embed` first");
-    }
+    let all = store.embeddings()?;
     let registry = match default_registry_path() {
         Some(p) => Registry::load(&p)?,
         None => Registry::default(),
     };
-    // Map each embedding's node id back to a registry repo (for the display name
-    // and visibility). Built from the registry, since the node id is a one-way hash.
+
+    // Two embedding spaces share the side-table: text (`atlas embed`) and graph
+    // (`atlas graph-embed`), each keyed by its own id scheme. Keep only rows whose
+    // id is in the *active mode's* registry-derived id set, so a stray row (a
+    // deregistered repo, or the other space) can't slip in and trip the dimension
+    // guard. The same map names rows + resolves visibility.
+    let id_of = |name: &str| -> NodeId {
+        if args.graph {
+            repo_graph_node_id(name)
+        } else {
+            repo_node_id(name)
+        }
+    };
     let by_id: std::collections::HashMap<String, &RegistryEntry> = registry
         .repos
         .iter()
-        .map(|e| (repo_node_id(&e.name).0, e))
+        .map(|e| (id_of(&e.name).0, e))
         .collect();
-
-    // All stored vectors must share a width, else cosine silently scores mismatches
-    // as 0 and the ranking is misleading. `atlas embed` clears before writing, so
-    // this only trips on a hand-tampered store — fail loudly and tell the user.
-    let dim = embeddings[0].vector.len();
-    if embeddings.iter().any(|e| e.vector.len() != dim) {
-        bail!("stored embeddings have inconsistent dimensions; re-run `glyphtrail atlas embed`");
+    let embeddings: Vec<&Embedding> = all
+        .iter()
+        .filter(|e| by_id.contains_key(&e.node_id.0))
+        .collect();
+    if embeddings.is_empty() {
+        let cmd = if args.graph { "graph-embed" } else { "embed" };
+        bail!("no {cmd} embeddings yet; run `glyphtrail atlas {cmd}` first");
     }
 
-    // Resolve the query vector: a known repo name uses its stored embedding (and is
-    // excluded from its own results); anything else is embedded as free text under
-    // the same provider the repos were embedded with (recorded in `Meta`).
-    let self_id = repo_node_id(&args.query).0;
+    // All vectors in a space must share a width, else cosine silently scores
+    // mismatches as 0. Both embed commands clear before writing, so this only trips
+    // on a hand-tampered store — fail loudly.
+    let dim = embeddings[0].vector.len();
+    if embeddings.iter().any(|e| e.vector.len() != dim) {
+        bail!("stored embeddings have inconsistent dimensions; re-run the embed command");
+    }
+
+    // Resolve the query vector: a known repo uses its stored embedding (excluded
+    // from its own results). For text, anything else is embedded as a free-text
+    // query under the stored provider; structural similarity needs a repo, not text.
+    let self_id = id_of(&args.query).0;
     let (qvec, self_id, mode) = if let Some(e) = embeddings.iter().find(|e| e.node_id.0 == self_id)
     {
         (
@@ -761,6 +861,11 @@ fn similar(dir: &Path, args: SimilarArgs) -> Result<()> {
             Some(self_id),
             format!("repo '{}'", args.query),
         )
+    } else if args.graph {
+        bail!(
+            "graph similarity compares repositories; pass a registered repo name \
+             (run `glyphtrail atlas graph-embed` if it isn't embedded yet)"
+        );
     } else {
         let model = store
             .get_meta("embedding_model")?
@@ -811,10 +916,17 @@ fn similar(dir: &Path, args: SimilarArgs) -> Result<()> {
     });
     scored.truncate(args.limit);
 
+    let model_label = if args.graph {
+        GRAPH_MODEL_ID.to_string()
+    } else {
+        store
+            .get_meta("embedding_model")?
+            .unwrap_or_else(|| "lexical-hash-v1".to_string())
+    };
     let emit = Emit::from_flags(args.json, args.yaml);
     if emit == Emit::Text {
         println!("atlas similar — {mode}");
-        println!("  model:   lexical-hash-v1");
+        println!("  model:   {model_label}");
         if excluded > 0 {
             println!(
                 "  hidden:  {excluded} restricted (private/proprietary/unregistered; use --include-restricted)"
@@ -845,7 +957,7 @@ fn similar(dir: &Path, args: SimilarArgs) -> Result<()> {
             &serde_json::json!({
                 "query": args.query,
                 "mode": mode,
-                "model": "lexical-hash-v1",
+                "model": model_label,
                 "hidden_restricted": excluded,
                 "matches": matches,
             }),
