@@ -11,10 +11,10 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand};
 use glyphtrail_core::{
-    AtlasConfig, AtlasHeads, CodeGraph, CommitMeta, Confidence, EdgeKind, Embedder, Embedding,
-    HashingEmbedder, MeConfig, Node, NodeId, NodeKind, Registry, RegistryEntry, TimelineQuery,
-    Window, author_scope_label, cosine, default_atlas_path, default_registry_path, filter_timeline,
-    format_date, scrub_secrets, timeline_value,
+    AtlasConfig, AtlasHeads, CodeGraph, CommitMeta, Confidence, EdgeKind, Embedding, MeConfig,
+    Node, NodeId, NodeKind, Registry, RegistryEntry, TimelineQuery, Window, author_scope_label,
+    cosine, default_atlas_path, default_registry_path, filter_timeline, format_date, scrub_secrets,
+    timeline_value,
 };
 use glyphtrail_store::{GraphStore, LadybugStore};
 
@@ -48,9 +48,20 @@ pub enum AtlasCmd {
 
 #[derive(Args)]
 pub struct EmbedArgs {
-    /// Embedding vector width (the hashing-trick bucket count).
+    /// Embedding vector width for the local provider (the hashing-trick bucket
+    /// count). Ignored by API providers, which set their own dimension.
     #[arg(long, default_value_t = glyphtrail_core::DEFAULT_DIM)]
     pub dim: usize,
+    /// Embedding provider. `local` is the default and never leaves the machine;
+    /// `openai` POSTs commit text to an OpenAI-compatible endpoint.
+    #[arg(long, value_enum, default_value_t)]
+    pub provider: crate::commands::embed_provider::EmbedProvider,
+    /// Embedding model id (provider default when unset).
+    #[arg(long)]
+    pub model: Option<String>,
+    /// Override the embeddings endpoint (e.g. a local Ollama server) for `openai`.
+    #[arg(long)]
+    pub base_url: Option<String>,
 }
 
 #[derive(Args)]
@@ -634,11 +645,14 @@ fn repo_node_id(name: &str) -> NodeId {
     NodeId::derive(&["repo", name])
 }
 
-/// `glyphtrail atlas embed` — compute a lexical embedding per repo from the synced
-/// commit history and store it in the side table (#338). Local-only: this reads
-/// the atlas store and writes vectors back; nothing leaves the machine, so it
-/// embeds every repo regardless of visibility (gating is at `similar` output).
+/// `glyphtrail atlas embed` — compute an embedding per repo from the synced commit
+/// history and store it in the side table (#338). The default `local` provider
+/// never leaves the machine; an `openai` provider POSTs the per-repo commit-subject
+/// summaries to the configured endpoint (announced first), one of the few atlas
+/// functions allowed off-machine on explicit opt-in. Embeds every repo regardless
+/// of visibility (gating is at `similar` output).
 fn embed(dir: &Path, args: EmbedArgs) -> Result<()> {
+    use crate::commands::embed_provider::{EmbedConfig, embed_docs};
     let lb = ladybug_dir(dir);
     if !lb.exists() {
         bail!("atlas is disabled; run `glyphtrail atlas init` first");
@@ -658,26 +672,48 @@ fn embed(dir: &Path, args: EmbedArgs) -> Result<()> {
     if docs.is_empty() {
         bail!("no commits to embed; run `glyphtrail atlas sync` first");
     }
-    let embedder = HashingEmbedder::new(args.dim);
-    let embeddings: Vec<Embedding> = docs
-        .iter()
-        .map(|(name, doc)| Embedding {
-            node_id: repo_node_id(name),
-            vector: embedder.embed(doc),
+    let cfg = EmbedConfig {
+        provider: args.provider,
+        model: args.model.clone(),
+        base_url: args.base_url.clone(),
+        dim: args.dim,
+    };
+    if cfg.is_offmachine() {
+        eprintln!(
+            "atlas embed: sending {} repo summaries off-machine to {} ({})",
+            docs.len(),
+            crate::commands::embed_provider::host_of(&cfg.endpoint()),
+            cfg.describe(),
+        );
+    }
+    let names: Vec<String> = docs.keys().cloned().collect();
+    let texts: Vec<String> = docs.values().cloned().collect();
+    let vectors = embed_docs(&cfg, &texts)?;
+    let embeddings: Vec<Embedding> = names
+        .into_iter()
+        .zip(vectors)
+        .map(|(name, vector)| Embedding {
+            node_id: repo_node_id(&name),
+            vector,
         })
         .collect();
     let mut store = store;
     // Replace the whole set, so a repo that has left the active date window (no
     // in-bounds commits) doesn't keep a stale vector from an older window, and a
-    // changed --dim never leaves mixed-width rows behind.
+    // changed model/width never leaves mismatched rows behind.
     store.clear_embeddings()?;
-    store.set_embeddings(&embeddings, embedder.id())?;
+    store.set_embeddings(&embeddings, &cfg.model_id())?;
+    // Record the active provider so `similar` embeds a free-text query the same way.
+    store.set_meta("embedding_model", &cfg.model_id())?;
+    store.set_meta(
+        "embedding_base_url",
+        &cfg.base_url.clone().unwrap_or_default(),
+    )?;
     println!(
-        "embedded {} repo{} ({}, dim {})",
+        "embedded {} repo{} ({})",
         embeddings.len(),
         if embeddings.len() == 1 { "" } else { "s" },
-        embedder.id(),
-        embedder.dim(),
+        cfg.describe(),
     );
     Ok(())
 }
@@ -715,7 +751,8 @@ fn similar(dir: &Path, args: SimilarArgs) -> Result<()> {
     }
 
     // Resolve the query vector: a known repo name uses its stored embedding (and is
-    // excluded from its own results); anything else is embedded as free text.
+    // excluded from its own results); anything else is embedded as free text under
+    // the same provider the repos were embedded with (recorded in `Meta`).
     let self_id = repo_node_id(&args.query).0;
     let (qvec, self_id, mode) = if let Some(e) = embeddings.iter().find(|e| e.node_id.0 == self_id)
     {
@@ -725,7 +762,21 @@ fn similar(dir: &Path, args: SimilarArgs) -> Result<()> {
             format!("repo '{}'", args.query),
         )
     } else {
-        let v = HashingEmbedder::new(dim).embed(&args.query);
+        let model = store
+            .get_meta("embedding_model")?
+            .unwrap_or_else(|| "lexical-hash-v1".to_string());
+        let base_url = store
+            .get_meta("embedding_base_url")?
+            .filter(|s| !s.is_empty());
+        let qcfg = crate::commands::embed_provider::config_from_stored(&model, base_url, dim);
+        if qcfg.is_offmachine() {
+            eprintln!(
+                "atlas similar: sending the query off-machine to {} ({})",
+                crate::commands::embed_provider::host_of(&qcfg.endpoint()),
+                qcfg.describe(),
+            );
+        }
+        let v = crate::commands::embed_provider::embed_one(&qcfg, &args.query)?;
         (v, None, format!("query \"{}\"", args.query))
     };
 
