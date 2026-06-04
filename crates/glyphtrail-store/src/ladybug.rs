@@ -759,6 +759,22 @@ impl GraphStore for LadybugStore {
         Ok(())
     }
 
+    fn clear_embeddings_by_model(&mut self, model: &str) -> Result<()> {
+        self.run(
+            "MATCH (e:Embedding) WHERE e.model = $m DELETE e",
+            vec![("m", s(model))],
+        )?;
+        Ok(())
+    }
+
+    fn clear_embeddings_except_model(&mut self, model: &str) -> Result<()> {
+        self.run(
+            "MATCH (e:Embedding) WHERE e.model <> $m DELETE e",
+            vec![("m", s(model))],
+        )?;
+        Ok(())
+    }
+
     fn remark_commit_bounds(&mut self, since: Option<i64>, until: Option<i64>) -> Result<()> {
         // Inline the bounds (lbug caches a bound param's type by name across
         // statements, so an INT64 param here would clash with STRING params
@@ -1316,6 +1332,28 @@ impl GraphStore for LadybugStore {
         })
     }
 
+    fn node_kind_counts(&self) -> Result<Vec<(String, usize)>> {
+        Ok(self
+            .run(
+                "MATCH (n:Node) RETURN n.kind, COUNT(*) ORDER BY n.kind",
+                vec![],
+            )?
+            .iter()
+            .map(|r| (get_str(r, 0), get_i64(r, 1).max(0) as usize))
+            .collect())
+    }
+
+    fn edge_kind_counts(&self) -> Result<Vec<(String, usize)>> {
+        Ok(self
+            .run(
+                "MATCH ()-[e:Edge]->() RETURN e.kind, COUNT(*) ORDER BY e.kind",
+                vec![],
+            )?
+            .iter()
+            .map(|r| (get_str(r, 0), get_i64(r, 1).max(0) as usize))
+            .collect())
+    }
+
     fn export_graph(&self, limit: usize) -> Result<(Vec<Node>, Vec<Edge>)> {
         self.export_filtered(None, None, limit)
     }
@@ -1624,6 +1662,62 @@ mod tests {
         // clear_embeddings drops every row, so a re-embed starts clean.
         lb.clear_embeddings().unwrap();
         check!(lb.embeddings().unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Atlas (#338): the text and graph embedding spaces share the side table; the
+    // model-scoped clears delete one without touching the other.
+    #[test]
+    fn model_scoped_embedding_clears() {
+        let dir = tmp_dir("atlas-embed-scoped");
+        let mut lb = LadybugStore::open(&dir).unwrap();
+        let text = Embedding {
+            node_id: NodeId("repo:a".into()),
+            vector: vec![1.0, 0.0],
+        };
+        let graph = Embedding {
+            node_id: NodeId("graph:a".into()),
+            vector: vec![0.0, 1.0],
+        };
+        lb.set_embeddings(std::slice::from_ref(&text), "lexical-hash-v1")
+            .unwrap();
+        lb.set_embeddings(std::slice::from_ref(&graph), "graph-struct-v1")
+            .unwrap();
+        check!(lb.embeddings().unwrap().len() == 2);
+        // Clearing graph leaves text.
+        lb.clear_embeddings_by_model("graph-struct-v1").unwrap();
+        check!(lb.embeddings().unwrap() == vec![text.clone()]);
+        // Re-add graph, then clear everything-except-graph leaves only graph.
+        lb.set_embeddings(std::slice::from_ref(&graph), "graph-struct-v1")
+            .unwrap();
+        lb.clear_embeddings_except_model("graph-struct-v1").unwrap();
+        check!(lb.embeddings().unwrap() == vec![graph]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Atlas (#338): node/edge-kind histograms feed the structural graph embedding.
+    #[test]
+    fn node_and_edge_kind_counts() {
+        let dir = tmp_dir("kind-counts");
+        let mut lb = LadybugStore::open(&dir).unwrap();
+        let mut t = node("t", "users");
+        t.kind = NodeKind::Table;
+        lb.insert_nodes(&[node("a", "fa"), node("b", "fb"), t], true)
+            .unwrap();
+        lb.insert_edges(
+            &[Edge {
+                src: NodeId("a".into()),
+                dst: NodeId("b".into()),
+                kind: EdgeKind::Calls,
+                confidence: Confidence::Extracted,
+            }],
+            true,
+        )
+        .unwrap();
+        let nk = lb.node_kind_counts().unwrap();
+        check!(nk.contains(&("function".to_string(), 2)));
+        check!(nk.contains(&("table".to_string(), 1)));
+        check!(lb.edge_kind_counts().unwrap() == vec![("calls".to_string(), 1)]);
         std::fs::remove_dir_all(&dir).ok();
     }
 

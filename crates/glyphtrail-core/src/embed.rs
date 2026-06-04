@@ -86,12 +86,7 @@ impl Embedder for HashingEmbedder {
             .into_iter()
             .map(|c| if c == 0 { 0.0 } else { 1.0 + (c as f32).ln() })
             .collect();
-        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if norm > 0.0 {
-            for x in &mut v {
-                *x /= norm;
-            }
-        }
+        l2_normalize(&mut v);
         v
     }
 }
@@ -137,6 +132,90 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     h
 }
 
+/// L2-normalise a vector in place (no-op for a zero vector).
+fn l2_normalize(v: &mut [f32]) {
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for x in v {
+            *x /= norm;
+        }
+    }
+}
+
+/// A repo's structural profile: histograms over its code graph's node kinds, edge
+/// kinds, and languages. The structural analogue of the lexical document — the
+/// input a [`GraphEmbedder`] turns into a vector (#338).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GraphProfile {
+    pub node_kinds: Vec<(String, usize)>,
+    pub edge_kinds: Vec<(String, usize)>,
+    pub languages: Vec<(String, usize)>,
+}
+
+/// The model id recorded with a structural graph embedding, so it's distinguishable
+/// from a text embedding in the shared side-table.
+pub const GRAPH_MODEL_ID: &str = "graph-struct-v1";
+
+/// Turns a repo's [`GraphProfile`] into a vector, so repos with a similar
+/// architecture (kind / edge / language mix) read as similar — the structural
+/// counterpart to text [`Embedder`]. Local-first and pluggable: a real graph model
+/// (a GNN over the actual graph) implements the same trait later.
+pub trait GraphEmbedder {
+    fn dim(&self) -> usize;
+    fn id(&self) -> &str;
+    fn embed(&self, profile: &GraphProfile) -> Vec<f32>;
+}
+
+/// Local structural graph embedder: hashes each `facet:name` feature (a node kind,
+/// edge kind, or language) into a bucket weighted by the square root of its count
+/// (so a huge file count doesn't swamp the signal), then L2-normalises. Cosine of
+/// two such vectors reflects how alike two repos' structural distributions are.
+#[derive(Debug, Clone)]
+pub struct StructuralEmbedder {
+    dim: usize,
+}
+
+impl Default for StructuralEmbedder {
+    fn default() -> Self {
+        Self::new(DEFAULT_DIM)
+    }
+}
+
+impl StructuralEmbedder {
+    pub fn new(dim: usize) -> Self {
+        Self { dim: dim.max(1) }
+    }
+
+    fn accumulate(&self, v: &mut [f32], facet: &str, features: &[(String, usize)]) {
+        for (name, count) in features {
+            if *count == 0 {
+                continue;
+            }
+            let bucket = (fnv1a(format!("{facet}:{name}").as_bytes()) % self.dim as u64) as usize;
+            v[bucket] += (*count as f32).sqrt();
+        }
+    }
+}
+
+impl GraphEmbedder for StructuralEmbedder {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn id(&self) -> &str {
+        GRAPH_MODEL_ID
+    }
+
+    fn embed(&self, profile: &GraphProfile) -> Vec<f32> {
+        let mut v = vec![0.0f32; self.dim];
+        self.accumulate(&mut v, "nk", &profile.node_kinds);
+        self.accumulate(&mut v, "ek", &profile.edge_kinds);
+        self.accumulate(&mut v, "lang", &profile.languages);
+        l2_normalize(&mut v);
+        v
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,5 +257,49 @@ mod tests {
     #[test]
     fn cosine_handles_mismatched_lengths() {
         check!(cosine(&[1.0, 0.0], &[1.0]) == 0.0);
+    }
+
+    fn profile(nk: &[(&str, usize)], lang: &[(&str, usize)]) -> GraphProfile {
+        GraphProfile {
+            node_kinds: nk.iter().map(|(k, c)| (k.to_string(), *c)).collect(),
+            edge_kinds: vec![("Calls".to_string(), 50)],
+            languages: lang.iter().map(|(k, c)| (k.to_string(), *c)).collect(),
+        }
+    }
+
+    #[test]
+    fn structural_embedding_is_unit_length() {
+        let e = StructuralEmbedder::default();
+        let v = e.embed(&profile(
+            &[("Function", 100), ("Struct", 20)],
+            &[("rust", 30)],
+        ));
+        check!(v.len() == DEFAULT_DIM);
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        check!((norm - 1.0).abs() < 1e-5);
+        check!(e.id() == GRAPH_MODEL_ID);
+    }
+
+    #[test]
+    fn similar_architectures_score_higher_than_different_ones() {
+        let e = StructuralEmbedder::default();
+        // Two Rust function-heavy repos vs an HTML/CSS, table-heavy one.
+        let code_a = e.embed(&profile(
+            &[("Function", 200), ("Struct", 40)],
+            &[("rust", 60)],
+        ));
+        let code_b = e.embed(&profile(
+            &[("Function", 150), ("Struct", 30)],
+            &[("rust", 50)],
+        ));
+        let data_repo = e.embed(&profile(&[("Table", 80), ("Column", 400)], &[("sql", 40)]));
+        check!(cosine(&code_a, &code_b) > cosine(&code_a, &data_repo));
+    }
+
+    #[test]
+    fn empty_profile_is_a_zero_vector() {
+        let e = StructuralEmbedder::default();
+        let v = e.embed(&GraphProfile::default());
+        check!(v.iter().all(|x| *x == 0.0));
     }
 }
