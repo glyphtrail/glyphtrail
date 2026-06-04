@@ -883,15 +883,7 @@ const SPACE_TEXT: &str = "text";
 const SPACE_GRAPH: &str = "graph";
 const SPACE_COMMIT: &str = "commit";
 
-/// The per-`(space, model)` FLOAT[]/HNSW table name, sanitised to kuzu's
-/// `[A-Za-z0-9_]` identifier charset so each model gets its own index.
-fn vec_table(space: &str, model: &str) -> String {
-    let slug: String = model
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
-    format!("Vec_{space}_{slug}")
-}
+use glyphtrail_core::vec_table;
 
 /// Record the most-recently-embedded model for a space (the `similar` default),
 /// plus the provider base URL + dim, so a free-text query re-embeds the same way.
@@ -982,7 +974,28 @@ fn embed_commits(dir: &Path, args: EmbedCommitsArgs) -> Result<()> {
             cfg.describe(),
         );
     }
-    let docs: Vec<String> = rows.iter().map(|r| r.commit.subject.clone()).collect();
+    // Fold a bounded digest of each commit's changed paths (top dirs + extensions)
+    // into its document, so a sparse message ("Initial commit" that adds 500 images)
+    // still embeds with meaning — without the path list blowing the token budget.
+    let mut paths_by_commit: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for (commit_id, path) in store.commit_touched_paths()? {
+        paths_by_commit.entry(commit_id).or_default().push(path);
+    }
+    let docs: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            let mut doc = r.commit.subject.clone();
+            if let Some(paths) = paths_by_commit.get(&r.commit.node_id.0) {
+                let digest = glyphtrail_core::paths_digest(paths);
+                if !digest.is_empty() {
+                    doc.push(' ');
+                    doc.push_str(&digest);
+                }
+            }
+            doc
+        })
+        .collect();
     let vectors = embed_docs(&cfg, &docs)?;
     // Skip commits whose subject carries no signal (a zero vector has no defined
     // cosine and would poison the index).

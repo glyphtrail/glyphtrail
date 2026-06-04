@@ -129,6 +129,12 @@ pub trait GraphStore: Adjacency {
         let _ = node_ids;
         Ok(Vec::new())
     }
+    /// `(commit node id, touched file path)` over every atlas commit's `Touched`
+    /// edges, so `embed-commits` can fold a bounded digest of the changed paths into
+    /// each commit's document (meaning for sparse messages) (#338). Default empty.
+    fn commit_touched_paths(&self) -> Result<Vec<(String, String)>> {
+        Ok(Vec::new())
+    }
     fn all_pending(&self) -> Result<Vec<PendingLink>>;
     fn all_imports(&self) -> Result<Vec<(String, String, String)>>;
     fn node_files(&self) -> Result<Vec<(String, String)>>;

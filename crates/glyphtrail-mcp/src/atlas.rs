@@ -10,7 +10,7 @@ use std::path::Path;
 use glyphtrail_core::config::RepoPaths;
 use glyphtrail_core::{
     AtlasConfig, Embedder, HashingEmbedder, NodeId, Registry, RegistryEntry, TimelineQuery, Window,
-    author_scope_label, cosine, default_registry_path, filter_timeline, timeline_value,
+    author_scope_label, cosine, default_registry_path, filter_timeline, timeline_value, vec_table,
 };
 use glyphtrail_store::{GraphStore, LadybugStore};
 use serde_json::{Value, json};
@@ -204,17 +204,16 @@ fn similar(atlas_dir: &Path, args: &Value) -> Result<Value, String> {
         if Some(id) == self_id.as_ref() {
             continue;
         }
-        let entry = by_id.get(id);
-        let restricted = entry.map(|x| x.visibility.is_restricted()).unwrap_or(true);
-        if restricted && !include_restricted {
+        // Only return repos the registry can name — the MCP server can't recover a
+        // name from the one-way node id, so a deregistered/stray row is skipped.
+        let Some(entry) = by_id.get(id) else {
+            continue;
+        };
+        if entry.visibility.is_restricted() && !include_restricted {
             hidden += 1;
             continue;
         }
-        let name = entry.map(|x| x.name.clone()).unwrap_or_default();
-        let vis = entry
-            .map(|x| x.visibility.as_str())
-            .unwrap_or("unregistered");
-        scored.push((*sim, name, vis));
+        scored.push((*sim, entry.name.clone(), entry.visibility.as_str()));
     }
     scored.sort_by(|a, b| {
         b.0.partial_cmp(&a.0)
@@ -233,15 +232,6 @@ fn similar(atlas_dir: &Path, args: &Value) -> Result<Value, String> {
             .map(|(score, name, vis)| json!({ "repo": name, "score": score, "visibility": vis }))
             .collect::<Vec<_>>(),
     }))
-}
-
-/// The per-`(space, model)` FLOAT[]/HNSW table name (must match the CLI's scheme).
-fn vec_table(space: &str, model: &str) -> String {
-    let slug: String = model
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
-    format!("Vec_{space}_{slug}")
 }
 
 /// Resolve which embedding model to search in `space`: the explicit one, else the

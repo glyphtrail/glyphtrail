@@ -1212,6 +1212,18 @@ impl GraphStore for LadybugStore {
             .collect())
     }
 
+    fn commit_touched_paths(&self) -> Result<Vec<(String, String)>> {
+        Ok(self
+            .run(
+                "MATCH (c:Node {kind:'commit'})-[:Edge {kind:'touched'}]->(f:Node {kind:'file'}) \
+                 RETURN c.id, f.name",
+                vec![],
+            )?
+            .iter()
+            .map(|r| (get_str(r, 0), get_str(r, 1)))
+            .collect())
+    }
+
     fn all_pending(&self) -> Result<Vec<PendingLink>> {
         Ok(self
             .run(

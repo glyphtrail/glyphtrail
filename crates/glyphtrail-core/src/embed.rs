@@ -122,6 +122,21 @@ fn tokenize(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// The per-`(space, model)` FLOAT[]/HNSW table name (#338), so each model gets its
+/// own isolated index. A readable slug of the model aids debugging, but a hash of
+/// the *full* model id guarantees uniqueness — two ids that slug the same (e.g.
+/// `openai:m` vs `openai-m`) still get distinct tables, never sharing/overwriting.
+/// Lives in core so the CLI (which builds the table) and MCP (which queries it)
+/// always agree.
+pub fn vec_table(space: &str, model: &str) -> String {
+    let slug: String = model
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(24)
+        .collect();
+    format!("Vec_{space}_{slug}_{:016x}", fnv1a(model.as_bytes()))
+}
+
 /// FNV-1a 64-bit hash — small, stable, no dependency, good enough for bucketing.
 fn fnv1a(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
@@ -304,6 +319,21 @@ mod tests {
         let e = StructuralEmbedder::default();
         let v = e.embed(&GraphProfile::default());
         check!(v.iter().all(|x| *x == 0.0));
+    }
+
+    #[test]
+    fn vec_table_is_distinct_for_models_that_slug_alike() {
+        // Two ids that differ only in punctuation must not share a table.
+        check!(vec_table("text", "openai:m") != vec_table("text", "openai-m"));
+        // Same id is stable; different spaces differ.
+        check!(vec_table("text", "openai:m") == vec_table("text", "openai:m"));
+        check!(vec_table("text", "lexical-hash-v1") != vec_table("commit", "lexical-hash-v1"));
+        // Identifier-safe (kuzu charset).
+        check!(
+            vec_table("text", "openai:text-embedding-3-small")
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        );
     }
 
     #[test]
