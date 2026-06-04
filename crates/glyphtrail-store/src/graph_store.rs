@@ -128,6 +128,17 @@ pub trait GraphStore: Adjacency {
     ) -> Result<Vec<glyphtrail_core::AtlasTimelineRow>>;
     /// Derived atlas topics with their commit counts, most-tagged first (#334).
     fn atlas_topics(&self) -> Result<Vec<(String, usize)>>;
+    /// Just the atlas commit rows for the given node ids, joined to their repo
+    /// (touched-count omitted), so a commit similarity query maps its small ANN
+    /// hit set back to repo/date/subject without loading the whole timeline (#338).
+    /// Default empty for non-atlas backends.
+    fn atlas_commit_rows(
+        &self,
+        node_ids: &[String],
+    ) -> Result<Vec<glyphtrail_core::AtlasTimelineRow>> {
+        let _ = node_ids;
+        Ok(Vec::new())
+    }
     fn all_pending(&self) -> Result<Vec<PendingLink>>;
     fn all_imports(&self) -> Result<Vec<(String, String, String)>>;
     fn node_files(&self) -> Result<Vec<(String, String)>>;

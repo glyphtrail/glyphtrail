@@ -43,8 +43,12 @@ pub enum AtlasCmd {
     Embed(EmbedArgs),
     /// Compute structural embeddings from each repo's code graph (local, #338).
     GraphEmbed(GraphEmbedArgs),
+    /// Embed every synced commit (by subject) into an HNSW index (#338).
+    EmbedCommits(EmbedCommitsArgs),
     /// Find repos similar to a repo name or free-text query (visibility-gated).
     Similar(SimilarArgs),
+    /// Find commits similar to a free-text query, across repos (visibility-gated).
+    SimilarCommits(SimilarCommitsArgs),
     /// Serve the atlas over MCP (stdio): timeline, status, and the repo+file bridge.
     Mcp,
 }
@@ -72,6 +76,45 @@ pub struct GraphEmbedArgs {
     /// Embedding vector width (the hashing-trick bucket count).
     #[arg(long, default_value_t = glyphtrail_core::DEFAULT_DIM)]
     pub dim: usize,
+}
+
+#[derive(Args)]
+pub struct EmbedCommitsArgs {
+    /// Embedding vector width for the local provider.
+    #[arg(long, default_value_t = glyphtrail_core::DEFAULT_DIM)]
+    pub dim: usize,
+    /// Embedding provider (`local` never leaves the machine; `openai` POSTs commit
+    /// subjects to an OpenAI-compatible endpoint).
+    #[arg(long, value_enum, default_value_t)]
+    pub provider: crate::commands::embed_provider::EmbedProvider,
+    /// Embedding model id (provider default when unset).
+    #[arg(long)]
+    pub model: Option<String>,
+    /// Override the embeddings endpoint (e.g. a local Ollama server) for `openai`.
+    #[arg(long)]
+    pub base_url: Option<String>,
+}
+
+#[derive(Args)]
+pub struct SimilarCommitsArgs {
+    /// Free-text query; the nearest commits across repos are returned.
+    pub query: String,
+    /// Restrict to one registered repo.
+    #[arg(long)]
+    pub repo: Option<String>,
+    /// How many commits to show (most similar first).
+    #[arg(long, default_value_t = 10)]
+    pub limit: usize,
+    /// Include restricted repos — private, proprietary, or unregistered (excluded
+    /// by default).
+    #[arg(long)]
+    pub include_restricted: bool,
+    /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
+    /// Emit YAML.
+    #[arg(long)]
+    pub yaml: bool,
 }
 
 #[derive(Args)]
@@ -244,7 +287,9 @@ pub fn run(cmd: AtlasCmd) -> Result<()> {
         AtlasCmd::Export(args) => export(&dir, args)?,
         AtlasCmd::Embed(args) => embed(&dir, args)?,
         AtlasCmd::GraphEmbed(args) => graph_embed(&dir, args)?,
+        AtlasCmd::EmbedCommits(args) => embed_commits(&dir, args)?,
         AtlasCmd::Similar(args) => similar(&dir, args)?,
+        AtlasCmd::SimilarCommits(args) => similar_commits(&dir, args)?,
         AtlasCmd::Mcp => glyphtrail_mcp::serve_atlas_stdio(dir)?,
     }
     Ok(())
@@ -819,9 +864,204 @@ fn embed(dir: &Path, args: EmbedArgs) -> Result<()> {
     Ok(())
 }
 
-/// FLOAT[]/HNSW table names for the two embedding spaces (#338).
+/// FLOAT[]/HNSW table names for the embedding spaces (#338).
 const TEXT_VEC_TABLE: &str = "TextVec";
 const GRAPH_VEC_TABLE: &str = "GraphVec";
+const COMMIT_VEC_TABLE: &str = "CommitVec";
+
+/// `glyphtrail atlas embed-commits` — embed every in-bounds commit (by subject)
+/// into an HNSW index, so `atlas similar-commits` can find commits like a query
+/// (#338). This is the per-commit, ANN-scale path, so it requires the lbug vector
+/// extension. `local` never leaves the machine; `openai` POSTs commit subjects.
+fn embed_commits(dir: &Path, args: EmbedCommitsArgs) -> Result<()> {
+    use crate::commands::embed_provider::{EmbedConfig, embed_docs, host_of};
+    let lb = ladybug_dir(dir);
+    if !lb.exists() {
+        bail!("atlas is disabled; run `glyphtrail atlas init` first");
+    }
+    let mut store = LadybugStore::open(&lb)?;
+    let rows = store.atlas_timeline(None, None, None)?;
+    if rows.is_empty() {
+        bail!("no commits to embed; run `glyphtrail atlas sync` first");
+    }
+    if !store.install_vector_ext() {
+        bail!(
+            "commit embeddings need the lbug vector extension (HNSW); it couldn't be \
+             installed/loaded — see #473"
+        );
+    }
+    let cfg = EmbedConfig {
+        provider: args.provider,
+        model: args.model.clone(),
+        base_url: args.base_url.clone(),
+        dim: args.dim,
+    };
+    if cfg.is_offmachine() {
+        eprintln!(
+            "atlas embed-commits: sending {} commit subjects off-machine to {} ({})",
+            rows.len(),
+            host_of(&cfg.endpoint()),
+            cfg.describe(),
+        );
+    }
+    let docs: Vec<String> = rows.iter().map(|r| r.commit.subject.clone()).collect();
+    let vectors = embed_docs(&cfg, &docs)?;
+    // Skip commits whose subject carries no signal (a zero vector has no defined
+    // cosine and would poison the index).
+    let embeddings: Vec<Embedding> = rows
+        .iter()
+        .zip(vectors)
+        .filter(|(_, v)| v.iter().any(|x| *x != 0.0))
+        .map(|(r, vector)| Embedding {
+            node_id: r.commit.node_id.clone(),
+            vector,
+        })
+        .collect();
+    if embeddings.is_empty() {
+        bail!("no commit subjects produced a usable embedding");
+    }
+    let dim = embeddings[0].vector.len();
+    store.rebuild_vector_index(COMMIT_VEC_TABLE, &embeddings)?;
+    store.set_meta("commit_embedding_model", &cfg.model_id())?;
+    store.set_meta(
+        "commit_embedding_base_url",
+        &cfg.base_url.clone().unwrap_or_default(),
+    )?;
+    store.set_meta("commit_embedding_dim", &dim.to_string())?;
+    println!(
+        "embedded {} commits ({}) [HNSW ANN]",
+        embeddings.len(),
+        cfg.describe(),
+    );
+    Ok(())
+}
+
+/// `glyphtrail atlas similar-commits` — rank commits across repos by similarity to
+/// a free-text query, gating restricted repos out of the result (#338).
+fn similar_commits(dir: &Path, args: SimilarCommitsArgs) -> Result<()> {
+    use crate::commands::embed_provider::{config_from_stored, embed_one, host_of};
+    let lb = ladybug_dir(dir);
+    if !lb.exists() {
+        bail!("atlas is disabled; run `glyphtrail atlas init` first");
+    }
+    let store = LadybugStore::open(&lb)?;
+    if !store.load_vector_ext() {
+        bail!(
+            "commit similarity needs the lbug vector extension; run `glyphtrail atlas embed-commits` first"
+        );
+    }
+    let model = store.get_meta("commit_embedding_model")?.ok_or_else(|| {
+        anyhow!("no commit embeddings yet; run `glyphtrail atlas embed-commits` first")
+    })?;
+    let base_url = store
+        .get_meta("commit_embedding_base_url")?
+        .filter(|s| !s.is_empty());
+    let dim = store
+        .get_meta("commit_embedding_dim")?
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(glyphtrail_core::DEFAULT_DIM);
+    let qcfg = config_from_stored(&model, base_url, dim);
+    if qcfg.is_offmachine() {
+        eprintln!(
+            "atlas similar-commits: sending the query off-machine to {} ({})",
+            host_of(&qcfg.endpoint()),
+            qcfg.describe(),
+        );
+    }
+    let qvec = embed_one(&qcfg, &args.query)?;
+    if qvec.iter().all(|x| *x == 0.0) {
+        bail!("the query has no searchable terms after tokenization; try different words");
+    }
+
+    // Over-fetch from the HNSW index, then map *only those* commits back to their
+    // repo/date/subject (not the whole timeline) and gate by repo visibility before
+    // truncating to the requested limit.
+    let hits = store.vector_knn(COMMIT_VEC_TABLE, &qvec, args.limit * 4 + 32)?;
+    let ids: Vec<String> = hits.iter().map(|(id, _)| id.0.clone()).collect();
+    let rows = store.atlas_commit_rows(&ids)?;
+    let by_id: std::collections::HashMap<String, &glyphtrail_core::AtlasTimelineRow> = rows
+        .iter()
+        .map(|r| (r.commit.node_id.0.clone(), r))
+        .collect();
+    let registry = match default_registry_path() {
+        Some(p) => Registry::load(&p)?,
+        None => Registry::default(),
+    };
+
+    let mut hidden = 0usize;
+    let mut out: Vec<(f32, String, i64, String)> = Vec::new();
+    for (id, sim) in &hits {
+        let Some(row) = by_id.get(&id.0) else {
+            continue;
+        };
+        if let Some(repo) = &args.repo
+            && &row.repo != repo
+        {
+            continue;
+        }
+        let restricted = registry
+            .get(&row.repo)
+            .map(|e| e.visibility.is_restricted())
+            .unwrap_or(true);
+        if restricted && !args.include_restricted {
+            hidden += 1;
+            continue;
+        }
+        out.push((
+            *sim,
+            row.repo.clone(),
+            row.commit.committed_at,
+            row.commit.subject.clone(),
+        ));
+        if out.len() >= args.limit {
+            break;
+        }
+    }
+
+    let emit = Emit::from_flags(args.json, args.yaml);
+    if emit == Emit::Text {
+        println!("atlas similar-commits — query \"{}\"", args.query);
+        if hidden > 0 {
+            println!("  hidden:  {hidden} restricted (use --include-restricted)");
+        }
+        println!("  showing: {}", out.len());
+        println!();
+        for (i, (sim, repo, at, subject)) in out.iter().enumerate() {
+            println!(
+                "  {:>2}. {:6.3}  {}  {:<16}  {}",
+                i + 1,
+                sim,
+                format_date(*at),
+                truncate(repo, 16),
+                subject,
+            );
+        }
+        if out.is_empty() {
+            println!("  (no matches)");
+        }
+    } else {
+        let matches: Vec<serde_json::Value> = out
+            .iter()
+            .map(|(sim, repo, at, subject)| {
+                serde_json::json!({
+                    "score": sim,
+                    "repo": repo,
+                    "date": format_date(*at),
+                    "subject": subject,
+                })
+            })
+            .collect();
+        print_value(
+            &serde_json::json!({
+                "query": args.query,
+                "hidden_restricted": hidden,
+                "matches": matches,
+            }),
+            emit,
+        )?;
+    }
+    Ok(())
+}
 
 /// Build the HNSW vector index for a space if the lbug vector extension is
 /// available (installing it on first use — a one-time, documented network fetch).
