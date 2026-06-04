@@ -49,8 +49,31 @@ pub enum AtlasCmd {
     Similar(SimilarArgs),
     /// Find commits similar to a free-text query, across repos (visibility-gated).
     SimilarCommits(SimilarCommitsArgs),
+    /// Export one embedding namespace as JSONL (backup, re-import, off-box compute).
+    EmbedExport(EmbedExportArgs),
+    /// Import embedding namespaces from JSONL (replaces each space+model).
+    EmbedImport(EmbedImportArgs),
     /// Serve the atlas over MCP (stdio): timeline, status, and the repo+file bridge.
     Mcp,
+}
+
+#[derive(Args)]
+pub struct EmbedExportArgs {
+    /// Which space to export: text, graph, or commit.
+    #[arg(long)]
+    pub space: String,
+    /// Which model's namespace (default: the most-recently-embedded for the space).
+    #[arg(long)]
+    pub model: Option<String>,
+    /// Write to a file instead of stdout.
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+}
+
+#[derive(Args)]
+pub struct EmbedImportArgs {
+    /// JSONL file to import (reads stdin when omitted).
+    pub file: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -297,6 +320,8 @@ pub fn run(cmd: AtlasCmd) -> Result<()> {
         AtlasCmd::EmbedCommits(args) => embed_commits(&dir, args)?,
         AtlasCmd::Similar(args) => similar(&dir, args)?,
         AtlasCmd::SimilarCommits(args) => similar_commits(&dir, args)?,
+        AtlasCmd::EmbedExport(args) => embed_export(&dir, args)?,
+        AtlasCmd::EmbedImport(args) => embed_import(&dir, args)?,
         AtlasCmd::Mcp => glyphtrail_mcp::serve_atlas_stdio(dir)?,
     }
     Ok(())
@@ -1173,6 +1198,125 @@ fn build_vector_index(store: &LadybugStore, table: &str, embeddings: &[Embedding
             false
         }
     }
+}
+
+/// `glyphtrail atlas embed-export` — dump one `(space, model)` namespace as JSONL
+/// (`{node_id, space, model, dim, vector}` per line), so embeddings can be backed
+/// up, moved, or computed off-box and re-imported (#338). A local file write only.
+fn embed_export(dir: &Path, args: EmbedExportArgs) -> Result<()> {
+    use std::io::Write;
+    let lb = ladybug_dir(dir);
+    if !lb.exists() {
+        bail!("atlas is disabled; run `glyphtrail atlas init` first");
+    }
+    let store = LadybugStore::open(&lb)?;
+    let model = resolve_model(&store, &args.space, args.model.as_deref())?;
+    let embeddings = store.embeddings_for(&args.space, &model)?;
+    if embeddings.is_empty() {
+        bail!("no embeddings for ({}, {model})", args.space);
+    }
+    let mut out: Box<dyn Write> = match &args.out {
+        Some(p) => Box::new(std::io::BufWriter::new(
+            std::fs::File::create(p).with_context(|| format!("creating {}", p.display()))?,
+        )),
+        None => Box::new(std::io::stdout().lock()),
+    };
+    for e in &embeddings {
+        let line = serde_json::json!({
+            "node_id": e.node_id.0,
+            "space": args.space,
+            "model": model,
+            "dim": e.vector.len(),
+            "vector": e.vector,
+        });
+        writeln!(out, "{}", serde_json::to_string(&line)?)?;
+    }
+    out.flush()?;
+    if let Some(p) = &args.out {
+        eprintln!(
+            "exported {} embeddings ({}, {model}) to {}",
+            embeddings.len(),
+            args.space,
+            p.display()
+        );
+    }
+    Ok(())
+}
+
+/// `glyphtrail atlas embed-import` — load JSONL written by `embed-export`, grouping
+/// by `(space, model)` and replacing each namespace (rebuilding its HNSW index when
+/// the vector extension is available) (#338).
+fn embed_import(dir: &Path, args: EmbedImportArgs) -> Result<()> {
+    use std::io::BufRead;
+    let lb = ladybug_dir(dir);
+    if !lb.exists() {
+        bail!("atlas is disabled; run `glyphtrail atlas init` first");
+    }
+    let reader: Box<dyn BufRead> = match &args.file {
+        Some(p) => Box::new(std::io::BufReader::new(
+            std::fs::File::open(p).with_context(|| format!("opening {}", p.display()))?,
+        )),
+        None => Box::new(std::io::BufReader::new(std::io::stdin().lock())),
+    };
+    let mut groups: std::collections::BTreeMap<(String, String), Vec<Embedding>> =
+        std::collections::BTreeMap::new();
+    for (n, line) in reader.lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let v: serde_json::Value =
+            serde_json::from_str(&line).with_context(|| format!("parsing JSONL line {}", n + 1))?;
+        let node_id = v["node_id"]
+            .as_str()
+            .ok_or_else(|| anyhow!("line {}: missing `node_id`", n + 1))?;
+        let space = v["space"]
+            .as_str()
+            .ok_or_else(|| anyhow!("line {}: missing `space`", n + 1))?;
+        let model = v["model"]
+            .as_str()
+            .ok_or_else(|| anyhow!("line {}: missing `model`", n + 1))?;
+        let vector = v["vector"]
+            .as_array()
+            .ok_or_else(|| anyhow!("line {}: missing `vector`", n + 1))?
+            .iter()
+            .map(|x| {
+                x.as_f64()
+                    .map(|f| f as f32)
+                    .ok_or_else(|| anyhow!("line {}: non-numeric vector component", n + 1))
+            })
+            .collect::<Result<Vec<f32>>>()?;
+        groups
+            .entry((space.to_string(), model.to_string()))
+            .or_default()
+            .push(Embedding {
+                node_id: NodeId(node_id.to_string()),
+                vector,
+            });
+    }
+    if groups.is_empty() {
+        bail!("no embeddings found in the input");
+    }
+    let mut store = LadybugStore::open(&lb)?;
+    let have_ext = store.install_vector_ext();
+    for ((space, model), embeddings) in &groups {
+        let dim = embeddings[0].vector.len();
+        if embeddings.iter().any(|e| e.vector.len() != dim) {
+            bail!("({space}, {model}) has mixed vector dimensions");
+        }
+        store.clear_embeddings_for(space, model)?;
+        store.set_embeddings(space, model, embeddings)?;
+        if have_ext {
+            let _ = store.rebuild_vector_index(&vec_table(space, model), embeddings);
+        }
+        set_active_model(&mut store, space, model, None, dim)?;
+        println!(
+            "imported {} embeddings ({space}, {model}, dim {dim}){}",
+            embeddings.len(),
+            if have_ext { " [HNSW ANN]" } else { "" },
+        );
+    }
+    Ok(())
 }
 
 /// `glyphtrail atlas similar` — rank repos by lexical similarity to a repo name or
