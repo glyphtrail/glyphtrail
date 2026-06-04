@@ -1170,6 +1170,41 @@ impl GraphStore for LadybugStore {
             .collect())
     }
 
+    fn atlas_commit_rows(
+        &self,
+        node_ids: &[String],
+    ) -> Result<Vec<glyphtrail_core::AtlasTimelineRow>> {
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Inline the ids as a Cypher string-list literal (node ids are derived
+        // hex/identifier hashes, so quote-stripping is belt-and-braces). This
+        // restricts the commit→repo join to just the ANN hit set.
+        let list = node_ids
+            .iter()
+            .map(|i| format!("'{}'", i.replace('\'', "")))
+            .collect::<Vec<_>>()
+            .join(",");
+        Ok(self
+            .run(
+                &format!(
+                    "MATCH (c:Commit), (cn:Node)-[:Edge {{kind:'part_of'}}]->(r:Node) \
+                     WHERE cn.kind = 'commit' AND cn.id = c.node_id AND r.kind = 'repo' \
+                     AND c.node_id IN [{list}] \
+                     RETURN c.node_id, c.hash, c.author_email, c.committed_at, c.subject, \
+                     c.in_bounds, r.name"
+                ),
+                vec![],
+            )?
+            .iter()
+            .map(|r| glyphtrail_core::AtlasTimelineRow {
+                touched: 0,
+                repo: get_str(r, 6),
+                commit: commit_from_row(r),
+            })
+            .collect())
+    }
+
     fn all_pending(&self) -> Result<Vec<PendingLink>> {
         Ok(self
             .run(

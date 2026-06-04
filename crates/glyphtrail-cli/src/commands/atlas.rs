@@ -969,11 +969,16 @@ fn similar_commits(dir: &Path, args: SimilarCommitsArgs) -> Result<()> {
         );
     }
     let qvec = embed_one(&qcfg, &args.query)?;
+    if qvec.iter().all(|x| *x == 0.0) {
+        bail!("the query has no searchable terms after tokenization; try different words");
+    }
 
-    // Over-fetch from the HNSW index, then map each commit to its repo/date/subject
-    // and gate by repo visibility before truncating to the requested limit.
+    // Over-fetch from the HNSW index, then map *only those* commits back to their
+    // repo/date/subject (not the whole timeline) and gate by repo visibility before
+    // truncating to the requested limit.
     let hits = store.vector_knn(COMMIT_VEC_TABLE, &qvec, args.limit * 4 + 32)?;
-    let rows = store.atlas_timeline(None, None, None)?;
+    let ids: Vec<String> = hits.iter().map(|(id, _)| id.0.clone()).collect();
+    let rows = store.atlas_commit_rows(&ids)?;
     let by_id: std::collections::HashMap<String, &glyphtrail_core::AtlasTimelineRow> = rows
         .iter()
         .map(|r| (r.commit.node_id.0.clone(), r))
