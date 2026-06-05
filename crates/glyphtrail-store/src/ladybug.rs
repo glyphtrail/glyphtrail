@@ -10,7 +10,7 @@
 //! with `CONTAINS`.
 
 use std::collections::{HashSet, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use glyphtrail_core::{
@@ -79,6 +79,9 @@ pub const EMBEDDING_SCHEMA_VERSION: &str = "1";
 
 pub struct LadybugStore {
     db: Database,
+    /// The database directory, so embedding writes can mirror a portable Parquet
+    /// backup into `<root>/embeddings-backup/` (#473).
+    root: PathBuf,
 }
 
 impl LadybugStore {
@@ -98,7 +101,10 @@ impl LadybugStore {
             let _ = conn.query("DROP TABLE Embedding");
             let _ = conn.query("DROP TABLE EmbeddingV2");
         }
-        let mut store = Self { db };
+        let mut store = Self {
+            db,
+            root: path.to_path_buf(),
+        };
         store.migrate_schema()?;
         store.migrate_embeddings()?;
         Ok(store)
@@ -118,7 +124,10 @@ impl LadybugStore {
                 conn.query(ddl)?;
             }
         }
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            root: path.to_path_buf(),
+        })
     }
 
     /// Open a fresh store in a unique temporary directory. LadybugDB has no
@@ -631,6 +640,147 @@ impl LadybugStore {
         let _ = self.run(&format!("DROP TABLE {table}"), vec![]);
     }
 
+    /// The portable embedding backup directory beside the database. LadybugDB stores
+    /// the database as a single file, so the backup is a sibling (`<db>-embeddings-
+    /// backup/`), never a child.
+    fn backup_dir(&self) -> PathBuf {
+        let name = self.root.file_name().map(|n| {
+            let mut s = n.to_os_string();
+            s.push("-embeddings-backup");
+            s
+        });
+        match name {
+            Some(n) => self.root.with_file_name(n),
+            None => self.root.join("embeddings-backup"),
+        }
+    }
+
+    /// Mirror every embedding namespace to a portable Parquet backup under
+    /// `<root>/embeddings-backup/` (one `<table>.parquet` per namespace + a
+    /// `manifest.json`), so the paid-for vectors survive even a full database loss
+    /// and can be copied to another machine. Driven off the `EmbeddingNs` catalog so
+    /// the backup always matches the live data; an empty catalog removes the backup.
+    /// Best-effort: a backup write never fails an embedding store (callers ignore the
+    /// error). Uses LadybugDB's native `COPY … TO` (no extra dependency). #473.
+    fn write_embedding_backup(&self) -> Result<()> {
+        let dir = self.backup_dir();
+        let catalog = self.run(
+            "MATCH (n:EmbeddingNs) RETURN n.space, n.model, n.dim ORDER BY n.space, n.model",
+            vec![],
+        )?;
+        if catalog.is_empty() {
+            // No embeddings left — drop a stale backup so it can't resurrect deleted
+            // namespaces on a later restore.
+            let _ = std::fs::remove_dir_all(&dir);
+            return Ok(());
+        }
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let mut entries = Vec::new();
+        for row in &catalog {
+            let (space, model, dim) = (get_str(row, 0), get_str(row, 1), get_i64(row, 2));
+            let table = glyphtrail_core::vec_table(&space, &model);
+            let file = dir.join(format!("{table}.parquet"));
+            // COPY TO refuses to overwrite, so clear a prior dump first.
+            let _ = std::fs::remove_file(&file);
+            self.run(
+                &format!(
+                    "COPY (MATCH (v:{table}) RETURN v.node_id, v.vec) TO '{}'",
+                    file.display()
+                ),
+                vec![],
+            )?;
+            let active =
+                self.get_meta(&format!("active_model_{space}"))?.as_deref() == Some(&model);
+            let base_url = self
+                .get_meta(&format!("active_base_url_{space}"))?
+                .unwrap_or_default();
+            entries.push(serde_json::json!({
+                "space": space,
+                "model": model,
+                "dim": dim,
+                "file": format!("{table}.parquet"),
+                "active": active,
+                "base_url": base_url,
+            }));
+        }
+        let manifest = serde_json::json!({
+            "embedding_schema_version": EMBEDDING_SCHEMA_VERSION,
+            "namespaces": entries,
+        });
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest)?,
+        )?;
+        Ok(())
+    }
+
+    /// Restore embeddings from the Parquet backup written by
+    /// [`Self::write_embedding_backup`], replacing each namespace and re-stamping the
+    /// active-model pointers. Returns the number of namespaces restored. Skips a
+    /// backup whose `embedding_schema_version` doesn't match this binary's (its
+    /// table shape would be stale). #473.
+    pub fn restore_embedding_backup(&mut self) -> Result<usize> {
+        let dir = self.backup_dir();
+        let path = dir.join("manifest.json");
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("no embedding backup at {}", path.display()))?;
+        let manifest: serde_json::Value = serde_json::from_str(&text)?;
+        if manifest["embedding_schema_version"].as_str() != Some(EMBEDDING_SCHEMA_VERSION) {
+            anyhow::bail!(
+                "embedding backup was written for a different embedding schema version; \
+                 re-embed or use `atlas embed-import` instead"
+            );
+        }
+        let Some(namespaces) = manifest["namespaces"].as_array() else {
+            return Ok(0);
+        };
+        let mut restored = 0;
+        for ns in namespaces {
+            let (Some(space), Some(model), Some(dim), Some(file)) = (
+                ns["space"].as_str(),
+                ns["model"].as_str(),
+                ns["dim"].as_i64(),
+                ns["file"].as_str(),
+            ) else {
+                continue;
+            };
+            let parquet = dir.join(file);
+            if !parquet.exists() {
+                continue;
+            }
+            let table = glyphtrail_core::vec_table(space, model);
+            self.drop_vec_table(&table);
+            self.run(
+                &format!(
+                    "CREATE NODE TABLE {table}(node_id STRING, vec FLOAT[{dim}], PRIMARY KEY(node_id))"
+                ),
+                vec![],
+            )?;
+            self.run(
+                &format!("COPY {table} FROM '{}'", parquet.display()),
+                vec![],
+            )?;
+            self.run(
+                "MERGE (n:EmbeddingNs {pk:$pk}) SET n.space=$sp, n.model=$m, n.dim=$d",
+                vec![
+                    ("pk", s(&format!("{space}\u{1f}{model}"))),
+                    ("sp", s(space)),
+                    ("m", s(model)),
+                    ("d", Value::Int64(dim)),
+                ],
+            )?;
+            if ns["active"].as_bool() == Some(true) {
+                self.set_meta(&format!("active_model_{space}"), model)?;
+                self.set_meta(&format!("active_dim_{space}"), &dim.to_string())?;
+                if let Some(base) = ns["base_url"].as_str().filter(|b| !b.is_empty()) {
+                    self.set_meta(&format!("active_base_url_{space}"), base)?;
+                }
+            }
+            restored += 1;
+        }
+        Ok(restored)
+    }
+
     /// Build the HNSW cosine index on a namespace's `FLOAT[]` table when the vector
     /// extension is loaded, for fast ANN; returns whether it was built. The table is
     /// created by [`GraphStore::set_embeddings`]; this just adds the index. No-op
@@ -957,6 +1107,9 @@ impl GraphStore for LadybugStore {
                 ("d", Value::Int64(dim as i64)),
             ],
         )?;
+        // Refresh the portable Parquet backup so the paid-for vectors survive a DB
+        // loss / upgrade; never fail the store on a backup error.
+        let _ = self.write_embedding_backup();
         Ok(())
     }
 
@@ -966,6 +1119,7 @@ impl GraphStore for LadybugStore {
             "MATCH (n:EmbeddingNs) WHERE n.pk = $pk DELETE n",
             vec![("pk", s(&format!("{space}\u{1f}{model}")))],
         )?;
+        let _ = self.write_embedding_backup();
         Ok(())
     }
 
@@ -1935,6 +2089,59 @@ mod tests {
         check!(lb.embedding_index().unwrap() == vec![("text".into(), "openai:m".into(), 2, 3)]);
         check!(lb.get_meta("active_model_text").unwrap().as_deref() == Some("openai:m"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // #473: `set_embeddings` mirrors the vectors to a portable Parquet backup, so
+    // even a full database loss is recoverable. Simulate the loss by restoring the
+    // backup into a fresh database in a second directory.
+    #[test]
+    fn embedding_parquet_backup_round_trips() {
+        let dir = tmp_dir("embed-backup");
+        let embs = vec![
+            Embedding {
+                node_id: NodeId("a".into()),
+                vector: vec![1.0, 0.0, 0.0],
+            },
+            Embedding {
+                node_id: NodeId("b".into()),
+                vector: vec![0.0, 1.0, 0.0],
+            },
+        ];
+        // The backup is a sibling of the single-file database.
+        let backup_src = dir.with_file_name(format!(
+            "{}-embeddings-backup",
+            dir.file_name().unwrap().to_string_lossy()
+        ));
+        {
+            let mut lb = LadybugStore::open(&dir).unwrap();
+            lb.set_meta("active_model_text", "openai:m").unwrap();
+            lb.set_embeddings("text", "openai:m", &embs).unwrap();
+            // The backup was mirrored automatically.
+            check!(backup_src.join("manifest.json").exists());
+        }
+        // A fresh database elsewhere with only the copied backup dir (the DB itself
+        // is "lost").
+        let dir2 = tmp_dir("embed-restore");
+        let dst = dir2.with_file_name(format!(
+            "{}-embeddings-backup",
+            dir2.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(&dst).unwrap();
+        for entry in std::fs::read_dir(&backup_src).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), dst.join(entry.file_name())).unwrap();
+        }
+        let mut lb2 = LadybugStore::open(&dir2).unwrap();
+        check!(lb2.embeddings_for("text", "openai:m").unwrap().is_empty()); // lost
+        let restored = lb2.restore_embedding_backup().unwrap();
+        check!(restored == 1);
+        check!(lb2.embeddings_for("text", "openai:m").unwrap() == embs);
+        check!(lb2.embedding_index().unwrap() == vec![("text".into(), "openai:m".into(), 2, 3)]);
+        check!(lb2.get_meta("active_model_text").unwrap().as_deref() == Some("openai:m"));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir2).ok();
+        std::fs::remove_dir_all(&backup_src).ok();
+        std::fs::remove_dir_all(&dst).ok();
     }
 
     // #338: a read-only open must NOT migrate, so a reporting command (atlas
