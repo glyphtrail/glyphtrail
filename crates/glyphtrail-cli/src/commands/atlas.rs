@@ -53,6 +53,8 @@ pub enum AtlasCmd {
     EmbedExport(EmbedExportArgs),
     /// Import embedding namespaces from JSONL (replaces each space+model).
     EmbedImport(EmbedImportArgs),
+    /// Restore all embeddings from the automatic Parquet backup (after a DB loss).
+    EmbedRestoreBackup,
     /// Serve the atlas over MCP (stdio): timeline, status, and the repo+file bridge.
     Mcp,
 }
@@ -322,6 +324,7 @@ pub fn run(cmd: AtlasCmd) -> Result<()> {
         AtlasCmd::SimilarCommits(args) => similar_commits(&dir, args)?,
         AtlasCmd::EmbedExport(args) => embed_export(&dir, args)?,
         AtlasCmd::EmbedImport(args) => embed_import(&dir, args)?,
+        AtlasCmd::EmbedRestoreBackup => embed_restore_backup(&dir)?,
         AtlasCmd::Mcp => glyphtrail_mcp::serve_atlas_stdio(dir)?,
     }
     Ok(())
@@ -803,8 +806,9 @@ fn graph_embed(dir: &Path, args: GraphEmbedArgs) -> Result<()> {
         bail!("no indexed repos to embed; run `glyphtrail analyze` in your repos first");
     }
     let mut store = LadybugStore::open(&lb)?;
-    // `set_embeddings` replaces the whole namespace table, so no separate clear.
-    store.set_embeddings(SPACE_GRAPH, embedder.id(), &embeddings)?;
+    // Record the active model first, so the Parquet backup that `set_embeddings`
+    // mirrors captures it. `set_embeddings` replaces the whole namespace table, so
+    // no separate clear.
     set_active_model(
         &mut store,
         SPACE_GRAPH,
@@ -812,6 +816,7 @@ fn graph_embed(dir: &Path, args: GraphEmbedArgs) -> Result<()> {
         None,
         embeddings[0].vector.len(),
     )?;
+    store.set_embeddings(SPACE_GRAPH, embedder.id(), &embeddings)?;
     let ann = build_ann_index(&store, SPACE_GRAPH, embedder.id());
     println!(
         "graph-embedded {} repo{} ({} no index, {} empty) [{}{}]",
@@ -881,8 +886,8 @@ fn embed(dir: &Path, args: EmbedArgs) -> Result<()> {
     let model = cfg.model_id();
     // Replace just this (text, model) namespace — other models and the graph/commit
     // spaces coexist untouched, so a model upgrade never mixes with the old set.
+    // Record the active model first, so the Parquet backup captures it;
     // `set_embeddings` replaces the whole namespace table, so no separate clear.
-    store.set_embeddings(SPACE_TEXT, &model, &embeddings)?;
     set_active_model(
         &mut store,
         SPACE_TEXT,
@@ -890,6 +895,7 @@ fn embed(dir: &Path, args: EmbedArgs) -> Result<()> {
         cfg.base_url.as_deref(),
         embeddings[0].vector.len(),
     )?;
+    store.set_embeddings(SPACE_TEXT, &model, &embeddings)?;
     let ann = build_ann_index(&store, SPACE_TEXT, &model);
     println!(
         "embedded {} repo{} ({}) [model {}{}]",
@@ -1034,9 +1040,8 @@ fn embed_commits(dir: &Path, args: EmbedCommitsArgs) -> Result<()> {
     let model = cfg.model_id();
     // Durable `FLOAT[]` rows (offline + export) namespaced so a model upgrade
     // coexists with the prior commit embeddings; `set_embeddings` replaces just this
-    // namespace. An HNSW index is layered on when the extension is available.
-    store.set_embeddings(SPACE_COMMIT, &model, &embeddings)?;
-    let ann = build_ann_index(&store, SPACE_COMMIT, &model);
+    // namespace. Record the active model first so the Parquet backup captures it; an
+    // HNSW index is layered on when the extension is available.
     set_active_model(
         &mut store,
         SPACE_COMMIT,
@@ -1044,6 +1049,8 @@ fn embed_commits(dir: &Path, args: EmbedCommitsArgs) -> Result<()> {
         cfg.base_url.as_deref(),
         dim,
     )?;
+    store.set_embeddings(SPACE_COMMIT, &model, &embeddings)?;
+    let ann = build_ann_index(&store, SPACE_COMMIT, &model);
     println!(
         "embedded {} commits ({}) [model {model}{}]",
         embeddings.len(),
@@ -1295,16 +1302,53 @@ fn embed_import(dir: &Path, args: EmbedImportArgs) -> Result<()> {
         if embeddings.iter().any(|e| e.vector.len() != dim) {
             bail!("({space}, {model}) has mixed vector dimensions");
         }
+        // Record the active model first so the Parquet backup captures it;
         // `set_embeddings` replaces the whole namespace; layer HNSW on if available.
+        set_active_model(&mut store, space, model, None, dim)?;
         store.set_embeddings(space, model, embeddings)?;
         let ann = build_ann_index(&store, space, model);
-        set_active_model(&mut store, space, model, None, dim)?;
         println!(
             "imported {} embeddings ({space}, {model}, dim {dim}){}",
             embeddings.len(),
             if ann { " [HNSW ANN]" } else { "" },
         );
     }
+    Ok(())
+}
+
+/// `glyphtrail atlas embed-restore-backup` — rebuild every embedding namespace from
+/// the automatic Parquet backup (`<db>-embeddings-backup/`), then rebuild each HNSW
+/// index when the vector extension is available. Used after a database loss; the
+/// backup is refreshed on every `embed*`/`embed-import`, so it matches the last
+/// embedding state (#473).
+fn embed_restore_backup(dir: &Path) -> Result<()> {
+    // Restore must work even when the database file itself was lost (that's the
+    // point), so gate on the atlas directory, not the `ladybug` db file; opening
+    // recreates an empty db that the backup repopulates.
+    if !dir.exists() {
+        bail!("atlas is disabled; run `glyphtrail atlas init` first");
+    }
+    let mut store = LadybugStore::open(&ladybug_dir(dir))?;
+    let restored = store.restore_embedding_backup()?;
+    if restored == 0 {
+        println!("no embedding backup found (nothing restored)");
+        return Ok(());
+    }
+    let mut ann = 0;
+    for (space, model, _count, _dim) in store.embedding_index()? {
+        if build_ann_index(&store, &space, &model) {
+            ann += 1;
+        }
+    }
+    println!(
+        "restored {restored} embedding namespace{} from the Parquet backup{}",
+        if restored == 1 { "" } else { "s" },
+        if ann > 0 {
+            format!(" ({ann} HNSW ANN rebuilt)")
+        } else {
+            String::new()
+        },
+    );
     Ok(())
 }
 
