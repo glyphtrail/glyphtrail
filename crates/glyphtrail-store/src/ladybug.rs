@@ -68,6 +68,15 @@ const NODE_COLS: &str = "n.id, n.kind, n.name, n.qualified_name, n.file, n.langu
 /// indexes must be rebuilt, else a COPY of the new 12-field rows fails.
 pub const SCHEMA_VERSION: &str = "2";
 
+/// Versions the *embedding* tables (`EmbeddingNs` + the per-namespace `Vec_*`
+/// columns) independently of [`SCHEMA_VERSION`]. Atlas embeddings can be expensive
+/// to recompute (a paid API call per document), so a code-graph schema bump must
+/// NOT discard them: `migrate_schema` rebuilds only the code-graph tables and
+/// leaves the embedding tables alone. They are rebuilt solely when *their own*
+/// shape changes and this version is bumped. A DB that predates this versioning
+/// (no stored `embedding_schema_version`) is grandfathered as current, never wiped.
+pub const EMBEDDING_SCHEMA_VERSION: &str = "1";
+
 pub struct LadybugStore {
     db: Database,
 }
@@ -91,6 +100,7 @@ impl LadybugStore {
         }
         let mut store = Self { db };
         store.migrate_schema()?;
+        store.migrate_embeddings()?;
         Ok(store)
     }
 
@@ -124,8 +134,12 @@ impl LadybugStore {
         Self::open(&dir)
     }
 
-    /// Drop + recreate the LadybugDB schema when the stored `schema_version`
-    /// differs from the current one. The index is rebuilt on the next `analyze`.
+    /// Drop + recreate the *code-graph* tables when the stored `schema_version`
+    /// differs from the current one; the index is rebuilt on the next `analyze`.
+    /// The embedding tables (`EmbeddingNs` + the `Vec_*` columns) and `Meta` are
+    /// deliberately preserved — atlas embeddings are expensive to recompute and
+    /// don't depend on the code-graph schema, so a code schema bump must not lose
+    /// them (their own migration is [`Self::migrate_embeddings`]). #473.
     fn migrate_schema(&mut self) -> Result<()> {
         if self.get_meta("schema_version")?.as_deref() == Some(SCHEMA_VERSION) {
             return Ok(());
@@ -133,19 +147,19 @@ impl LadybugStore {
         {
             let conn = self.conn()?;
             // Drop the rel table before its node tables. Ignore "missing table"
-            // on a partial DB; the schema is recreated immediately after.
+            // on a partial DB; the schema is recreated immediately after. Only the
+            // code-graph tables (+ the legacy pre-#473 embedding STRING tables) are
+            // dropped — `EmbeddingNs`, the `Vec_*` tables, and `Meta` are kept.
             for tbl in [
                 "Edge",
                 "Node",
                 "File",
                 "ApiOp",
                 "Commit",
-                "Embedding", // pre-#473 tables, dropped if present
+                "Embedding", // pre-#473 STRING embeddings, dropped if present
                 "EmbeddingV2",
-                "EmbeddingNs",
                 "Pending",
                 "Import",
-                "Meta",
             ] {
                 let _ = conn.query(&format!("DROP TABLE {tbl}"));
             }
@@ -154,6 +168,40 @@ impl LadybugStore {
             }
         }
         self.set_meta("schema_version", SCHEMA_VERSION)?;
+        Ok(())
+    }
+
+    /// Migrate the embedding tables, versioned independently of the code graph so a
+    /// [`SCHEMA_VERSION`] bump never discards paid-for atlas embeddings. A DB with
+    /// no stored `embedding_schema_version` is grandfathered as current (its
+    /// embeddings, if any, are kept); only a genuinely stale stored version — i.e.
+    /// a future change to the embedding table shape — wipes them. #338/#473.
+    fn migrate_embeddings(&mut self) -> Result<()> {
+        match self.get_meta("embedding_schema_version")?.as_deref() {
+            Some(EMBEDDING_SCHEMA_VERSION) => return Ok(()),
+            None => {} // grandfather: stamp current, never wipe existing embeddings
+            Some(_stale) => self.wipe_embeddings()?, // embedding shape changed
+        }
+        self.set_meta("embedding_schema_version", EMBEDDING_SCHEMA_VERSION)?;
+        Ok(())
+    }
+
+    /// Drop every embedding namespace (the catalog rows, their `Vec_*` tables, and
+    /// the active-model pointers). Used only by an embedding-schema-version bump;
+    /// callers re-embed or re-import afterwards. Best-effort.
+    fn wipe_embeddings(&mut self) -> Result<()> {
+        let namespaces = self.run("MATCH (n:EmbeddingNs) RETURN n.space, n.model", vec![])?;
+        for row in &namespaces {
+            let (space, model) = (get_str(row, 0), get_str(row, 1));
+            if space.is_empty() && model.is_empty() {
+                continue;
+            }
+            self.drop_vec_table(&glyphtrail_core::vec_table(&space, &model));
+        }
+        let _ = self.run("MATCH (n:EmbeddingNs) DELETE n", vec![]);
+        for space in ["text", "graph", "commit"] {
+            let _ = self.set_meta(&format!("active_model_{space}"), "");
+        }
         Ok(())
     }
 
@@ -1852,6 +1900,40 @@ mod tests {
         // Reopen: the version mismatch drops + recreates, wiping stale data.
         let lb = LadybugStore::open(&dir).unwrap();
         check!(lb.find_by_name("stale").unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // #473: a code-graph schema bump must rebuild the code tables WITHOUT discarding
+    // the (expensive, API-derived) atlas embeddings. Simulates an upgrade by stamping
+    // a stale `schema_version`, then checks the embeddings survive the reopen.
+    #[test]
+    fn embeddings_survive_a_code_schema_bump() {
+        let dir = tmp_dir("embed-migrate");
+        let embs = vec![
+            Embedding {
+                node_id: NodeId("a".into()),
+                vector: vec![1.0, 0.0, 0.0],
+            },
+            Embedding {
+                node_id: NodeId("b".into()),
+                vector: vec![0.0, 1.0, 0.0],
+            },
+        ];
+        {
+            let mut lb = LadybugStore::open(&dir).unwrap();
+            lb.insert_graph(&[node("a", "code_node")], &[]).unwrap();
+            lb.set_embeddings("text", "openai:m", &embs).unwrap();
+            lb.set_meta("active_model_text", "openai:m").unwrap();
+            // Simulate a future binary whose SCHEMA_VERSION moved on.
+            lb.set_meta("schema_version", "1").unwrap();
+        }
+        // Reopen with the current binary: migrate rebuilds the code graph (so the
+        // code node is gone, awaiting re-analyze) but the embeddings are untouched.
+        let lb = LadybugStore::open(&dir).unwrap();
+        check!(lb.find_by_name("code_node").unwrap().is_empty());
+        check!(lb.embeddings_for("text", "openai:m").unwrap() == embs);
+        check!(lb.embedding_index().unwrap() == vec![("text".into(), "openai:m".into(), 2, 3)]);
+        check!(lb.get_meta("active_model_text").unwrap().as_deref() == Some("openai:m"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
