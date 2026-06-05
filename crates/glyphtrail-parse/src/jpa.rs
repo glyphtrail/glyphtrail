@@ -594,6 +594,51 @@ mod tests {
         check!(e.entity_tables == vec![("user".to_string(), "users".to_string())]);
     }
 
+    // #445: the table → column edge must be `Contains` (the #426 convention the
+    // DDL path follows), never `Calls` — a table doesn't "call" its columns, and a
+    // `Calls` edge here pollutes call-graph / impact traversal.
+    #[test]
+    fn table_to_column_edges_are_contains_not_calls() {
+        let e = extract(
+            r#"
+            @Entity
+            @Table(name = "thing")
+            public class Thing {
+                @Id Long id;
+                @Column String status;
+            }
+        "#,
+        );
+        let table = e
+            .graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Table)
+            .expect("a Table node");
+        let col_ids: std::collections::HashSet<&NodeId> = e
+            .graph
+            .nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Column)
+            .map(|n| &n.id)
+            .collect();
+        let to_cols: Vec<EdgeKind> = e
+            .graph
+            .edges
+            .iter()
+            .filter(|edge| edge.src == table.id && col_ids.contains(&edge.dst))
+            .map(|edge| edge.kind)
+            .collect();
+        check!(to_cols.len() == 2); // id + status
+        check!(to_cols.iter().all(|kind| *kind == EdgeKind::Contains));
+        check!(
+            !e.graph
+                .edges
+                .iter()
+                .any(|edge| edge.kind == EdgeKind::Calls)
+        );
+    }
+
     #[test]
     fn entity_without_table_annotation_uses_class_name() {
         let e = extract("@Entity class Org { Long id; }");
