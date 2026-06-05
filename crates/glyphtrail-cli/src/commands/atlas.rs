@@ -14,7 +14,7 @@ use glyphtrail_core::config::RepoPaths;
 use glyphtrail_core::{
     AtlasConfig, AtlasHeads, CodeGraph, CommitMeta, Confidence, EdgeKind, Embedding, GraphEmbedder,
     GraphProfile, MeConfig, Node, NodeId, NodeKind, Registry, RegistryEntry, StructuralEmbedder,
-    TimelineQuery, Window, author_scope_label, cosine, default_atlas_path, default_registry_path,
+    TimelineQuery, Window, author_scope_label, default_atlas_path, default_registry_path,
     filter_timeline, format_date, scrub_secrets, timeline_value,
 };
 use glyphtrail_store::{GraphStore, LadybugStore};
@@ -803,7 +803,7 @@ fn graph_embed(dir: &Path, args: GraphEmbedArgs) -> Result<()> {
         bail!("no indexed repos to embed; run `glyphtrail analyze` in your repos first");
     }
     let mut store = LadybugStore::open(&lb)?;
-    store.clear_embeddings_for(SPACE_GRAPH, embedder.id())?;
+    // `set_embeddings` replaces the whole namespace table, so no separate clear.
     store.set_embeddings(SPACE_GRAPH, embedder.id(), &embeddings)?;
     set_active_model(
         &mut store,
@@ -812,7 +812,7 @@ fn graph_embed(dir: &Path, args: GraphEmbedArgs) -> Result<()> {
         None,
         embeddings[0].vector.len(),
     )?;
-    let ann = build_vector_index(&store, &vec_table(SPACE_GRAPH, embedder.id()), &embeddings);
+    let ann = build_ann_index(&store, SPACE_GRAPH, embedder.id());
     println!(
         "graph-embedded {} repo{} ({} no index, {} empty) [{}{}]",
         embeddings.len(),
@@ -881,7 +881,7 @@ fn embed(dir: &Path, args: EmbedArgs) -> Result<()> {
     let model = cfg.model_id();
     // Replace just this (text, model) namespace — other models and the graph/commit
     // spaces coexist untouched, so a model upgrade never mixes with the old set.
-    store.clear_embeddings_for(SPACE_TEXT, &model)?;
+    // `set_embeddings` replaces the whole namespace table, so no separate clear.
     store.set_embeddings(SPACE_TEXT, &model, &embeddings)?;
     set_active_model(
         &mut store,
@@ -890,7 +890,7 @@ fn embed(dir: &Path, args: EmbedArgs) -> Result<()> {
         cfg.base_url.as_deref(),
         embeddings[0].vector.len(),
     )?;
-    let ann = build_vector_index(&store, &vec_table(SPACE_TEXT, &model), &embeddings);
+    let ann = build_ann_index(&store, SPACE_TEXT, &model);
     println!(
         "embedded {} repo{} ({}) [model {}{}]",
         embeddings.len(),
@@ -907,8 +907,6 @@ fn embed(dir: &Path, args: EmbedArgs) -> Result<()> {
 const SPACE_TEXT: &str = "text";
 const SPACE_GRAPH: &str = "graph";
 const SPACE_COMMIT: &str = "commit";
-
-use glyphtrail_core::vec_table;
 
 /// Record the most-recently-embedded model for a space (the `similar` default),
 /// plus the provider base URL + dim, so a free-text query re-embeds the same way.
@@ -964,10 +962,12 @@ fn resolve_model(store: &LadybugStore, space: &str, explicit: Option<&str>) -> R
     );
 }
 
-/// `glyphtrail atlas embed-commits` — embed every in-bounds commit (by subject)
-/// into an HNSW index, so `atlas similar-commits` can find commits like a query
-/// (#338). This is the per-commit, ANN-scale path, so it requires the lbug vector
-/// extension. `local` never leaves the machine; `openai` POSTs commit subjects.
+/// `glyphtrail atlas embed-commits` — embed every in-bounds commit (by subject +
+/// changed-path digest) into its `FLOAT[]` namespace, so `atlas similar-commits`
+/// can find commits like a query (#338). Vectors are the source of truth and search
+/// runs server-side over the native column; the lbug vector extension only adds an
+/// optional HNSW index on top. `local` never leaves the machine; `openai` POSTs
+/// commit subjects.
 fn embed_commits(dir: &Path, args: EmbedCommitsArgs) -> Result<()> {
     use crate::commands::embed_provider::{EmbedConfig, embed_docs, host_of};
     let lb = ladybug_dir(dir);
@@ -978,12 +978,6 @@ fn embed_commits(dir: &Path, args: EmbedCommitsArgs) -> Result<()> {
     let rows = store.atlas_timeline(None, None, None)?;
     if rows.is_empty() {
         bail!("no commits to embed; run `glyphtrail atlas sync` first");
-    }
-    if !store.install_vector_ext() {
-        bail!(
-            "commit embeddings need the lbug vector extension (HNSW); it couldn't be \
-             installed/loaded — see #473"
-        );
     }
     let cfg = EmbedConfig {
         provider: args.provider,
@@ -1038,11 +1032,11 @@ fn embed_commits(dir: &Path, args: EmbedCommitsArgs) -> Result<()> {
     }
     let dim = embeddings[0].vector.len();
     let model = cfg.model_id();
-    // Durable rows (offline + export) plus the per-model HNSW index, namespaced so
-    // a model upgrade coexists with the prior commit embeddings.
-    store.clear_embeddings_for(SPACE_COMMIT, &model)?;
+    // Durable `FLOAT[]` rows (offline + export) namespaced so a model upgrade
+    // coexists with the prior commit embeddings; `set_embeddings` replaces just this
+    // namespace. An HNSW index is layered on when the extension is available.
     store.set_embeddings(SPACE_COMMIT, &model, &embeddings)?;
-    store.rebuild_vector_index(&vec_table(SPACE_COMMIT, &model), &embeddings)?;
+    let ann = build_ann_index(&store, SPACE_COMMIT, &model);
     set_active_model(
         &mut store,
         SPACE_COMMIT,
@@ -1051,9 +1045,10 @@ fn embed_commits(dir: &Path, args: EmbedCommitsArgs) -> Result<()> {
         dim,
     )?;
     println!(
-        "embedded {} commits ({}) [model {model}, HNSW ANN]",
+        "embedded {} commits ({}) [model {model}{}]",
         embeddings.len(),
         cfg.describe(),
+        if ann { ", HNSW ANN" } else { "" },
     );
     Ok(())
 }
@@ -1067,11 +1062,6 @@ fn similar_commits(dir: &Path, args: SimilarCommitsArgs) -> Result<()> {
         bail!("atlas is disabled; run `glyphtrail atlas init` first");
     }
     let store = LadybugStore::open(&lb)?;
-    if !store.load_vector_ext() {
-        bail!(
-            "commit similarity needs the lbug vector extension; run `glyphtrail atlas embed-commits` first"
-        );
-    }
     let model = resolve_model(&store, SPACE_COMMIT, args.model.as_deref())?;
     let base_url = store
         .get_meta("active_base_url_commit")?
@@ -1093,10 +1083,10 @@ fn similar_commits(dir: &Path, args: SimilarCommitsArgs) -> Result<()> {
         bail!("the query has no searchable terms after tokenization; try different words");
     }
 
-    // Over-fetch from the chosen model's HNSW index, then map *only those* commits
-    // back to their repo/date/subject (not the whole timeline) and gate by repo
-    // visibility before truncating to the requested limit.
-    let hits = store.vector_knn(&vec_table(SPACE_COMMIT, &model), &qvec, args.limit * 4 + 32)?;
+    // Over-fetch from the chosen model's namespace (HNSW if present, else server-side
+    // cosine), then map *only those* commits back to their repo/date/subject (not the
+    // whole timeline) and gate by repo visibility before truncating to the limit.
+    let hits = store.vector_search(SPACE_COMMIT, &model, &qvec, args.limit * 4 + 32)?;
     let ids: Vec<String> = hits.iter().map(|(id, _)| id.0.clone()).collect();
     let rows = store.atlas_commit_rows(&ids)?;
     let by_id: std::collections::HashMap<String, &glyphtrail_core::AtlasTimelineRow> = rows
@@ -1183,18 +1173,20 @@ fn similar_commits(dir: &Path, args: SimilarCommitsArgs) -> Result<()> {
     Ok(())
 }
 
-/// Build the HNSW vector index for a space if the lbug vector extension is
+/// Build the HNSW vector index for a namespace if the lbug vector extension is
 /// available (installing it on first use — a one-time, documented network fetch).
-/// Returns whether the index was built; a failure is non-fatal (the brute-force
-/// path in `similar` still works). #338/#473.
-fn build_vector_index(store: &LadybugStore, table: &str, embeddings: &[Embedding]) -> bool {
+/// Returns whether the index was built; a failure is non-fatal: search falls back
+/// to server-side `array_cosine_similarity` over the native `FLOAT[]` column. #338/#473.
+fn build_ann_index(store: &LadybugStore, space: &str, model: &str) -> bool {
     if !store.install_vector_ext() {
         return false;
     }
-    match store.rebuild_vector_index(table, embeddings) {
-        Ok(()) => true,
+    match store.build_vector_index(space, model) {
+        Ok(built) => built,
         Err(e) => {
-            eprintln!("note: HNSW vector index not built ({e}); similarity falls back to a scan");
+            eprintln!(
+                "note: HNSW vector index not built ({e}); similarity uses server-side cosine"
+            );
             false
         }
     }
@@ -1298,22 +1290,19 @@ fn embed_import(dir: &Path, args: EmbedImportArgs) -> Result<()> {
         bail!("no embeddings found in the input");
     }
     let mut store = LadybugStore::open(&lb)?;
-    let have_ext = store.install_vector_ext();
     for ((space, model), embeddings) in &groups {
         let dim = embeddings[0].vector.len();
         if embeddings.iter().any(|e| e.vector.len() != dim) {
             bail!("({space}, {model}) has mixed vector dimensions");
         }
-        store.clear_embeddings_for(space, model)?;
+        // `set_embeddings` replaces the whole namespace; layer HNSW on if available.
         store.set_embeddings(space, model, embeddings)?;
-        if have_ext {
-            let _ = store.rebuild_vector_index(&vec_table(space, model), embeddings);
-        }
+        let ann = build_ann_index(&store, space, model);
         set_active_model(&mut store, space, model, None, dim)?;
         println!(
             "imported {} embeddings ({space}, {model}, dim {dim}){}",
             embeddings.len(),
-            if have_ext { " [HNSW ANN]" } else { "" },
+            if ann { " [HNSW ANN]" } else { "" },
         );
     }
     Ok(())
@@ -1387,21 +1376,13 @@ fn similar(dir: &Path, args: SimilarArgs) -> Result<()> {
         (v, None, format!("query \"{}\"", args.query))
     };
 
-    // Candidate (node id, similarity) pairs: prefer this (space,model)'s HNSW index;
-    // fall back to an exact in-Rust cosine scan when the extension isn't available.
-    let table = vec_table(space, &model);
+    // Candidate (node id, similarity) pairs from this (space,model) namespace —
+    // HNSW if the extension is present, else a server-side cosine scan over `FLOAT[]`.
     let candidates: Vec<(String, f32)> = store
-        .load_vector_ext()
-        .then(|| store.vector_knn(&table, &qvec, embeddings.len()).ok())
-        .flatten()
-        .filter(|h| !h.is_empty())
-        .map(|h| h.into_iter().map(|(id, sim)| (id.0, sim)).collect())
-        .unwrap_or_else(|| {
-            embeddings
-                .iter()
-                .map(|e| (e.node_id.0.clone(), cosine(&qvec, &e.vector)))
-                .collect()
-        });
+        .vector_search(space, &model, &qvec, embeddings.len())?
+        .into_iter()
+        .map(|(id, sim)| (id.0, sim))
+        .collect();
 
     let mut excluded = 0usize;
     let mut scored: Vec<(f32, String, &'static str)> = Vec::new();
