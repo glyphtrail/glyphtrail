@@ -660,8 +660,13 @@ impl LadybugStore {
     /// `manifest.json`), so the paid-for vectors survive even a full database loss
     /// and can be copied to another machine. Driven off the `EmbeddingNs` catalog so
     /// the backup always matches the live data; an empty catalog removes the backup.
-    /// Best-effort: a backup write never fails an embedding store (callers ignore the
-    /// error). Uses LadybugDB's native `COPY … TO` (no extra dependency). #473.
+    ///
+    /// Each row carries `(node_id, key, vec)`: `node_id` is glyphtrail's internal,
+    /// one-way derived id (used by restore), and `key` is the human identifier so the
+    /// backup is usable WITHOUT glyphtrail — the commit hash for the `commit` space,
+    /// the repo name for `text`/`graph`. Best-effort: a backup write never fails an
+    /// embedding store (callers ignore the error). Uses LadybugDB's native
+    /// `COPY … TO` (no extra dependency). #473.
     fn write_embedding_backup(&self) -> Result<()> {
         let dir = self.backup_dir();
         let catalog = self.run(
@@ -675,6 +680,29 @@ impl LadybugStore {
             return Ok(());
         }
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        // Build a small node_id -> repo-name map for the repo-level spaces. A repo
+        // node's id is `derive(["repo", name])` (== the `text` embedding id); the
+        // `graph` embedding id is `derive(["repo_graph", name])`, which no node
+        // carries, so both are mapped here from the repo names. Commits join the
+        // `Commit` table directly (it holds the hash), so they need no map.
+        let _ = self.run("DROP TABLE EmbRepoKey", vec![]);
+        self.run(
+            "CREATE NODE TABLE EmbRepoKey(id STRING, key STRING, PRIMARY KEY(id))",
+            vec![],
+        )?;
+        for row in &self.run("MATCH (r:Node {kind:'repo'}) RETURN r.name", vec![])? {
+            let name = get_str(row, 0);
+            if name.is_empty() {
+                continue;
+            }
+            for prefix in ["repo", "repo_graph"] {
+                let id = glyphtrail_core::NodeId::derive(&[prefix, &name]).0;
+                self.run(
+                    "MERGE (m:EmbRepoKey {id:$id}) SET m.key=$k",
+                    vec![("id", s(&id)), ("k", s(&name))],
+                )?;
+            }
+        }
         let mut entries = Vec::new();
         for row in &catalog {
             let (space, model, dim) = (get_str(row, 0), get_str(row, 1), get_i64(row, 2));
@@ -682,13 +710,39 @@ impl LadybugStore {
             let file = dir.join(format!("{table}.parquet"));
             // COPY TO refuses to overwrite, so clear a prior dump first.
             let _ = std::fs::remove_file(&file);
+            // Resolve the human `key` (commits → the `Commit` hash, repos → the name)
+            // into a temp table FIRST, then `COPY` that single table. `COPY … TO`
+            // mis-writes a `FLOAT[]` column when the query joins another table, so the
+            // join can't live in the COPY itself; `coalesce(.., '')` keeps `key`
+            // non-null (a null column corrupts the adjacent list column too).
+            let bk = format!("{table}_bk");
+            let _ = self.run(&format!("DROP TABLE {bk}"), vec![]);
             self.run(
                 &format!(
-                    "COPY (MATCH (v:{table}) RETURN v.node_id, v.vec) TO '{}'",
+                    "CREATE NODE TABLE {bk}(node_id STRING, key STRING, vec FLOAT[{dim}], PRIMARY KEY(node_id))"
+                ),
+                vec![],
+            )?;
+            let materialize = if space == "commit" {
+                format!(
+                    "MATCH (v:{table}) OPTIONAL MATCH (c:Commit) WHERE c.node_id = v.node_id \
+                     CREATE (b:{bk} {{node_id:v.node_id, key:coalesce(c.hash, ''), vec:v.vec}})"
+                )
+            } else {
+                format!(
+                    "MATCH (v:{table}) OPTIONAL MATCH (m:EmbRepoKey) WHERE m.id = v.node_id \
+                     CREATE (b:{bk} {{node_id:v.node_id, key:coalesce(m.key, ''), vec:v.vec}})"
+                )
+            };
+            self.run(&materialize, vec![])?;
+            self.run(
+                &format!(
+                    "COPY (MATCH (b:{bk}) RETURN b.node_id AS node_id, b.key AS key, b.vec AS vec) TO '{}'",
                     file.display()
                 ),
                 vec![],
             )?;
+            let _ = self.run(&format!("DROP TABLE {bk}"), vec![]);
             let active =
                 self.get_meta(&format!("active_model_{space}"))?.as_deref() == Some(&model);
             let base_url = self
@@ -703,6 +757,7 @@ impl LadybugStore {
                 "base_url": base_url,
             }));
         }
+        let _ = self.run("DROP TABLE EmbRepoKey", vec![]);
         let manifest = serde_json::json!({
             "embedding_schema_version": EMBEDDING_SCHEMA_VERSION,
             "namespaces": entries,
@@ -756,10 +811,24 @@ impl LadybugStore {
                 ),
                 vec![],
             )?;
+            // The parquet has three columns `(node_id, key, vec)` but the live table
+            // only `(node_id, vec)`, so COPY the full file into a temp table of the
+            // same shape, then graph-copy just `node_id`/`vec` across (a projected
+            // `LOAD FROM` mis-reads the `FLOAT[]` list column when `key` is null).
+            let tmp = format!("{table}_imp");
+            let _ = self.run(&format!("DROP TABLE {tmp}"), vec![]);
             self.run(
-                &format!("COPY {table} FROM '{}'", parquet.display()),
+                &format!(
+                    "CREATE NODE TABLE {tmp}(node_id STRING, key STRING, vec FLOAT[{dim}], PRIMARY KEY(node_id))"
+                ),
                 vec![],
             )?;
+            self.run(&format!("COPY {tmp} FROM '{}'", parquet.display()), vec![])?;
+            self.run(
+                &format!("MATCH (t:{tmp}) CREATE (v:{table} {{node_id:t.node_id, vec:t.vec}})"),
+                vec![],
+            )?;
+            let _ = self.run(&format!("DROP TABLE {tmp}"), vec![]);
             self.run(
                 "MERGE (n:EmbeddingNs {pk:$pk}) SET n.space=$sp, n.model=$m, n.dim=$d",
                 vec![
@@ -2142,6 +2211,64 @@ mod tests {
         std::fs::remove_dir_all(&dir2).ok();
         std::fs::remove_dir_all(&backup_src).ok();
         std::fs::remove_dir_all(&dst).ok();
+    }
+
+    // #473: the Parquet backup carries a human `key` next to the opaque `node_id`,
+    // so an external tool can map a commit hash / repo name to its vector without
+    // glyphtrail: repo name for `text`/`graph`, commit hash for `commit`.
+    #[test]
+    fn embedding_backup_carries_human_key() {
+        let dir = tmp_dir("embed-humankey");
+        let mut lb = LadybugStore::open(&dir).unwrap();
+        let repo_id = glyphtrail_core::NodeId::derive(&["repo", "myrepo"]).0;
+        {
+            let conn = lb.conn().unwrap();
+            conn.query(&format!(
+                "CREATE (n:Node {{id:'{repo_id}', kind:'repo', name:'myrepo'}})"
+            ))
+            .unwrap();
+            conn.query(
+                "CREATE (c:Commit {node_id:'cnode', hash:'deadbeef', author_email:'', \
+                 committed_at:0, subject:'x', in_bounds:1})",
+            )
+            .unwrap();
+        }
+        lb.set_embeddings(
+            "text",
+            "m",
+            &[Embedding {
+                node_id: NodeId(repo_id),
+                vector: vec![1.0, 0.0],
+            }],
+        )
+        .unwrap();
+        lb.set_embeddings(
+            "commit",
+            "m",
+            &[Embedding {
+                node_id: NodeId("cnode".into()),
+                vector: vec![0.0, 1.0],
+            }],
+        )
+        .unwrap();
+
+        let backup = lb.backup_dir();
+        let conn = lb.conn().unwrap();
+        let read_key = |space: &str| -> String {
+            let f = backup.join(format!(
+                "{}.parquet",
+                glyphtrail_core::vec_table(space, "m")
+            ));
+            format!(
+                "{}",
+                conn.query(&format!("LOAD FROM '{}' RETURN key", f.display()))
+                    .unwrap()
+            )
+        };
+        check!(read_key("text").contains("myrepo")); // repo name, not the derived id
+        check!(read_key("commit").contains("deadbeef")); // the commit hash
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&backup).ok();
     }
 
     // #338: a read-only open must NOT migrate, so a reporting command (atlas
