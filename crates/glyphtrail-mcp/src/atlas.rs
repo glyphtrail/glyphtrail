@@ -10,7 +10,7 @@ use std::path::Path;
 use glyphtrail_core::config::RepoPaths;
 use glyphtrail_core::{
     AtlasConfig, Embedder, HashingEmbedder, NodeId, Registry, RegistryEntry, TimelineQuery, Window,
-    author_scope_label, cosine, default_registry_path, filter_timeline, timeline_value, vec_table,
+    author_scope_label, default_registry_path, filter_timeline, timeline_value,
 };
 use glyphtrail_store::{GraphStore, LadybugStore};
 use serde_json::{Value, json};
@@ -183,20 +183,14 @@ fn similar(atlas_dir: &Path, args: &Value) -> Result<Value, String> {
         );
     };
 
-    // Prefer this (space,model)'s HNSW index; fall back to an exact in-Rust scan.
-    let table = vec_table(space, &model);
+    // Candidate (node id, similarity) pairs from this (space,model) namespace —
+    // HNSW if the extension is present, else a server-side cosine scan over `FLOAT[]`.
     let candidates: Vec<(String, f32)> = store
-        .load_vector_ext()
-        .then(|| store.vector_knn(&table, &qvec, space_vecs.len()).ok())
-        .flatten()
-        .filter(|h| !h.is_empty())
-        .map(|h| h.into_iter().map(|(id, sim)| (id.0, sim)).collect())
-        .unwrap_or_else(|| {
-            space_vecs
-                .iter()
-                .map(|e| (e.node_id.0.clone(), cosine(&qvec, &e.vector)))
-                .collect()
-        });
+        .vector_search(space, &model, &qvec, space_vecs.len())
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|(id, sim)| (id.0, sim))
+        .collect();
 
     let mut hidden = 0usize;
     let mut scored: Vec<(f32, String, &'static str)> = Vec::new();

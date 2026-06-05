@@ -46,14 +46,14 @@ const SCHEMA: &[&str] = &[
     "CREATE NODE TABLE IF NOT EXISTS Commit(node_id STRING, hash STRING, author_email STRING, committed_at INT64, subject STRING, in_bounds INT64, PRIMARY KEY(node_id))",
     "CREATE NODE TABLE IF NOT EXISTS Pending(pk STRING, anchor STRING, name STRING, kind STRING, name_is_src INT64, PRIMARY KEY(pk))",
     "CREATE NODE TABLE IF NOT EXISTS Import(pk STRING, importer STRING, raw STRING, language STRING, PRIMARY KEY(pk))",
-    // Atlas (#338): dense embedding vectors, namespaced by `(space, model)` so
-    // several models (e.g. a lexical default and a neural upgrade) coexist without
-    // mixing in search, and each can be exported independently. `space` is what was
-    // embedded + how (`text`/`graph`/`commit`); `model` is the producing embedder
-    // id. kuzu node tables take one primary key, so `pk = model \x1f node_id`.
-    // `vec` is the comma-joined floats. (A pre-namespacing `Embedding` table, if
-    // present, is dropped on open — those embeddings are regenerable.)
-    "CREATE NODE TABLE IF NOT EXISTS EmbeddingV2(pk STRING, node_id STRING, model STRING, space STRING, dim INT64, vec STRING, PRIMARY KEY(pk))",
+    // Atlas (#338/#473): embedding namespaces. Vectors live in native `FLOAT[dim]`
+    // columns in a per-`(space, model)` table (`Vec_<space>_<slug>_<hash>`), created
+    // on demand, so storage is compact and similarity runs server-side
+    // (`array_cosine_similarity`, or the HNSW index when the vector extension is
+    // loaded). This catalog is one row per namespace — what's stored, where —
+    // `pk = space \x1f model`. (Pre-#473 `Embedding`/`EmbeddingV2` tables are dropped
+    // on open; those embeddings are regenerable via `atlas embed*`.)
+    "CREATE NODE TABLE IF NOT EXISTS EmbeddingNs(pk STRING, space STRING, model STRING, dim INT64, PRIMARY KEY(pk))",
     "CREATE NODE TABLE IF NOT EXISTS Meta(key STRING, value STRING, PRIMARY KEY(key))",
 ];
 
@@ -82,9 +82,12 @@ impl LadybugStore {
             for ddl in SCHEMA {
                 conn.query(ddl)?;
             }
-            // Drop the pre-namespacing embedding table if an older atlas left one;
-            // those embeddings are regenerable via `atlas embed*` (#338). Best-effort.
+            // Drop pre-#473 embedding tables if an older atlas left them; those
+            // embeddings are regenerable via `atlas embed*` (#338/#473). Best-effort.
+            // The per-(space,model) `Vec_*` tables are left (no fixed names to drop);
+            // a re-embed replaces them.
             let _ = conn.query("DROP TABLE Embedding");
+            let _ = conn.query("DROP TABLE EmbeddingV2");
         }
         let mut store = Self { db };
         store.migrate_schema()?;
@@ -137,8 +140,9 @@ impl LadybugStore {
                 "File",
                 "ApiOp",
                 "Commit",
-                "Embedding", // pre-namespacing table, dropped if present
+                "Embedding", // pre-#473 tables, dropped if present
                 "EmbeddingV2",
+                "EmbeddingNs",
                 "Pending",
                 "Import",
                 "Meta",
@@ -379,21 +383,20 @@ fn rank_search_hits(nodes: &mut [Node], terms: &[String], case_sensitive: bool) 
     });
 }
 
-/// Encode an embedding vector as comma-joined floats. Rust's float formatting is
-/// shortest-round-trip, so `decode_vec` recovers the same `f32`s.
-fn encode_vec(v: &[f32]) -> String {
-    v.iter()
-        .map(|x| x.to_string())
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-/// Decode a comma-joined embedding vector; unparseable entries become `0.0`.
-fn decode_vec(s: &str) -> Vec<f32> {
-    if s.is_empty() {
-        return Vec::new();
+/// Decode a `FLOAT[]` column value (an lbug `Array` of `Float`) into `Vec<f32>`
+/// (#473); anything unexpected yields an empty vector.
+fn decode_float_array(value: Option<&Value>) -> Vec<f32> {
+    match value {
+        Some(Value::Array(_, items)) | Some(Value::List(_, items)) => items
+            .iter()
+            .map(|v| match v {
+                Value::Float(x) => *x,
+                Value::Double(x) => *x as f32,
+                _ => 0.0,
+            })
+            .collect(),
+        _ => Vec::new(),
     }
-    s.split(',').map(|t| t.parse().unwrap_or(0.0)).collect()
 }
 
 fn get_str(row: &[Value], idx: usize) -> String {
@@ -550,9 +553,9 @@ impl LadybugStore {
     }
 
     /// Load the lbug `vector` extension (HNSW ANN) if it's already installed, so
-    /// `vector_knn` can run. Cheap and offline; returns whether it loaded. A loaded
-    /// extension persists for the open `Database`, so one call per process suffices
-    /// (#338, #473).
+    /// `vector_search` can use a `QUERY_VECTOR_INDEX`. Cheap and offline; returns
+    /// whether it loaded. A loaded extension persists for the open `Database`, so one
+    /// call per process suffices (#338, #473).
     pub fn load_vector_ext(&self) -> bool {
         self.run("LOAD EXTENSION VECTOR", vec![]).is_ok()
     }
@@ -569,66 +572,85 @@ impl LadybugStore {
         self.load_vector_ext()
     }
 
-    /// (Re)build a `FLOAT[dim]` table + HNSW vector index named `table`/`<table>_idx`
-    /// from `embeddings` (which must all share one non-zero dimension), for fast
-    /// cosine ANN. Drops any prior table first — so an empty input just clears the
-    /// (now-stale) index. Requires the vector extension to be loaded
-    /// ([`Self::install_vector_ext`]).
-    pub fn rebuild_vector_index(&self, table: &str, embeddings: &[Embedding]) -> Result<()> {
-        // Drop the old table (and its index); ignore "missing table" on first build.
-        let _ = self.run(&format!("DROP TABLE {table}"), vec![]);
-        let Some(first) = embeddings.first() else {
-            return Ok(()); // empty: the index is now cleared, nothing to build
-        };
-        let dim = first.vector.len();
-        if dim == 0 {
-            anyhow::bail!("cannot build a vector index over zero-length embeddings");
-        }
-        if embeddings.iter().any(|e| e.vector.len() != dim) {
-            anyhow::bail!("cannot build a vector index over mixed-dimension embeddings");
-        }
-        self.run(
-            &format!(
-                "CREATE NODE TABLE {table}(node_id STRING, vec FLOAT[{dim}], PRIMARY KEY(node_id))"
-            ),
+    /// Drop a namespace's `FLOAT[]` table, removing any HNSW index first (a table
+    /// with a vector index can't be dropped directly). Best-effort — a missing
+    /// table / index / extension is ignored.
+    fn drop_vec_table(&self, table: &str) {
+        let _ = self.run(
+            &format!("CALL DROP_VECTOR_INDEX('{table}', '{table}_idx')"),
             vec![],
-        )?;
-        for e in embeddings {
-            self.run(
-                &format!("CREATE (v:{table} {{node_id:$id, vec:$e}})"),
-                vec![("id", s(&e.node_id.0)), ("e", float_array(&e.vector))],
-            )?;
+        );
+        let _ = self.run(&format!("DROP TABLE {table}"), vec![]);
+    }
+
+    /// Build the HNSW cosine index on a namespace's `FLOAT[]` table when the vector
+    /// extension is loaded, for fast ANN; returns whether it was built. The table is
+    /// created by [`GraphStore::set_embeddings`]; this just adds the index. No-op
+    /// (returns `false`) when the extension isn't available — search then falls back
+    /// to server-side `array_cosine_similarity` over the same column.
+    pub fn build_vector_index(&self, space: &str, model: &str) -> Result<bool> {
+        if !self.load_vector_ext() {
+            return Ok(false);
         }
+        let table = glyphtrail_core::vec_table(space, model);
         self.run(
             &format!("CALL CREATE_VECTOR_INDEX('{table}','{table}_idx','vec', metric := 'cosine')"),
             vec![],
         )?;
-        Ok(())
+        Ok(true)
     }
 
-    /// Cosine-nearest `k` neighbours of `query` via the HNSW index on `table`, as
-    /// `(node_id, similarity)` where similarity is `1 - cosine_distance` (higher is
-    /// nearer), ordered nearest-first. Requires the index to exist and the extension
-    /// to be loaded.
-    pub fn vector_knn(&self, table: &str, query: &[f32], k: usize) -> Result<Vec<(NodeId, f32)>> {
+    /// Cosine-nearest `k` neighbours of `query` in a `(space, model)` namespace, as
+    /// `(node_id, similarity)` (higher is nearer), nearest-first. Uses the HNSW index
+    /// when present, else server-side `array_cosine_similarity` over the `FLOAT[]`
+    /// column — so search works with or without the extension.
+    pub fn vector_search(
+        &self,
+        space: &str,
+        model: &str,
+        query: &[f32],
+        k: usize,
+    ) -> Result<Vec<(NodeId, f32)>> {
+        let table = glyphtrail_core::vec_table(space, model);
+        // HNSW path (extension + index): distance → similarity = 1 - distance.
+        if self.load_vector_ext()
+            && let Ok(rows) = self.run(
+                &format!(
+                    "CALL QUERY_VECTOR_INDEX('{table}','{table}_idx',$q,{k}) \
+                     RETURN node.node_id AS id, distance ORDER BY distance"
+                ),
+                vec![("q", float_array(query))],
+            )
+        {
+            return Ok(rows
+                .iter()
+                .map(|r| {
+                    let distance = match r.get(1) {
+                        Some(Value::Double(x)) => *x as f32,
+                        Some(Value::Float(x)) => *x,
+                        _ => f32::INFINITY,
+                    };
+                    (NodeId(get_str(r, 0)), 1.0 - distance)
+                })
+                .collect());
+        }
+        // Server-side exact cosine (no extension); the function returns similarity.
         let rows = self.run(
             &format!(
-                "CALL QUERY_VECTOR_INDEX('{table}','{table}_idx',$q,{k}) \
-                 RETURN node.node_id AS id, distance ORDER BY distance"
+                "MATCH (v:{table}) RETURN v.node_id, array_cosine_similarity(v.vec, $q) AS sim \
+                 ORDER BY sim DESC LIMIT {k}"
             ),
             vec![("q", float_array(query))],
         )?;
         Ok(rows
             .iter()
             .map(|r| {
-                // A missing/garbled distance becomes +∞ → similarity -∞, so a
-                // malformed row sorts last rather than masquerading as a match.
-                let distance = match r.get(1) {
-                    Some(Value::Double(x)) => *x as f32,
+                let sim = match r.get(1) {
                     Some(Value::Float(x)) => *x,
-                    _ => f32::INFINITY,
+                    Some(Value::Double(x)) => *x as f32,
+                    _ => 0.0,
                 };
-                (NodeId(get_str(r, 0)), 1.0 - distance)
+                (NodeId(get_str(r, 0)), sim)
             })
             .collect())
     }
@@ -850,34 +872,51 @@ impl GraphStore for LadybugStore {
     }
 
     fn set_embeddings(&mut self, space: &str, model: &str, embeddings: &[Embedding]) -> Result<()> {
-        let conn = self.conn()?;
-        // PK is `model \x1f node_id`, so the same node embedded under several models
-        // coexists; `space`/`model` columns let queries filter to one namespace.
-        let rows: Vec<Vec<(&str, Value)>> = embeddings
-            .iter()
-            .map(|e| {
-                vec![
-                    ("pk", s(&format!("{model}\u{1f}{}", e.node_id.0))),
-                    ("id", s(&e.node_id.0)),
-                    ("m", s(model)),
-                    ("sp", s(space)),
-                    ("d", Value::Int64(e.vector.len() as i64)),
-                    ("v", s(&encode_vec(&e.vector))),
-                ]
-            })
-            .collect();
-        self.exec_unwind(
-            &conn,
-            "UNWIND $rows AS r MERGE (e:EmbeddingV2 {pk:r.pk}) \
-             SET e.node_id=r.id, e.model=r.m, e.space=r.sp, e.dim=r.d, e.vec=r.v",
-            rows,
-        )
+        let Some(first) = embeddings.first() else {
+            // Nothing to store; ensure the namespace is cleared.
+            return self.clear_embeddings_for(space, model);
+        };
+        let dim = first.vector.len();
+        if dim == 0 {
+            anyhow::bail!("cannot store zero-length embeddings");
+        }
+        if embeddings.iter().any(|e| e.vector.len() != dim) {
+            anyhow::bail!("cannot store mixed-dimension embeddings in one namespace");
+        }
+        let table = glyphtrail_core::vec_table(space, model);
+        // Replace the namespace's `FLOAT[dim]` table (vectors are the source of
+        // truth; storage is native, search runs server-side / via HNSW).
+        self.drop_vec_table(&table);
+        self.run(
+            &format!(
+                "CREATE NODE TABLE {table}(node_id STRING, vec FLOAT[{dim}], PRIMARY KEY(node_id))"
+            ),
+            vec![],
+        )?;
+        for e in embeddings {
+            self.run(
+                &format!("CREATE (v:{table} {{node_id:$id, vec:$e}})"),
+                vec![("id", s(&e.node_id.0)), ("e", float_array(&e.vector))],
+            )?;
+        }
+        // Catalog the namespace (one row), so `embedding_index` can enumerate them.
+        self.run(
+            "MERGE (n:EmbeddingNs {pk:$pk}) SET n.space=$sp, n.model=$m, n.dim=$d",
+            vec![
+                ("pk", s(&format!("{space}\u{1f}{model}"))),
+                ("sp", s(space)),
+                ("m", s(model)),
+                ("d", Value::Int64(dim as i64)),
+            ],
+        )?;
+        Ok(())
     }
 
     fn clear_embeddings_for(&mut self, space: &str, model: &str) -> Result<()> {
+        self.drop_vec_table(&glyphtrail_core::vec_table(space, model));
         self.run(
-            "MATCH (e:EmbeddingV2) WHERE e.space = $sp AND e.model = $m DELETE e",
-            vec![("sp", s(space)), ("m", s(model))],
+            "MATCH (n:EmbeddingNs) WHERE n.pk = $pk DELETE n",
+            vec![("pk", s(&format!("{space}\u{1f}{model}")))],
         )?;
         Ok(())
     }
@@ -1073,37 +1112,45 @@ impl GraphStore for LadybugStore {
     }
 
     fn embeddings_for(&self, space: &str, model: &str) -> Result<Vec<Embedding>> {
-        Ok(self
-            .run(
-                "MATCH (e:EmbeddingV2) WHERE e.space = $sp AND e.model = $m \
-                 RETURN e.node_id, e.vec ORDER BY e.node_id",
-                vec![("sp", s(space)), ("m", s(model))],
-            )?
+        let table = glyphtrail_core::vec_table(space, model);
+        // The namespace may not exist (nothing embedded for it yet); a missing table
+        // is not an error here — return empty.
+        let Ok(rows) = self.run(
+            &format!("MATCH (v:{table}) RETURN v.node_id, v.vec ORDER BY v.node_id"),
+            vec![],
+        ) else {
+            return Ok(Vec::new());
+        };
+        Ok(rows
             .iter()
             .map(|r| Embedding {
                 node_id: NodeId(get_str(r, 0)),
-                vector: decode_vec(&get_str(r, 1)),
+                vector: decode_float_array(r.get(1)),
             })
             .collect())
     }
 
     fn embedding_index(&self) -> Result<Vec<(String, String, usize, usize)>> {
-        Ok(self
-            .run(
-                "MATCH (e:EmbeddingV2) \
-                 RETURN e.space, e.model, COUNT(*), MAX(e.dim) ORDER BY e.space, e.model",
-                vec![],
-            )?
-            .iter()
-            .map(|r| {
-                (
-                    get_str(r, 0),
-                    get_str(r, 1),
-                    get_i64(r, 2).max(0) as usize,
-                    get_i64(r, 3).max(0) as usize,
-                )
-            })
-            .collect())
+        // Counts come from the per-namespace tables; the catalog gives space/model/dim.
+        let mut out = Vec::new();
+        for r in self.run(
+            "MATCH (n:EmbeddingNs) RETURN n.space, n.model, n.dim ORDER BY n.space, n.model",
+            vec![],
+        )? {
+            let (space, model, dim) = (
+                get_str(&r, 0),
+                get_str(&r, 1),
+                get_i64(&r, 2).max(0) as usize,
+            );
+            let table = glyphtrail_core::vec_table(&space, &model);
+            let count = self
+                .run(&format!("MATCH (v:{table}) RETURN COUNT(*)"), vec![])
+                .ok()
+                .and_then(|rs| rs.first().map(|r| get_i64(r, 0).max(0) as usize))
+                .unwrap_or(0);
+            out.push((space, model, count, dim));
+        }
+        Ok(out)
     }
 
     fn atlas_topics(&self) -> Result<Vec<(String, usize)>> {
@@ -1715,20 +1762,12 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // #338/#473: FLOAT[] storage + HNSW vector index round-trips to a cosine k-NN.
-    // Skips when the lbug vector extension isn't installable (offline CI), so it
-    // only asserts where the extension is available.
+    // #473: FLOAT[] storage round-trips and `vector_search` ranks by cosine —
+    // server-side without the extension (always), and via HNSW when it's loaded.
     #[test]
-    fn vector_index_knn_round_trips() {
-        let dir = tmp_dir("vec-knn");
-        let lb = LadybugStore::open(&dir).unwrap();
-        // Load-only (no network INSTALL): skip unless the extension is already
-        // installed, so offline CI stays green and fast.
-        if !lb.load_vector_ext() {
-            eprintln!("skip: lbug vector extension not installed");
-            std::fs::remove_dir_all(&dir).ok();
-            return;
-        }
+    fn vector_search_float_storage_and_cosine() {
+        let dir = tmp_dir("vec-search");
+        let mut lb = LadybugStore::open(&dir).unwrap();
         let embs = vec![
             Embedding {
                 node_id: NodeId("a".into()),
@@ -1743,12 +1782,27 @@ mod tests {
                 vector: vec![0.9, 0.1, 0.0],
             },
         ];
-        lb.rebuild_vector_index("TVec", &embs).unwrap();
-        let hits = lb.vector_knn("TVec", &[1.0, 0.05, 0.0], 2).unwrap();
+        lb.set_embeddings("text", "m", &embs).unwrap();
+        // FLOAT[] storage round-trips (the vectors are the source of truth).
+        check!(lb.embeddings_for("text", "m").unwrap() == embs);
+        check!(lb.embedding_index().unwrap() == vec![("text".into(), "m".into(), 3, 3)]);
+
+        // Server-side cosine — no extension needed.
+        let hits = lb.vector_search("text", "m", &[1.0, 0.05, 0.0], 2).unwrap();
         check!(hits.len() == 2);
-        check!(hits[0].0 == NodeId("a".into())); // nearest to the query
-        check!(hits[0].1 > hits[1].1); // similarity descending (1 - cosine distance)
-        check!(hits[0].1 > 0.99); // a ≈ the query direction
+        check!(hits[0].0 == NodeId("a".into())); // nearest
+        check!(hits[0].1 > hits[1].1 && hits[0].1 > 0.99);
+
+        // HNSW path when the extension is available (skips offline).
+        if lb.build_vector_index("text", "m").unwrap() {
+            let h = lb.vector_search("text", "m", &[1.0, 0.05, 0.0], 2).unwrap();
+            check!(h[0].0 == NodeId("a".into()) && h[0].1 > 0.99);
+        }
+
+        // Clearing the namespace drops its table + catalog row.
+        lb.clear_embeddings_for("text", "m").unwrap();
+        check!(lb.embeddings_for("text", "m").unwrap().is_empty());
+        check!(lb.embedding_index().unwrap().is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 
