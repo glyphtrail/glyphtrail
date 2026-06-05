@@ -15,6 +15,7 @@ pub mod jpa;
 pub mod registry;
 pub mod rest;
 pub mod sql;
+pub mod sqlalchemy;
 pub mod ws;
 
 pub use build::{
@@ -43,6 +44,7 @@ pub use sql::{
     DbAccess, SqlTable, build_sql_graph, extract_query_access, extract_sql_schema, normalize_name,
     table_node_id,
 };
+pub use sqlalchemy::{SqlAlchemyExtract, extract_sqlalchemy};
 pub use ws::{RawWsConnect, RawWsEvent, WsEventKind, extract_ws_connections, extract_ws_events};
 
 #[cfg(test)]

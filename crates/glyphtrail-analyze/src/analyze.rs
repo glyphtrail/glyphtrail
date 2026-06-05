@@ -441,6 +441,14 @@ fn parse_file(
             }
         }
     }
+    // SQLAlchemy declarative models (#440, Python): a class with `__tablename__`
+    // declares a `Table` + a `Column` per `Column(…)`/`mapped_column(…)` field. The
+    // schema nodes share the `sql_*` id scheme, so a raw `cursor.execute("… FROM
+    // users")` in the same repo (already extracted above) resolves to this table.
+    if *language == Language::Python {
+        let sa = glyphtrail_parse::extract_sqlalchemy(&f.rel_path, &file_id, &source, language);
+        out.graph.extend(sa.graph);
+    }
     out.pending.extend(fg.pending);
     out.imports.extend(
         fg.imports
@@ -1255,7 +1263,10 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 20: Diesel ORM (Rust) — `table!` macros yield `Table`/`Column` nodes and the
 /// query DSL (`<t>::table.load`, `insert_into`/`update`/`delete`) links code to
 /// those tables (#440), so Diesel repos rebuild to gain the schema + access edges.
-const ANALYSIS_REVISION: u32 = 20;
+/// 21: SQLAlchemy declarative models (Python) — a class with `__tablename__` yields
+/// `Table`/`Column` nodes, so a raw `cursor.execute` query in the repo links to the
+/// model-declared table (#440).
+const ANALYSIS_REVISION: u32 = 21;
 
 /// Fingerprint of everything that determines analysis output: the crate
 /// version, the manual revision counter, and the built-in tree-sitter query
@@ -3406,6 +3417,44 @@ mod tests {
             dir.join("src/repo.rs"),
             "pub fn load_user(conn: &mut PgConnection) -> Vec<User> { \
              users::table.filter(users::id.eq(1)).load(conn).unwrap() }\n",
+        )
+        .unwrap();
+        run(&dir, false).unwrap();
+
+        let store = LadybugStore::open(&RepoPaths::new(&dir).index_dir.join("ladybug")).unwrap();
+        let f = store
+            .find_by_name("load_user")
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("function indexed");
+        let reads = store
+            .neighbors(&f.id.0, Some(EdgeKind::Reads), true)
+            .unwrap();
+        check!(
+            reads
+                .iter()
+                .any(|(n, _, _)| n.kind == NodeKind::Table && n.name == "users"),
+            "expected a Reads edge to the users table, got {:?}",
+            reads.iter().map(|(n, _, _)| &n.name).collect::<Vec<_>>()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // #440 (Python): a SQLAlchemy declarative model declares the `users` table in
+    // one file; a raw `cursor.execute` query in another links its function to that
+    // table by name, crossing files.
+    #[test]
+    fn analyze_links_raw_query_to_sqlalchemy_model_table() {
+        let dir = temp_repo("sqlalchemy-link");
+        std::fs::write(
+            dir.join("models.py"),
+            "class User(Base):\n    __tablename__ = \"users\"\n    id = Column(Integer, primary_key=True)\n    email = Column(String)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("repo.py"),
+            "def load_user(cursor, uid):\n    cursor.execute(\"SELECT id, email FROM users WHERE id = %s\", (uid,))\n    return cursor.fetchone()\n",
         )
         .unwrap();
         run(&dir, false).unwrap();
