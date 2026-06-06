@@ -136,6 +136,21 @@ glyphtrail atlas waka show                  # effort per repo · language/editor
 Keys for the OpenAI embedder / WakaTime are read from the environment; a `.env`
 file in the working directory (or an ancestor) is loaded automatically.
 
+`atlas sync` keeps only **your** commits by default (pass `--everyone` for all
+authors). Tell it who you are in the `[me]` section of `~/.glyphtrail/atlas/atlas.toml`
+(a commented template is written on `atlas init`):
+
+```toml
+[me]
+emails   = ["you@example.com", "you@work.com"]      # exact addresses
+domains  = ["example.com"]                           # any address @ a domain you own
+patterns = ["you+*@gmail.com", "*@*.example.com"]    # globs (* / ?) over the whole address
+```
+
+An address is yours if it matches any `emails` entry, sits at an owned `domain`, or
+matches a `patterns` glob — all case-insensitive. `CTRL-C` during a sync stops
+gracefully at a safe point (the database stays consistent); a second `CTRL-C` aborts.
+
 ### Registering glyphtrail as an MCP server
 
 `glyphtrail mcp` speaks the [Model Context Protocol](https://modelcontextprotocol.io)

@@ -17,6 +17,25 @@ semantically. It lives under `~/.glyphtrail/atlas/` (the LadybugDB database is t
 single file `~/.glyphtrail/atlas/ladybug`). Nothing here touches a repo's working
 tree; it reads git history only.
 
+## Identity (`[me]`) and interruption
+
+`atlas sync` keeps only **your** commits by default (`--everyone` for all authors).
+Configure who you are in `~/.glyphtrail/atlas/atlas.toml` (a commented template is
+written on `atlas init`):
+
+```toml
+[me]
+emails   = ["you@example.com", "you@work.com"]      # exact addresses
+domains  = ["example.com"]                           # any address @ a domain you own
+patterns = ["you+*@gmail.com", "*@*.example.com"]    # globs (* / ?) over the whole address
+```
+
+An address is yours if it matches any `emails` entry, an owned `domain`, or a
+`patterns` glob — all case-insensitive. Unset, it falls back to `git config
+user.email`. `CTRL-C` during any operation stops gracefully at a safe point so the
+database stays consistent (a second `CTRL-C` aborts); an interrupted `sync` saves
+the repos it finished and resumes on the next run.
+
 ## Command surface
 
 ```bash

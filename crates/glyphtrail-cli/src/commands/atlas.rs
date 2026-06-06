@@ -416,7 +416,17 @@ pub fn run(cmd: AtlasCmd) -> Result<()> {
             std::fs::create_dir_all(&dir)?;
             // Open once to stamp the schema (creates the ladybug dir + tables).
             LadybugStore::open(&ladybug_dir(&dir))?;
+            // Write a commented config template (once) so the `[me]` identity — which
+            // gates `sync` to your own commits — is discoverable.
+            let cfg_path = dir.join("atlas.toml");
+            if !cfg_path.exists() {
+                std::fs::write(&cfg_path, ATLAS_CONFIG_TEMPLATE)?;
+            }
             println!("atlas initialized at {}", dir.display());
+            println!(
+                "  config:  {} (set [me] to scope `sync` to you)",
+                cfg_path.display()
+            );
         }
         AtlasCmd::Path => println!("{}", ladybug_dir(&dir).display()),
         AtlasCmd::Status => status(&dir)?,
@@ -455,6 +465,25 @@ repositories. Use only the provided facts — do not invent commits, features, d
 Write engaging, accurate GitHub-flavored Markdown: the arc of what they worked on over time, \
 recurring themes, and how their focus shifted between projects. Group related commits into themes \
 rather than listing them verbatim.";
+
+/// Commented `atlas.toml` template written on `init` — all examples are comments so
+/// the file parses to defaults until the user uncomments and edits.
+const ATLAS_CONFIG_TEMPLATE: &str = r#"# glyphtrail atlas configuration.
+
+# [window] — restrict ingestion / views to a date range (omit for all of history).
+# [window]
+# earliest = "2020-01-01"   # on/after this date
+# latest   = "2025-12-31"   # on/before this date
+
+# [me] — who you are, so `atlas sync` keeps only YOUR commits by default (pass
+# --everyone to ingest all authors). An address is yours if it matches `emails`,
+# sits at an owned `domain`, or matches a `patterns` glob (`*` = any run of chars,
+# `?` = any one char). All matching is case-insensitive.
+# [me]
+# emails   = ["you@example.com", "you@work.com"]      # exact addresses
+# domains  = ["example.com"]                           # any address @ a domain you own
+# patterns = ["you+*@gmail.com", "*@*.example.com"]    # plus-tag aliases, subdomains
+"#;
 
 /// Gather the **outbound** (public-only) gated timeline shared by `atlas story`
 /// and `atlas export` (#336): private/proprietary/unregistered repos are
@@ -765,8 +794,12 @@ fn sync(dir: &Path, args: SyncArgs) -> Result<()> {
     let me = resolve_me(&cfg.me);
     if !args.everyone && !me.is_set() {
         bail!(
-            "cannot tell who you are: add an [me] section (emails/domains) to \
-             {}/atlas.toml, or pass --everyone",
+            "cannot tell who you are. Add a [me] section to {0}/atlas.toml, e.g.\n\n\
+             \x20   [me]\n\
+             \x20   emails  = [\"you@example.com\", \"you@work.com\"]   # exact addresses\n\
+             \x20   domains = [\"example.com\"]                          # any address @ a domain you own\n\
+             \x20   patterns = [\"you+*@gmail.com\", \"*@*.example.com\"] # globs over the whole address\n\n\
+             …then `glyphtrail atlas sync` keeps only your commits. Or pass --everyone to ingest all authors.",
             dir.display()
         );
     }
@@ -2495,6 +2528,7 @@ mod tests {
         let me = MeConfig {
             emails: vec!["ada@x.dev".into()],
             domains: vec!["mine.dev".into()],
+            ..Default::default()
         };
         let entry = RegistryEntry {
             name: "proj".into(),

@@ -447,9 +447,10 @@ pub struct WakaStat {
 }
 
 /// `[me]` — who "I" am, so `atlas sync` can keep only my own commits by default
-/// and roll every raw author of mine up to one `Identity` (#331). An address
-/// matches if it is listed in `emails`, or sits at one of my `domains` (catching
-/// forgotten local-parts on a domain I own). Seeded best-effort from
+/// and roll every raw author of mine up to one `Identity` (#331). An address is
+/// mine if it is listed in `emails`, sits at one of my owned `domains`, or matches
+/// one of my `patterns` (a glob over the whole address, e.g. `me+*@gmail.com` for
+/// plus-tag aliases or `*@*.example.com` for subdomains). Seeded best-effort from
 /// `git config user.email` and the registry contributors; user-curated.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct MeConfig {
@@ -459,35 +460,73 @@ pub struct MeConfig {
     /// Domains I own; any address at one of them is mine.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub domains: Vec<String>,
+    /// Glob patterns matched against the whole address (`*` = any run, `?` = any
+    /// one char), e.g. `me+*@gmail.com` or `*@*.example.com`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub patterns: Vec<String>,
 }
 
 impl MeConfig {
     /// Whether any identity is configured.
     pub fn is_set(&self) -> bool {
-        !self.emails.is_empty() || !self.domains.is_empty()
+        !self.emails.is_empty() || !self.domains.is_empty() || !self.patterns.is_empty()
     }
 
     /// Whether `email` resolves to me: an exact (case-insensitive) address match,
-    /// or any address at one of my owned domains.
+    /// any address at one of my owned domains, or a match of one of my glob patterns.
     pub fn matches(&self, email: &str) -> bool {
         let email = email.trim().to_ascii_lowercase();
         if self.emails.iter().any(|m| m.eq_ignore_ascii_case(&email)) {
             return true;
         }
-        match email.rsplit_once('@') {
-            Some((_, domain)) => self.domains.iter().any(|d| d.eq_ignore_ascii_case(domain)),
-            None => false,
+        if let Some((_, domain)) = email.rsplit_once('@')
+            && self.domains.iter().any(|d| d.eq_ignore_ascii_case(domain))
+        {
+            return true;
         }
+        self.patterns
+            .iter()
+            .any(|p| glob_match_ci(p.trim(), &email))
     }
 
-    /// A display address for my unified identity: the first configured email, or
-    /// `me@<first domain>` when only domains are known.
+    /// A display address for my unified identity: the first configured email, the
+    /// first pattern, or `me@<first domain>` when only domains are known.
     pub fn display(&self) -> Option<String> {
         self.emails
             .first()
+            .or_else(|| self.patterns.first())
             .cloned()
             .or_else(|| self.domains.first().map(|d| format!("me@{d}")))
     }
+}
+
+/// Case-insensitive glob match (`*` = any run incl. empty, `?` = any one char),
+/// with linear-time star backtracking. Used for `[me].patterns`.
+fn glob_match_ci(pattern: &str, text: &str) -> bool {
+    let pat = pattern.to_ascii_lowercase().into_bytes();
+    let txt = text.as_bytes(); // `text` is already lowercased by the caller
+    let (mut p, mut t) = (0usize, 0usize);
+    let (mut star, mut mark) = (None, 0usize);
+    while t < txt.len() {
+        if p < pat.len() && (pat[p] == b'?' || pat[p] == txt[t]) {
+            p += 1;
+            t += 1;
+        } else if p < pat.len() && pat[p] == b'*' {
+            star = Some(p);
+            mark = t;
+            p += 1;
+        } else if let Some(sp) = star {
+            p = sp + 1;
+            mark += 1;
+            t = mark;
+        } else {
+            return false;
+        }
+    }
+    while p < pat.len() && pat[p] == b'*' {
+        p += 1;
+    }
+    p == pat.len()
 }
 
 /// Per-repo last-synced HEAD (`~/.glyphtrail/atlas/heads.json`), keyed by
@@ -699,6 +738,7 @@ mod tests {
         let me = MeConfig {
             emails: vec!["Ada@Example.com".into()],
             domains: vec!["mine.dev".into()],
+            ..Default::default()
         };
         // Exact match, case-insensitive.
         check!(me.matches("ada@example.com"));
@@ -711,6 +751,24 @@ mod tests {
         check!(!me.matches("x@notmine.dev"));
         check!(!me.matches("no-at-sign"));
         check!(me.display().as_deref() == Some("Ada@Example.com"));
+    }
+
+    #[test]
+    fn me_matches_glob_patterns() {
+        let me = MeConfig {
+            patterns: vec!["me+*@gmail.com".into(), "*@*.example.com".into()],
+            ..Default::default()
+        };
+        // Plus-tag aliases on a shared provider.
+        check!(me.matches("me+work@gmail.com"));
+        check!(me.matches("ME+Foo@Gmail.com")); // case-insensitive
+        check!(me.matches("me+@gmail.com")); // `*` matches empty
+        check!(!me.matches("me@gmail.com")); // no `+` → no match (don't claim all gmail)
+        check!(!me.matches("someoneelse+x@gmail.com"));
+        // Subdomain wildcard.
+        check!(me.matches("ada@eng.example.com"));
+        check!(!me.matches("ada@example.com")); // `*.example.com` needs a subdomain
+        check!(me.is_set());
     }
 
     #[test]
@@ -761,6 +819,7 @@ mod tests {
         let me = MeConfig {
             emails: vec!["ada@x.dev".into()],
             domains: vec![],
+            ..Default::default()
         };
         // Explicit substring (case-insensitive) wins, ignoring me.
         check!(author_matches(&Some("EVE".into()), &me, "eve@evil.dev"));
@@ -812,6 +871,7 @@ mod tests {
             me: MeConfig {
                 emails: vec!["ada@x.dev".into()],
                 domains: vec![],
+                ..Default::default()
             },
             limit: 10,
             ..Default::default()
