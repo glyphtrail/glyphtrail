@@ -70,29 +70,31 @@ three ways so you don't recompute them:
    The backup is a **sibling directory** of the database file (LadybugDB stores the
    DB as a single file, not a directory). It is refreshed to match the live data on
    every embed, removed when no embeddings remain, and written best-effort (a
-   backup failure never fails an embed). Restore after a database loss with:
+   backup failure never fails an embed).
+
+   **Recovery is automatic on `sync`.** `atlas sync` recreates the database if it's
+   gone, rebuilds the commit/repo graph, and then — when the live embeddings are
+   empty but a backup is present — **restores the paid-for vectors from the Parquet
+   backup itself** (rebuilding the HNSW indexes). So a single command recovers from
+   a wiped store:
 
    ```bash
-   glyphtrail atlas embed-restore-backup
-   ```
-
-   This rebuilds every namespace — the vector tables, the catalog, the
-   active-model pointers, and the HNSW indexes — and works **even if the database
-   file itself is gone**, as long as the `-embeddings-backup/` sibling survives.
-
-   The backup holds only the **vectors**, not the commit/repo graph that
-   `similar`/`similar-commits` join against for display. So after a *total* DB loss,
-   full recovery is two free steps then the restore:
-
-   ```bash
-   glyphtrail atlas embed-restore-backup     # paid vectors, from Parquet
-   glyphtrail atlas sync --full              # rebuild the commit/repo graph (free, no API)
+   glyphtrail atlas sync --full
+   #   …
+   #   total:   <n> commits ingested
+   #   restored 2 embedding namespaces from the Parquet backup
    ```
 
    The node ids are deterministic (derived from repo name + commit hash), so the
    re-synced commits line back up with the restored vectors — **no re-embedding, no
-   API spend**. (This only applies to a wiped database; an ordinary glyphtrail
-   upgrade never loses the graph or the embeddings in the first place.)
+   API spend**. Auto-restore never overwrites a live embedding set (it only fires
+   when the catalog is empty), and an ordinary glyphtrail upgrade never loses the
+   graph or embeddings in the first place.
+
+   `glyphtrail atlas embed-restore-backup` does the same restore on demand (e.g.
+   without re-syncing, or to force a restore over the current set), and works even
+   if the database file itself is gone, as long as the `-embeddings-backup/` sibling
+   survives.
 
 3. **Explicit JSONL export.** `atlas embed-export` / `embed-import` is the
    human-inspectable, per-namespace path (e.g. to move one model between machines).
