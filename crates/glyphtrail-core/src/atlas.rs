@@ -415,6 +415,35 @@ pub struct AtlasConfig {
     pub window: Window,
     #[serde(default)]
     pub me: MeConfig,
+    #[serde(default)]
+    pub waka: WakaConfig,
+}
+
+/// `[waka]` — optional WakaTime time-tracking integration (#486). Pulling
+/// summaries is an opt-in, off-machine network fetch (the key is read from
+/// `WAKATIME_API_KEY`, never stored); this only configures how the data maps in.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct WakaConfig {
+    /// Map a WakaTime `project` name to a registry repo name, for the few cases
+    /// where they differ. An unmapped project keeps its WakaTime name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub projects: BTreeMap<String, String>,
+    /// Override the API base URL (default `https://wakatime.com/api/v1`), e.g. for
+    /// a self-hosted Wakapi instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+}
+
+/// One aggregated WakaTime datum (#486): the coding `seconds` spent on a given
+/// `date` (YYYY-MM-DD) for one value of one `dimension`. Dimensions are the
+/// marginal breakdowns WakaTime reports per day — `project`, `language`, `editor`,
+/// `os`, `machine`, `category` — plus `total` (the day's grand total, `name` ="").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakaStat {
+    pub date: String,
+    pub dimension: String,
+    pub name: String,
+    pub seconds: i64,
 }
 
 /// `[me]` — who "I" am, so `atlas sync` can keep only my own commits by default

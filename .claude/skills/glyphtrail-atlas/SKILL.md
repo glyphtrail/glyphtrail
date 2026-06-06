@@ -36,6 +36,10 @@ glyphtrail atlas similar-commits <text>       [--model …]
 glyphtrail atlas embed-export --space <s> --model <m> [--out f.jsonl]
 glyphtrail atlas embed-import [f.jsonl]
 glyphtrail atlas embed-restore-backup         # rebuild from the Parquet backup
+
+# Time tracking (WakaTime, #486) — off-machine, opt-in
+glyphtrail atlas waka-sync [--since YYYY-MM-DD --until YYYY-MM-DD]   # default: last 7d
+glyphtrail atlas waka      [--since --until --limit N --json|--yaml]
 ```
 
 An **embedding namespace** is a `(space, model)` pair. `space` is one of `text`
@@ -44,6 +48,25 @@ or `commit` (one vector per commit). `model` is the embedder id, e.g.
 `lexical-hash-v1` (local, no network), `graph-struct-v1`, or
 `openai:text-embedding-3-small`. Vectors for different models coexist and are
 never compared against each other.
+
+## Time tracking (WakaTime)
+
+`atlas waka-sync` pulls WakaTime daily summaries (effort + environment — the axis
+git can't show: coding seconds, time by language, editor/IDE, OS, machine/device,
+category) into a `WakaStat(date, dimension, name, seconds)` side table, and `atlas
+waka` reports them: effort per repo, plus language / editor / device / OS /
+category breakdowns (`--json`/`--yaml` for agents). `atlas status` shows a summary
+line when data is present.
+
+- **Off-machine, opt-in.** The fetch hits the WakaTime cloud API; the request is
+  announced before it's sent. The key is read from `WAKATIME_API_KEY` and never
+  stored. Override the endpoint (e.g. a self-hosted Wakapi) via `[waka].base_url`
+  in `atlas.toml`.
+- **Repo join.** A WakaTime `project` maps to its registry repo by name; add
+  `[waka].projects = { "<waka project>" = "<repo name>" }` for mismatches.
+- Like embeddings, `WakaStat` is **fetched data preserved across glyphtrail
+  upgrades** (it is not dropped by a code-graph schema migration). Not embedded —
+  the data is quantitative, not semantic.
 
 ## Embedding durability — read this before paying for OpenAI embeddings
 

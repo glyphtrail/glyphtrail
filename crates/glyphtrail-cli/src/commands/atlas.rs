@@ -1,8 +1,9 @@
 //! Atlas (#329/#330): the opt-in, local-only global archaeology index. This
 //! module is the lifecycle surface — create the store, report its state and the
 //! active limits, print its path. Ingestion (#331) and queries (#333) build on
-//! it. Atlas writes only under `~/.glyphtrail/atlas/`; nothing here touches the
-//! network or exports.
+//! it. Atlas writes only under `~/.glyphtrail/atlas/`. Most of it is local-only;
+//! the few off-machine paths (API embeddings #338, WakaTime sync #486) are opt-in
+//! and announce each network request before sending.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -55,8 +56,40 @@ pub enum AtlasCmd {
     EmbedImport(EmbedImportArgs),
     /// Restore all embeddings from the automatic Parquet backup (after a DB loss).
     EmbedRestoreBackup,
+    /// Pull WakaTime time-tracking summaries into the atlas (off-machine, #486).
+    WakaSync(WakaSyncArgs),
+    /// Report time-tracking insights: effort per repo, language/editor/device (#486).
+    Waka(WakaArgs),
     /// Serve the atlas over MCP (stdio): timeline, status, and the repo+file bridge.
     Mcp,
+}
+
+#[derive(Args)]
+pub struct WakaSyncArgs {
+    /// Earliest day to fetch (YYYY-MM-DD). Default: 7 days ago.
+    #[arg(long)]
+    pub since: Option<String>,
+    /// Latest day to fetch (YYYY-MM-DD). Default: today.
+    #[arg(long)]
+    pub until: Option<String>,
+}
+
+#[derive(Args)]
+pub struct WakaArgs {
+    /// Restrict the report to this date range (YYYY-MM-DD).
+    #[arg(long)]
+    pub since: Option<String>,
+    #[arg(long)]
+    pub until: Option<String>,
+    /// Top N entries per breakdown.
+    #[arg(long, default_value_t = 8)]
+    pub limit: usize,
+    /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
+    /// Emit YAML (compact for agents).
+    #[arg(long)]
+    pub yaml: bool,
 }
 
 #[derive(Args)]
@@ -325,6 +358,8 @@ pub fn run(cmd: AtlasCmd) -> Result<()> {
         AtlasCmd::EmbedExport(args) => embed_export(&dir, args)?,
         AtlasCmd::EmbedImport(args) => embed_import(&dir, args)?,
         AtlasCmd::EmbedRestoreBackup => embed_restore_backup(&dir)?,
+        AtlasCmd::WakaSync(args) => waka_sync(&dir, args)?,
+        AtlasCmd::Waka(args) => waka_report(&dir, args)?,
         AtlasCmd::Mcp => glyphtrail_mcp::serve_atlas_stdio(dir)?,
     }
     Ok(())
@@ -545,6 +580,19 @@ fn status(dir: &Path) -> Result<()> {
         for (space, model, count, dim) in &embeds {
             println!("  {space:<7} {model:<32} {count} vec, dim {dim}");
         }
+    }
+    let waka_days = store.waka_dates()?;
+    if !waka_days.is_empty() {
+        let total: i64 = store
+            .waka_stats(Some("total"), None, None)?
+            .iter()
+            .map(|w| w.seconds)
+            .sum();
+        println!(
+            "waka:    {} days tracked ({}) — see `glyphtrail atlas waka`",
+            waka_days.len(),
+            fmt_hms(total)
+        );
     }
     println!("window:  {}", cfg.window.label());
     Ok(())
@@ -1382,6 +1430,159 @@ fn embed_restore_backup(dir: &Path) -> Result<()> {
         },
     );
     Ok(())
+}
+
+/// Today / N-days-ago as `YYYY-MM-DD`, from the wall clock.
+fn today_minus(days: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    format_date(now - days * 86_400)
+}
+
+/// `Xh Ym` for a coding-seconds total.
+fn fmt_hms(seconds: i64) -> String {
+    let (h, m) = (seconds / 3600, (seconds % 3600) / 60);
+    if h > 0 {
+        format!("{h}h {m}m")
+    } else {
+        format!("{m}m")
+    }
+}
+
+/// `glyphtrail atlas waka-sync` — fetch WakaTime daily summaries for a date range
+/// and store them as time-tracking aggregates (#486). Off-machine: the request is
+/// announced before it's sent; the key is read from `WAKATIME_API_KEY`.
+fn waka_sync(dir: &Path, args: WakaSyncArgs) -> Result<()> {
+    if !dir.exists() {
+        bail!("atlas is disabled; run `glyphtrail atlas init` first");
+    }
+    let cfg = AtlasConfig::load(dir)?;
+    let since = args.since.clone().unwrap_or_else(|| today_minus(7));
+    let until = args.until.clone().unwrap_or_else(|| today_minus(0));
+    let base = cfg.waka.base_url.as_deref();
+    eprintln!(
+        "atlas waka-sync: fetching WakaTime summaries {since}..={until} off-machine from {}",
+        super::waka::host(base)
+    );
+    let stats = super::waka::fetch_summaries(base, &since, &until)?;
+    let mut store = LadybugStore::open(&ladybug_dir(dir))?;
+    store.set_waka_stats(&stats)?;
+    let days: std::collections::BTreeSet<&str> = stats.iter().map(|w| w.date.as_str()).collect();
+    let total: i64 = stats
+        .iter()
+        .filter(|w| w.dimension == "total")
+        .map(|w| w.seconds)
+        .sum();
+    println!(
+        "waka-synced {} day{} ({}) [{since}..={until}]",
+        days.len(),
+        if days.len() == 1 { "" } else { "s" },
+        fmt_hms(total),
+    );
+    Ok(())
+}
+
+/// Sum a dimension's seconds by name (optionally remapping names, e.g. WakaTime
+/// project → registry repo), sorted by seconds descending and capped at `limit`.
+fn waka_breakdown(
+    store: &LadybugStore,
+    dimension: &str,
+    since: Option<&str>,
+    until: Option<&str>,
+    remap: impl Fn(&str) -> String,
+    limit: usize,
+) -> Result<Vec<(String, i64)>> {
+    let mut by_name: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+    for w in store.waka_stats(Some(dimension), since, until)? {
+        *by_name.entry(remap(&w.name)).or_default() += w.seconds;
+    }
+    let mut rows: Vec<(String, i64)> = by_name.into_iter().collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    rows.truncate(limit);
+    Ok(rows)
+}
+
+/// `glyphtrail atlas waka` — time-tracking insights from the synced WakaTime data:
+/// effort per repo, plus language / editor / device / category breakdowns (#486).
+fn waka_report(dir: &Path, args: WakaArgs) -> Result<()> {
+    if !dir.exists() {
+        bail!("atlas is disabled; run `glyphtrail atlas init` first");
+    }
+    let cfg = AtlasConfig::load(dir)?;
+    let store = LadybugStore::open(&ladybug_dir(dir))?;
+    let (since, until) = (args.since.as_deref(), args.until.as_deref());
+    let total: i64 = store
+        .waka_stats(Some("total"), since, until)?
+        .iter()
+        .map(|w| w.seconds)
+        .sum();
+    if total == 0 {
+        bail!("no WakaTime data; run `glyphtrail atlas waka-sync` first");
+    }
+    // Map a WakaTime project name to its registry repo name via `[waka].projects`.
+    let repo_of = |project: &str| -> String {
+        cfg.waka
+            .projects
+            .get(project)
+            .cloned()
+            .unwrap_or_else(|| project.to_string())
+    };
+    let repos = waka_breakdown(&store, "project", since, until, repo_of, args.limit)?;
+    let id = |s: &str| s.to_string();
+    let languages = waka_breakdown(&store, "language", since, until, id, args.limit)?;
+    let editors = waka_breakdown(&store, "editor", since, until, id, args.limit)?;
+    let devices = waka_breakdown(&store, "machine", since, until, id, args.limit)?;
+    let oses = waka_breakdown(&store, "os", since, until, id, args.limit)?;
+    let categories = waka_breakdown(&store, "category", since, until, id, args.limit)?;
+
+    let emit = Emit::from_flags(args.json, args.yaml);
+    if emit == Emit::Text {
+        println!("atlas waka");
+        if since.is_some() || until.is_some() {
+            println!(
+                "  range:   {}..={}",
+                since.unwrap_or("…"),
+                until.unwrap_or("…")
+            );
+        }
+        println!("  tracked: {}", fmt_hms(total));
+        let section = |title: &str, rows: &[(String, i64)]| {
+            println!("\n{title}");
+            for (name, secs) in rows {
+                println!("  {:>8}  {name}", fmt_hms(*secs));
+            }
+        };
+        section("effort per repo", &repos);
+        section("by language", &languages);
+        section("by editor", &editors);
+        section("by device", &devices);
+        section("by OS", &oses);
+        section("by category", &categories);
+        return Ok(());
+    }
+    let to_json = |rows: &[(String, i64)]| -> serde_json::Value {
+        serde_json::Value::Array(
+            rows.iter()
+                .map(|(name, secs)| {
+                    serde_json::json!({ "name": name, "seconds": secs, "human": fmt_hms(*secs) })
+                })
+                .collect(),
+        )
+    };
+    let value = serde_json::json!({
+        "range": { "since": since, "until": until },
+        "tracked_seconds": total,
+        "tracked": fmt_hms(total),
+        "repos": to_json(&repos),
+        "languages": to_json(&languages),
+        "editors": to_json(&editors),
+        "devices": to_json(&devices),
+        "operating_systems": to_json(&oses),
+        "categories": to_json(&categories),
+    });
+    print_value(&value, emit)
 }
 
 /// `glyphtrail atlas similar` — rank repos by lexical similarity to a repo name or

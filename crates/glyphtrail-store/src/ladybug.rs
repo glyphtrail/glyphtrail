@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use glyphtrail_core::{
     Adjacency, ClassifiedItem, CommitMeta, Confidence, Direction, Edge, EdgeKind, Embedding,
-    ImpactPolicy, Node, NodeId, NodeKind, OperationKey, PendingLink, Span, classify,
+    ImpactPolicy, Node, NodeId, NodeKind, OperationKey, PendingLink, Span, WakaStat, classify,
     compute_impact, is_cross_boundary_path,
 };
 use lbug::{Connection, Database, LogicalType, SystemConfig, Value};
@@ -54,6 +54,11 @@ const SCHEMA: &[&str] = &[
     // `pk = space \x1f model`. (Pre-#473 `Embedding`/`EmbeddingV2` tables are dropped
     // on open; those embeddings are regenerable via `atlas embed*`.)
     "CREATE NODE TABLE IF NOT EXISTS EmbeddingNs(pk STRING, space STRING, model STRING, dim INT64, PRIMARY KEY(pk))",
+    // Atlas WakaTime time-tracking (#486): aggregated coding seconds per
+    // `date`/`dimension`/`name` (pk = `date \x1f dimension \x1f name`). Like the
+    // embedding tables, this is fetched data, so `migrate_schema` preserves it
+    // across a code-graph schema bump (it is not in the drop list).
+    "CREATE NODE TABLE IF NOT EXISTS WakaStat(pk STRING, date STRING, dimension STRING, name STRING, seconds INT64, PRIMARY KEY(pk))",
     "CREATE NODE TABLE IF NOT EXISTS Meta(key STRING, value STRING, PRIMARY KEY(key))",
 ];
 
@@ -848,6 +853,92 @@ impl LadybugStore {
             restored += 1;
         }
         Ok(restored)
+    }
+
+    /// Upsert WakaTime aggregates (#486), keyed by `(date, dimension, name)` so
+    /// re-syncing a day overwrites it. Idempotent.
+    pub fn set_waka_stats(&mut self, stats: &[WakaStat]) -> Result<()> {
+        let conn = self.conn()?;
+        let rows: Vec<Vec<(&str, Value)>> = stats
+            .iter()
+            .map(|w| {
+                vec![
+                    (
+                        "pk",
+                        s(&format!("{}\u{1f}{}\u{1f}{}", w.date, w.dimension, w.name)),
+                    ),
+                    ("d", s(&w.date)),
+                    ("dim", s(&w.dimension)),
+                    ("n", s(&w.name)),
+                    ("sec", Value::Int64(w.seconds)),
+                ]
+            })
+            .collect();
+        self.exec_unwind(
+            &conn,
+            "UNWIND $rows AS r MERGE (w:WakaStat {pk:r.pk}) \
+             SET w.date=r.d, w.dimension=r.dim, w.name=r.n, w.seconds=r.sec",
+            rows,
+        )
+    }
+
+    /// Read WakaTime aggregates, optionally filtered to one `dimension` and/or an
+    /// inclusive `[since, until]` date range (lexical YYYY-MM-DD compare). Ordered
+    /// by date, then descending seconds. #486.
+    pub fn waka_stats(
+        &self,
+        dimension: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> Result<Vec<WakaStat>> {
+        let mut conds: Vec<&str> = Vec::new();
+        let mut params: Vec<(&str, Value)> = Vec::new();
+        if let Some(dim) = dimension {
+            conds.push("w.dimension = $dim");
+            params.push(("dim", s(dim)));
+        }
+        if let Some(a) = since {
+            conds.push("w.date >= $since");
+            params.push(("since", s(a)));
+        }
+        if let Some(b) = until {
+            conds.push("w.date <= $until");
+            params.push(("until", s(b)));
+        }
+        let where_clause = if conds.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conds.join(" AND "))
+        };
+        let rows = self.run(
+            &format!(
+                "MATCH (w:WakaStat) {where_clause} \
+                 RETURN w.date, w.dimension, w.name, w.seconds \
+                 ORDER BY w.date, w.dimension, w.seconds DESC"
+            ),
+            params,
+        )?;
+        Ok(rows
+            .iter()
+            .map(|r| WakaStat {
+                date: get_str(r, 0),
+                dimension: get_str(r, 1),
+                name: get_str(r, 2),
+                seconds: get_i64(r, 3),
+            })
+            .collect())
+    }
+
+    /// The distinct dates present in `WakaStat`, ascending (for "synced N days"). #486.
+    pub fn waka_dates(&self) -> Result<Vec<String>> {
+        Ok(self
+            .run(
+                "MATCH (w:WakaStat) RETURN DISTINCT w.date ORDER BY w.date",
+                vec![],
+            )?
+            .iter()
+            .map(|r| get_str(r, 0))
+            .collect())
     }
 
     /// Build the HNSW cosine index on a namespace's `FLOAT[]` table when the vector
@@ -2074,6 +2165,58 @@ mod tests {
         lb.clear_embeddings_for("text", "m").unwrap();
         check!(lb.embeddings_for("text", "m").unwrap().is_empty());
         check!(lb.embedding_index().unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn waka_stats_upsert_filter_and_dates() {
+        let dir = tmp_dir("waka");
+        let mut lb = LadybugStore::open(&dir).unwrap();
+        let stats = vec![
+            WakaStat {
+                date: "2026-06-05".into(),
+                dimension: "project".into(),
+                name: "codegraph".into(),
+                seconds: 3600,
+            },
+            WakaStat {
+                date: "2026-06-05".into(),
+                dimension: "language".into(),
+                name: "Rust".into(),
+                seconds: 3000,
+            },
+            WakaStat {
+                date: "2026-06-06".into(),
+                dimension: "project".into(),
+                name: "codegraph".into(),
+                seconds: 1800,
+            },
+        ];
+        lb.set_waka_stats(&stats).unwrap();
+        // Filter by dimension.
+        let projects = lb.waka_stats(Some("project"), None, None).unwrap();
+        check!(projects.len() == 2);
+        check!(projects.iter().all(|w| w.dimension == "project"));
+        // Date range (inclusive lexical).
+        let day5 = lb
+            .waka_stats(Some("project"), Some("2026-06-05"), Some("2026-06-05"))
+            .unwrap();
+        check!(day5.len() == 1 && day5[0].seconds == 3600);
+        // Upsert: re-syncing the same (date,dim,name) overwrites, not duplicates.
+        lb.set_waka_stats(&[WakaStat {
+            date: "2026-06-05".into(),
+            dimension: "project".into(),
+            name: "codegraph".into(),
+            seconds: 7200,
+        }])
+        .unwrap();
+        let again = lb
+            .waka_stats(Some("project"), Some("2026-06-05"), Some("2026-06-05"))
+            .unwrap();
+        check!(again.len() == 1 && again[0].seconds == 7200);
+        check!(
+            lb.waka_dates().unwrap() == vec!["2026-06-05".to_string(), "2026-06-06".to_string()]
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
