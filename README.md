@@ -117,6 +117,19 @@ glyphtrail config show
 glyphtrail config set security.record_sensitive_files true   # validated before write
 glyphtrail config get impact.test_globs
 glyphtrail config unset impact.test_globs
+
+# Atlas — an opt-in, private, local-only cross-repo history + embedding index
+glyphtrail atlas init                       # create the store (~/.glyphtrail/atlas)
+glyphtrail atlas sync [--everyone]          # ingest registered repos' git history
+glyphtrail atlas status | timeline | story  # state · chronological log · LLM narrative
+glyphtrail atlas embed [--provider openai]  # embed each repo from a structured digest
+#   (local lexical model by default — no network; openai/Ollama opt-in, announced)
+glyphtrail atlas similar <repo|"free text"> # rank repos by similarity (visibility-gated)
+glyphtrail atlas digest [repo] [--json]     # structured repo digest: languages/deps/API
+glyphtrail atlas viz -o atlas-map.html      # repo-similarity map (force-graph HTML)
+glyphtrail atlas serve --port 8351          # serve the similarity map
+glyphtrail atlas waka-sync                  # pull WakaTime time-tracking (off-machine)
+glyphtrail atlas waka                       # effort per repo · language/editor/device
 ```
 
 ### Registering glyphtrail as an MCP server
