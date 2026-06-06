@@ -32,6 +32,8 @@ glyphtrail atlas embed-commits  [--provider … --model …]   # one vector per 
 glyphtrail atlas similar         <repo|text> [--graph] [--model …]
 glyphtrail atlas similar-commits <text>       [--model …]
 glyphtrail atlas digest          [repo] [--json]   # structured repo digest (#338)
+glyphtrail atlas viz   [--graph --neighbors N -o map.html]  # repo-similarity map → HTML
+glyphtrail atlas serve [--graph --neighbors N --port P]     # serve the similarity map
 
 # Backup / portability
 glyphtrail atlas embed-export --space <s> --model <m> [--out f.jsonl]
@@ -42,6 +44,12 @@ glyphtrail atlas embed-restore-backup         # rebuild from the Parquet backup
 glyphtrail atlas waka-sync [--since YYYY-MM-DD --until YYYY-MM-DD]   # default: last 7d
 glyphtrail atlas waka      [--since --until --limit N --json|--yaml]
 ```
+
+`atlas viz` renders a **repo-similarity map**: each repo is a node, each edge links
+a repo to its most embedding-similar repos, laid out as a force graph so clusters of
+related projects emerge (`--graph` for structural similarity, `--neighbors N` for
+edge density). `atlas viz` writes a self-contained HTML file; `atlas serve` serves
+the same map over HTTP. Both reuse the `glyphtrail viz`/`serve` renderer.
 
 The `text` embedding represents each repo by a **structured digest** (languages,
 dependencies, API/endpoint surface, structure counts, git timeline, README excerpt,

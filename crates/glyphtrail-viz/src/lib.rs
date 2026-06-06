@@ -132,6 +132,14 @@ pub fn static_html(nodes: &[Node], edges: &[Edge], ops: &[(NodeId, OperationKey)
     render(to_elements(nodes, edges, ops, None), None)
 }
 
+/// Render a self-contained HTML page from pre-built Cytoscape `elements` (each a
+/// `{ "data": { … } }` object). For graphs that aren't the code graph — e.g. the
+/// atlas repo-similarity map (#338), whose nodes are repos and whose edges are
+/// embedding similarity — built directly rather than from [`Node`]/[`Edge`].
+pub fn static_html_elements(elements: Value) -> String {
+    render(elements, None)
+}
+
 /// Render a self-contained page highlighting the impact blast radius of a seed.
 pub fn static_html_impact(
     nodes: &[Node],
@@ -198,6 +206,20 @@ mod tests {
 
     fn set(items: &[&str]) -> Option<HashSet<String>> {
         Some(items.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn static_html_elements_inlines_custom_elements() {
+        // The atlas viz feeds bespoke repo/similarity elements (not Node/Edge).
+        let elements = serde_json::json!([
+            { "data": { "id": "r1", "label": "alpha", "kind": "repo" } },
+            { "data": { "id": "r2", "label": "beta", "kind": "repo" } },
+            { "data": { "id": "e0", "source": "r1", "target": "r2", "kind": "similar", "weight": 0.9 } },
+        ]);
+        let html = static_html_elements(elements);
+        check!(html.contains("window.GLYPHTRAIL_DATA"));
+        check!(html.contains("\"label\":\"alpha\""));
+        check!(html.contains("\"kind\":\"similar\""));
     }
 
     #[test]
