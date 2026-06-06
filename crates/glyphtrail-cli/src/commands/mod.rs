@@ -20,6 +20,7 @@ pub mod clean;
 pub mod config;
 pub mod config_file;
 pub mod cypher;
+pub mod digest;
 pub mod drift;
 pub mod embed_provider;
 pub mod group;

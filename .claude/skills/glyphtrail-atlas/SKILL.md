@@ -31,6 +31,7 @@ glyphtrail atlas graph-embed                  # structural embedding per repo
 glyphtrail atlas embed-commits  [--provider … --model …]   # one vector per commit
 glyphtrail atlas similar         <repo|text> [--graph] [--model …]
 glyphtrail atlas similar-commits <text>       [--model …]
+glyphtrail atlas digest          [repo] [--json]   # structured repo digest (#338)
 
 # Backup / portability
 glyphtrail atlas embed-export --space <s> --model <m> [--out f.jsonl]
@@ -42,8 +43,14 @@ glyphtrail atlas waka-sync [--since YYYY-MM-DD --until YYYY-MM-DD]   # default: 
 glyphtrail atlas waka      [--since --until --limit N --json|--yaml]
 ```
 
+The `text` embedding represents each repo by a **structured digest** (languages,
+dependencies, API/endpoint surface, structure counts, git timeline, README excerpt,
+and frequency-ranked topics) built from its own index + commit history — not raw
+commit subjects — so repo similarity matches what a repo *is*. `atlas digest [repo]`
+prints that digest (`--json` for structured); it's the same document `embed` uses.
+
 An **embedding namespace** is a `(space, model)` pair. `space` is one of `text`
-(repo summary from commit subjects), `graph` (structural, from the code graph),
+(repo digest), `graph` (structural, from the code graph),
 or `commit` (one vector per commit). `model` is the embedder id, e.g.
 `lexical-hash-v1` (local, no network), `graph-struct-v1`, or
 `openai:text-embedding-3-small`. Vectors for different models coexist and are
