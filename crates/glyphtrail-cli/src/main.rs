@@ -227,6 +227,12 @@ enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Load a local `.env` (cwd or an ancestor) into the environment before parsing,
+    // so keys like `OPENAI_API_KEY` / `WAKATIME_API_KEY` are picked up without
+    // exporting them by hand. Existing environment variables win; a missing file is
+    // not an error.
+    let _ = dotenvy::dotenv();
+
     // Logs go to stderr so stdout carries only command output — critical for the
     // MCP stdio transport (JSON-RPC) and for piping JSON/YAML query results.
     tracing_subscriber::fmt()
