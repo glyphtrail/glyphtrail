@@ -63,6 +63,8 @@ pub struct CargoDependency {
 pub struct CargoPackage {
     pub name: String,
     pub version: Option<String>,
+    /// `[package].description`, when declared.
+    pub description: Option<String>,
     pub dependencies: Vec<CargoDependency>,
 }
 
@@ -88,6 +90,13 @@ pub fn parse_cargo_manifest(text: &str) -> Result<Option<CargoPackage>> {
         .and_then(|pkg| pkg.get("version"))
         .and_then(Value::as_str)
         .map(str::to_string);
+    let description = table
+        .get("package")
+        .and_then(Value::as_table)
+        .and_then(|pkg| pkg.get("description"))
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 
     let mut dependencies = Vec::new();
     for (key, kind) in [
@@ -105,6 +114,7 @@ pub fn parse_cargo_manifest(text: &str) -> Result<Option<CargoPackage>> {
     Ok(Some(CargoPackage {
         name: name.to_string(),
         version,
+        description,
         dependencies,
     }))
 }
@@ -198,6 +208,186 @@ pub fn workspace_members(text: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// A package's identity as parsed from a non-Cargo manifest (#338 digest): the
+/// declared description and external dependency names, plus the ecosystem tag.
+/// Cargo has its own richer [`CargoPackage`]; convert via [`cargo_manifest_package`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestPackage {
+    pub description: Option<String>,
+    pub deps: Vec<String>,
+    pub ecosystem: &'static str,
+}
+
+/// The external dependency names a Cargo package declares: `Normal`-kind deps that
+/// are not local `path` dependencies (so workspace-inherited and registry/git crates
+/// count, but sibling crates pulled by relative path are dropped as local noise).
+pub fn cargo_external_deps(pkg: &CargoPackage) -> Vec<String> {
+    let mut names: Vec<String> = pkg
+        .dependencies
+        .iter()
+        .filter(|d| d.kind == DepKind::Normal && !matches!(d.source, DepSource::Path(_)))
+        .map(|d| d.name.clone())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Dependency names declared in a `[workspace.dependencies]` table (the external
+/// crates a workspace root pins for its members), dropping local `path` entries.
+pub fn workspace_dependencies(text: &str) -> Vec<String> {
+    let Ok(table) = toml::from_str::<toml::Table>(text) else {
+        return Vec::new();
+    };
+    let Some(deps) = table
+        .get("workspace")
+        .and_then(Value::as_table)
+        .and_then(|w| w.get("dependencies"))
+        .and_then(Value::as_table)
+    else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = deps
+        .iter()
+        .filter(|(_, spec)| {
+            // Drop path deps; keep registry/git/workspace-version specs.
+            !spec
+                .as_table()
+                .map(|t| t.contains_key("path"))
+                .unwrap_or(false)
+        })
+        .map(|(key, spec)| {
+            spec.as_table()
+                .and_then(|t| t.get("package"))
+                .and_then(Value::as_str)
+                .unwrap_or(key)
+                .to_string()
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Parse an npm `package.json` for its description + external dependency names.
+pub fn parse_npm_manifest(text: &str) -> Option<ManifestPackage> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    let description = v
+        .get("description")
+        .and_then(|d| d.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let mut deps: Vec<String> = Vec::new();
+    for key in ["dependencies", "peerDependencies", "optionalDependencies"] {
+        if let Some(obj) = v.get(key).and_then(|d| d.as_object()) {
+            deps.extend(obj.keys().cloned());
+        }
+    }
+    deps.sort();
+    deps.dedup();
+    (description.is_some() || !deps.is_empty()).then_some(ManifestPackage {
+        description,
+        deps,
+        ecosystem: "npm",
+    })
+}
+
+/// Parse a Python `pyproject.toml` (PEP 621 `[project]` or `[tool.poetry]`).
+pub fn parse_pyproject_manifest(text: &str) -> Option<ManifestPackage> {
+    let table: toml::Table = toml::from_str(text).ok()?;
+    let project = table
+        .get("project")
+        .or_else(|| table.get("tool").and_then(|t| t.get("poetry")))?;
+    let description = project
+        .get("description")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let mut deps: Vec<String> = Vec::new();
+    if let Some(arr) = project.get("dependencies").and_then(Value::as_array) {
+        // PEP 621: a list of PEP 508 strings (`requests>=2`).
+        for d in arr {
+            if let Some(name) = d.as_str().and_then(strip_pep508_name) {
+                deps.push(name);
+            }
+        }
+    } else if let Some(tab) = project.get("dependencies").and_then(Value::as_table) {
+        // Poetry: a table; `python` is the interpreter constraint, not a package.
+        deps.extend(tab.keys().filter(|k| k.as_str() != "python").cloned());
+    }
+    deps.sort();
+    deps.dedup();
+    (description.is_some() || !deps.is_empty()).then_some(ManifestPackage {
+        description,
+        deps,
+        ecosystem: "pypi",
+    })
+}
+
+/// The package name at the front of a PEP 508 requirement (`requests[extra]>=2`).
+fn strip_pep508_name(spec: &str) -> Option<String> {
+    let trimmed = spec.trim();
+    let end = trimmed
+        .find(|c: char| !c.is_alphanumeric() && c != '-' && c != '_' && c != '.')
+        .unwrap_or(trimmed.len());
+    let name = &trimmed[..end];
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Parse the `require` directives of a Go `go.mod` for module dependency paths.
+pub fn parse_gomod_manifest(text: &str) -> Option<ManifestPackage> {
+    let mut deps = Vec::new();
+    let mut in_block = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with("//") {
+            continue;
+        }
+        if line.starts_with("require (") {
+            in_block = true;
+            continue;
+        }
+        if in_block {
+            if line == ")" {
+                in_block = false;
+            } else if let Some(name) = line.split_whitespace().next() {
+                deps.push(name.to_string());
+            }
+        } else if let Some(rest) = line.strip_prefix("require ")
+            && let Some(name) = rest.split_whitespace().next()
+        {
+            deps.push(name.to_string());
+        }
+    }
+    deps.sort();
+    deps.dedup();
+    (!deps.is_empty()).then_some(ManifestPackage {
+        description: None,
+        deps,
+        ecosystem: "go",
+    })
+}
+
+/// Parse a PHP `composer.json` for its description + `require` names.
+pub fn parse_composer_manifest(text: &str) -> Option<ManifestPackage> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    let description = v
+        .get("description")
+        .and_then(|d| d.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let deps: Vec<String> = v
+        .get("require")
+        .and_then(|d| d.as_object())
+        .map(|o| o.keys().cloned().collect())
+        .unwrap_or_default();
+    (description.is_some() || !deps.is_empty()).then_some(ManifestPackage {
+        description,
+        deps,
+        ecosystem: "composer",
+    })
 }
 
 #[cfg(test)]
@@ -345,5 +535,65 @@ mod tests {
         let text = "[package]\nname = \"c\"\n[dependencies]\nserde.workspace = true\n";
         let pkg = parse_cargo_manifest(text).unwrap().unwrap();
         check!(dep(&pkg, "serde").source == DepSource::Workspace);
+    }
+
+    #[test]
+    fn cargo_description_and_external_deps() {
+        let text = r#"
+            [package]
+            name = "widget"
+            description = "  A widget toolkit  "
+            [dependencies]
+            anyhow = "1"
+            serde.workspace = true
+            sibling = { path = "../sibling" }
+            [dev-dependencies]
+            assert2 = "0.3"
+        "#;
+        let pkg = parse_cargo_manifest(text).unwrap().unwrap();
+        check!(pkg.description.as_deref() == Some("A widget toolkit")); // trimmed
+        // External = normal, non-path: anyhow (registry) + serde (workspace), not the
+        // path sibling and not the dev-dep.
+        check!(cargo_external_deps(&pkg) == vec!["anyhow".to_string(), "serde".to_string()]);
+    }
+
+    #[test]
+    fn workspace_dependencies_drop_path_entries() {
+        let text = "[workspace.dependencies]\nanyhow = \"1\"\nlocal = { path = \"crates/local\" }\n\
+                    renamed = { package = \"real-crate\", version = \"2\" }\n";
+        check!(
+            workspace_dependencies(text) == vec!["anyhow".to_string(), "real-crate".to_string()]
+        );
+    }
+
+    #[test]
+    fn npm_merges_dep_groups_and_reads_description() {
+        let text = r#"{ "description": "a tool", "dependencies": { "react": "^18" },
+            "peerDependencies": { "react-dom": "^18" } }"#;
+        let m = parse_npm_manifest(text).unwrap();
+        check!(m.description.as_deref() == Some("a tool"));
+        check!(m.deps == vec!["react".to_string(), "react-dom".to_string()]);
+        check!(m.ecosystem == "npm");
+    }
+
+    #[test]
+    fn pyproject_pep621_and_poetry() {
+        let pep621 =
+            "[project]\ndescription = \"svc\"\ndependencies = [\"requests>=2\", \"httpx\"]\n";
+        let m = parse_pyproject_manifest(pep621).unwrap();
+        check!(m.description.as_deref() == Some("svc"));
+        check!(m.deps == vec!["httpx".to_string(), "requests".to_string()]); // sorted, PEP508 stripped
+        // Poetry table form drops the `python` interpreter constraint.
+        let poetry = "[tool.poetry]\ndescription = \"p\"\n[tool.poetry.dependencies]\npython = \"^3.11\"\nflask = \"^3\"\n";
+        let m2 = parse_pyproject_manifest(poetry).unwrap();
+        check!(m2.deps == vec!["flask".to_string()]);
+    }
+
+    #[test]
+    fn gomod_require_block_and_single() {
+        let text =
+            "module x\n\nrequire github.com/a/b v1.2.3\n\nrequire (\n\tgithub.com/c/d v0.1.0\n)\n";
+        let m = parse_gomod_manifest(text).unwrap();
+        check!(m.deps == vec!["github.com/a/b".to_string(), "github.com/c/d".to_string()]);
     }
 }

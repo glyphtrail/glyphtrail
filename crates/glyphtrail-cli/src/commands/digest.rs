@@ -18,6 +18,9 @@ use glyphtrail_store::{GraphStore, LadybugStore};
 /// A structured summary of one repository.
 pub struct RepoDigest {
     pub name: String,
+    /// The package description from a manifest, when declared — the most
+    /// authoritative one-line "what is this repo".
+    pub description: Option<String>,
     /// `(language, file count)`, descending.
     pub languages: Vec<(String, usize)>,
     pub total_files: usize,
@@ -49,6 +52,7 @@ pub fn build_repo_digest(
 ) -> RepoDigest {
     let mut d = RepoDigest {
         name: name.to_string(),
+        description: None,
         languages: Vec::new(),
         total_files: 0,
         functions: 0,
@@ -121,6 +125,17 @@ pub fn build_repo_digest(
         }
     }
 
+    // Manifest layer (#338 follow-up, borrowed from codesearch): the declared
+    // package description + external dependencies are more authoritative than
+    // inferred imports — use them when a manifest is present.
+    if let Some(root) = root {
+        let (description, manifest_deps, _ecosystems) = repo_manifest_digest(root);
+        d.description = description;
+        if !manifest_deps.is_empty() {
+            d.deps = manifest_deps.into_iter().take(20).collect();
+        }
+    }
+
     // Timeline + topics from the atlas commits.
     let mut times: Vec<i64> = rows.iter().map(|r| r.commit.committed_at).collect();
     times.sort_unstable();
@@ -144,14 +159,139 @@ pub fn build_repo_digest(
     d
 }
 
+/// Aggregate the repo's package manifests into `(description, external deps,
+/// ecosystems)`. Walks the working tree (bounded) for `Cargo.toml`/`package.json`/
+/// `pyproject.toml`/`go.mod`/`composer.json`, parses each with the core manifest
+/// parsers, and unions the declared external dependencies. The description is the
+/// shallowest manifest's (root wins over a member crate). #338.
+type ParsedManifest = (Option<String>, Vec<String>, &'static str, Option<String>);
+
+fn repo_manifest_digest(root: &Path) -> (Option<String>, Vec<String>, Vec<String>) {
+    use glyphtrail_core::{
+        cargo_external_deps, parse_cargo_manifest, parse_composer_manifest, parse_gomod_manifest,
+        parse_npm_manifest, parse_pyproject_manifest, workspace_dependencies,
+    };
+    let mut manifests: Vec<(usize, std::path::PathBuf)> = Vec::new();
+    collect_manifests(root, 0, &mut manifests);
+    manifests.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1))); // shallowest (root) first
+    let mut description: Option<String> = None;
+    let mut deps: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut ecosystems: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // The repo's own package names — these leak into a member's deps via
+    // `foo.workspace = true`, so subtract them so a workspace doesn't list itself.
+    let mut local: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (depth, path) in &manifests {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        // Parse into `(description, external deps, ecosystem, own package name)`.
+        let parsed: Option<ParsedManifest> =
+            match path.file_name().and_then(|n| n.to_str()).unwrap_or("") {
+                "Cargo.toml" => match parse_cargo_manifest(&text) {
+                    Ok(Some(pkg)) => {
+                        let mut d = cargo_external_deps(&pkg);
+                        d.extend(workspace_dependencies(&text));
+                        Some((pkg.description.clone(), d, "cargo", Some(pkg.name.clone())))
+                    }
+                    // A virtual workspace root: still mine its `[workspace.dependencies]`.
+                    _ => {
+                        let ws = workspace_dependencies(&text);
+                        (!ws.is_empty()).then_some((None, ws, "cargo", None))
+                    }
+                },
+                "package.json" => {
+                    parse_npm_manifest(&text).map(|m| (m.description, m.deps, m.ecosystem, None))
+                }
+                "pyproject.toml" => parse_pyproject_manifest(&text)
+                    .map(|m| (m.description, m.deps, m.ecosystem, None)),
+                "go.mod" => {
+                    parse_gomod_manifest(&text).map(|m| (m.description, m.deps, m.ecosystem, None))
+                }
+                "composer.json" => parse_composer_manifest(&text)
+                    .map(|m| (m.description, m.deps, m.ecosystem, None)),
+                _ => None,
+            };
+        if let Some((desc, mdeps, eco, own)) = parsed {
+            // Only the root manifest's description is repo-level; a member crate's
+            // is too narrow, so a workspace falls back to its README.
+            if *depth == 0
+                && description.is_none()
+                && let Some(s) = desc
+            {
+                description = Some(s);
+            }
+            deps.extend(mdeps);
+            ecosystems.insert(eco.to_string());
+            if let Some(n) = own {
+                local.insert(n);
+            }
+        }
+    }
+    deps.retain(|d| !local.contains(d));
+    (
+        description,
+        deps.into_iter().collect(),
+        ecosystems.into_iter().collect(),
+    )
+}
+
+/// Collect manifest file paths under `dir` (bounded depth), each tagged with its
+/// depth, skipping vendored / build / VCS directories.
+fn collect_manifests(dir: &Path, depth: usize, out: &mut Vec<(usize, std::path::PathBuf)>) {
+    if depth > 3 {
+        return;
+    }
+    const SKIP: &[&str] = &[
+        "target",
+        "node_modules",
+        ".git",
+        ".glyphtrail",
+        "vendor",
+        "dist",
+        "build",
+        ".venv",
+        "__pycache__",
+    ];
+    const MANIFESTS: &[&str] = &[
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+        "go.mod",
+        "composer.json",
+    ];
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_str().unwrap_or("");
+        let path = entry.path();
+        if path.is_dir() {
+            if !SKIP.contains(&name) && !name.starts_with('.') {
+                collect_manifests(&path, depth + 1, out);
+            }
+        } else if MANIFESTS.contains(&name) {
+            out.push((depth, path));
+        }
+    }
+}
+
 /// The compact document fed to the text embedder: a few high-signal lines, bounded
 /// so it stays cheap to embed. Includes a topics line so the "what was worked on"
 /// commit signal is preserved alongside the structure.
 pub fn render_embed_doc(d: &RepoDigest) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "{}", d.name);
-    if let Some(readme) = &d.readme {
-        let _ = writeln!(s, "{readme}");
+    // The manifest description is the most authoritative "what is this"; fall back
+    // to the README excerpt only when there's no description.
+    match (&d.description, &d.readme) {
+        (Some(desc), _) => {
+            let _ = writeln!(s, "{desc}");
+        }
+        (None, Some(readme)) => {
+            let _ = writeln!(s, "{readme}");
+        }
+        (None, None) => {}
     }
     if !d.languages.is_empty() {
         let langs = d
@@ -218,6 +358,9 @@ pub fn render_markdown(d: &RepoDigest) -> String {
                 .join(", "),
         );
     }
+    if let Some(desc) = &d.description {
+        let _ = writeln!(s, "> {desc}\n");
+    }
     if let Some(readme) = &d.readme {
         let _ = writeln!(s, "{readme}\n");
     }
@@ -254,6 +397,7 @@ pub fn render_markdown(d: &RepoDigest) -> String {
 pub fn render_json(d: &RepoDigest) -> serde_json::Value {
     serde_json::json!({
         "name": d.name,
+        "description": d.description,
         "languages": d.languages.iter().map(|(l, c)| serde_json::json!({ "name": l, "files": c })).collect::<Vec<_>>(),
         "total_files": d.total_files,
         "functions": d.functions,
@@ -318,6 +462,7 @@ mod tests {
     fn digest() -> RepoDigest {
         RepoDigest {
             name: "codegraph".into(),
+            description: Some("Local code intelligence graph.".into()),
             languages: vec![("Rust".into(), 120), ("TOML".into(), 8)],
             total_files: 128,
             functions: 400,
@@ -338,6 +483,7 @@ mod tests {
     fn embed_doc_is_compact_and_high_signal() {
         let doc = render_embed_doc(&digest());
         check!(doc.contains("codegraph"));
+        check!(doc.contains("Local code intelligence graph.")); // manifest description leads
         check!(doc.contains("Languages: Rust, TOML"));
         check!(doc.contains("Dependencies: lbug, clap"));
         check!(doc.contains("API: 2 endpoints"));
