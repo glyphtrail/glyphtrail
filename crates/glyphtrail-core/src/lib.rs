@@ -60,8 +60,9 @@ pub use link_hints::{
 };
 pub use links::{CrossRepoLink, LinkKind, RepoIdentity, imported_symbols, resolve_links};
 pub use manifest::{
-    CargoDependency, CargoPackage, DepKind, DepSource, manifest_repository, parse_cargo_manifest,
-    workspace_members,
+    CargoDependency, CargoPackage, DepKind, DepSource, ManifestPackage, cargo_external_deps,
+    manifest_repository, parse_cargo_manifest, parse_composer_manifest, parse_gomod_manifest,
+    parse_npm_manifest, parse_pyproject_manifest, workspace_dependencies, workspace_members,
 };
 pub use matcher::{ClientCall, Endpoint, Match, Matcher};
 pub use model::{CodeGraph, Confidence, Edge, EdgeKind, Node, NodeId, NodeKind, PendingLink, Span};
