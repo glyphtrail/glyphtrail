@@ -416,6 +416,11 @@ fn outbound_timeline(
 /// `glyphtrail atlas story` — an LLM narrative of the evolution of your work
 /// across repos, over the public-only gated timeline (#336).
 fn story(dir: &Path, args: StoryArgs) -> Result<()> {
+    // Resolve the waka date filter to the same bounds the timeline uses (the CLI
+    // flags override the config window), before `args` is moved.
+    let cfg = AtlasConfig::load(dir)?;
+    let waka_since = args.since.clone().or_else(|| cfg.window.earliest.clone());
+    let waka_until = args.until.clone().or_else(|| cfg.window.latest.clone());
     let (tl, window, _scope) = outbound_timeline(
         dir,
         args.since,
@@ -434,7 +439,21 @@ fn story(dir: &Path, args: StoryArgs) -> Result<()> {
         tl.rows.len(),
         tl.excluded_restricted
     );
-    let prompt = atlas_story_prompt(&tl, &window);
+    // Time-tracking facts (#486), gated to the visible repo set for per-repo effort.
+    let store = LadybugStore::open(&ladybug_dir(dir))?;
+    let visible: std::collections::BTreeSet<&str> =
+        tl.rows.iter().map(|r| r.repo.as_str()).collect();
+    let waka = waka_story_section(
+        &store,
+        &cfg,
+        &visible,
+        waka_since.as_deref(),
+        waka_until.as_deref(),
+    )?;
+    if waka.is_some() {
+        eprintln!("atlas story: weaving in WakaTime time-tracking facts");
+    }
+    let prompt = atlas_story_prompt(&tl, &window, waka.as_deref());
 
     if args.dry_run {
         std::fs::write(
@@ -462,7 +481,7 @@ fn story(dir: &Path, args: StoryArgs) -> Result<()> {
 
 /// Compose the narration prompt from the gated timeline: a facts header plus the
 /// commit log oldest-first (so the model reads a forward arc).
-fn atlas_story_prompt(tl: &glyphtrail_core::Timeline, window: &str) -> String {
+fn atlas_story_prompt(tl: &glyphtrail_core::Timeline, window: &str, waka: Option<&str>) -> String {
     use std::collections::BTreeSet;
     let repos: BTreeSet<&str> = tl.rows.iter().map(|r| r.repo.as_str()).collect();
     let log = tl
@@ -479,11 +498,20 @@ fn atlas_story_prompt(tl: &glyphtrail_core::Timeline, window: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n");
+    // Optional time-tracking facts (#486): effort + environment to color the arc.
+    let waka_block = match waka {
+        Some(w) => format!(
+            "\n\n{w}\nWeave these time-tracking facts into the narrative — which work \
+             consumed the most time, and in what environment (languages, tools, machines) \
+             — rather than listing the numbers.",
+        ),
+        None => String::new(),
+    };
     format!(
         "Window: {window}\nRepositories ({}): {}\nCommits: {}\n\n\
          Commit log (oldest first):\n{log}\n\n\
          Write a narrative of how my work evolved over this window — the arc across \
-         these projects, recurring themes, and how my focus shifted between them.",
+         these projects, recurring themes, and how my focus shifted between them.{waka_block}",
         repos.len(),
         repos.into_iter().collect::<Vec<_>>().join(", "),
         tl.rows.len(),
@@ -1504,6 +1532,70 @@ fn waka_breakdown(
     Ok(rows)
 }
 
+/// `name Xh Ym, …` for a breakdown, or "—" when empty.
+fn fmt_breakdown(rows: &[(String, i64)]) -> String {
+    if rows.is_empty() {
+        return "—".to_string();
+    }
+    rows.iter()
+        .map(|(name, secs)| format!("{name} {}", fmt_hms(*secs)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A time-tracking fact block for the `atlas story` prompt (#486), or `None` when
+/// no WakaTime data is present. Effort-per-repo is restricted to `visible` repos so
+/// a public-only story never names a hidden/proprietary project; the aggregate
+/// language/editor/device breakdowns carry no repo names.
+fn waka_story_section(
+    store: &LadybugStore,
+    cfg: &AtlasConfig,
+    visible: &std::collections::BTreeSet<&str>,
+    since: Option<&str>,
+    until: Option<&str>,
+) -> Result<Option<String>> {
+    let total: i64 = store
+        .waka_stats(Some("total"), since, until)?
+        .iter()
+        .map(|w| w.seconds)
+        .sum();
+    if total == 0 {
+        return Ok(None);
+    }
+    // Effort per visible repo (WakaTime project → registry repo via the alias map).
+    let mut per_repo: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+    for w in store.waka_stats(Some("project"), since, until)? {
+        let repo = cfg
+            .waka
+            .projects
+            .get(&w.name)
+            .cloned()
+            .unwrap_or_else(|| w.name.clone());
+        if visible.contains(repo.as_str()) {
+            *per_repo.entry(repo).or_default() += w.seconds;
+        }
+    }
+    let mut repos: Vec<(String, i64)> = per_repo.into_iter().collect();
+    repos.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let id = |s: &str| s.to_string();
+    let languages = waka_breakdown(store, "language", since, until, id, 6)?;
+    let editors = waka_breakdown(store, "editor", since, until, id, 5)?;
+    let devices = waka_breakdown(store, "machine", since, until, id, 5)?;
+    Ok(Some(format!(
+        "Time tracking (WakaTime), same window:\n\
+         - Total coding time: {}\n\
+         - Effort per repo: {}\n\
+         - Languages: {}\n\
+         - Editors/IDEs: {}\n\
+         - Machines: {}",
+        fmt_hms(total),
+        fmt_breakdown(&repos),
+        fmt_breakdown(&languages),
+        fmt_breakdown(&editors),
+        fmt_breakdown(&devices),
+    )))
+}
+
 /// `glyphtrail atlas waka` — time-tracking insights from the synced WakaTime data:
 /// effort per repo, plus language / editor / device / category breakdowns (#486).
 fn waka_report(dir: &Path, args: WakaArgs) -> Result<()> {
@@ -2194,7 +2286,7 @@ mod tests {
             excluded_restricted: 0,
             excluded_author: 0,
         };
-        let p = atlas_story_prompt(&tl, "2020-09-01..");
+        let p = atlas_story_prompt(&tl, "2020-09-01..", None);
         check!(p.contains("Window: 2020-09-01.."));
         check!(p.contains("Repositories (2): alpha, beta"));
         check!(p.contains("Commits: 2"));
@@ -2203,6 +2295,57 @@ mod tests {
         let second = p.find("second thing").unwrap();
         check!(first < second);
         check!(p.contains("how my work evolved"));
+        // No time-tracking block when none is provided.
+        check!(!p.contains("Time tracking"));
+
+        // With a waka section, it is appended plus the weaving instruction.
+        let pw = atlas_story_prompt(&tl, "2020-09-01..", Some("Time tracking (WakaTime)…"));
+        check!(pw.contains("Time tracking (WakaTime)…"));
+        check!(pw.contains("Weave these time-tracking facts"));
+    }
+
+    // #486: the story's per-repo effort must list only visible repos — a hidden /
+    // proprietary project's WakaTime time is never named in a public-only story.
+    #[test]
+    fn waka_story_section_excludes_hidden_repos() {
+        let mut store = LadybugStore::open_temp().unwrap();
+        store
+            .set_waka_stats(&[
+                glyphtrail_core::WakaStat {
+                    date: "2026-06-05".into(),
+                    dimension: "total".into(),
+                    name: String::new(),
+                    seconds: 10800,
+                },
+                glyphtrail_core::WakaStat {
+                    date: "2026-06-05".into(),
+                    dimension: "project".into(),
+                    name: "alpha".into(),
+                    seconds: 3600,
+                },
+                glyphtrail_core::WakaStat {
+                    date: "2026-06-05".into(),
+                    dimension: "project".into(),
+                    name: "secret-proprietary".into(),
+                    seconds: 7200,
+                },
+                glyphtrail_core::WakaStat {
+                    date: "2026-06-05".into(),
+                    dimension: "language".into(),
+                    name: "Rust".into(),
+                    seconds: 9000,
+                },
+            ])
+            .unwrap();
+        let cfg = AtlasConfig::default();
+        let visible: std::collections::BTreeSet<&str> = ["alpha"].into_iter().collect();
+        let section = waka_story_section(&store, &cfg, &visible, None, None)
+            .unwrap()
+            .expect("waka data present");
+        check!(section.contains("alpha")); // visible repo named
+        check!(!section.contains("secret-proprietary")); // hidden repo never named
+        check!(section.contains("Rust")); // aggregate language kept
+        check!(section.contains("Total coding time: 3h")); // 10800s
     }
 
     fn raw(

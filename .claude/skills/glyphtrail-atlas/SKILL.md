@@ -64,6 +64,11 @@ line when data is present.
   in `atlas.toml`.
 - **Repo join.** A WakaTime `project` maps to its registry repo by name; add
   `[waka].projects = { "<waka project>" = "<repo name>" }` for mismatches.
+- **`atlas story` weaves it in.** When WakaTime data covers the story window, the
+  narration prompt gains a time-tracking block (total, effort per repo, languages,
+  editors, machines) so the narrative reflects effort + environment. Per-repo
+  effort is gated to the visible repo set, so a public-only story never names a
+  hidden/proprietary project; the aggregate breakdowns carry no repo names.
 - Like embeddings, `WakaStat` is **fetched data preserved across glyphtrail
   upgrades** (it is not dropped by a code-graph schema migration). Not embedded —
   the data is quantitative, not semantic.
