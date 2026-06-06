@@ -789,7 +789,16 @@ fn sync(dir: &Path, args: SyncArgs) -> Result<()> {
     let mut store = LadybugStore::open(&lb)?;
     let mut total = 0usize;
 
+    let mut interrupted = false;
     for e in &selected {
+        // Stop between repos on CTRL-C: each repo's writes are committed before the
+        // next starts, so breaking here leaves the database clean and persists the
+        // completed repos' HEAD watermarks (saved below).
+        if crate::interrupt::requested() {
+            println!("  interrupted — stopping after the completed repos");
+            interrupted = true;
+            break;
+        }
         let root = e.active_root();
         if !root.exists() {
             println!("  {}: root missing, skipped", e.name);
@@ -828,7 +837,13 @@ fn sync(dir: &Path, args: SyncArgs) -> Result<()> {
         );
     }
 
+    // Persist the completed repos' HEAD watermarks either way, so a graceful stop
+    // keeps its progress and the next sync resumes from there.
     heads.save(dir)?;
+    if interrupted {
+        println!("  total:   {total} commits ingested (stopped early; rerun to continue)");
+        return Ok(());
+    }
     // Re-evaluate *every* stored commit against the persistent window, always:
     // narrowing re-marks rows out of bounds, and removing the window (bounds
     // become `None`) restores them to in-bounds (not deletes).
