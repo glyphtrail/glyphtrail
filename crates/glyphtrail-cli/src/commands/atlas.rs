@@ -564,10 +564,13 @@ struct RawCommit {
 /// atlas. Mine-only by default, incremental from a saved per-repo HEAD, gated by
 /// the configured date window. Echoes every active gate before writing.
 fn sync(dir: &Path, args: SyncArgs) -> Result<()> {
-    let lb = ladybug_dir(dir);
-    if !lb.exists() {
+    // Gate on the atlas directory, not the `ladybug` db file: if the database was
+    // lost, `sync` recreates it (and auto-restores embeddings from the Parquet
+    // backup at the end), so a single `atlas sync` recovers from a wiped store.
+    if !dir.exists() {
         bail!("atlas is disabled; run `glyphtrail atlas init` first");
     }
+    let lb = ladybug_dir(dir);
 
     let reg_path = default_registry_path()
         .ok_or_else(|| anyhow!("cannot locate home directory (set HOME or USERPROFILE)"))?;
@@ -671,7 +674,36 @@ fn sync(dir: &Path, args: SyncArgs) -> Result<()> {
     // become `None`) restores them to in-bounds (not deletes).
     store.remark_commit_bounds(bound_since, bound_until)?;
     println!("  total:   {total} commits ingested");
+    // If the database had no embeddings but a Parquet backup is present (e.g. this
+    // sync just rebuilt a lost database), restore the paid-for vectors automatically.
+    // The node ids are deterministic, so they re-key to the commits just ingested.
+    if let Ok(n) = auto_restore_embeddings(&mut store)
+        && n > 0
+    {
+        println!(
+            "  restored {n} embedding namespace{} from the Parquet backup",
+            if n == 1 { "" } else { "s" }
+        );
+    }
     Ok(())
+}
+
+/// Restore embeddings from the Parquet backup when the live catalog is empty and a
+/// backup is present, rebuilding the HNSW indexes. A no-op when embeddings already
+/// exist (never clobbers a live set) or no backup is found. Returns the number of
+/// namespaces restored. Shared by `sync` (automatic) and the explicit
+/// `embed-restore-backup`. #473.
+fn auto_restore_embeddings(store: &mut LadybugStore) -> Result<usize> {
+    if !store.embedding_index()?.is_empty() {
+        return Ok(0);
+    }
+    let restored = store.restore_embedding_backup().unwrap_or(0);
+    if restored > 0 {
+        for (space, model, _count, _dim) in store.embedding_index()? {
+            build_ann_index(store, &space, &model);
+        }
+    }
+    Ok(restored)
 }
 
 /// `glyphtrail atlas timeline` — chronological commits across repos. Default-deny
