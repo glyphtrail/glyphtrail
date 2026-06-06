@@ -60,8 +60,19 @@ pub enum AtlasCmd {
     WakaSync(WakaSyncArgs),
     /// Report time-tracking insights: effort per repo, language/editor/device (#486).
     Waka(WakaArgs),
+    /// Print a structured digest of a repo (languages, deps, API, structure, #338).
+    Digest(DigestArgs),
     /// Serve the atlas over MCP (stdio): timeline, status, and the repo+file bridge.
     Mcp,
+}
+
+#[derive(Args)]
+pub struct DigestArgs {
+    /// Repo to digest (default: every registered repo).
+    pub repo: Option<String>,
+    /// Emit JSON instead of Markdown.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args)]
@@ -360,6 +371,7 @@ pub fn run(cmd: AtlasCmd) -> Result<()> {
         AtlasCmd::EmbedRestoreBackup => embed_restore_backup(&dir)?,
         AtlasCmd::WakaSync(args) => waka_sync(&dir, args)?,
         AtlasCmd::Waka(args) => waka_report(&dir, args)?,
+        AtlasCmd::Digest(args) => digest_cmd(&dir, args)?,
         AtlasCmd::Mcp => glyphtrail_mcp::serve_atlas_stdio(dir)?,
     }
     Ok(())
@@ -938,12 +950,12 @@ fn graph_embed(dir: &Path, args: GraphEmbedArgs) -> Result<()> {
     Ok(())
 }
 
-/// `glyphtrail atlas embed` — compute an embedding per repo from the synced commit
-/// history and store it in the side table (#338). The default `local` provider
-/// never leaves the machine; an `openai` provider POSTs the per-repo commit-subject
-/// summaries to the configured endpoint (announced first), one of the few atlas
-/// functions allowed off-machine on explicit opt-in. Embeds every repo regardless
-/// of visibility (gating is at `similar` output).
+/// `glyphtrail atlas embed` — compute an embedding per repo from a structured digest
+/// of its index + commit history (#338; see `commands::digest`) and store it in the
+/// side table. The default `local` provider never leaves the machine; an `openai`
+/// provider POSTs the per-repo digest summaries to the configured endpoint
+/// (announced first), one of the few atlas functions allowed off-machine on explicit
+/// opt-in. Embeds every repo regardless of visibility (gating is at `similar` output).
 fn embed(dir: &Path, args: EmbedArgs) -> Result<()> {
     use crate::commands::embed_provider::{EmbedConfig, embed_docs};
     let lb = ladybug_dir(dir);
@@ -951,16 +963,36 @@ fn embed(dir: &Path, args: EmbedArgs) -> Result<()> {
         bail!("atlas is disabled; run `glyphtrail atlas init` first");
     }
     let store = LadybugStore::open(&lb)?;
-    // Every in-bounds commit, joined to its repo; build one document per repo from
-    // the repo name plus its commit subjects (already secret-scrubbed at sync).
+    let registry = match default_registry_path() {
+        Some(p) => Registry::load(&p)?,
+        None => Registry::default(),
+    };
+    // Build one document per repo as a structured digest (languages, dependencies,
+    // API surface, structure, timeline, topics) from its own index + commit history
+    // — a far better repo representation than concatenated commit subjects (#338,
+    // borrowed from codesearch's repo-digest). A registry root supplies the index +
+    // README; commit-only repos still get a name + topics digest.
     let rows = store.atlas_timeline(None, None, None)?;
+    let mut by_repo: std::collections::BTreeMap<String, Vec<&glyphtrail_core::AtlasTimelineRow>> =
+        std::collections::BTreeMap::new();
+    for row in &rows {
+        by_repo.entry(row.repo.clone()).or_default().push(row);
+    }
+    let root_of = |name: &str| -> Option<std::path::PathBuf> {
+        registry
+            .repos
+            .iter()
+            .find(|e| e.name == name)
+            .map(|e| e.active_root().clone())
+    };
     let mut docs: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
-    for row in rows {
-        let doc = docs
-            .entry(row.repo.clone())
-            .or_insert_with(|| row.repo.clone());
-        doc.push(' ');
-        doc.push_str(&row.commit.subject);
+    for (name, repo_rows) in &by_repo {
+        let root = root_of(name);
+        let digest = crate::commands::digest::build_repo_digest(name, root.as_deref(), repo_rows);
+        docs.insert(
+            name.clone(),
+            crate::commands::digest::render_embed_doc(&digest),
+        );
     }
     if docs.is_empty() {
         bail!("no commits to embed; run `glyphtrail atlas sync` first");
@@ -1509,6 +1541,62 @@ fn waka_sync(dir: &Path, args: WakaSyncArgs) -> Result<()> {
         if days.len() == 1 { "" } else { "s" },
         fmt_hms(total),
     );
+    Ok(())
+}
+
+/// `glyphtrail atlas digest [repo]` — print a structured digest (languages, deps,
+/// API surface, structure, timeline, topics) for one or every registered repo, the
+/// same document `atlas embed` represents a repo by (#338).
+fn digest_cmd(dir: &Path, args: DigestArgs) -> Result<()> {
+    if !dir.exists() {
+        bail!("atlas is disabled; run `glyphtrail atlas init` first");
+    }
+    let store = LadybugStore::open(&ladybug_dir(dir))?;
+    let registry = match default_registry_path() {
+        Some(p) => Registry::load(&p)?,
+        None => Registry::default(),
+    };
+    let rows = store.atlas_timeline(None, None, None)?;
+    let mut by_repo: std::collections::BTreeMap<String, Vec<&glyphtrail_core::AtlasTimelineRow>> =
+        std::collections::BTreeMap::new();
+    for row in &rows {
+        by_repo.entry(row.repo.clone()).or_default().push(row);
+    }
+    // Which repos to print: the requested one, else the union of registered repos
+    // and repos seen in the commit history.
+    let mut names: std::collections::BTreeSet<String> = registry
+        .repos
+        .iter()
+        .map(|e| e.name.clone())
+        .chain(by_repo.keys().cloned())
+        .collect();
+    if let Some(repo) = &args.repo {
+        if !names.contains(repo) {
+            bail!("no repo named '{repo}' (registered or in the atlas history)");
+        }
+        names = std::iter::once(repo.clone()).collect();
+    }
+    let root_of = |name: &str| -> Option<std::path::PathBuf> {
+        registry
+            .repos
+            .iter()
+            .find(|e| e.name == name)
+            .map(|e| e.active_root().clone())
+    };
+    let empty: Vec<&glyphtrail_core::AtlasTimelineRow> = Vec::new();
+    for name in &names {
+        let repo_rows = by_repo.get(name).unwrap_or(&empty);
+        let digest =
+            crate::commands::digest::build_repo_digest(name, root_of(name).as_deref(), repo_rows);
+        if args.json {
+            print_value(&crate::commands::digest::render_json(&digest), Emit::Json)?;
+        } else {
+            print!("{}", crate::commands::digest::render_markdown(&digest));
+            if names.len() > 1 {
+                println!();
+            }
+        }
+    }
     Ok(())
 }
 
