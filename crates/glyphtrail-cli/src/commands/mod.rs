@@ -35,4 +35,5 @@ pub mod setup;
 pub mod status;
 pub mod story;
 pub mod viz;
+pub mod waka;
 pub mod wiki;
