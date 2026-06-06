@@ -174,6 +174,25 @@ pub async fn serve(store: Box<dyn GraphStore + Send>, mcp_db: PathBuf, port: u16
 /// HTML on the fly (#52). `/` serves `index.md`; `/<slug>` serves `<slug>.md`.
 /// Page slugs are restricted to a single safe filename segment (no path
 /// traversal). Other assets are not served — the wiki output is flat Markdown.
+/// Serve a single self-contained HTML page (the atlas viz, #338) at `/`. The page
+/// already inlines its data, so there are no API routes — this just makes it
+/// browsable / refreshable over HTTP, the served analog of `atlas viz`.
+pub async fn serve_html(html: String, port: u16) -> Result<()> {
+    let html = Arc::new(html);
+    let app = Router::new().route(
+        "/",
+        get(move || {
+            let html = html.clone();
+            async move { Html((*html).clone()) }
+        }),
+    );
+    let addr = format!("127.0.0.1:{port}");
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    println!("atlas viz serving at http://{addr}");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
 pub async fn serve_wiki(dir: PathBuf, port: u16) -> Result<()> {
     let app = Router::new()
         .route("/", get(wiki_page))

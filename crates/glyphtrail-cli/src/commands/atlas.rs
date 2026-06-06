@@ -62,8 +62,47 @@ pub enum AtlasCmd {
     Waka(WakaArgs),
     /// Print a structured digest of a repo (languages, deps, API, structure, #338).
     Digest(DigestArgs),
+    /// Write a repo-similarity map (embedding force-graph) to a self-contained HTML
+    /// file — the atlas analog of `glyphtrail viz` (#338).
+    Viz(VizArgs),
+    /// Serve the repo-similarity map over HTTP (the atlas analog of `serve`, #338).
+    Serve(VizServeArgs),
     /// Serve the atlas over MCP (stdio): timeline, status, and the repo+file bridge.
     Mcp,
+}
+
+#[derive(Args)]
+pub struct VizArgs {
+    /// Map structural (`graph`) similarity instead of text-digest similarity.
+    #[arg(long)]
+    pub graph: bool,
+    /// Embedding model to map (default: the active one for the space).
+    #[arg(long)]
+    pub model: Option<String>,
+    /// Link each repo to its N most-similar repos.
+    #[arg(long, default_value_t = 3)]
+    pub neighbors: usize,
+    /// Include restricted (private/proprietary) repos.
+    #[arg(long)]
+    pub include_restricted: bool,
+    /// Output HTML file.
+    #[arg(long, short, default_value = "atlas-map.html")]
+    pub out: PathBuf,
+}
+
+#[derive(Args)]
+pub struct VizServeArgs {
+    #[arg(long)]
+    pub graph: bool,
+    #[arg(long)]
+    pub model: Option<String>,
+    #[arg(long, default_value_t = 3)]
+    pub neighbors: usize,
+    #[arg(long)]
+    pub include_restricted: bool,
+    /// Port to serve on.
+    #[arg(long, default_value_t = 8351)]
+    pub port: u16,
 }
 
 #[derive(Args)]
@@ -372,6 +411,8 @@ pub fn run(cmd: AtlasCmd) -> Result<()> {
         AtlasCmd::WakaSync(args) => waka_sync(&dir, args)?,
         AtlasCmd::Waka(args) => waka_report(&dir, args)?,
         AtlasCmd::Digest(args) => digest_cmd(&dir, args)?,
+        AtlasCmd::Viz(args) => viz(&dir, args)?,
+        AtlasCmd::Serve(args) => viz_serve(&dir, args)?,
         AtlasCmd::Mcp => glyphtrail_mcp::serve_atlas_stdio(dir)?,
     }
     Ok(())
@@ -1598,6 +1639,132 @@ fn digest_cmd(dir: &Path, args: DigestArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Build Cytoscape `elements` for the repo-similarity map (#338): one `repo` node
+/// per visible embedded repo, and a `similar` edge from each repo to its
+/// `neighbors` most-cosine-similar repos (deduped). Returns `(elements, repo count,
+/// edge count)`.
+fn atlas_similarity_elements(
+    dir: &Path,
+    graph: bool,
+    model: Option<String>,
+    neighbors: usize,
+    include_restricted: bool,
+) -> Result<(serde_json::Value, usize, usize)> {
+    let lb = ladybug_dir(dir);
+    if !lb.exists() {
+        bail!("atlas is disabled; run `glyphtrail atlas init` first");
+    }
+    let store = LadybugStore::open(&lb)?;
+    let registry = match default_registry_path() {
+        Some(p) => Registry::load(&p)?,
+        None => Registry::default(),
+    };
+    let space = if graph { SPACE_GRAPH } else { SPACE_TEXT };
+    let model = resolve_model(&store, space, model.as_deref())?;
+    let embs = store.embeddings_for(space, &model)?;
+    if embs.is_empty() {
+        bail!(
+            "no {space} embeddings for model '{model}'; run `glyphtrail atlas {}` first",
+            if graph { "graph-embed" } else { "embed" }
+        );
+    }
+    let id_of = |name: &str| {
+        if graph {
+            repo_graph_node_id(name)
+        } else {
+            repo_node_id(name)
+        }
+    };
+    let by_id: std::collections::HashMap<String, &RegistryEntry> = registry
+        .repos
+        .iter()
+        .map(|e| (id_of(&e.name).0, e))
+        .collect();
+    // Only repos the registry can name and that the visibility gate allows.
+    let repos: Vec<(&str, &str, &Vec<f32>)> = embs
+        .iter()
+        .filter_map(|e| {
+            let entry = by_id.get(&e.node_id.0)?;
+            (!entry.visibility.is_restricted() || include_restricted).then_some((
+                e.node_id.0.as_str(),
+                entry.name.as_str(),
+                &e.vector,
+            ))
+        })
+        .collect();
+    if repos.is_empty() {
+        bail!("no nameable repos to map (try --include-restricted)");
+    }
+    let mut elements: Vec<serde_json::Value> = repos
+        .iter()
+        .map(|(id, name, _)| serde_json::json!({ "data": { "id": id, "label": name, "kind": "repo" } }))
+        .collect();
+    let mut seen: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+    let mut edge_count = 0usize;
+    for (i, (_, _, vi)) in repos.iter().enumerate() {
+        let mut sims: Vec<(usize, f32)> = repos
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(j, (_, _, vj))| (j, glyphtrail_core::cosine(vi, vj)))
+            .collect();
+        sims.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (j, score) in sims.into_iter().take(neighbors) {
+            if score <= 0.0 {
+                continue;
+            }
+            let key = if i < j { (i, j) } else { (j, i) };
+            if !seen.insert(key) {
+                continue;
+            }
+            elements.push(serde_json::json!({ "data": {
+                "id": format!("e{edge_count}"),
+                "source": repos[key.0].0,
+                "target": repos[key.1].0,
+                "kind": "similar",
+                "weight": score,
+            } }));
+            edge_count += 1;
+        }
+    }
+    Ok((serde_json::Value::Array(elements), repos.len(), edge_count))
+}
+
+/// `glyphtrail atlas viz` — write the repo-similarity map to a self-contained HTML
+/// file (the atlas analog of `glyphtrail viz`). #338.
+fn viz(dir: &Path, args: VizArgs) -> Result<()> {
+    let (elements, repos, edges) = atlas_similarity_elements(
+        dir,
+        args.graph,
+        args.model,
+        args.neighbors,
+        args.include_restricted,
+    )?;
+    let html = glyphtrail_viz::static_html_elements(elements);
+    std::fs::write(&args.out, html).with_context(|| format!("writing {}", args.out.display()))?;
+    println!(
+        "wrote {} ({repos} repos, {edges} similarity links)",
+        args.out.display()
+    );
+    Ok(())
+}
+
+/// `glyphtrail atlas serve` — serve the repo-similarity map over HTTP (the atlas
+/// analog of `glyphtrail serve`). #338.
+fn viz_serve(dir: &Path, args: VizServeArgs) -> Result<()> {
+    let (elements, repos, edges) = atlas_similarity_elements(
+        dir,
+        args.graph,
+        args.model,
+        args.neighbors,
+        args.include_restricted,
+    )?;
+    let html = glyphtrail_viz::static_html_elements(elements);
+    eprintln!("atlas viz: {repos} repos, {edges} similarity links");
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(glyphtrail_server::serve_html(html, args.port))
 }
 
 /// Sum a dimension's seconds by name (optionally remapping names, e.g. WakaTime
