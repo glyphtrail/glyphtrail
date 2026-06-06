@@ -40,26 +40,15 @@ pub enum AtlasCmd {
     Story(StoryArgs),
     /// Export the gated atlas timeline as structured data (public-only).
     Export(ExportArgs),
-    /// Compute repo embeddings from the synced history (local lexical model, #338).
-    Embed(EmbedArgs),
-    /// Compute structural embeddings from each repo's code graph (local, #338).
-    GraphEmbed(GraphEmbedArgs),
-    /// Embed every synced commit (by subject) into an HNSW index (#338).
-    EmbedCommits(EmbedCommitsArgs),
-    /// Find repos similar to a repo name or free-text query (visibility-gated).
-    Similar(SimilarArgs),
-    /// Find commits similar to a free-text query, across repos (visibility-gated).
-    SimilarCommits(SimilarCommitsArgs),
-    /// Export one embedding namespace as JSONL (backup, re-import, off-box compute).
-    EmbedExport(EmbedExportArgs),
-    /// Import embedding namespaces from JSONL (replaces each space+model).
-    EmbedImport(EmbedImportArgs),
-    /// Restore all embeddings from the automatic Parquet backup (after a DB loss).
-    EmbedRestoreBackup,
-    /// Pull WakaTime time-tracking summaries into the atlas (off-machine, #486).
-    WakaSync(WakaSyncArgs),
-    /// Report time-tracking insights: effort per repo, language/editor/device (#486).
-    Waka(WakaArgs),
+    /// Compute and manage embeddings (#338): repos / graph / commits / export-import.
+    #[command(subcommand)]
+    Embed(EmbedCmd),
+    /// Find similar repos or commits by embedding (visibility-gated, #338).
+    #[command(subcommand)]
+    Similar(SimilarCmd),
+    /// WakaTime time-tracking: sync summaries and report insights (#486).
+    #[command(subcommand)]
+    Waka(WakaCmd),
     /// Print a structured digest of a repo (languages, deps, API, structure, #338).
     Digest(DigestArgs),
     /// Write a repo-similarity map (embedding force-graph) to a self-contained HTML
@@ -69,6 +58,42 @@ pub enum AtlasCmd {
     Serve(VizServeArgs),
     /// Serve the atlas over MCP (stdio): timeline, status, and the repo+file bridge.
     Mcp,
+}
+
+/// `atlas embed …` — compute and manage embeddings (#338).
+#[derive(Subcommand)]
+pub enum EmbedCmd {
+    /// Embed each repo from its structured digest (local model by default; an
+    /// OpenAI-compatible provider is opt-in and announced).
+    Repos(EmbedArgs),
+    /// Compute structural embeddings from each repo's code graph (local).
+    Graph(GraphEmbedArgs),
+    /// Embed every synced commit (by subject) into an HNSW index.
+    Commits(EmbedCommitsArgs),
+    /// Export one embedding namespace as JSONL (backup, re-import, off-box compute).
+    Export(EmbedExportArgs),
+    /// Import embedding namespaces from JSONL (replaces each space+model).
+    Import(EmbedImportArgs),
+    /// Restore all embeddings from the automatic Parquet backup (after a DB loss).
+    Restore,
+}
+
+/// `atlas similar …` — embedding similarity search (#338).
+#[derive(Subcommand)]
+pub enum SimilarCmd {
+    /// Find repos similar to a repo name or free-text query.
+    Repos(SimilarArgs),
+    /// Find commits similar to a free-text query, across repos.
+    Commits(SimilarCommitsArgs),
+}
+
+/// `atlas waka …` — WakaTime time tracking (#486).
+#[derive(Subcommand)]
+pub enum WakaCmd {
+    /// Pull WakaTime time-tracking summaries into the atlas (off-machine).
+    Sync(WakaSyncArgs),
+    /// Report time-tracking insights: effort per repo, language/editor/device.
+    Show(WakaArgs),
 }
 
 #[derive(Args)]
@@ -400,16 +425,22 @@ pub fn run(cmd: AtlasCmd) -> Result<()> {
         AtlasCmd::Topics(args) => topics(&dir, args)?,
         AtlasCmd::Story(args) => story(&dir, args)?,
         AtlasCmd::Export(args) => export(&dir, args)?,
-        AtlasCmd::Embed(args) => embed(&dir, args)?,
-        AtlasCmd::GraphEmbed(args) => graph_embed(&dir, args)?,
-        AtlasCmd::EmbedCommits(args) => embed_commits(&dir, args)?,
-        AtlasCmd::Similar(args) => similar(&dir, args)?,
-        AtlasCmd::SimilarCommits(args) => similar_commits(&dir, args)?,
-        AtlasCmd::EmbedExport(args) => embed_export(&dir, args)?,
-        AtlasCmd::EmbedImport(args) => embed_import(&dir, args)?,
-        AtlasCmd::EmbedRestoreBackup => embed_restore_backup(&dir)?,
-        AtlasCmd::WakaSync(args) => waka_sync(&dir, args)?,
-        AtlasCmd::Waka(args) => waka_report(&dir, args)?,
+        AtlasCmd::Embed(cmd) => match cmd {
+            EmbedCmd::Repos(args) => embed(&dir, args)?,
+            EmbedCmd::Graph(args) => graph_embed(&dir, args)?,
+            EmbedCmd::Commits(args) => embed_commits(&dir, args)?,
+            EmbedCmd::Export(args) => embed_export(&dir, args)?,
+            EmbedCmd::Import(args) => embed_import(&dir, args)?,
+            EmbedCmd::Restore => embed_restore_backup(&dir)?,
+        },
+        AtlasCmd::Similar(cmd) => match cmd {
+            SimilarCmd::Repos(args) => similar(&dir, args)?,
+            SimilarCmd::Commits(args) => similar_commits(&dir, args)?,
+        },
+        AtlasCmd::Waka(cmd) => match cmd {
+            WakaCmd::Sync(args) => waka_sync(&dir, args)?,
+            WakaCmd::Show(args) => waka_report(&dir, args)?,
+        },
         AtlasCmd::Digest(args) => digest_cmd(&dir, args)?,
         AtlasCmd::Viz(args) => viz(&dir, args)?,
         AtlasCmd::Serve(args) => viz_serve(&dir, args)?,

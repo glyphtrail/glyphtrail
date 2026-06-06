@@ -26,24 +26,29 @@ glyphtrail atlas status               # store + embedding state
 glyphtrail atlas timeline | topics | story   # browse / narrate the history
 
 # Embeddings (namespaced by space + model; models never mix in search)
-glyphtrail atlas embed          [--provider local|openai --model … --base-url …]
-glyphtrail atlas graph-embed                  # structural embedding per repo
-glyphtrail atlas embed-commits  [--provider … --model …]   # one vector per commit
-glyphtrail atlas similar         <repo|text> [--graph] [--model …]
-glyphtrail atlas similar-commits <text>       [--model …]
+glyphtrail atlas embed repos    [--provider local|openai --model … --base-url …]
+glyphtrail atlas embed graph                  # structural embedding per repo
+glyphtrail atlas embed commits  [--provider … --model …]   # one vector per commit
+glyphtrail atlas similar repos   <repo|text> [--graph] [--model …]
+glyphtrail atlas similar commits <text>       [--model …]
 glyphtrail atlas digest          [repo] [--json]   # structured repo digest (#338)
 glyphtrail atlas viz   [--graph --neighbors N -o map.html]  # repo-similarity map → HTML
 glyphtrail atlas serve [--graph --neighbors N --port P]     # serve the similarity map
 
-# Backup / portability
-glyphtrail atlas embed-export --space <s> --model <m> [--out f.jsonl]
-glyphtrail atlas embed-import [f.jsonl]
-glyphtrail atlas embed-restore-backup         # rebuild from the Parquet backup
+# Backup / portability (under `embed`)
+glyphtrail atlas embed export --space <s> --model <m> [--out f.jsonl]
+glyphtrail atlas embed import [f.jsonl]
+glyphtrail atlas embed restore                # rebuild from the Parquet backup
 
 # Time tracking (WakaTime, #486) — off-machine, opt-in
-glyphtrail atlas waka-sync [--since YYYY-MM-DD --until YYYY-MM-DD]   # default: last 7d
-glyphtrail atlas waka      [--since --until --limit N --json|--yaml]
+glyphtrail atlas waka sync [--since YYYY-MM-DD --until YYYY-MM-DD]   # default: last 7d
+glyphtrail atlas waka show [--since --until --limit N --json|--yaml]
 ```
+
+The `embed`, `similar`, and `waka` commands are grouped: `embed repos|graph|
+commits|export|import|restore`, `similar repos|commits`, `waka sync|show`.
+Keys (OpenAI / WakaTime) come from the environment; a `.env` in the working
+directory (or an ancestor) is auto-loaded.
 
 `atlas viz` renders a **repo-similarity map**: each repo is a node, each edge links
 a repo to its most embedding-similar repos, laid out as a force graph so clusters of
@@ -66,10 +71,10 @@ never compared against each other.
 
 ## Time tracking (WakaTime)
 
-`atlas waka-sync` pulls WakaTime daily summaries (effort + environment — the axis
+`atlas waka sync` pulls WakaTime daily summaries (effort + environment — the axis
 git can't show: coding seconds, time by language, editor/IDE, OS, machine/device,
 category) into a `WakaStat(date, dimension, name, seconds)` side table, and `atlas
-waka` reports them: effort per repo, plus language / editor / device / OS /
+waka show` reports them: effort per repo, plus language / editor / device / OS /
 category breakdowns (`--json`/`--yaml` for agents). `atlas status` shows a summary
 line when data is present.
 
@@ -100,8 +105,8 @@ three ways so you don't recompute them:
    active-model pointers. They are only ever discarded if the embedding storage
    format itself changes (a deliberate version bump).
 
-2. **Automatic Parquet backup on disk.** Every `atlas embed`, `graph-embed`,
-   `embed-commits`, and `embed-import` mirrors the vectors to a portable Parquet
+2. **Automatic Parquet backup on disk.** Every `atlas embed repos`, `embed graph`,
+   `embed commits`, and `embed import` mirrors the vectors to a portable Parquet
    backup beside the database:
 
    ```
@@ -134,12 +139,12 @@ three ways so you don't recompute them:
    when the catalog is empty), and an ordinary glyphtrail upgrade never loses the
    graph or embeddings in the first place.
 
-   `glyphtrail atlas embed-restore-backup` does the same restore on demand (e.g.
+   `glyphtrail atlas embed restore` does the same restore on demand (e.g.
    without re-syncing, or to force a restore over the current set), and works even
    if the database file itself is gone, as long as the `-embeddings-backup/` sibling
    survives.
 
-3. **Explicit JSONL export.** `atlas embed-export` / `embed-import` is the
+3. **Explicit JSONL export.** `atlas embed export` / `embed import` is the
    human-inspectable, per-namespace path (e.g. to move one model between machines).
 
 **Portability gotcha:** if you relocate or clean `~/.glyphtrail/atlas`, move the

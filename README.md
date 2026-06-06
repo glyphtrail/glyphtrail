@@ -122,15 +122,19 @@ glyphtrail config unset impact.test_globs
 glyphtrail atlas init                       # create the store (~/.glyphtrail/atlas)
 glyphtrail atlas sync [--everyone]          # ingest registered repos' git history
 glyphtrail atlas status | timeline | story  # state · chronological log · LLM narrative
-glyphtrail atlas embed [--provider openai]  # embed each repo from a structured digest
+glyphtrail atlas embed repos [--provider openai]  # embed each repo from its digest
 #   (local lexical model by default — no network; openai/Ollama opt-in, announced)
-glyphtrail atlas similar <repo|"free text"> # rank repos by similarity (visibility-gated)
+#   also: embed graph | commits | export | import | restore
+glyphtrail atlas similar repos <repo|"free text">  # rank repos (or `similar commits`)
 glyphtrail atlas digest [repo] [--json]     # structured repo digest: languages/deps/API
 glyphtrail atlas viz -o atlas-map.html      # repo-similarity map (force-graph HTML)
 glyphtrail atlas serve --port 8351          # serve the similarity map
-glyphtrail atlas waka-sync                  # pull WakaTime time-tracking (off-machine)
-glyphtrail atlas waka                       # effort per repo · language/editor/device
+glyphtrail atlas waka sync                  # pull WakaTime time-tracking (off-machine)
+glyphtrail atlas waka show                  # effort per repo · language/editor/device
 ```
+
+Keys for the OpenAI embedder / WakaTime are read from the environment; a `.env`
+file in the working directory (or an ancestor) is loaded automatically.
 
 ### Registering glyphtrail as an MCP server
 
