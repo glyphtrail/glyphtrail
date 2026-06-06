@@ -40,6 +40,7 @@ indicatif = "0.18"
 globset = "0.4"
 rayon = "1"
 dotenvy = "0.15"
+ctrlc = "3"
 
 [dev-dependencies]
 assert2.workspace = true

@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod commands;
+mod interrupt;
 mod ui;
 
 use clap::{ArgGroup, CommandFactory, Parser, Subcommand};
@@ -232,6 +233,10 @@ fn main() -> anyhow::Result<()> {
     // exporting them by hand. Existing environment variables win; a missing file is
     // not an error.
     let _ = dotenvy::dotenv();
+
+    // CTRL-C requests a graceful stop (so DB-writing commands close cleanly) rather
+    // than killing mid-write; a second CTRL-C aborts.
+    interrupt::install();
 
     // Logs go to stderr so stdout carries only command output — critical for the
     // MCP stdio transport (JSON-RPC) and for piping JSON/YAML query results.
