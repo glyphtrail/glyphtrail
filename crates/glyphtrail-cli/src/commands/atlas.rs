@@ -409,13 +409,24 @@ fn ladybug_dir(atlas: &Path) -> PathBuf {
     atlas.join("ladybug")
 }
 
-/// Write the commented `atlas.toml` template if the atlas directory exists but the
-/// config file does not. Best-effort and idempotent — never overwrites an existing
-/// config, and a write failure is silently ignored (the config is optional).
+/// Keep the atlas config discoverable. When the atlas directory exists: create the
+/// editable `atlas.toml` if it's missing (never overwritten — it's the user's), and
+/// always keep `atlas.toml.example` in sync with the current built-in template
+/// (rewritten only when missing or out of date) so every option stays documented as
+/// glyphtrail gains them. Best-effort: write failures are ignored.
 fn ensure_atlas_config(dir: &Path) {
+    if !dir.exists() {
+        return;
+    }
     let cfg = dir.join("atlas.toml");
-    if dir.exists() && !cfg.exists() {
+    if !cfg.exists() {
         let _ = std::fs::write(&cfg, ATLAS_CONFIG_TEMPLATE);
+    }
+    // The canonical reference, refreshed whenever the embedded template changes (the
+    // content comparison is the "expected hash").
+    let example = dir.join("atlas.toml.example");
+    if std::fs::read_to_string(&example).ok().as_deref() != Some(ATLAS_CONFIG_TEMPLATE) {
+        let _ = std::fs::write(&example, ATLAS_CONFIG_TEMPLATE);
     }
 }
 

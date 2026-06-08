@@ -20,8 +20,9 @@ tree; it reads git history only.
 ## Identity (`[me]`) and interruption
 
 `atlas sync` keeps only **your** commits by default (`--everyone` for all authors).
-Configure who you are in `~/.glyphtrail/atlas/atlas.toml` (a commented template is
-written on `atlas init`):
+Configure who you are in `~/.glyphtrail/atlas/atlas.toml` (created on first use;
+never overwritten). A read-only `atlas.toml.example` next to it always mirrors the
+current built-in template, so every option stays documented:
 
 ```toml
 [me]
