@@ -436,12 +436,16 @@ pub struct ReposConfig {
     /// Same matching, marking a repo at least `Private`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub private: Vec<String>,
+    /// Allowlist that **wins** over `proprietary`/`private`: a match pins the repo
+    /// `Public`, so a public repo caught by a broad work-org glob stays public.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub public: Vec<String>,
 }
 
 impl ReposConfig {
     /// Whether any classification pattern is configured.
     pub fn is_set(&self) -> bool {
-        !self.proprietary.is_empty() || !self.private.is_empty()
+        !self.proprietary.is_empty() || !self.private.is_empty() || !self.public.is_empty()
     }
 }
 

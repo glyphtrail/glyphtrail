@@ -64,7 +64,11 @@ fn registry(atlas_dir: &Path) -> Registry {
         .and_then(|p| Registry::load(&p).ok())
         .unwrap_or_default();
     if let Ok(cfg) = AtlasConfig::load(atlas_dir) {
-        registry.classify(&cfg.repos.proprietary, &cfg.repos.private);
+        registry.classify(
+            &cfg.repos.public,
+            &cfg.repos.proprietary,
+            &cfg.repos.private,
+        );
     }
     registry
 }

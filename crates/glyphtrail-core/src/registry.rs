@@ -518,14 +518,16 @@ impl Registry {
         self.repos.iter().find(|e| e.ids.iter().any(|r| r.id == id))
     }
 
-    /// Raise each entry's atlas visibility by name/forge-org glob patterns
-    /// (`[repos]` in `atlas.toml`, #332): a `proprietary` match marks the repo
-    /// `Proprietary`, a `private` match marks it at least `Private`. Patterns are
-    /// matched (case-insensitively) against the repo name and each forge id
-    /// (`host/owner/repo`), and only ever *increase* restrictiveness — a repo's
-    /// explicit tier is never lowered. In-place; the caller doesn't persist it.
-    pub fn classify(&mut self, proprietary: &[String], private: &[String]) {
-        if proprietary.is_empty() && private.is_empty() {
+    /// Classify each entry's atlas visibility by name/forge-org glob patterns
+    /// (`[repos]` in `atlas.toml`, #332). Patterns match (case-insensitively)
+    /// against the repo name and each forge id (`host/owner/repo`). Precedence,
+    /// highest first: a `public` match **pins** the repo `Public` (the escape hatch
+    /// for a public repo caught by a broad work-org glob); a `proprietary` match
+    /// marks it `Proprietary`; a `private` match marks it at least `Private`. Apart
+    /// from the `public` pin, classification only ever *increases* restrictiveness.
+    /// In-place; the caller doesn't persist it.
+    pub fn classify(&mut self, public: &[String], proprietary: &[String], private: &[String]) {
+        if public.is_empty() && proprietary.is_empty() && private.is_empty() {
             return;
         }
         let rank = |v: Visibility| match v {
@@ -542,6 +544,10 @@ impl Registry {
             })
         };
         for e in &mut self.repos {
+            if matches(public, e) {
+                e.visibility = Visibility::Public; // allowlist wins, overriding a glob raise
+                continue;
+            }
             let target = if matches(proprietary, e) {
                 Visibility::Proprietary
             } else if matches(private, e) {
@@ -938,6 +944,9 @@ mod tests {
                 public("acme-dashboard"),                // name matches `*acme*`
                 public_org("frontend", "acme-corp/web"), // forge org matches `*/acme-corp/*`
                 public("personal-blog"),                 // matches nothing
+                // In the work org (would be caught by the org glob) but explicitly
+                // allowlisted public — the allowlist must win.
+                public_org("oss-tool", "acme-corp/oss-tool"),
                 RegistryEntry {
                     visibility: Visibility::Proprietary, // a `private` pattern must not lower this
                     ..entry("legacy", "/x")
@@ -945,11 +954,13 @@ mod tests {
             ],
         };
         reg.classify(
+            &["*oss-tool*".into()],
             &["*acme*".into(), "*/acme-corp/*".into()],
             &["legacy".into()],
         );
         let vis = |n: &str| reg.repos.iter().find(|e| e.name == n).unwrap().visibility;
         check!(vis("acme-dashboard") == Visibility::Proprietary); // by name
+        check!(vis("oss-tool") == Visibility::Public); // allowlist beats the org glob
         check!(vis("frontend") == Visibility::Proprietary); // by forge org
         check!(vis("personal-blog") == Visibility::Public); // untouched
         check!(vis("legacy") == Visibility::Proprietary); // only raises, never lowers
