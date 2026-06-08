@@ -19,6 +19,7 @@ use glyphtrail_core::{
     filter_timeline, format_date, scrub_secrets, timeline_value,
 };
 use glyphtrail_store::{GraphStore, LadybugStore};
+use indicatif::{ProgressBar, ProgressStyle};
 
 use super::query::{Emit, print_value};
 
@@ -444,6 +445,19 @@ fn atlas_registry(dir: &Path) -> Result<Registry> {
     let repos = AtlasConfig::load(dir)?.repos;
     registry.classify(&repos.public, &repos.proprietary, &repos.private);
     Ok(registry)
+}
+
+/// A determinate `[pos/len]` progress bar for the atlas long loops (digesting,
+/// embedding). Auto-hidden under a non-TTY, so piped/CI output stays clean.
+fn progress_bar(len: u64, prefix: &str) -> ProgressBar {
+    let bar = ProgressBar::new(len);
+    bar.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} {prefix} [{pos}/{len}] {wide_msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_bar()),
+    );
+    bar.set_prefix(prefix.to_string());
+    bar.enable_steady_tick(std::time::Duration::from_millis(120));
+    bar
 }
 
 pub fn run(cmd: AtlasCmd) -> Result<()> {
@@ -1179,18 +1193,25 @@ fn embed(dir: &Path, args: EmbedArgs) -> Result<()> {
             .find(|e| e.name == name)
             .map(|e| e.active_root().clone())
     };
+    // Building each repo's digest reads its index + README, so with many repos this
+    // is the slow phase — show progress.
+    let bar = progress_bar(by_repo.len() as u64, "building repo digests");
     let mut docs: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     for (name, repo_rows) in &by_repo {
+        bar.set_message(name.clone());
         let root = root_of(name);
         let digest = crate::commands::digest::build_repo_digest(name, root.as_deref(), repo_rows);
         docs.insert(
             name.clone(),
             crate::commands::digest::render_embed_doc(&digest),
         );
+        bar.inc(1);
     }
+    bar.finish_and_clear();
     if docs.is_empty() {
         bail!("no commits to embed; run `glyphtrail atlas sync` first");
     }
+    println!("embedding {} repo digests…", docs.len());
     let cfg = EmbedConfig {
         provider: args.provider,
         model: args.model.clone(),
