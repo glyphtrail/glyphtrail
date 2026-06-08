@@ -502,11 +502,18 @@ impl MeConfig {
         !self.emails.is_empty() || !self.domains.is_empty() || !self.patterns.is_empty()
     }
 
-    /// Whether `email` resolves to me: an exact (case-insensitive) address match,
-    /// any address at one of my owned domains, or a match of one of my glob patterns.
+    /// Whether `email` resolves to me: an exact address match (case-insensitive,
+    /// and provider-aware — see [`canonical_email`], so `m.mayer+x@gmail.com` and
+    /// `mmayer@gmail.com` are the same person), any address at one of my owned
+    /// domains, or a match of one of my glob patterns.
     pub fn matches(&self, email: &str) -> bool {
         let email = email.trim().to_ascii_lowercase();
-        if self.emails.iter().any(|m| m.eq_ignore_ascii_case(&email)) {
+        let canon = canonical_email(&email);
+        if self
+            .emails
+            .iter()
+            .any(|m| canonical_email(m.trim()) == canon)
+        {
             return true;
         }
         if let Some((_, domain)) = email.rsplit_once('@')
@@ -546,6 +553,72 @@ impl MeConfig {
             .collect();
         Some(parts.join(", "))
     }
+}
+
+/// How a provider folds the local part of an address: ignore everything from a
+/// `+` onward (sub-addressing tags), and/or ignore `.` separators — so that
+/// several written addresses deliver to one mailbox and so denote one person.
+struct ProviderFolding {
+    plus_tags: bool,
+    dots: bool,
+}
+
+/// The folding rules for a mail provider's domain, **only** where the behaviour is
+/// documented and certain. Conservative by design: an unlisted domain folds
+/// nothing (a `+` or `.` there may be significant), so we never merge two distinct
+/// people. Gmail is the sole provider that also ignores dots.
+fn provider_folding(domain: &str) -> Option<ProviderFolding> {
+    match domain {
+        // Google: sub-addressing with `+`, and dots in the local part are ignored.
+        "gmail.com" | "googlemail.com" => Some(ProviderFolding {
+            plus_tags: true,
+            dots: true,
+        }),
+        // Microsoft consumer, Apple iCloud, Fastmail, Proton: documented `+`
+        // sub-addressing; dots are significant on all of them.
+        "outlook.com" | "hotmail.com" | "live.com" | "msn.com" | "icloud.com" | "me.com"
+        | "mac.com" | "fastmail.com" | "fastmail.fm" | "proton.me" | "protonmail.com" | "pm.me" => {
+            Some(ProviderFolding {
+                plus_tags: true,
+                dots: false,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Canonicalise an address to the mailbox it actually delivers to, for identity
+/// matching. Always lowercased and trimmed; additionally, for the handful of
+/// providers whose folding is certain ([`provider_folding`]), drops a `+tag`
+/// sub-address and (Gmail only) the dots in the local part — so `M.Mayer+ci@gmail.com`
+/// and `mmayer@gmail.com` canonicalise alike. Addresses on any other domain (and
+/// anything without a single `@`) are returned lowercased but otherwise untouched,
+/// so two genuinely different people are never merged.
+pub fn canonical_email(email: &str) -> String {
+    let email = email.trim().to_ascii_lowercase();
+    let Some((local, domain)) = email.rsplit_once('@') else {
+        return email;
+    };
+    let Some(folding) = provider_folding(domain) else {
+        return email;
+    };
+    let mut local = local;
+    if folding.plus_tags
+        && let Some((base, _tag)) = local.split_once('+')
+    {
+        local = base;
+    }
+    let local = if folding.dots {
+        local.replace('.', "")
+    } else {
+        local.to_string()
+    };
+    // A pathological all-tag/all-dot local part would empty out; keep the address
+    // well-formed by falling back rather than producing `@domain`.
+    if local.is_empty() {
+        return email;
+    }
+    format!("{local}@{domain}")
 }
 
 /// Case-insensitive glob match (`*` = any run incl. empty, `?` = any one char),
@@ -799,6 +872,43 @@ mod tests {
         check!(!me.matches("x@notmine.dev"));
         check!(!me.matches("no-at-sign"));
         check!(me.display().as_deref() == Some("Ada@Example.com"));
+    }
+
+    #[test]
+    fn canonical_email_folds_only_known_providers() {
+        // Gmail: drops +tags AND dots, case-insensitively.
+        check!(canonical_email("M.Mayer+ci@Gmail.com") == "mmayer@gmail.com");
+        check!(canonical_email("mmayer@gmail.com") == "mmayer@gmail.com");
+        check!(canonical_email("m.mayer@googlemail.com") == "mmayer@googlemail.com");
+        // Plus-only providers: drop the tag, keep dots (dots are significant there).
+        check!(canonical_email("john.doe+news@outlook.com") == "john.doe@outlook.com");
+        check!(canonical_email("a.b+x@icloud.com") == "a.b@icloud.com");
+        check!(canonical_email("a+x@proton.me") == "a@proton.me");
+        // Unknown domain: never folded — a `+`/`.` there may be significant.
+        check!(canonical_email("first.last+tag@example.com") == "first.last+tag@example.com");
+        // Degenerate inputs: lowercased/trimmed, otherwise untouched.
+        check!(canonical_email("  Plain  ") == "plain");
+        check!(canonical_email("+only@gmail.com") == "+only@gmail.com"); // empties out → keep
+    }
+
+    #[test]
+    fn me_matches_provider_folded_aliases() {
+        let me = MeConfig {
+            emails: vec!["mmayer@gmail.com".into()],
+            ..Default::default()
+        };
+        // Dot/plus variants of the same Gmail mailbox are me.
+        check!(me.matches("m.mayer@gmail.com"));
+        check!(me.matches("M.Mayer+work@gmail.com"));
+        check!(me.matches("mmayer+ci@gmail.com"));
+        // A genuinely different Gmail local part is not.
+        check!(!me.matches("m.mayer.jr@gmail.com")); // -> mmayerjr, distinct
+        // The same fold the other way: config carries the dotted form.
+        let me2 = MeConfig {
+            emails: vec!["m.mayer@gmail.com".into()],
+            ..Default::default()
+        };
+        check!(me2.matches("mmayer@gmail.com"));
     }
 
     #[test]
