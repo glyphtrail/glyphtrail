@@ -518,6 +518,43 @@ impl Registry {
         self.repos.iter().find(|e| e.ids.iter().any(|r| r.id == id))
     }
 
+    /// Raise each entry's atlas visibility by name/forge-org glob patterns
+    /// (`[repos]` in `atlas.toml`, #332): a `proprietary` match marks the repo
+    /// `Proprietary`, a `private` match marks it at least `Private`. Patterns are
+    /// matched (case-insensitively) against the repo name and each forge id
+    /// (`host/owner/repo`), and only ever *increase* restrictiveness — a repo's
+    /// explicit tier is never lowered. In-place; the caller doesn't persist it.
+    pub fn classify(&mut self, proprietary: &[String], private: &[String]) {
+        if proprietary.is_empty() && private.is_empty() {
+            return;
+        }
+        let rank = |v: Visibility| match v {
+            Visibility::Public => 0u8,
+            Visibility::Private => 1,
+            Visibility::Proprietary => 2,
+        };
+        let matches = |pats: &[String], e: &RegistryEntry| {
+            pats.iter().any(|p| {
+                crate::atlas::glob_match_ci(p, &e.name)
+                    || e.ids
+                        .iter()
+                        .any(|id| crate::atlas::glob_match_ci(p, &id.source))
+            })
+        };
+        for e in &mut self.repos {
+            let target = if matches(proprietary, e) {
+                Visibility::Proprietary
+            } else if matches(private, e) {
+                Visibility::Private
+            } else {
+                continue;
+            };
+            if rank(target) > rank(e.visibility) {
+                e.visibility = target;
+            }
+        }
+    }
+
     /// Reconcile `missing_since` with the current filesystem: stamp newly-missing
     /// roots, clear it for roots that reappeared. Returns `true` if anything
     /// changed (the caller should persist).
@@ -880,6 +917,42 @@ mod tests {
             }],
             ..entry(name, root)
         }
+    }
+
+    #[test]
+    fn classify_promotes_by_name_and_org_glob_only_raising() {
+        let public = |name: &str| RegistryEntry {
+            visibility: Visibility::Public,
+            ..entry(name, "/x")
+        };
+        let public_org = |name: &str, org_path: &str| RegistryEntry {
+            visibility: Visibility::Public,
+            ids: vec![RepoId {
+                id: "u".into(),
+                source: format!("github.com/{org_path}"),
+            }],
+            ..entry(name, "/x")
+        };
+        let mut reg = Registry {
+            repos: vec![
+                public("acme-dashboard"),                // name matches `*acme*`
+                public_org("frontend", "acme-corp/web"), // forge org matches `*/acme-corp/*`
+                public("personal-blog"),                 // matches nothing
+                RegistryEntry {
+                    visibility: Visibility::Proprietary, // a `private` pattern must not lower this
+                    ..entry("legacy", "/x")
+                },
+            ],
+        };
+        reg.classify(
+            &["*acme*".into(), "*/acme-corp/*".into()],
+            &["legacy".into()],
+        );
+        let vis = |n: &str| reg.repos.iter().find(|e| e.name == n).unwrap().visibility;
+        check!(vis("acme-dashboard") == Visibility::Proprietary); // by name
+        check!(vis("frontend") == Visibility::Proprietary); // by forge org
+        check!(vis("personal-blog") == Visibility::Public); // untouched
+        check!(vis("legacy") == Visibility::Proprietary); // only raises, never lowers
     }
 
     // #272: the same repo (shared forge id) discovered at a second path folds

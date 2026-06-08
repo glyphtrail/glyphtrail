@@ -148,8 +148,21 @@ patterns = ["you+*@gmail.com", "*@*.example.com"]    # globs (* / ?) over the wh
 ```
 
 An address is yours if it matches any `emails` entry, sits at an owned `domain`, or
-matches a `patterns` glob — all case-insensitive. `CTRL-C` during a sync stops
-gracefully at a safe point (the database stays consistent); a second `CTRL-C` aborts.
+matches a `patterns` glob — all case-insensitive.
+
+Classify whole organizations or naming conventions as work with `[repos]` globs
+(matched against the repo name and each forge id `host/owner/repo`):
+
+```toml
+[repos]
+proprietary = ["*acme*", "*/acme-corp/*"]   # hidden from public/default atlas views
+private     = ["*-internal"]
+```
+
+Patterns only raise restrictiveness; restricted repos are gated out of `story`,
+`export`, and the default `similar`/`viz` output (pass `--include-restricted` to
+include them). `CTRL-C` during a sync stops gracefully at a safe point (the database
+stays consistent); a second `CTRL-C` aborts.
 
 ### Registering glyphtrail as an MCP server
 

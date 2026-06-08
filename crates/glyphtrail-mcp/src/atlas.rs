@@ -43,7 +43,7 @@ fn dispatch(atlas_dir: &Path, name: &str, args: &Value) -> Result<Value, String>
         "atlas_timeline" => timeline(atlas_dir, args),
         "atlas_topics" => topics(atlas_dir),
         "atlas_similar" => similar(atlas_dir, args),
-        "atlas_resolve" => resolve(args),
+        "atlas_resolve" => resolve(atlas_dir, args),
         other => Err(format!("unknown atlas tool: {other}")),
     }
 }
@@ -57,11 +57,16 @@ fn atlas_store(atlas_dir: &Path) -> Result<LadybugStore, String> {
     LadybugStore::open(&lb).map_err(|e| e.to_string())
 }
 
-/// The registry, or an empty one when it can't be located.
-fn registry() -> Registry {
-    default_registry_path()
+/// The registry with the atlas's `[repos]` name/forge-org classification applied,
+/// or an empty one when it can't be located.
+fn registry(atlas_dir: &Path) -> Registry {
+    let mut registry = default_registry_path()
         .and_then(|p| Registry::load(&p).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if let Ok(cfg) = AtlasConfig::load(atlas_dir) {
+        registry.classify(&cfg.repos.proprietary, &cfg.repos.private);
+    }
+    registry
 }
 
 fn status(atlas_dir: &Path) -> Result<Value, String> {
@@ -113,7 +118,7 @@ fn timeline(atlas_dir: &Path, args: &Value) -> Result<Value, String> {
     let rows = store
         .atlas_timeline(since, until, topic.as_deref())
         .map_err(|e| e.to_string())?;
-    let tl = filter_timeline(rows, &registry(), &query);
+    let tl = filter_timeline(rows, &registry(atlas_dir), &query);
     Ok(timeline_value(
         &tl,
         &window.label(),
@@ -148,7 +153,7 @@ fn similar(atlas_dir: &Path, args: &Value) -> Result<Value, String> {
 
     // Pick the (space, model) namespace: graph vs text, model from `model` arg else
     // the active/default one. Read just that namespace — models never mix.
-    let reg = registry();
+    let reg = registry(atlas_dir);
     let space = if graph { "graph" } else { "text" };
     let model = resolve_model(&store, space, args.get("model").and_then(Value::as_str))?;
     let id_of = |name: &str| -> NodeId {
@@ -276,10 +281,10 @@ fn resolve_model(
 /// Bridge an atlas hit (repo + file) into that repo's own graph: resolve the
 /// registry name to its active root, open its index, and return the file's
 /// symbols so the agent can chain straight into per-repo detail.
-fn resolve(args: &Value) -> Result<Value, String> {
+fn resolve(atlas_dir: &Path, args: &Value) -> Result<Value, String> {
     let repo = req_str(args, "repo")?;
     let file = req_str(args, "file")?;
-    let registry = registry();
+    let registry = registry(atlas_dir);
     let entry = registry
         .get(repo)
         .ok_or_else(|| format!("no repository named '{repo}' in the registry"))?;
