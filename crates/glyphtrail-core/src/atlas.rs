@@ -528,6 +528,24 @@ impl MeConfig {
             .cloned()
             .or_else(|| self.domains.first().map(|d| format!("me@{d}")))
     }
+
+    /// A one-line summary of *every* identity that counts as mine (all `emails`,
+    /// owned `domains` shown as `@domain`, and `patterns`), so the matched scope is
+    /// transparent rather than reduced to a single representative [`display`](Self::display)
+    /// address. `None` when nothing is configured.
+    pub fn summary(&self) -> Option<String> {
+        if !self.is_set() {
+            return None;
+        }
+        let parts: Vec<String> = self
+            .emails
+            .iter()
+            .cloned()
+            .chain(self.domains.iter().map(|d| format!("@{d}")))
+            .chain(self.patterns.iter().cloned())
+            .collect();
+        Some(parts.join(", "))
+    }
 }
 
 /// Case-insensitive glob match (`*` = any run incl. empty, `?` = any one char),
@@ -781,6 +799,21 @@ mod tests {
         check!(!me.matches("x@notmine.dev"));
         check!(!me.matches("no-at-sign"));
         check!(me.display().as_deref() == Some("Ada@Example.com"));
+    }
+
+    #[test]
+    fn me_summary_lists_every_identity() {
+        let me = MeConfig {
+            emails: vec!["a@x.com".into(), "b@y.com".into()],
+            domains: vec!["mine.dev".into()],
+            patterns: vec!["me+*@gmail.com".into()],
+        };
+        // All three groups are named, so the matched scope is transparent — not
+        // reduced to the single representative `display` address.
+        check!(me.summary().as_deref() == Some("a@x.com, b@y.com, @mine.dev, me+*@gmail.com"));
+        check!(me.display().as_deref() == Some("a@x.com")); // still just the first
+        // Nothing configured → no summary.
+        check!(MeConfig::default().summary() == None);
     }
 
     #[test]
