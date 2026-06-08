@@ -980,6 +980,12 @@ fn sync(dir: &Path, args: SyncArgs) -> Result<()> {
     }
 
     let mut heads = AtlasHeads::load(dir)?;
+    // Walk never-synced repos first (no saved HEAD watermark), already-synced ones
+    // last. So a cancellation captures the new repos before re-checking the
+    // already-ingested thousand, and successive runs make forward progress instead
+    // of re-walking the same repos every time. Stable, so order is otherwise kept.
+    targets.sort_by_key(|e| heads.get(&e.name).is_some());
+
     let mut store = LadybugStore::open(&lb)?;
     let mut total = 0usize;
 
@@ -1081,9 +1087,16 @@ fn github_targets(
             .unwrap_or_else(|| PathBuf::from("forge.toml")),
     );
     let sp = spinner("  github: discovering repos…");
-    let repos =
+    let mut repos =
         list_account_repos(&forge_config, "github.com", &opts).map_err(|e| anyhow!("{e}"))?;
     sp.finish_and_clear();
+
+    let cache = atlas_cache_dir(dir);
+    // Clone brand-new repos *before* re-fetching already-cached ones: a cancellation
+    // then captures the new data first, and a re-run makes forward progress instead
+    // of re-fetching the same thousand cached repos every time. Stable, so order is
+    // otherwise preserved.
+    repos.sort_by_key(|r| is_cached(&cache, r));
 
     // Forge ids already covered by a local clone (dedup; local wins), and the names
     // already in use (so a remote with a colliding name is disambiguated).
@@ -1094,7 +1107,6 @@ fn github_targets(
         .collect();
     let mut used_names: HashSet<String> = registry.repos.iter().map(|e| e.name.clone()).collect();
 
-    let cache = atlas_cache_dir(dir);
     let mut pending: Vec<RegistryEntry> = Vec::new();
     let (mut cloned, mut already_local) = (0usize, 0usize);
     // Cloning each uncloned repo is the slow part (network) — show progress over
@@ -1174,11 +1186,22 @@ fn github_targets(
 /// returning its path. First time: `git clone --bare --filter=blob:none` (SSH, then
 /// HTTPS); afterwards: `git fetch` the delta. Bare + blobless keeps only history
 /// (no file contents), which is all `git log --name-only` needs.
-fn ensure_bare_cache(cache_dir: &Path, repo: &RemoteRepo) -> Result<PathBuf> {
-    let path = cache_dir
+/// Where a repo's bare-blobless cache lives: `cache/<host>/<owner>/<name>.git`.
+fn bare_cache_path(cache_dir: &Path, repo: &RemoteRepo) -> PathBuf {
+    cache_dir
         .join(&repo.host)
         .join(&repo.owner)
-        .join(format!("{}.git", repo.name));
+        .join(format!("{}.git", repo.name))
+}
+
+/// Whether `repo` already has a cached clone (a `HEAD` file). Used to order
+/// discovery so brand-new repos are cloned before already-cached ones are fetched.
+fn is_cached(cache_dir: &Path, repo: &RemoteRepo) -> bool {
+    bare_cache_path(cache_dir, repo).join("HEAD").exists()
+}
+
+fn ensure_bare_cache(cache_dir: &Path, repo: &RemoteRepo) -> Result<PathBuf> {
+    let path = bare_cache_path(cache_dir, repo);
     if path.join("HEAD").exists() {
         // Existing bare clone: fetch the delta. Best-effort — a transient network
         // failure shouldn't abort; we still walk the history already present.
