@@ -409,23 +409,32 @@ fn ladybug_dir(atlas: &Path) -> PathBuf {
     atlas.join("ladybug")
 }
 
+/// Write the commented `atlas.toml` template if the atlas directory exists but the
+/// config file does not. Best-effort and idempotent — never overwrites an existing
+/// config, and a write failure is silently ignored (the config is optional).
+fn ensure_atlas_config(dir: &Path) {
+    let cfg = dir.join("atlas.toml");
+    if dir.exists() && !cfg.exists() {
+        let _ = std::fs::write(&cfg, ATLAS_CONFIG_TEMPLATE);
+    }
+}
+
 pub fn run(cmd: AtlasCmd) -> Result<()> {
     let dir = atlas_dir()?;
+    // Materialize the commented config template whenever the atlas exists but the
+    // file is missing (e.g. an atlas initialized before the template existed), so
+    // `[me]`/`[window]` are always discoverable, not just on a fresh `init`.
+    ensure_atlas_config(&dir);
     match cmd {
         AtlasCmd::Init => {
             std::fs::create_dir_all(&dir)?;
             // Open once to stamp the schema (creates the ladybug dir + tables).
             LadybugStore::open(&ladybug_dir(&dir))?;
-            // Write a commented config template (once) so the `[me]` identity — which
-            // gates `sync` to your own commits — is discoverable.
-            let cfg_path = dir.join("atlas.toml");
-            if !cfg_path.exists() {
-                std::fs::write(&cfg_path, ATLAS_CONFIG_TEMPLATE)?;
-            }
+            ensure_atlas_config(&dir); // dir now exists → writes the template
             println!("atlas initialized at {}", dir.display());
             println!(
                 "  config:  {} (set [me] to scope `sync` to you)",
-                cfg_path.display()
+                dir.join("atlas.toml").display()
             );
         }
         AtlasCmd::Path => println!("{}", ladybug_dir(&dir).display()),
