@@ -17,6 +17,21 @@ semantically. It lives under `~/.glyphtrail/atlas/` (the LadybugDB database is t
 single file `~/.glyphtrail/atlas/ladybug`). Nothing here touches a repo's working
 tree; it reads git history only.
 
+`atlas sync --github` widens ingestion to your GitHub repos, even ones you never
+cloned: it discovers them via `GITHUB_TOKEN` or the `gh` CLI, then
+**bare-blobless-clones** each one not already checked out locally into
+`~/.glyphtrail/atlas/cache/` and walks its history like any other repo. The cache
+holds only history (no file contents), so later runs just `git fetch` the delta.
+Private repos clone over your SSH key (HTTPS fallback, never prompting); each
+repo's visibility comes straight from its GitHub private/public flag. A repo you
+already have locally is used from there, not re-cloned.
+
+Scope is **owned repos only by default** — a stray org membership (e.g. the
+EpicGames org the Unreal EULA enrolls you in) won't drag in thousands of repos you
+never wrote. Add your work orgs explicitly with `--orgs acme,acme-labs`, every org
+with `--all-orgs`, collaborator repos with `--collaborator`, and trim noise with
+`--no-forks` / `--no-archived`.
+
 ## Identity (`[me]`) and interruption
 
 `atlas sync` keeps only **your** commits by default (`--everyone` for all authors).
@@ -77,6 +92,8 @@ clear it with `glyphtrail atlas unlock`.
 ```bash
 glyphtrail atlas init                 # create the store (idempotent)
 glyphtrail atlas sync [--everyone]    # ingest git history (mine-only by default)
+glyphtrail atlas sync --github [--orgs a,b --all-orgs --collaborator --no-forks]  # + your GitHub repos
+glyphtrail atlas unlock               # clear a stale write-lock (after a crash)
 glyphtrail atlas status               # store + embedding state
 glyphtrail atlas timeline | topics | story   # browse / narrate the history
 

@@ -1,4 +1,4 @@
-//! Error type for forge-id config loading.
+//! Error type for forge-id config loading and account repo discovery.
 
 use std::path::PathBuf;
 
@@ -18,4 +18,8 @@ pub enum ForgeIdError {
         #[source]
         source: Box<toml::de::Error>,
     },
+    /// Account repo discovery failed: no credentials, a network/API error, or an
+    /// unsupported host.
+    #[error("forge repo discovery failed: {message}")]
+    Discovery { message: String },
 }

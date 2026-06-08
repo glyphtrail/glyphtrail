@@ -20,6 +20,7 @@ use std::process::Command;
 use serde_json::Value;
 
 use crate::config::{ForgeConfig, ForgeKind};
+use crate::error::ForgeIdError;
 use crate::id::{RepoId, canonicalize_remote, forge_numeric_repo_id};
 
 /// Best-effort forge-API numeric ids for a repo's git remotes, using `config`
@@ -219,6 +220,204 @@ fn gh_repo_private(owner: &str, repo: &str) -> Option<bool> {
     }
 }
 
+/// One repo discovered on a forge account (#nnn): enough to dedup against the
+/// registry, decide visibility, and clone it. `numeric_id` is the forge's stable
+/// id (`None` if the API omitted it); `ssh_url`/`clone_url` are the SSH and HTTPS
+/// clone URLs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteRepo {
+    pub host: String,
+    pub owner: String,
+    pub name: String,
+    pub numeric_id: Option<String>,
+    pub ssh_url: String,
+    pub clone_url: String,
+    pub private: bool,
+    pub fork: bool,
+    pub archived: bool,
+}
+
+/// Which repos account discovery returns. **Owned** repos are always included;
+/// the rest are opt-in, so a stray org membership (e.g. the EpicGames org the
+/// Unreal EULA enrolls you in) can't drag in thousands of repos you never wrote.
+#[derive(Debug, Clone, Default)]
+pub struct ListOpts {
+    pub include_forks: bool,
+    pub include_archived: bool,
+    /// Specific org logins to include (case-insensitive), e.g. your work orgs.
+    pub orgs: Vec<String>,
+    /// Include *every* org you're a member of (the broad, footgun-y set).
+    pub all_orgs: bool,
+    /// Include repos you're only a collaborator on (owned by others).
+    pub collaborator: bool,
+}
+
+/// Every repo on the configured account for `host` that `opts` selects, across
+/// pages. GitHub only for now: with `GITHUB_TOKEN` it calls the REST API directly,
+/// else it shells out to `gh` (which carries its own auth). Owned repos always;
+/// org repos only for `--orgs`/`--all-orgs`; collaborator repos only for
+/// `--collaborator`. Errors when no credentials are available, the host isn't
+/// GitHub, or the API/network fails — so the caller can tell "found nothing" from
+/// "couldn't ask".
+pub fn list_account_repos(
+    config: &ForgeConfig,
+    host: &str,
+    opts: &ListOpts,
+) -> Result<Vec<RemoteRepo>, ForgeIdError> {
+    match forge_kind(config, host) {
+        Some(ForgeKind::GitHub) => {}
+        Some(_) => {
+            return Err(ForgeIdError::Discovery {
+                message: format!("account discovery is GitHub-only for now (got {host})"),
+            });
+        }
+        None => {
+            return Err(ForgeIdError::Discovery {
+                message: format!("unrecognized forge host {host}"),
+            });
+        }
+    }
+    let token = resolve_token(config, host, Some("GITHUB_TOKEN"));
+    // One query per affiliation, so each repo is attributable (a combined
+    // affiliation list returns a union with no per-repo source).
+    let fetch = |affiliation: &str| -> Result<Vec<RemoteRepo>, ForgeIdError> {
+        match &token {
+            Some(t) => github_repos_by_affiliation(t, affiliation),
+            None => gh_repos_by_affiliation(affiliation),
+        }
+    };
+
+    let mut repos = fetch("owner")?; // always
+    if opts.all_orgs || !opts.orgs.is_empty() {
+        let mut org = fetch("organization_member")?;
+        if !opts.all_orgs {
+            let want: std::collections::HashSet<String> =
+                opts.orgs.iter().map(|o| o.to_ascii_lowercase()).collect();
+            org.retain(|r| want.contains(&r.owner.to_ascii_lowercase()));
+        }
+        repos.extend(org);
+    }
+    if opts.collaborator {
+        repos.extend(fetch("collaborator")?);
+    }
+    // De-dup by canonical identity, keeping the first (owned > org > collaborator).
+    let mut seen = std::collections::HashSet::new();
+    repos.retain(|r| seen.insert(format!("{}/{}/{}", r.host, r.owner, r.name)));
+    Ok(filter_repos(repos, opts))
+}
+
+/// GitHub `/user/repos` for a single `affiliation` over the REST API with a bearer
+/// token, paginated by `?page=N` until a short (< 100) page.
+fn github_repos_by_affiliation(
+    token: &str,
+    affiliation: &str,
+) -> Result<Vec<RemoteRepo>, ForgeIdError> {
+    let mut all = Vec::new();
+    // Cap pages so a pathological/looping response can't spin forever (100 pages ×
+    // 100 = 10k repos, well beyond any real account).
+    for page in 1..=100u32 {
+        // `affiliation` and `type` are mutually exclusive here (the API 422s if both
+        // are set); affiliation alone already returns forks + archived, trimmed
+        // client-side per `opts`.
+        let url = format!(
+            "https://api.github.com/user/repos?per_page=100&page={page}&affiliation={affiliation}"
+        );
+        let json: Value = ureq::get(&url)
+            .header("Authorization", &format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "glyphtrail")
+            .call()
+            .map_err(|e| ForgeIdError::Discovery {
+                message: format!("GitHub API request failed: {e}"),
+            })?
+            .into_body()
+            .read_json()
+            .map_err(|e| ForgeIdError::Discovery {
+                message: format!("GitHub API response was not JSON: {e}"),
+            })?;
+        let page_len = json.as_array().map(Vec::len).unwrap_or(0);
+        all.extend(repos_from_json(&json));
+        if page_len < 100 {
+            break; // last page
+        }
+    }
+    Ok(all)
+}
+
+/// GitHub `/user/repos` for a single `affiliation` via the `gh` CLI (`gh api
+/// --paginate … --jq '.[]'`), the fallback when `GITHUB_TOKEN` isn't set. `gh`
+/// follows pagination and emits one repo object per line (NDJSON).
+fn gh_repos_by_affiliation(affiliation: &str) -> Result<Vec<RemoteRepo>, ForgeIdError> {
+    let output = Command::new("gh")
+        .args([
+            "api",
+            "--paginate",
+            &format!("user/repos?per_page=100&affiliation={affiliation}"),
+            "--jq",
+            ".[]",
+        ])
+        .output()
+        .map_err(|e| ForgeIdError::Discovery {
+            message: format!("could not run `gh` (install it or set GITHUB_TOKEN): {e}"),
+        })?;
+    if !output.status.success() {
+        return Err(ForgeIdError::Discovery {
+            message: format!(
+                "`gh api user/repos` failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        });
+    }
+    let mut objects = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let line = line.trim();
+        if !line.is_empty()
+            && let Ok(v) = serde_json::from_str::<Value>(line)
+        {
+            objects.push(v);
+        }
+    }
+    Ok(repos_from_json(&Value::Array(objects)))
+}
+
+/// Parse a GitHub `/user/repos` JSON array into [`RemoteRepo`]s — the network-free
+/// core of discovery, so it's unit-testable. Skips entries missing the
+/// `owner/name` full name; absent booleans default to `false`.
+pub fn repos_from_json(json: &Value) -> Vec<RemoteRepo> {
+    let Some(arr) = json.as_array() else {
+        return Vec::new();
+    };
+    arr.iter().filter_map(repo_from_value).collect()
+}
+
+fn repo_from_value(v: &Value) -> Option<RemoteRepo> {
+    let (owner, name) = v
+        .get("full_name")
+        .and_then(Value::as_str)?
+        .split_once('/')?;
+    let str_field = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let bool_field = |k: &str| v.get(k).and_then(Value::as_bool).unwrap_or(false);
+    Some(RemoteRepo {
+        host: "github.com".to_string(),
+        owner: owner.to_string(),
+        name: name.to_string(),
+        numeric_id: v.get("id").and_then(Value::as_i64).map(|n| n.to_string()),
+        ssh_url: str_field("ssh_url"),
+        clone_url: str_field("clone_url"),
+        private: bool_field("private"),
+        fork: bool_field("fork"),
+        archived: bool_field("archived"),
+    })
+}
+
+fn filter_repos(repos: Vec<RemoteRepo>, opts: &ListOpts) -> Vec<RemoteRepo> {
+    repos
+        .into_iter()
+        .filter(|r| opts.include_forks || !r.fork)
+        .filter(|r| opts.include_archived || !r.archived)
+        .collect()
+}
+
 /// GitHub numeric id via the `gh` CLI (`gh api repos/{owner}/{repo} --jq .id`),
 /// the fallback when `GITHUB_TOKEN` isn't set. `None` if `gh` is absent,
 /// unauthenticated, or returns a non-numeric result.
@@ -248,6 +447,52 @@ mod tests {
         check!(private_from_response(ForgeKind::Gitea, &json!({"private": true})) == Some(true));
         // Absent/non-bool field → unknown, so the caller falls back to inference.
         check!(private_from_response(ForgeKind::GitHub, &json!({"id": 42})) == None);
+    }
+
+    #[test]
+    fn repos_from_json_parses_and_filters() {
+        let page = json!([
+            {"full_name": "octo/app", "ssh_url": "git@github.com:octo/app.git",
+             "clone_url": "https://github.com/octo/app.git", "id": 12, "private": true,
+             "fork": false, "archived": false},
+            {"full_name": "octo/forked", "ssh_url": "git@github.com:octo/forked.git",
+             "clone_url": "https://github.com/octo/forked.git", "id": 34, "private": false,
+             "fork": true, "archived": false},
+            {"full_name": "octo/old", "ssh_url": "git@github.com:octo/old.git",
+             "clone_url": "https://github.com/octo/old.git", "id": 56, "private": false,
+             "fork": false, "archived": true},
+            {"no_full_name": true}, // skipped — missing owner/name
+        ]);
+        let all = repos_from_json(&page);
+        check!(all.len() == 3); // the malformed entry is dropped
+        let app = &all[0];
+        check!(app.owner == "octo" && app.name == "app");
+        check!(app.numeric_id.as_deref() == Some("12"));
+        check!(app.private && !app.fork && !app.archived);
+        check!(app.ssh_url == "git@github.com:octo/app.git");
+
+        // Default opts drop forks and archived.
+        let lean = filter_repos(
+            repos_from_json(&page),
+            &ListOpts {
+                include_forks: false,
+                include_archived: false,
+                ..Default::default()
+            },
+        );
+        check!(lean.len() == 1);
+        check!(lean[0].name == "app");
+
+        // Broad opts keep everything.
+        let broad = filter_repos(
+            repos_from_json(&page),
+            &ListOpts {
+                include_forks: true,
+                include_archived: true,
+                ..Default::default()
+            },
+        );
+        check!(broad.len() == 3);
     }
 
     #[test]
