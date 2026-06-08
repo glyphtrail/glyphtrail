@@ -66,6 +66,12 @@ it. Restricted repos are gated out of `story`/`export` and the default
 database stays consistent (a second `CTRL-C` aborts); an interrupted `sync` saves
 the repos it finished and resumes on the next run.
 
+Write commands (`sync`, every `embed` except `export`, `waka sync`, `init`) take an
+exclusive `atlas.lock` for their duration, so a second write fails fast — `another
+glyphtrail process is using the atlas (pid …)` — instead of colliding on the
+single-file database. Read commands aren't blocked. If a crash leaves a stale lock,
+clear it with `glyphtrail atlas unlock`.
+
 ## Command surface
 
 ```bash

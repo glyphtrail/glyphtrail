@@ -15,7 +15,7 @@ use glyphtrail_core::config::RepoPaths;
 use glyphtrail_core::{
     AtlasConfig, AtlasHeads, CodeGraph, CommitMeta, Confidence, EdgeKind, Embedding, GraphEmbedder,
     GraphProfile, MeConfig, Node, NodeId, NodeKind, Registry, RegistryEntry, StructuralEmbedder,
-    TimelineQuery, Window, author_scope_label, default_atlas_path, default_registry_path,
+    TimelineQuery, Window, author_scope_label, default_atlas_path, default_registry_path, filelock,
     filter_timeline, format_date, scrub_secrets, timeline_value,
 };
 use glyphtrail_store::{GraphStore, LadybugStore};
@@ -58,6 +58,10 @@ pub enum AtlasCmd {
     Serve(VizServeArgs),
     /// Serve the atlas over MCP (stdio): timeline, status, and the repo+file bridge.
     Mcp,
+    /// Remove a stale atlas write-lock left by a crashed `sync`/`embed` (the escape
+    /// hatch when a guard refuses with "another glyphtrail process is using the
+    /// atlas"). Safe: refuses nothing, just clears the lock file.
+    Unlock,
 }
 
 /// `atlas embed …` — compute and manage embeddings (#338).
@@ -448,6 +452,21 @@ pub fn run(cmd: AtlasCmd) -> Result<()> {
     // file is missing (e.g. an atlas initialized before the template existed), so
     // `[me]`/`[window]` are always discoverable, not just on a fresh `init`.
     ensure_atlas_config(&dir);
+
+    // Guard the single-file atlas DB against concurrent writers: any command that
+    // opens it read-write takes the long-hold atlas lock first, so a second
+    // `sync`/`embed` fails fast with a clear message rather than the raw engine
+    // "could not set lock" error mid-run. Read-only commands don't take it. Held
+    // for the whole command; released on return (the guard drops).
+    let _write_lock = if cmd_opens_read_write(&cmd) {
+        Some(filelock::acquire_held(
+            &atlas_lock_path(&dir),
+            "glyphtrail atlas unlock",
+        )?)
+    } else {
+        None
+    };
+
     match cmd {
         AtlasCmd::Init => {
             std::fs::create_dir_all(&dir)?;
@@ -487,8 +506,32 @@ pub fn run(cmd: AtlasCmd) -> Result<()> {
         AtlasCmd::Viz(args) => viz(&dir, args)?,
         AtlasCmd::Serve(args) => viz_serve(&dir, args)?,
         AtlasCmd::Mcp => glyphtrail_mcp::serve_atlas_stdio(dir)?,
+        AtlasCmd::Unlock => match filelock::force_unlock(&atlas_lock_path(&dir))? {
+            Some(desc) => println!("removed atlas lock ({desc})"),
+            None => println!("no atlas lock held"),
+        },
     }
     Ok(())
+}
+
+/// The atlas write-lock file, beside the config and the ladybug store under
+/// `~/.glyphtrail/atlas/`. Held for the duration of any read-write command;
+/// cleared by `atlas unlock`.
+fn atlas_lock_path(dir: &Path) -> PathBuf {
+    dir.join("atlas.lock")
+}
+
+/// Whether a command opens the atlas DB **read-write** (so it must take the write
+/// lock). The read-only commands — status, timeline, story, export, similar,
+/// digest, viz/serve, waka show, embed export, mcp — don't. `init` stamps the
+/// schema; every `embed` variant except `export` mutates; `waka sync` ingests.
+fn cmd_opens_read_write(cmd: &AtlasCmd) -> bool {
+    match cmd {
+        AtlasCmd::Init | AtlasCmd::Sync(_) => true,
+        AtlasCmd::Embed(c) => !matches!(c, EmbedCmd::Export(_)),
+        AtlasCmd::Waka(WakaCmd::Sync(_)) => true,
+        _ => false,
+    }
 }
 
 const ATLAS_SYSTEM: &str = "You are a technical writer narrating the evolution of one \

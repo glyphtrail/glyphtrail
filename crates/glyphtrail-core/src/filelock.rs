@@ -1,5 +1,9 @@
-//! Portable advisory lock for the brief read-modify-write on the registry and
-//! groups files.
+//! Portable advisory lock, in two flavours: [`with_lock`] for the brief
+//! read-modify-write on the registry and groups files, and [`acquire_held`] for
+//! long-running exclusive operations (the single-writer atlas DB during
+//! `sync`/`embed`). They differ only in staleness policy — the brief lock steals
+//! by age, the long-hold lock only on a dead holder — and share the lock-file
+//! format below.
 //!
 //! The previous implementation used an OS advisory lock (`flock` via `fs4`).
 //! That works locally but is unreliable on network / FUSE / sync filesystems
@@ -169,8 +173,83 @@ pub fn with_lock<T>(lock_path: &Path, f: impl FnOnce() -> Result<T>) -> Result<T
     f()
 }
 
-/// Remove the lock file at `lock_path` (the `repo unlock` escape hatch).
-/// Returns a human description of what was removed, or `None` if no lock held.
+/// Acquire a **long-hold** advisory lock at `lock_path`, returning a guard held
+/// until it drops (which removes the file). Unlike [`with_lock`] — built for the
+/// sub-second registry RMW, where a lock older than [`STALE_TTL_SECS`] is assumed
+/// abandoned and stolen — this guards operations that legitimately run for minutes
+/// (an `atlas sync`/`embed`). It therefore **never** steals by age: a held lock is
+/// only reclaimed when its holder process is provably dead (same host, no
+/// `/proc/<pid>`), or the file is unreadable past [`UNREADABLE_GRACE`]. Against a
+/// live holder it **fails fast** (no waiting — a long op won't release soon) with a
+/// `CoreError::Lock` naming the holder and suggesting `unlock_cmd`.
+///
+/// Assumes the lock lives on a local filesystem where pid-liveness is meaningful
+/// (the atlas store is under `~/.glyphtrail/`, always local home) — that's what
+/// makes age-free stealing safe here.
+pub fn acquire_held(lock_path: &Path, unlock_cmd: &str) -> Result<LockGuard> {
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let host = hostname();
+    let mut unreadable_since: Option<SystemTime> = None;
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(lock_path)
+        {
+            Ok(file) => {
+                let info = LockInfo {
+                    pid: std::process::id(),
+                    host: host.clone(),
+                    ts: now_secs(),
+                };
+                let _ = serde_json::to_writer(&file, &info);
+                return Ok(LockGuard {
+                    path: lock_path.to_path_buf(),
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => match read_info(lock_path) {
+                Some(info) => {
+                    // Reclaim only a dead same-host holder — never by age, since a
+                    // legitimate long op holds this for the whole run.
+                    if !host.is_empty() && info.host == host && !pid_alive(info.pid) {
+                        let _ = std::fs::remove_file(lock_path); // steal a dead holder
+                        continue;
+                    }
+                    let age = now_secs().saturating_sub(info.ts).max(0);
+                    return Err(CoreError::Lock {
+                        path: lock_path.to_path_buf(),
+                        message: format!(
+                            "another glyphtrail process is using the atlas (pid {} on {}, \
+                             held for {age}s); wait for it to finish, or if it is stale run \
+                             `{unlock_cmd}`",
+                            info.pid, info.host,
+                        ),
+                    });
+                }
+                None => {
+                    // Unreadable: a leftover 0-byte lock, or one mid-creation. Wait
+                    // out the grace (so we don't steal a lock being written right
+                    // now), then steal.
+                    let since = *unreadable_since.get_or_insert_with(SystemTime::now);
+                    if SystemTime::now().duration_since(since).unwrap_or_default()
+                        >= UNREADABLE_GRACE
+                    {
+                        let _ = std::fs::remove_file(lock_path);
+                        continue;
+                    }
+                    std::thread::sleep(POLL);
+                }
+            },
+            Err(e) => return Err(CoreError::Io(e)),
+        }
+    }
+}
+
+/// Remove the lock file at `lock_path` (the `repo unlock` / `atlas unlock` escape
+/// hatch). Returns a human description of what was removed, or `None` if no lock
+/// held.
 pub fn force_unlock(lock_path: &Path) -> Result<Option<String>> {
     if !lock_path.exists() {
         return Ok(None);
@@ -268,5 +347,42 @@ mod tests {
             .unwrap();
         check!(final_v == N as u64); // no lost updates
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn acquire_held_blocks_a_second_live_holder_then_releases() {
+        let p = tmp("held");
+        let guard = acquire_held(&p, "glyphtrail atlas unlock").unwrap();
+        check!(p.exists());
+        // A second acquire fails fast (no wait) while the first guard lives.
+        let err = acquire_held(&p, "glyphtrail atlas unlock");
+        check!(err.is_err());
+        if let Err(CoreError::Lock { message, .. }) = err {
+            check!(message.contains("another glyphtrail process"));
+            check!(message.contains("glyphtrail atlas unlock"));
+        }
+        // Dropping the guard removes the lock; a fresh acquire then succeeds.
+        drop(guard);
+        check!(!p.exists());
+        let again = acquire_held(&p, "glyphtrail atlas unlock").unwrap();
+        drop(again);
+        check!(!p.exists());
+    }
+
+    #[test]
+    fn acquire_held_steals_a_dead_same_host_holder() {
+        let p = tmp("held-dead");
+        // A lock from a long-dead pid on this host (pid 0 is never a live process)
+        // is reclaimed — fresh ts notwithstanding, since long holds aren't aged out.
+        let info = LockInfo {
+            pid: 0,
+            host: hostname(),
+            ts: now_secs(),
+        };
+        std::fs::write(&p, serde_json::to_string(&info).unwrap()).unwrap();
+        let guard = acquire_held(&p, "glyphtrail atlas unlock");
+        check!(guard.is_ok()); // dead holder stolen despite a fresh timestamp
+        drop(guard);
+        check!(!p.exists());
     }
 }
