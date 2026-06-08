@@ -638,6 +638,11 @@ impl LadybugStore {
     /// with a vector index can't be dropped directly). Best-effort — a missing
     /// table / index / extension is ignored.
     fn drop_vec_table(&self, table: &str) {
+        // Load the VECTOR extension first: `DROP_VECTOR_INDEX` is one of its
+        // functions, so without it the index is NOT removed, the still-indexed
+        // table refuses to drop, and the stale table survives — making the next
+        // re-embed's `CREATE NODE TABLE` fail with "already exists in catalog".
+        self.load_vector_ext();
         let _ = self.run(
             &format!("CALL DROP_VECTOR_INDEX('{table}', '{table}_idx')"),
             vec![],
@@ -2508,6 +2513,37 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Regression: re-embedding a namespace that already carries an HNSW index must
+    // succeed. `drop_vec_table` has to load the VECTOR extension so it can drop the
+    // index *before* the table; otherwise the indexed table refuses to drop, the
+    // stale table survives, and the re-embed's `CREATE NODE TABLE` fails with
+    // "already exists in catalog". Only exercised when the extension is present
+    // (build_vector_index returns true), like the other HNSW tests.
+    #[test]
+    fn re_embed_after_building_the_hnsw_index_succeeds() {
+        let dir = tmp_dir("atlas-reembed-index");
+        let mut lb = LadybugStore::open(&dir).unwrap();
+        let v = |tag: &str, a: f32, b: f32, c: f32, d: f32| Embedding {
+            node_id: NodeId(format!("repo:{tag}")),
+            vector: vec![a, b, c, d],
+        };
+        let first = vec![
+            v("a", 1.0, 0.0, 0.0, 0.0),
+            v("b", 0.0, 1.0, 0.0, 0.0),
+            v("c", 0.0, 0.0, 1.0, 0.0),
+        ];
+        lb.set_embeddings("text", "lexical-hash-v1", &first)
+            .unwrap();
+        if lb.build_vector_index("text", "lexical-hash-v1").unwrap() {
+            // Extension present + index built: this is the path that used to fail.
+            let second = vec![v("d", 0.0, 0.0, 0.0, 1.0), v("e", 0.5, 0.5, 0.0, 0.0)];
+            lb.set_embeddings("text", "lexical-hash-v1", &second)
+                .unwrap(); // must not error with "already exists in catalog"
+            check!(lb.embeddings_for("text", "lexical-hash-v1").unwrap().len() == 2);
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
