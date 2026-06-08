@@ -851,7 +851,7 @@ fn sync(dir: &Path, args: SyncArgs) -> Result<()> {
     } else {
         println!(
             "  authors: mine only ({})",
-            me.display().unwrap_or_default()
+            me.summary().unwrap_or_default()
         );
     }
 
