@@ -43,10 +43,13 @@ work without tagging each repo:
 [repos]
 proprietary = ["*acme*", "*/acme-corp/*"]   # hidden from public/default views
 private     = ["*-internal"]
+public      = ["*/acme-corp/oss-*"]          # allowlist — wins over the above
 ```
 
-These only *raise* restrictiveness; matched repos are gated out of `story`/`export`
-and the default `similar`/`viz` output (`--include-restricted` to include them). `CTRL-C` during any operation stops gracefully at a safe point so the
+`proprietary`/`private` only *raise* restrictiveness; `public` is an allowlist that
+**wins**, keeping a public repo public even when a broad work-org glob would catch
+it. Restricted repos are gated out of `story`/`export` and the default
+`similar`/`viz` output (`--include-restricted` to include them). `CTRL-C` during any operation stops gracefully at a safe point so the
 database stays consistent (a second `CTRL-C` aborts); an interrupted `sync` saves
 the repos it finished and resumes on the next run.
 

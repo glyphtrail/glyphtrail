@@ -157,9 +157,11 @@ Classify whole organizations or naming conventions as work with `[repos]` globs
 [repos]
 proprietary = ["*acme*", "*/acme-corp/*"]   # hidden from public/default atlas views
 private     = ["*-internal"]
+public      = ["*/acme-corp/oss-*"]          # allowlist — wins, keeps these public
 ```
 
-Patterns only raise restrictiveness; restricted repos are gated out of `story`,
+`public` is an escape hatch (it wins over the others) for a public repo caught by a
+broad work-org glob. The other patterns only raise restrictiveness; restricted repos are gated out of `story`,
 `export`, and the default `similar`/`viz` output (pass `--include-restricted` to
 include them). `CTRL-C` during a sync stops gracefully at a safe point (the database
 stays consistent); a second `CTRL-C` aborts.

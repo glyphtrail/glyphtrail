@@ -438,7 +438,7 @@ fn atlas_registry(dir: &Path) -> Result<Registry> {
         None => Registry::default(),
     };
     let repos = AtlasConfig::load(dir)?.repos;
-    registry.classify(&repos.proprietary, &repos.private);
+    registry.classify(&repos.public, &repos.proprietary, &repos.private);
     Ok(registry)
 }
 
@@ -524,6 +524,7 @@ const ATLAS_CONFIG_TEMPLATE: &str = r#"# glyphtrail atlas configuration.
 # [repos]
 # proprietary = ["*acme*", "*/acme-corp/*"]   # work — hidden by default
 # private     = ["*-secret"]                   # at least private
+# public      = ["*/acme-corp/oss-*"]          # allowlist — wins over the above
 "#;
 
 /// Gather the **outbound** (public-only) gated timeline shared by `atlas story`
