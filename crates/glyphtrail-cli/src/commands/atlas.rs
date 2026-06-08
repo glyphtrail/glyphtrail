@@ -487,6 +487,20 @@ fn progress_bar(len: u64, prefix: &str) -> ProgressBar {
     bar
 }
 
+/// An indeterminate spinner for a single blocking step of unknown length (e.g.
+/// paginated forge discovery). Its steady tick animates from a background thread,
+/// so it keeps spinning even while the main thread is blocked in the call.
+fn spinner(msg: &str) -> ProgressBar {
+    let sp = ProgressBar::new_spinner();
+    sp.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    sp.set_message(msg.to_string());
+    sp.enable_steady_tick(std::time::Duration::from_millis(120));
+    sp
+}
+
 pub fn run(cmd: AtlasCmd) -> Result<()> {
     let dir = atlas_dir()?;
     // Materialize the commented config template whenever the atlas exists but the
@@ -1066,9 +1080,10 @@ fn github_targets(
             .map(|p| p.with_file_name("forge.toml"))
             .unwrap_or_else(|| PathBuf::from("forge.toml")),
     );
-    println!("  github:  discovering repos…");
+    let sp = spinner("  github: discovering repos…");
     let repos =
         list_account_repos(&forge_config, "github.com", &opts).map_err(|e| anyhow!("{e}"))?;
+    sp.finish_and_clear();
 
     // Forge ids already covered by a local clone (dedup; local wins), and the names
     // already in use (so a remote with a colliding name is disambiguated).
@@ -1082,11 +1097,16 @@ fn github_targets(
     let cache = atlas_cache_dir(dir);
     let mut pending: Vec<RegistryEntry> = Vec::new();
     let (mut cloned, mut already_local) = (0usize, 0usize);
+    // Cloning each uncloned repo is the slow part (network) — show progress over
+    // the whole discovered set.
+    let bar = progress_bar(repos.len() as u64, "  github: cloning");
     for r in &repos {
         if crate::interrupt::requested() {
-            println!("  github:  interrupted during discovery");
+            bar.suspend(|| println!("  github:  interrupted during discovery"));
             break;
         }
+        bar.set_message(format!("{}/{}", r.owner, r.name));
+        bar.inc(1);
         let slug = format!("{}/{}/{}", r.host, r.owner, r.name);
         let numeric_src = r.numeric_id.as_ref().map(|n| format!("{}#{}", r.host, n));
         if known_ids.contains(&slug)
@@ -1100,7 +1120,7 @@ fn github_targets(
         let root = match ensure_bare_cache(&cache, r) {
             Ok(p) => p,
             Err(err) => {
-                println!("  {}/{}: skipped ({err})", r.owner, r.name);
+                bar.suspend(|| println!("  {}/{}: skipped ({err})", r.owner, r.name));
                 continue;
             }
         };
@@ -1134,6 +1154,7 @@ fn github_targets(
             visibility,
         });
     }
+    bar.finish_and_clear();
     println!(
         "  github:  {} discovered, {cloned} via cache, {already_local} already local",
         repos.len()
