@@ -510,9 +510,12 @@ const ATLAS_CONFIG_TEMPLATE: &str = r#"# glyphtrail atlas configuration.
 # [me] — who you are, so `atlas sync` keeps only YOUR commits by default (pass
 # --everyone to ingest all authors). An address is yours if it matches `emails`,
 # sits at an owned `domain`, or matches a `patterns` glob (`*` = any run of chars,
-# `?` = any one char). All matching is case-insensitive.
+# `?` = any one char). All matching is case-insensitive. `emails` matching is
+# provider-aware: a `+tag` is folded for providers with documented sub-addressing
+# (you+ci@gmail.com = you@gmail.com), and Gmail dots too (m.mayer@gmail.com =
+# mmayer@gmail.com), so listing one form covers its aliases.
 # [me]
-# emails   = ["you@example.com", "you@work.com"]      # exact addresses
+# emails   = ["you@example.com", "you@work.com"]      # exact addresses (provider-aware)
 # domains  = ["example.com"]                           # any address @ a domain you own
 # patterns = ["you+*@gmail.com", "*@*.example.com"]    # plus-tag aliases, subdomains
 

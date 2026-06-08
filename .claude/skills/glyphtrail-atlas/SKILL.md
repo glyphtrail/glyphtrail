@@ -32,8 +32,11 @@ patterns = ["you+*@gmail.com", "*@*.example.com"]    # globs (* / ?) over the wh
 ```
 
 An address is yours if it matches any `emails` entry, an owned `domain`, or a
-`patterns` glob — all case-insensitive. Unset, it falls back to `git config
-user.email`.
+`patterns` glob — all case-insensitive. Exact `emails` matching is provider-aware:
+for providers whose sub-addressing is documented, a `+tag` is folded away
+(`you+ci@gmail.com` = `you@gmail.com`), and on Gmail dots are too
+(`m.mayer@gmail.com` = `mmayer@gmail.com`), so you needn't list every alias. Other
+domains are matched verbatim. Unset, it falls back to `git config user.email`.
 
 Each repo's visibility (`public` / `private` / `proprietary`) is auto-detected
 from the forge's **actual** repo status: at `repo add` the forge API (a token in
