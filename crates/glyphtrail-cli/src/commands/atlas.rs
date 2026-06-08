@@ -419,6 +419,18 @@ fn ensure_atlas_config(dir: &Path) {
     }
 }
 
+/// Load the global registry and apply the atlas's `[repos]` name/forge-org
+/// classification, so every visibility-gated atlas view sees the effective tier.
+fn atlas_registry(dir: &Path) -> Result<Registry> {
+    let mut registry = match default_registry_path() {
+        Some(p) => Registry::load(&p)?,
+        None => Registry::default(),
+    };
+    let repos = AtlasConfig::load(dir)?.repos;
+    registry.classify(&repos.proprietary, &repos.private);
+    Ok(registry)
+}
+
 pub fn run(cmd: AtlasCmd) -> Result<()> {
     let dir = atlas_dir()?;
     // Materialize the commented config template whenever the atlas exists but the
@@ -492,6 +504,15 @@ const ATLAS_CONFIG_TEMPLATE: &str = r#"# glyphtrail atlas configuration.
 # emails   = ["you@example.com", "you@work.com"]      # exact addresses
 # domains  = ["example.com"]                           # any address @ a domain you own
 # patterns = ["you+*@gmail.com", "*@*.example.com"]    # plus-tag aliases, subdomains
+
+# [repos] — classify repos by name / forge-org glob, so a whole organization or
+# naming convention is treated as work without tagging each repo. Matched (case-
+# insensitively) against the repo name and each forge id (`host/owner/repo`);
+# patterns only raise restrictiveness. Restricted repos are hidden from the
+# public-only views (story/export) and the default `similar`/`viz` output.
+# [repos]
+# proprietary = ["*acme*", "*/acme-corp/*"]   # work — hidden by default
+# private     = ["*-secret"]                   # at least private
 "#;
 
 /// Gather the **outbound** (public-only) gated timeline shared by `atlas story`
@@ -517,10 +538,7 @@ fn outbound_timeline(
     let (since, until) = window
         .epoch_bounds()
         .map_err(|d| anyhow!("invalid date: {d}"))?;
-    let registry = match default_registry_path() {
-        Some(p) => Registry::load(&p)?,
-        None => Registry::default(),
-    };
+    let registry = atlas_registry(dir)?;
     let query = TimelineQuery {
         repo: None,
         author: None,
@@ -770,9 +788,7 @@ fn sync(dir: &Path, args: SyncArgs) -> Result<()> {
     }
     let lb = ladybug_dir(dir);
 
-    let reg_path = default_registry_path()
-        .ok_or_else(|| anyhow!("cannot locate home directory (set HOME or USERPROFILE)"))?;
-    let registry = Registry::load(&reg_path)?;
+    let registry = atlas_registry(dir)?;
     let selected: Vec<&RegistryEntry> = match &args.repo {
         Some(name) => vec![
             registry
@@ -941,10 +957,7 @@ fn timeline(dir: &Path, args: TimelineArgs) -> Result<()> {
         .epoch_bounds()
         .map_err(|d| anyhow!("invalid date: {d}"))?;
 
-    let registry = match default_registry_path() {
-        Some(p) => Registry::load(&p)?,
-        None => Registry::default(),
-    };
+    let registry = atlas_registry(dir)?;
     let query = TimelineQuery {
         repo: args.repo.clone(),
         author: args.author.clone(),
@@ -1014,10 +1027,7 @@ fn graph_embed(dir: &Path, args: GraphEmbedArgs) -> Result<()> {
     if !lb.exists() {
         bail!("atlas is disabled; run `glyphtrail atlas init` first");
     }
-    let registry = match default_registry_path() {
-        Some(p) => Registry::load(&p)?,
-        None => Registry::default(),
-    };
+    let registry = atlas_registry(dir)?;
     let embedder = StructuralEmbedder::new(args.dim);
     let mut embeddings: Vec<Embedding> = Vec::new();
     let mut no_index = 0usize; // missing dir or unreadable index
@@ -1092,10 +1102,7 @@ fn embed(dir: &Path, args: EmbedArgs) -> Result<()> {
         bail!("atlas is disabled; run `glyphtrail atlas init` first");
     }
     let store = LadybugStore::open(&lb)?;
-    let registry = match default_registry_path() {
-        Some(p) => Registry::load(&p)?,
-        None => Registry::default(),
-    };
+    let registry = atlas_registry(dir)?;
     // Build one document per repo as a structured digest (languages, dependencies,
     // API surface, structure, timeline, topics) from its own index + commit history
     // — a far better repo representation than concatenated commit subjects (#338,
@@ -1369,10 +1376,7 @@ fn similar_commits(dir: &Path, args: SimilarCommitsArgs) -> Result<()> {
         .iter()
         .map(|r| (r.commit.node_id.0.clone(), r))
         .collect();
-    let registry = match default_registry_path() {
-        Some(p) => Registry::load(&p)?,
-        None => Registry::default(),
-    };
+    let registry = atlas_registry(dir)?;
 
     let mut hidden = 0usize;
     let mut out: Vec<(f32, String, i64, String)> = Vec::new();
@@ -1681,10 +1685,7 @@ fn digest_cmd(dir: &Path, args: DigestArgs) -> Result<()> {
         bail!("atlas is disabled; run `glyphtrail atlas init` first");
     }
     let store = LadybugStore::open(&ladybug_dir(dir))?;
-    let registry = match default_registry_path() {
-        Some(p) => Registry::load(&p)?,
-        None => Registry::default(),
-    };
+    let registry = atlas_registry(dir)?;
     let rows = store.atlas_timeline(None, None, None)?;
     let mut by_repo: std::collections::BTreeMap<String, Vec<&glyphtrail_core::AtlasTimelineRow>> =
         std::collections::BTreeMap::new();
@@ -1745,10 +1746,7 @@ fn atlas_similarity_elements(
         bail!("atlas is disabled; run `glyphtrail atlas init` first");
     }
     let store = LadybugStore::open(&lb)?;
-    let registry = match default_registry_path() {
-        Some(p) => Registry::load(&p)?,
-        None => Registry::default(),
-    };
+    let registry = atlas_registry(dir)?;
     let space = if graph { SPACE_GRAPH } else { SPACE_TEXT };
     let model = resolve_model(&store, space, model.as_deref())?;
     let embs = store.embeddings_for(space, &model)?;
@@ -2028,10 +2026,7 @@ fn similar(dir: &Path, args: SimilarArgs) -> Result<()> {
         bail!("atlas is disabled; run `glyphtrail atlas init` first");
     }
     let store = LadybugStore::open(&lb)?;
-    let registry = match default_registry_path() {
-        Some(p) => Registry::load(&p)?,
-        None => Registry::default(),
-    };
+    let registry = atlas_registry(dir)?;
     // Pick the (space, model) namespace: graph vs text, and the model (--model, else
     // the active/default one). Read just that namespace — models never mix.
     let space = if args.graph { SPACE_GRAPH } else { SPACE_TEXT };

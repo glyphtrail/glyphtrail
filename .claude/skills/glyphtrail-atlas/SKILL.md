@@ -32,7 +32,20 @@ patterns = ["you+*@gmail.com", "*@*.example.com"]    # globs (* / ?) over the wh
 
 An address is yours if it matches any `emails` entry, an owned `domain`, or a
 `patterns` glob — all case-insensitive. Unset, it falls back to `git config
-user.email`. `CTRL-C` during any operation stops gracefully at a safe point so the
+user.email`.
+
+Classify repos by name / forge-org with `[repos]` globs (matched against the repo
+name and each forge id `host/owner/repo`) so a whole organization is treated as
+work without tagging each repo:
+
+```toml
+[repos]
+proprietary = ["*acme*", "*/acme-corp/*"]   # hidden from public/default views
+private     = ["*-internal"]
+```
+
+These only *raise* restrictiveness; matched repos are gated out of `story`/`export`
+and the default `similar`/`viz` output (`--include-restricted` to include them). `CTRL-C` during any operation stops gracefully at a safe point so the
 database stays consistent (a second `CTRL-C` aborts); an interrupted `sync` saves
 the repos it finished and resumes on the next run.
 

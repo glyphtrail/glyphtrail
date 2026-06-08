@@ -417,6 +417,32 @@ pub struct AtlasConfig {
     pub me: MeConfig,
     #[serde(default)]
     pub waka: WakaConfig,
+    #[serde(default)]
+    pub repos: ReposConfig,
+}
+
+/// `[repos]` — classify repos by name/forge-org glob so a whole organization or
+/// naming convention is treated as work/private without tagging each repo. The
+/// patterns only ever *raise* restrictiveness (a `Public` repo can become
+/// `Proprietary`, never the reverse); they gate the atlas's public-only and
+/// default-deny output paths (#332/#336).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ReposConfig {
+    /// Globs (`*`/`?`, case-insensitive) matched against the repo name and each
+    /// forge id (`host/owner/repo`); a match marks the repo `Proprietary`, e.g.
+    /// `*acme*` or `*/acme-corp/*`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proprietary: Vec<String>,
+    /// Same matching, marking a repo at least `Private`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub private: Vec<String>,
+}
+
+impl ReposConfig {
+    /// Whether any classification pattern is configured.
+    pub fn is_set(&self) -> bool {
+        !self.proprietary.is_empty() || !self.private.is_empty()
+    }
 }
 
 /// `[waka]` — optional WakaTime time-tracking integration (#486). Pulling
@@ -501,8 +527,8 @@ impl MeConfig {
 }
 
 /// Case-insensitive glob match (`*` = any run incl. empty, `?` = any one char),
-/// with linear-time star backtracking. Used for `[me].patterns`.
-fn glob_match_ci(pattern: &str, text: &str) -> bool {
+/// with linear-time star backtracking. Used for `[me].patterns` and `[repos]`.
+pub(crate) fn glob_match_ci(pattern: &str, text: &str) -> bool {
     let pat = pattern.to_ascii_lowercase().into_bytes();
     let txt = text.as_bytes(); // `text` is already lowercased by the caller
     let (mut p, mut t) = (0usize, 0usize);
