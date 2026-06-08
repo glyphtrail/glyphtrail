@@ -18,6 +18,9 @@ use glyphtrail_core::{
     TimelineQuery, Window, author_scope_label, default_atlas_path, default_registry_path, filelock,
     filter_timeline, format_date, scrub_secrets, timeline_value,
 };
+use glyphtrail_forge_id::{
+    ForgeConfig, ListOpts, RemoteRepo, forge_numeric_repo_id, list_account_repos, repo_ids,
+};
 use glyphtrail_store::{GraphStore, LadybugStore};
 use indicatif::{ProgressBar, ProgressStyle};
 
@@ -402,6 +405,29 @@ pub struct SyncArgs {
     /// Ingest commits by everyone, not just my own.
     #[arg(long)]
     pub everyone: bool,
+    /// Also sync your GitHub repos, bare-blobless-cloning any not checked out
+    /// locally into `~/.glyphtrail/atlas/cache/`. Owned repos only by default (add
+    /// orgs with `--orgs`). Needs `GITHUB_TOKEN` or the `gh` CLI; private repos
+    /// clone over your SSH key.
+    #[arg(long)]
+    pub github: bool,
+    /// With `--github`, also include repos from these orgs (comma-separated logins),
+    /// e.g. `--orgs acme,acme-labs`. Without it, only your owned repos are pulled.
+    #[arg(long)]
+    pub orgs: Option<String>,
+    /// With `--github`, include **every** org you belong to (caution: a stray org
+    /// membership can pull in thousands of repos you never wrote).
+    #[arg(long)]
+    pub all_orgs: bool,
+    /// With `--github`, include repos you're only a collaborator on (owned by others).
+    #[arg(long)]
+    pub collaborator: bool,
+    /// With `--github`, skip forks.
+    #[arg(long)]
+    pub no_forks: bool,
+    /// With `--github`, skip archived repos.
+    #[arg(long)]
+    pub no_archived: bool,
 }
 
 /// `~/.glyphtrail/atlas/`, or an error when no home directory is set.
@@ -862,18 +888,6 @@ fn sync(dir: &Path, args: SyncArgs) -> Result<()> {
     let lb = ladybug_dir(dir);
 
     let registry = atlas_registry(dir)?;
-    let selected: Vec<&RegistryEntry> = match &args.repo {
-        Some(name) => vec![
-            registry
-                .get(name)
-                .ok_or_else(|| anyhow!("no repository named '{name}' in the registry"))?,
-        ],
-        None => registry.repos.iter().collect(),
-    };
-    if selected.is_empty() {
-        bail!("no repositories registered; use `glyphtrail repo add`");
-    }
-
     let cfg = AtlasConfig::load(dir)?;
     // The persistent config window drives `in_bounds` (and the later re-mark);
     // the CLI flags only widen/narrow *this run's* walk.
@@ -916,12 +930,47 @@ fn sync(dir: &Path, args: SyncArgs) -> Result<()> {
         );
     }
 
+    // The repos to walk: every registered local clone, plus — with --github —
+    // every repo on your GitHub account, bare-blobless-cloned into the atlas cache
+    // on demand and deduped against the local clones. Each entry's `active_root()`
+    // is the dir to `git log` (the working clone, or the bare cache).
+    let mut targets: Vec<RegistryEntry> = registry.repos.clone();
+    if args.github {
+        let opts = ListOpts {
+            include_forks: !args.no_forks,
+            include_archived: !args.no_archived,
+            orgs: args
+                .orgs
+                .as_deref()
+                .map(|s| {
+                    s.split(',')
+                        .map(str::trim)
+                        .filter(|x| !x.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            all_orgs: args.all_orgs,
+            collaborator: args.collaborator,
+        };
+        targets.extend(github_targets(dir, &registry, &cfg, opts)?);
+    }
+    if let Some(name) = &args.repo {
+        targets.retain(|e| &e.name == name);
+        if targets.is_empty() {
+            bail!("no repository named '{name}' (registered or on GitHub)");
+        }
+    }
+    if targets.is_empty() {
+        bail!("no repositories to sync; use `glyphtrail repo add`, or pass --github");
+    }
+
     let mut heads = AtlasHeads::load(dir)?;
     let mut store = LadybugStore::open(&lb)?;
     let mut total = 0usize;
 
     let mut interrupted = false;
-    for e in &selected {
+    for e in &targets {
         // Stop between repos on CTRL-C: each repo's writes are committed before the
         // next starts, so breaking here leaves the database clean and persists the
         // completed repos' HEAD watermarks (saved below).
@@ -992,6 +1041,178 @@ fn sync(dir: &Path, args: SyncArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The atlas clone cache (`~/.glyphtrail/atlas/cache/`): where `--github` keeps the
+/// bare, blobless clones of repos you haven't checked out locally.
+fn atlas_cache_dir(dir: &Path) -> PathBuf {
+    dir.join("cache")
+}
+
+/// Discover every repo on the GitHub account and return a synthesized
+/// [`RegistryEntry`] per repo that isn't already a registered local clone, with its
+/// `root` pointing at a freshly ensured bare-blobless cache. Visibility comes
+/// straight from the API's `private` flag, then `[repos]` globs are applied (same
+/// as `atlas_registry`). Deduped against the registry by forge id; a remote whose
+/// name collides with a different local repo is qualified as `owner/name`.
+fn github_targets(
+    dir: &Path,
+    registry: &Registry,
+    cfg: &AtlasConfig,
+    opts: ListOpts,
+) -> Result<Vec<RegistryEntry>> {
+    let forge_config = ForgeConfig::load_or_default(
+        &default_registry_path()
+            .map(|p| p.with_file_name("forge.toml"))
+            .unwrap_or_else(|| PathBuf::from("forge.toml")),
+    );
+    println!("  github:  discovering repos…");
+    let repos =
+        list_account_repos(&forge_config, "github.com", &opts).map_err(|e| anyhow!("{e}"))?;
+
+    // Forge ids already covered by a local clone (dedup; local wins), and the names
+    // already in use (so a remote with a colliding name is disambiguated).
+    let known_ids: HashSet<String> = registry
+        .repos
+        .iter()
+        .flat_map(|e| e.ids.iter().map(|i| i.source.clone()))
+        .collect();
+    let mut used_names: HashSet<String> = registry.repos.iter().map(|e| e.name.clone()).collect();
+
+    let cache = atlas_cache_dir(dir);
+    let mut pending: Vec<RegistryEntry> = Vec::new();
+    let (mut cloned, mut already_local) = (0usize, 0usize);
+    for r in &repos {
+        if crate::interrupt::requested() {
+            println!("  github:  interrupted during discovery");
+            break;
+        }
+        let slug = format!("{}/{}/{}", r.host, r.owner, r.name);
+        let numeric_src = r.numeric_id.as_ref().map(|n| format!("{}#{}", r.host, n));
+        if known_ids.contains(&slug)
+            || numeric_src
+                .as_deref()
+                .is_some_and(|s| known_ids.contains(s))
+        {
+            already_local += 1;
+            continue; // a registered local clone already covers it
+        }
+        let root = match ensure_bare_cache(&cache, r) {
+            Ok(p) => p,
+            Err(err) => {
+                println!("  {}/{}: skipped ({err})", r.owner, r.name);
+                continue;
+            }
+        };
+        cloned += 1;
+        let mut ids = repo_ids(&[r.ssh_url.clone(), r.clone_url.clone()]);
+        if let Some(n) = &r.numeric_id {
+            let nid = forge_numeric_repo_id(&r.host, n);
+            if !ids.iter().any(|i| i.id == nid.id) {
+                ids.push(nid);
+            }
+        }
+        let name = if used_names.contains(&r.name) {
+            format!("{}/{}", r.owner, r.name)
+        } else {
+            r.name.clone()
+        };
+        used_names.insert(name.clone());
+        let visibility = if r.private {
+            glyphtrail_core::Visibility::Private
+        } else {
+            glyphtrail_core::Visibility::Public
+        };
+        pending.push(RegistryEntry {
+            name,
+            root,
+            alt_roots: Vec::new(),
+            missing_since: None,
+            ids,
+            contributors: Vec::new(),
+            identity: None,
+            visibility,
+        });
+    }
+    println!(
+        "  github:  {} discovered, {cloned} via cache, {already_local} already local",
+        repos.len()
+    );
+
+    // Apply [repos] visibility classification to the synthesized entries too.
+    let mut reg = Registry { repos: pending };
+    reg.classify(
+        &cfg.repos.public,
+        &cfg.repos.proprietary,
+        &cfg.repos.private,
+    );
+    Ok(reg.repos)
+}
+
+/// Ensure a bare, blobless clone of `repo` is present in the cache and current,
+/// returning its path. First time: `git clone --bare --filter=blob:none` (SSH, then
+/// HTTPS); afterwards: `git fetch` the delta. Bare + blobless keeps only history
+/// (no file contents), which is all `git log --name-only` needs.
+fn ensure_bare_cache(cache_dir: &Path, repo: &RemoteRepo) -> Result<PathBuf> {
+    let path = cache_dir
+        .join(&repo.host)
+        .join(&repo.owner)
+        .join(format!("{}.git", repo.name));
+    if path.join("HEAD").exists() {
+        // Existing bare clone: fetch the delta. Best-effort — a transient network
+        // failure shouldn't abort; we still walk the history already present.
+        let _ = git_command()
+            .arg("-C")
+            .arg(&path)
+            .args([
+                "fetch",
+                "--quiet",
+                "--filter=blob:none",
+                "--prune",
+                "origin",
+                "+refs/heads/*:refs/heads/*",
+            ])
+            .output();
+        return Ok(path);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // SSH first (your key reaches private repos), then HTTPS.
+    let mut last = String::new();
+    for url in [repo.ssh_url.as_str(), repo.clone_url.as_str()] {
+        if url.is_empty() {
+            continue;
+        }
+        let out = git_command()
+            .args(["clone", "--bare", "--quiet", "--filter=blob:none", url])
+            .arg(&path)
+            .output()
+            .map_err(|e| anyhow!("running git clone: {e}"))?;
+        if out.status.success() {
+            return Ok(path);
+        }
+        last = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let _ = std::fs::remove_dir_all(&path); // clear a partial clone before retry
+    }
+    Err(anyhow!(
+        "clone failed for {}/{}: {last}",
+        repo.owner,
+        repo.name
+    ))
+}
+
+/// A `git` command that never blocks on an interactive prompt: no HTTPS credential
+/// prompt (`GIT_TERMINAL_PROMPT=0`), and SSH fails fast rather than asking for a
+/// passphrase or host-key confirmation. Essential when cloning many remote repos
+/// unattended — an auth-gated repo must fail and be skipped, not hang the sync.
+fn git_command() -> std::process::Command {
+    let mut c = std::process::Command::new("git");
+    c.env("GIT_TERMINAL_PROMPT", "0").env(
+        "GIT_SSH_COMMAND",
+        "ssh -oBatchMode=yes -oStrictHostKeyChecking=accept-new",
+    );
+    c
 }
 
 /// Restore embeddings from the Parquet backup when the live catalog is empty and a
