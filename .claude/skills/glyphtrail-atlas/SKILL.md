@@ -124,6 +124,12 @@ or `commit` (one vector per commit). `model` is the embedder id, e.g.
 `openai:text-embedding-3-small`. Vectors for different models coexist and are
 never compared against each other.
 
+When several models are stored, `similar` / `viz` / `serve` default to the
+**quality** (neural) model over the local `lexical-hash` bootstrap — so a
+convenient local `embed` never silently demotes your paid vectors — and print
+which model they used. Pass `--model <id>` to force one (e.g. `--model
+lexical-hash-v1`); `atlas status` lists what's stored.
+
 ## Time tracking (WakaTime)
 
 `atlas waka sync` pulls WakaTime daily summaries (effort + environment — the axis

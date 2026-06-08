@@ -105,7 +105,8 @@ pub struct VizArgs {
     /// Map structural (`graph`) similarity instead of text-digest similarity.
     #[arg(long)]
     pub graph: bool,
-    /// Embedding model to map (default: the active one for the space).
+    /// Embedding model to map (default: a quality/neural model if embedded, else
+    /// the active one for the space).
     #[arg(long)]
     pub model: Option<String>,
     /// Link each repo to its N most-similar repos.
@@ -1246,6 +1247,10 @@ fn embed(dir: &Path, args: EmbedArgs) -> Result<()> {
 /// namespace; the model id is the second (#338).
 const SPACE_TEXT: &str = "text";
 const SPACE_GRAPH: &str = "graph";
+/// The local, no-network bootstrap text model (`glyphtrail_core::HashingEmbedder`'s
+/// id). It's the convenient default for `embed`, but a *quality* (neural) model is
+/// preferred when one exists — see [`resolve_model`]. Must match `HashingEmbedder::id()`.
+const LOCAL_TEXT_MODEL: &str = "lexical-hash-v1";
 const SPACE_COMMIT: &str = "commit";
 
 /// Record the most-recently-embedded model for a space (the `similar` default),
@@ -1266,9 +1271,10 @@ fn set_active_model(
     Ok(())
 }
 
-/// Resolve which model a query searches in `space`: the explicit `--model`, else the
-/// active (last-embedded) one, else the sole stored model — erroring with the list
-/// of choices when none/ambiguous.
+/// Resolve which model a query searches in `space`: the explicit `--model`, else a
+/// *quality* (neural) model in preference to the local `lexical-hash` bootstrap (the
+/// active/last-embedded one breaking ties within that tier), else the sole stored
+/// model — erroring with the list of choices when none or still ambiguous.
 fn resolve_model(store: &LadybugStore, space: &str, explicit: Option<&str>) -> Result<String> {
     let models: Vec<String> = store
         .embedding_index()?
@@ -1288,17 +1294,37 @@ fn resolve_model(store: &LadybugStore, space: &str, explicit: Option<&str>) -> R
             models.join(", ")
         );
     }
+    // Default selection prefers a *quality* (neural) model over the local
+    // `lexical-hash` bootstrap, so a map / search uses the paid-for vectors whenever
+    // they exist — a convenient `embed` (local by default) no longer silently
+    // demotes them. The active (last-embedded) model wins only within that tier;
+    // `--model lexical-hash-v1` still selects the local one explicitly (#nnn).
+    let preferred: Vec<&String> = {
+        let neural: Vec<&String> = models
+            .iter()
+            .filter(|m| m.as_str() != LOCAL_TEXT_MODEL)
+            .collect();
+        if neural.is_empty() {
+            models.iter().collect()
+        } else {
+            neural
+        }
+    };
     if let Some(active) = store.get_meta(&format!("active_model_{space}"))?
-        && models.iter().any(|x| x == &active)
+        && preferred.iter().any(|m| **m == active)
     {
         return Ok(active);
     }
-    if models.len() == 1 {
-        return Ok(models[0].clone());
+    if preferred.len() == 1 {
+        return Ok(preferred[0].clone());
     }
     bail!(
         "multiple {space} embedding models stored; choose one with --model: {}",
-        models.join(", ")
+        preferred
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
     );
 }
 
@@ -1798,7 +1824,7 @@ fn atlas_similarity_elements(
     model: Option<String>,
     neighbors: usize,
     include_restricted: bool,
-) -> Result<(serde_json::Value, usize, usize)> {
+) -> Result<(serde_json::Value, usize, usize, String)> {
     let lb = ladybug_dir(dir);
     if !lb.exists() {
         bail!("atlas is disabled; run `glyphtrail atlas init` first");
@@ -1873,13 +1899,18 @@ fn atlas_similarity_elements(
             edge_count += 1;
         }
     }
-    Ok((serde_json::Value::Array(elements), repos.len(), edge_count))
+    Ok((
+        serde_json::Value::Array(elements),
+        repos.len(),
+        edge_count,
+        model,
+    ))
 }
 
 /// `glyphtrail atlas viz` — write the repo-similarity map to a self-contained HTML
 /// file (the atlas analog of `glyphtrail viz`). #338.
 fn viz(dir: &Path, args: VizArgs) -> Result<()> {
-    let (elements, repos, edges) = atlas_similarity_elements(
+    let (elements, repos, edges, model) = atlas_similarity_elements(
         dir,
         args.graph,
         args.model,
@@ -1889,7 +1920,7 @@ fn viz(dir: &Path, args: VizArgs) -> Result<()> {
     let html = glyphtrail_viz::static_html_elements(elements);
     std::fs::write(&args.out, html).with_context(|| format!("writing {}", args.out.display()))?;
     println!(
-        "wrote {} ({repos} repos, {edges} similarity links)",
+        "wrote {} ({repos} repos, {edges} similarity links, model {model})",
         args.out.display()
     );
     Ok(())
@@ -1898,7 +1929,7 @@ fn viz(dir: &Path, args: VizArgs) -> Result<()> {
 /// `glyphtrail atlas serve` — serve the repo-similarity map over HTTP (the atlas
 /// analog of `glyphtrail serve`). #338.
 fn viz_serve(dir: &Path, args: VizServeArgs) -> Result<()> {
-    let (elements, repos, edges) = atlas_similarity_elements(
+    let (elements, repos, edges, model) = atlas_similarity_elements(
         dir,
         args.graph,
         args.model,
@@ -1906,7 +1937,7 @@ fn viz_serve(dir: &Path, args: VizServeArgs) -> Result<()> {
         args.include_restricted,
     )?;
     let html = glyphtrail_viz::static_html_elements(elements);
-    eprintln!("atlas viz: {repos} repos, {edges} similarity links");
+    eprintln!("atlas viz: {repos} repos, {edges} similarity links, model {model}");
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(glyphtrail_server::serve_html(html, args.port))
 }
@@ -2583,6 +2614,35 @@ mod tests {
         check!(commits[1].files.is_empty());
         // A malformed timestamp drops the record rather than panicking.
         check!(parse_log("\u{1e}h\u{1f}notanint\u{1f}A\u{1f}a@x\u{1f}s").is_empty());
+    }
+
+    #[test]
+    fn resolve_model_prefers_quality_over_local_bootstrap() {
+        let mut lb = LadybugStore::open_temp().unwrap();
+        let e = |id: &str, v: Vec<f32>| Embedding {
+            node_id: glyphtrail_core::NodeId(id.into()),
+            vector: v,
+        };
+        lb.set_embeddings(SPACE_TEXT, LOCAL_TEXT_MODEL, &[e("repo:a", vec![1.0, 0.0])])
+            .unwrap();
+        lb.set_embeddings(
+            SPACE_TEXT,
+            "openai:m",
+            &[e("repo:a", vec![0.0, 1.0, 0.5, 0.5])],
+        )
+        .unwrap();
+        // Even with the local model marked active, the default prefers the neural one.
+        set_active_model(&mut lb, SPACE_TEXT, LOCAL_TEXT_MODEL, None, 2).unwrap();
+        check!(resolve_model(&lb, SPACE_TEXT, None).unwrap() == "openai:m");
+        // But an explicit choice of the local model is honoured.
+        check!(resolve_model(&lb, SPACE_TEXT, Some(LOCAL_TEXT_MODEL)).unwrap() == LOCAL_TEXT_MODEL);
+
+        // With only the local model present, it's the (sole) default.
+        let mut only_local = LadybugStore::open_temp().unwrap();
+        only_local
+            .set_embeddings(SPACE_TEXT, LOCAL_TEXT_MODEL, &[e("repo:a", vec![1.0, 0.0])])
+            .unwrap();
+        check!(resolve_model(&only_local, SPACE_TEXT, None).unwrap() == LOCAL_TEXT_MODEL);
     }
 
     #[test]
