@@ -35,9 +35,19 @@ An address is yours if it matches any `emails` entry, an owned `domain`, or a
 `patterns` glob — all case-insensitive. Unset, it falls back to `git config
 user.email`.
 
-Classify repos by name / forge-org with `[repos]` globs (matched against the repo
-name and each forge id `host/owner/repo`) so a whole organization is treated as
-work without tagging each repo:
+Each repo's visibility (`public` / `private` / `proprietary`) is auto-detected
+from the forge's **actual** repo status: at `repo add` the forge API (a token in
+`~/.glyphtrail/forge.toml`, or the `gh` CLI for GitHub) is queried for the repo's
+private/public flag — so a private repo on a public host is correctly `private`,
+not leaked as `public`. When no forge confirms the status it falls back to a
+host-based guess. `repo refresh` re-syncs visibility from the live forge status:
+it corrects a stale tier in either direction (a now-private repo to `private`, a
+confirmed-public one to `public`), but never relabels on an unconfirmed guess and
+never overrides a hand-set `proprietary`.
+
+Override the auto-detected tier by name / forge-org with `[repos]` globs (matched
+against the repo name and each forge id `host/owner/repo`) so a whole organization
+is treated as work without tagging each repo:
 
 ```toml
 [repos]

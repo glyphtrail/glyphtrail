@@ -7,7 +7,7 @@ use glyphtrail_core::{
     RecordOutcome, Registry, RegistryEntry, RepoHealth, Resolution, default_registry_path,
     filelock, lock_path, repo_ids,
 };
-use glyphtrail_forge_id::{ForgeConfig, forge_numeric_ids};
+use glyphtrail_forge_id::{ForgeConfig, forge_numeric_ids, forge_repo_private};
 use indicatif::{ProgressBar, ProgressStyle};
 
 #[derive(Subcommand)]
@@ -327,6 +327,7 @@ fn refresh(registry_path: &Path, only: Option<&str>) -> Result<()> {
 
     let (mut changed, mut unchanged, mut missing) = (0u32, 0u32, 0u32);
     let mut updates: Vec<(String, Vec<glyphtrail_core::RepoId>)> = Vec::new();
+    let mut vis_updates: Vec<(String, glyphtrail_core::Visibility)> = Vec::new();
     for e in &targets {
         bar.set_message(e.name.clone());
         if e.roots().all(|r| !r.exists()) {
@@ -335,11 +336,29 @@ fn refresh(registry_path: &Path, only: Option<&str>) -> Result<()> {
             bar.inc(1);
             continue;
         }
-        let fresh = entry_for(registry_path, e.active_root(), Some(e.name.clone()));
-        if fresh.ids == e.ids {
-            unchanged += 1;
+        let built = build_entry(registry_path, e.active_root(), Some(e.name.clone()));
+        let fresh = &built.entry;
+        let ids_changed = fresh.ids != e.ids;
+        // Backfill visibility from the *confirmed* forge status (#332).
+        // `Proprietary` is the explicit, hand-set tier — forge status never
+        // overrides it. Otherwise: a confirmed-private repo is raised to at least
+        // `Private` (fixes a private repo earlier mislabelled Public — a leak); a
+        // confirmed-public repo adopts `Public` (fixes a public repo stuck
+        // `Private`); an *unconfirmed* status (no token/forge answer) leaves the
+        // tier untouched — never relabel, least of all auto-expose, on a guess.
+        let new_vis = if e.visibility == glyphtrail_core::Visibility::Proprietary {
+            e.visibility
         } else {
-            changed += 1;
+            match built.forge_private {
+                Some(true) => e
+                    .visibility
+                    .more_restrictive(glyphtrail_core::Visibility::Private),
+                Some(false) => glyphtrail_core::Visibility::Public,
+                None => e.visibility,
+            }
+        };
+        let vis_changed = new_vis != e.visibility;
+        if ids_changed {
             let (name, old) = (e.name.clone(), e.ids.clone());
             let new = fresh.ids.clone();
             bar.suspend(|| {
@@ -353,14 +372,29 @@ fn refresh(registry_path: &Path, only: Option<&str>) -> Result<()> {
             });
             updates.push((name, new));
         }
+        if vis_changed {
+            let (name, old, new) = (e.name.clone(), e.visibility, new_vis);
+            bar.suspend(|| {
+                println!("{name}: visibility {} -> {}", old.as_str(), new.as_str());
+            });
+            vis_updates.push((name, new));
+        }
+        if ids_changed || vis_changed {
+            changed += 1;
+        } else {
+            unchanged += 1;
+        }
         bar.inc(1);
     }
     bar.finish_and_clear();
 
-    if !updates.is_empty() {
+    if !updates.is_empty() || !vis_updates.is_empty() {
         Registry::mutate(registry_path, |reg| {
             for (name, ids) in &updates {
                 reg.set_ids(name, ids.clone());
+            }
+            for (name, vis) in &vis_updates {
+                reg.set_visibility(name, *vis);
             }
         })?;
     }
@@ -391,11 +425,24 @@ pub(crate) fn register(registry_path: &Path, root: &Path, name: Option<String>) 
     Ok(())
 }
 
-/// Build a [`RegistryEntry`] for `root`: its name (the given override, else the
-/// directory name) plus its stable forge identities (#233) derived from its git
-/// remotes — slug ids always, forge-API numeric ids when a token is configured
-/// (via `~/.glyphtrail/forge.toml`, the sibling of `registry_path`).
-fn entry_for(registry_path: &Path, root: &Path, name: Option<String>) -> RegistryEntry {
+/// A freshly-built [`RegistryEntry`] plus the forge's *confirmed* privacy status.
+///
+/// `forge_private` is `Some(true/false)` only when a forge API (token or `gh`)
+/// actually answered, and `None` when the status couldn't be confirmed — in which
+/// case `entry.visibility` is a host-based *guess* ([`Visibility::infer`]), not a
+/// fact. Backfill paths use this distinction to avoid relabelling a repo on a
+/// guess (e.g. re-exposing a private repo just because it sits on a public host).
+struct BuiltEntry {
+    entry: RegistryEntry,
+    forge_private: Option<bool>,
+}
+
+/// Build a [`RegistryEntry`] for `root` together with the forge's confirmed
+/// privacy status: its name (the given override, else the directory name) plus
+/// its stable forge identities (#233) derived from its git remotes — slug ids
+/// always, forge-API numeric ids when a token is configured (via
+/// `~/.glyphtrail/forge.toml`, the sibling of `registry_path`).
+fn build_entry(registry_path: &Path, root: &Path, name: Option<String>) -> BuiltEntry {
     let name = name.unwrap_or_else(|| {
         root.file_name()
             .map(|s| s.to_string_lossy().to_string())
@@ -409,10 +456,17 @@ fn entry_for(registry_path: &Path, root: &Path, name: Option<String>) -> Registr
             ids.push(numeric);
         }
     }
-    // Infer the atlas visibility tier from the forge-id sources (#332): a public
-    // forge → Public, else Private; never Proprietary (explicit only).
-    let visibility = glyphtrail_core::Visibility::infer(ids.iter().map(|i| i.source.as_str()));
-    RegistryEntry {
+    // Visibility tier (#332). Prefer the forge's *actual* private/public status
+    // (one API call, same auth as the numeric-id lookup): a private repo on a
+    // public host would otherwise be mislabelled Public and leak into atlas public
+    // views. Fall back to host-based inference when no token/forge confirms it.
+    let forge_private = forge_repo_private(&remotes, &forge_config);
+    let visibility = match forge_private {
+        Some(true) => glyphtrail_core::Visibility::Private,
+        Some(false) => glyphtrail_core::Visibility::Public,
+        None => glyphtrail_core::Visibility::infer(ids.iter().map(|i| i.source.as_str())),
+    };
+    let entry = RegistryEntry {
         name,
         root: root.to_path_buf(),
         alt_roots: Vec::new(),
@@ -421,7 +475,17 @@ fn entry_for(registry_path: &Path, root: &Path, name: Option<String>) -> Registr
         contributors: git_contributors(root),
         identity: None,
         visibility,
+    };
+    BuiltEntry {
+        entry,
+        forge_private,
     }
+}
+
+/// Build a [`RegistryEntry`] for `root` (see [`build_entry`]), discarding the
+/// confirmed-privacy flag — the common path for callers that just need the entry.
+fn entry_for(registry_path: &Path, root: &Path, name: Option<String>) -> RegistryEntry {
+    build_entry(registry_path, root, name).entry
 }
 
 /// Cap on stored contributors per repo (#265): the top authors by commit count,

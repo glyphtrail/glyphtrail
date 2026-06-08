@@ -21,7 +21,7 @@ pub mod config;
 pub mod error;
 pub mod id;
 
-pub use api::forge_numeric_ids;
+pub use api::{forge_numeric_ids, forge_repo_private};
 pub use config::{ForgeConfig, ForgeHost, ForgeKind};
 pub use error::ForgeIdError;
 pub use id::{RepoId, canonicalize_remote, forge_numeric_repo_id, repo_ids, repo_uuid};
