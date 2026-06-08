@@ -120,6 +120,105 @@ fn fetch_numeric_id(config: &ForgeConfig, host: &str, owner: &str, repo: &str) -
         .map(|n| n.to_string())
 }
 
+/// Best-effort: whether the repo is **private** on its forge, from the forge API
+/// (the same endpoint the numeric id comes from). `Some(true/false)` from the first
+/// remote that resolves; `None` when no remote is on a recognised forge with an
+/// available token, or every request fails — the caller then falls back to
+/// host-based inference. Honest by construction: a `Some(false)` means the forge
+/// *confirmed* the repo is public, not merely that it's on a public host.
+pub fn forge_repo_private(remote_urls: &[String], config: &ForgeConfig) -> Option<bool> {
+    for url in remote_urls {
+        let Some(canonical) = canonicalize_remote(url) else {
+            continue;
+        };
+        let mut parts = canonical.splitn(3, '/');
+        let (Some(host), Some(owner), Some(repo)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if let Some(private) = fetch_repo_private(config, host, owner, repo) {
+            return Some(private);
+        }
+    }
+    None
+}
+
+/// Query a host's forge API for whether `owner/repo` is private. Mirrors
+/// [`fetch_numeric_id`] (same endpoints/auth); GitHub/Gitea report a `private`
+/// boolean, GitLab a `visibility` string (anything but `public` is private).
+fn fetch_repo_private(config: &ForgeConfig, host: &str, owner: &str, repo: &str) -> Option<bool> {
+    let kind = forge_kind(config, host)?;
+    let (url, header, value) = match kind {
+        ForgeKind::GitHub => match resolve_token(config, host, Some("GITHUB_TOKEN")) {
+            Some(token) => (
+                format!("https://api.github.com/repos/{owner}/{repo}"),
+                "Authorization",
+                format!("Bearer {token}"),
+            ),
+            None => return gh_repo_private(owner, repo),
+        },
+        ForgeKind::GitLab => {
+            let token = resolve_token(config, host, Some("GITLAB_TOKEN"))?;
+            let project = format!("{owner}/{repo}").replace('/', "%2F");
+            (
+                format!("https://{host}/api/v4/projects/{project}"),
+                "PRIVATE-TOKEN",
+                token,
+            )
+        }
+        ForgeKind::Gitea => {
+            let well_known = (host == "codeberg.org").then_some("CODEBERG_TOKEN");
+            let token = resolve_token(config, host, well_known)?;
+            (
+                format!("https://{host}/api/v1/repos/{owner}/{repo}"),
+                "Authorization",
+                format!("token {token}"),
+            )
+        }
+    };
+    let json: Value = ureq::get(&url)
+        .header(header, value.as_str())
+        .header("Accept", "application/json")
+        .header("User-Agent", "glyphtrail")
+        .call()
+        .ok()?
+        .into_body()
+        .read_json()
+        .ok()?;
+    private_from_response(kind, &json)
+}
+
+/// Read the private flag from a forge's repo/project JSON: GitHub/Gitea report a
+/// `private` boolean, GitLab a `visibility` string where anything but `public`
+/// (i.e. `internal`/`private`) counts as private. Pure — the network-free core of
+/// [`fetch_repo_private`], so it's unit-testable against captured responses.
+fn private_from_response(kind: ForgeKind, json: &Value) -> Option<bool> {
+    match kind {
+        ForgeKind::GitHub | ForgeKind::Gitea => json.get("private").and_then(Value::as_bool),
+        ForgeKind::GitLab => json
+            .get("visibility")
+            .and_then(Value::as_str)
+            .map(|v| !v.eq_ignore_ascii_case("public")),
+    }
+}
+
+/// GitHub repo private flag via the `gh` CLI (`gh api repos/{owner}/{repo} --jq
+/// .private`), the fallback when `GITHUB_TOKEN` isn't set.
+fn gh_repo_private(owner: &str, repo: &str) -> Option<bool> {
+    let output = Command::new("gh")
+        .args(["api", &format!("repos/{owner}/{repo}"), "--jq", ".private"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    match String::from_utf8_lossy(&output.stdout).trim() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
 /// GitHub numeric id via the `gh` CLI (`gh api repos/{owner}/{repo} --jq .id`),
 /// the fallback when `GITHUB_TOKEN` isn't set. `None` if `gh` is absent,
 /// unauthenticated, or returns a non-numeric result.
@@ -133,4 +232,44 @@ fn gh_numeric_id(owner: &str, repo: &str) -> Option<String> {
     }
     let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
     (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())).then_some(id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use assert2::check;
+    use serde_json::json;
+
+    #[test]
+    fn github_private_flag_drives_visibility() {
+        // GitHub/Gitea expose a boolean `private`.
+        check!(private_from_response(ForgeKind::GitHub, &json!({"private": true})) == Some(true));
+        check!(private_from_response(ForgeKind::GitHub, &json!({"private": false})) == Some(false));
+        check!(private_from_response(ForgeKind::Gitea, &json!({"private": true})) == Some(true));
+        // Absent/non-bool field → unknown, so the caller falls back to inference.
+        check!(private_from_response(ForgeKind::GitHub, &json!({"id": 42})) == None);
+    }
+
+    #[test]
+    fn gitlab_visibility_maps_non_public_to_private() {
+        // GitLab uses a `visibility` string; only `public` is public.
+        check!(
+            private_from_response(ForgeKind::GitLab, &json!({"visibility": "public"}))
+                == Some(false)
+        );
+        check!(
+            private_from_response(ForgeKind::GitLab, &json!({"visibility": "internal"}))
+                == Some(true)
+        );
+        check!(
+            private_from_response(ForgeKind::GitLab, &json!({"visibility": "private"}))
+                == Some(true)
+        );
+        // Case-insensitive, and a missing field stays unknown.
+        check!(
+            private_from_response(ForgeKind::GitLab, &json!({"visibility": "Public"}))
+                == Some(false)
+        );
+        check!(private_from_response(ForgeKind::GitLab, &json!({})) == None);
+    }
 }

@@ -138,6 +138,26 @@ impl Visibility {
         !matches!(self, Visibility::Public)
     }
 
+    /// Restrictiveness rank, lowest (most exposed) first: `Public` < `Private` <
+    /// `Proprietary`. Used to *raise but never lower* a tier (#332).
+    pub fn rank(self) -> u8 {
+        match self {
+            Visibility::Public => 0,
+            Visibility::Private => 1,
+            Visibility::Proprietary => 2,
+        }
+    }
+
+    /// The more restrictive of two tiers (higher [`rank`](Self::rank)). Used by
+    /// backfill paths that may only tighten an existing tier, never relax it.
+    pub fn more_restrictive(self, other: Visibility) -> Visibility {
+        if other.rank() > self.rank() {
+            other
+        } else {
+            self
+        }
+    }
+
     /// Infer a tier from a repo's forge-id sources (#332): any recognised public
     /// forge host → `Public`, else `Private`. Never infers `Proprietary`.
     pub fn infer<'a>(id_sources: impl IntoIterator<Item = &'a str>) -> Visibility {
@@ -497,6 +517,14 @@ impl Registry {
         }
     }
 
+    /// Set the atlas visibility tier for a named entry (#332). No-op if no entry
+    /// has that name.
+    pub fn set_visibility(&mut self, name: &str, visibility: Visibility) {
+        if let Some(e) = self.repos.iter_mut().find(|e| e.name == name) {
+            e.visibility = visibility;
+        }
+    }
+
     /// Cache a repo's cross-repo [`PackageIdentity`] on its entry, matched by
     /// canonical root (#292). No-op when no registered repo owns `root` (an
     /// unregistered repo doesn't federate). Returns whether an entry was updated.
@@ -530,11 +558,6 @@ impl Registry {
         if public.is_empty() && proprietary.is_empty() && private.is_empty() {
             return;
         }
-        let rank = |v: Visibility| match v {
-            Visibility::Public => 0u8,
-            Visibility::Private => 1,
-            Visibility::Proprietary => 2,
-        };
         let matches = |pats: &[String], e: &RegistryEntry| {
             pats.iter().any(|p| {
                 crate::atlas::glob_match_ci(p, &e.name)
@@ -555,9 +578,7 @@ impl Registry {
             } else {
                 continue;
             };
-            if rank(target) > rank(e.visibility) {
-                e.visibility = target;
-            }
+            e.visibility = e.visibility.more_restrictive(target);
         }
     }
 
@@ -1160,5 +1181,21 @@ mod tests {
         check!(tmp.exists()); // in-flight tmp untouched
         check!(!garbage.exists()); // decoded-as-garbage .json dropped
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn more_restrictive_only_raises_never_lowers() {
+        use Visibility::{Private, Proprietary, Public};
+        // Strict order Public < Private < Proprietary.
+        check!(Public.rank() < Private.rank());
+        check!(Private.rank() < Proprietary.rank());
+        // Picks the higher tier regardless of argument order (the backfill case:
+        // a Public-stored repo the forge reports Private gets raised).
+        check!(Public.more_restrictive(Private) == Private);
+        check!(Private.more_restrictive(Public) == Private);
+        // Never lowers: a manual Proprietary survives a forge-reported Public.
+        check!(Proprietary.more_restrictive(Public) == Proprietary);
+        // Idempotent on equal tiers.
+        check!(Private.more_restrictive(Private) == Private);
     }
 }
