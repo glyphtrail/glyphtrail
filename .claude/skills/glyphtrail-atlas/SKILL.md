@@ -32,6 +32,16 @@ never wrote. Add your work orgs explicitly with `--orgs acme,acme-labs`, every o
 with `--all-orgs`, collaborator repos with `--collaborator`, and trim noise with
 `--no-forks` / `--no-archived`.
 
+**Auto-ignore.** When a full walk finds a discovered repo has **zero commits by any
+`[me]` email**, it's recorded in `~/.glyphtrail/atlas/ignored.toml`, its cache is
+deleted, and later scans skip it (printing `ignored: …`) — no re-clone, no re-walk.
+So the first `--all-orgs`/`--collaborator` import is slow, then it self-tunes. It's
+self-correcting: if any `me` commit is ever found in a repo it's un-ignored, so
+after widening `[me]` (e.g. a new email) run `atlas sync --github --full` to
+re-evaluate the ignored ones. The list is mine-only (not used under `--everyone`),
+never includes a registered local clone, and is hand-editable (add a source to
+force-ignore). A `[window]` scopes "zero contributions" to the window.
+
 ## Identity (`[me]`) and interruption
 
 `atlas sync` keeps only **your** commits by default (`--everyone` for all authors).

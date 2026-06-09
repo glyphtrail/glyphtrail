@@ -14,9 +14,9 @@ use clap::{Args, Subcommand};
 use glyphtrail_core::config::RepoPaths;
 use glyphtrail_core::{
     AtlasConfig, AtlasHeads, CodeGraph, CommitMeta, Confidence, EdgeKind, Embedding, GraphEmbedder,
-    GraphProfile, MeConfig, Node, NodeId, NodeKind, Registry, RegistryEntry, StructuralEmbedder,
-    TimelineQuery, Window, author_scope_label, default_atlas_path, default_registry_path, filelock,
-    filter_timeline, format_date, scrub_secrets, timeline_value,
+    GraphProfile, IgnoredRepos, MeConfig, Node, NodeId, NodeKind, Registry, RegistryEntry,
+    StructuralEmbedder, TimelineQuery, Window, author_scope_label, default_atlas_path,
+    default_registry_path, filelock, filter_timeline, format_date, scrub_secrets, timeline_value,
 };
 use glyphtrail_forge_id::{
     ForgeConfig, ListOpts, RemoteRepo, forge_numeric_repo_id, list_account_repos, repo_ids,
@@ -948,6 +948,9 @@ fn sync(dir: &Path, args: SyncArgs) -> Result<()> {
     // every repo on your GitHub account, bare-blobless-cloned into the atlas cache
     // on demand and deduped against the local clones. Each entry's `active_root()`
     // is the dir to `git log` (the working clone, or the bare cache).
+    // Repos found to have zero commits by you are remembered here so a later
+    // `--github` scan skips them without re-cloning (#nnn). Self-correcting below.
+    let mut ignored = IgnoredRepos::load(dir)?;
     let mut targets: Vec<RegistryEntry> = registry.repos.clone();
     if args.github {
         let opts = ListOpts {
@@ -967,7 +970,15 @@ fn sync(dir: &Path, args: SyncArgs) -> Result<()> {
             all_orgs: args.all_orgs,
             collaborator: args.collaborator,
         };
-        targets.extend(github_targets(dir, &registry, &cfg, opts)?);
+        targets.extend(github_targets(
+            dir,
+            &registry,
+            &cfg,
+            opts,
+            &ignored,
+            args.full,
+            args.everyone,
+        )?);
     }
     if let Some(name) = &args.repo {
         targets.retain(|e| &e.name == name);
@@ -1035,11 +1046,36 @@ fn sync(dir: &Path, args: SyncArgs) -> Result<()> {
             e.name,
             e.visibility.as_str()
         );
+        // Maintain the auto-ignore list (never touches a local clone): a found
+        // me-commit un-ignores; a full walk of a github cache with none of your
+        // commits ignores it and reclaims the cache.
+        if let Some(source) = repo_source(e) {
+            match ignore_action(
+                args.everyone,
+                kept,
+                since_head.is_none(),
+                is_github_cache(dir, e),
+            ) {
+                IgnoreAction::Unignore => {
+                    if ignored.remove(&source) {
+                        println!("  {}: un-ignored (found your commits)", e.name);
+                    }
+                }
+                IgnoreAction::Ignore => {
+                    if ignored.insert(&source) {
+                        let _ = std::fs::remove_dir_all(root);
+                        println!("  {}: ignoring (no commits by you)", e.name);
+                    }
+                }
+                IgnoreAction::Keep => {}
+            }
+        }
     }
 
-    // Persist the completed repos' HEAD watermarks either way, so a graceful stop
-    // keeps its progress and the next sync resumes from there.
+    // Persist the completed repos' HEAD watermarks and the auto-ignore list either
+    // way, so a graceful stop keeps its progress and the next sync resumes from there.
     heads.save(dir)?;
+    ignored.save(dir)?;
     if interrupted {
         println!("  total:   {total} commits ingested (stopped early; rerun to continue)");
         return Ok(());
@@ -1069,6 +1105,49 @@ fn atlas_cache_dir(dir: &Path) -> PathBuf {
     dir.join("cache")
 }
 
+/// An entry's canonical slug forge source (`host/owner/repo`, lowercased) — the
+/// ignore-list key. The first id source that's a slug (contains `/`), skipping the
+/// numeric `host#id` form.
+fn repo_source(e: &RegistryEntry) -> Option<String> {
+    e.ids
+        .iter()
+        .map(|i| i.source.clone())
+        .find(|s| s.contains('/'))
+}
+
+/// Whether a target is a `--github` bare cache (under the atlas cache dir) rather
+/// than a registered local clone — so it's safe to auto-ignore and delete. A local
+/// working clone is never touched.
+fn is_github_cache(atlas_dir: &Path, e: &RegistryEntry) -> bool {
+    e.root.starts_with(atlas_cache_dir(atlas_dir))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum IgnoreAction {
+    /// Add to the ignore list (and drop its cache).
+    Ignore,
+    /// Remove from the ignore list (a me-commit was found).
+    Unignore,
+    /// Leave the ignore list unchanged.
+    Keep,
+}
+
+/// Decide the auto-ignore action for a just-walked target. Mine-only: a found
+/// me-commit (`kept >= 1`) un-ignores; a **full** walk of a github cache with zero
+/// of your commits ignores it. `--everyone` (no "mine" concept), an *incremental*
+/// walk (a 0 only means "nothing new"), and non-github / local targets all leave it.
+fn ignore_action(everyone: bool, kept: usize, full_walk: bool, github_cache: bool) -> IgnoreAction {
+    if everyone {
+        IgnoreAction::Keep
+    } else if kept >= 1 {
+        IgnoreAction::Unignore
+    } else if full_walk && github_cache {
+        IgnoreAction::Ignore
+    } else {
+        IgnoreAction::Keep
+    }
+}
+
 /// Discover every repo on the GitHub account and return a synthesized
 /// [`RegistryEntry`] per repo that isn't already a registered local clone, with its
 /// `root` pointing at a freshly ensured bare-blobless cache. Visibility comes
@@ -1080,6 +1159,9 @@ fn github_targets(
     registry: &Registry,
     cfg: &AtlasConfig,
     opts: ListOpts,
+    ignored: &IgnoredRepos,
+    full: bool,
+    everyone: bool,
 ) -> Result<Vec<RegistryEntry>> {
     let forge_config = ForgeConfig::load_or_default(
         &default_registry_path()
@@ -1108,7 +1190,7 @@ fn github_targets(
     let mut used_names: HashSet<String> = registry.repos.iter().map(|e| e.name.clone()).collect();
 
     let mut pending: Vec<RegistryEntry> = Vec::new();
-    let (mut cloned, mut already_local) = (0usize, 0usize);
+    let (mut cloned, mut already_local, mut ignored_skipped) = (0usize, 0usize, 0usize);
     // Fetching/cloning each repo is the slow part (network) — show progress over
     // the whole discovered set.
     let bar = progress_bar(repos.len() as u64, "  github: caching");
@@ -1127,6 +1209,15 @@ fn github_targets(
         {
             already_local += 1;
             continue; // a registered local clone already covers it
+        }
+        // Skip a repo previously found to have zero commits by you — no clone/fetch,
+        // and drop any stale cache. `--full` re-evaluates them; `--everyone` ingests
+        // everyone, so the "mine" ignore list doesn't apply there.
+        if !full && !everyone && ignored.contains(&slug.to_ascii_lowercase()) {
+            let _ = std::fs::remove_dir_all(bare_cache_path(&cache, r));
+            ignored_skipped += 1;
+            bar.suspend(|| println!("  ignored: {}/{}", r.owner, r.name));
+            continue;
         }
         // A new repo is cloned; an already-cached one only has its delta fetched.
         let verb = if is_cached(&cache, r) {
@@ -1174,7 +1265,8 @@ fn github_targets(
     }
     bar.finish_and_clear();
     println!(
-        "  github:  {} discovered, {cloned} cached (cloned/fetched), {already_local} already local",
+        "  github:  {} discovered, {cloned} cached (cloned/fetched), {already_local} already local, \
+         {ignored_skipped} ignored",
         repos.len()
     );
 
@@ -2922,6 +3014,67 @@ mod tests {
         check!(commits[1].files.is_empty());
         // A malformed timestamp drops the record rather than panicking.
         check!(parse_log("\u{1e}h\u{1f}notanint\u{1f}A\u{1f}a@x\u{1f}s").is_empty());
+    }
+
+    #[test]
+    fn ignore_action_truth_table() {
+        use IgnoreAction::*;
+        // mine-only, full walk, github cache, zero commits → ignore.
+        check!(ignore_action(false, 0, true, true) == Ignore);
+        // any me-commit → un-ignore, regardless of walk/cache.
+        check!(ignore_action(false, 1, true, true) == Unignore);
+        check!(ignore_action(false, 3, false, false) == Unignore);
+        // incremental (not full) zero → keep (no new commits ≠ none ever).
+        check!(ignore_action(false, 0, false, true) == Keep);
+        // a local clone (not github cache) is never auto-ignored.
+        check!(ignore_action(false, 0, true, false) == Keep);
+        // --everyone has no "mine" concept → never touch the list.
+        check!(ignore_action(true, 0, true, true) == Keep);
+    }
+
+    #[test]
+    fn repo_source_picks_the_slug_id() {
+        use glyphtrail_core::RepoId;
+        let e = RegistryEntry {
+            name: "widgets".into(),
+            root: "/x".into(),
+            alt_roots: vec![],
+            missing_since: None,
+            ids: vec![
+                RepoId {
+                    id: "n".into(),
+                    source: "github.com#123".into(), // numeric form, skipped
+                },
+                RepoId {
+                    id: "s".into(),
+                    source: "github.com/acme/widgets".into(), // the slug
+                },
+            ],
+            contributors: vec![],
+            identity: None,
+            visibility: glyphtrail_core::Visibility::Public,
+        };
+        check!(repo_source(&e).as_deref() == Some("github.com/acme/widgets"));
+    }
+
+    #[test]
+    fn is_github_cache_detects_cache_root() {
+        let atlas = std::path::Path::new("/home/u/.glyphtrail/atlas");
+        let mk = |root: &str| RegistryEntry {
+            name: "r".into(),
+            root: root.into(),
+            alt_roots: vec![],
+            missing_since: None,
+            ids: vec![],
+            contributors: vec![],
+            identity: None,
+            visibility: glyphtrail_core::Visibility::Public,
+        };
+        check!(is_github_cache(
+            atlas,
+            &mk("/home/u/.glyphtrail/atlas/cache/github.com/acme/r.git")
+        ));
+        check!(!is_github_cache(atlas, &mk("/home/u/dev/r"))); // a local clone
     }
 
     #[test]
