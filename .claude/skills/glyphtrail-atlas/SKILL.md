@@ -54,7 +54,17 @@ current built-in template, so every option stays documented:
 emails   = ["you@example.com", "you@work.com"]      # exact addresses
 domains  = ["example.com"]                           # any address @ a domain you own
 patterns = ["you+*@gmail.com", "*@*.example.com"]    # globs (* / ?) over the whole address
+bots     = ["*copilot*@users.noreply.github.com", "claude[bot]@*"]  # non-proprietary only
 ```
+
+**Bot commits on your behalf.** `bots` are glob patterns over the *author* address
+of coding agents (Copilot, Claude) whose commits count as yours — but **only in
+non-proprietary repos**, so blind bot usage on proprietary/shared work repos isn't
+swept in (mark those `proprietary` via `[repos]`). Independently, a commit that
+credits one of your `emails`/`domains`/`patterns` via a `Co-authored-by:` trailer is
+always yours, in any repo — the precise "on my behalf" signal. So a bot commit is
+yours if it's trailer-credited to you, **or** by an allowlisted bot in a
+non-proprietary repo.
 
 An address is yours if it matches any `emails` entry, an owned `domain`, or a
 `patterns` glob — all case-insensitive. Exact `emails` matching is provider-aware:

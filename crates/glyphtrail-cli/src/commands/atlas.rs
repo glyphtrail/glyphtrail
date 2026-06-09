@@ -612,10 +612,14 @@ const ATLAS_CONFIG_TEMPLATE: &str = r#"# glyphtrail atlas configuration.
 # provider-aware: a `+tag` is folded for providers with documented sub-addressing
 # (you+ci@gmail.com = you@gmail.com), and Gmail dots too (m.mayer@gmail.com =
 # mmayer@gmail.com), so listing one form covers its aliases.
+# `bots` glob author addresses whose commits count as yours (e.g. coding agents acting
+# on your behalf), but ONLY in non-proprietary repos — and a commit that credits you
+# via `Co-authored-by:` is always yours, regardless of `bots`.
 # [me]
 # emails   = ["you@example.com", "you@work.com"]      # exact addresses (provider-aware)
 # domains  = ["example.com"]                           # any address @ a domain you own
 # patterns = ["you+*@gmail.com", "*@*.example.com"]    # plus-tag aliases, subdomains
+# bots     = ["*copilot*@users.noreply.github.com", "claude[bot]@*"]   # non-proprietary only
 
 # [repos] — classify repos by name / forge-org glob, so a whole organization or
 # naming convention is treated as work without tagging each repo. Matched (case-
@@ -886,6 +890,9 @@ struct RawCommit {
     author_name: String,
     author_email: String,
     subject: String,
+    /// `Co-authored-by:` trailer emails (lowercased), so a bot/colleague commit that
+    /// credits one of my `[me]` addresses still counts as mine.
+    co_author_emails: Vec<String>,
     files: Vec<String>,
 }
 
@@ -2704,14 +2711,16 @@ fn gather_commits(
     until: Option<i64>,
 ) -> Result<Vec<RawCommit>> {
     // A record separator (\x1e) starts each commit; unit separators (\x1f)
-    // delimit its fields. The touched files follow on their own lines until the
-    // next record separator, so the layout survives any byte in a subject.
+    // delimit its fields. The last field is the `Co-authored-by` trailer emails,
+    // group-separated (\x1d) and kept inline (valueonly), so they don't disturb the
+    // `--name-only` file lines that follow. The touched files follow on their own
+    // lines until the next record separator, so the layout survives any subject.
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(root).args([
         "log",
         "--no-merges",
         "--name-only",
-        "--pretty=format:%x1e%H%x1f%ct%x1f%an%x1f%ae%x1f%s",
+        "--pretty=format:%x1e%H%x1f%ct%x1f%an%x1f%ae%x1f%s%x1f%(trailers:key=Co-authored-by,valueonly,separator=%x1d)",
     ]);
     if let Some(s) = since {
         cmd.arg(format!("--since=@{s}"));
@@ -2767,6 +2776,14 @@ fn parse_log(text: &str) -> Vec<RawCommit> {
             let author_name = f.next()?.to_string();
             let author_email = f.next()?.to_string();
             let subject = f.next().unwrap_or("").to_string();
+            // `Co-authored-by` trailers: `Name <email>`, group-separated. Pull each
+            // `<…>` email out (lowercased); skip any without an address.
+            let co_author_emails = f
+                .next()
+                .unwrap_or("")
+                .split('\u{1d}')
+                .filter_map(parse_coauthor_email)
+                .collect();
             let files = rest
                 .lines()
                 .map(str::trim)
@@ -2779,10 +2796,20 @@ fn parse_log(text: &str) -> Vec<RawCommit> {
                 author_name,
                 author_email,
                 subject,
+                co_author_emails,
                 files,
             })
         })
         .collect()
+}
+
+/// Extract the lowercased email from a `Co-authored-by` value (`Name <email>`).
+/// `None` for a value without an `<…>` address or an empty one.
+fn parse_coauthor_email(value: &str) -> Option<String> {
+    let start = value.find('<')?;
+    let end = value[start + 1..].find('>')? + start + 1;
+    let email = value[start + 1..end].trim().to_ascii_lowercase();
+    (!email.is_empty()).then_some(email)
 }
 
 /// Whether `t` (unix seconds) is inside the inclusive `[since, until]` bounds
@@ -2848,7 +2875,14 @@ fn build_repo_graph(
     let me_id = NodeId::derive(&["identity", "me"]);
 
     for c in commits {
-        let mine = me.matches(&c.author_email);
+        // A commit is mine when: I authored it; I'm credited via `Co-authored-by`
+        // (precise — works even in shared repos); or an allowlisted bot authored it
+        // in a non-proprietary repo (so blind bot usage on proprietary/shared repos
+        // isn't swept in).
+        let mine = me.matches(&c.author_email)
+            || c.co_author_emails.iter().any(|ca| me.matches(ca))
+            || (me.bot_matches(&c.author_email)
+                && e.visibility != glyphtrail_core::Visibility::Proprietary);
         if !everyone && !mine {
             skipped += 1;
             continue;
@@ -2998,9 +3032,11 @@ mod tests {
 
     #[test]
     fn parse_log_reads_fields_and_touched_files() {
-        // Two commits; the first touches two files, the second none. Fields are
-        // unit-separated, commits record-separated, exactly as `git log` emits.
-        let text = "\u{1e}abc\u{1f}1700000000\u{1f}Ada\u{1f}ada@x.dev\u{1f}Add parser\n\
+        // Two commits; the first touches two files + carries two co-authors, the
+        // second none. Fields are unit-separated, co-authors group-separated (\x1d),
+        // commits record-separated, exactly as `git log` emits.
+        let text = "\u{1e}abc\u{1f}1700000000\u{1f}Ada\u{1f}ada@x.dev\u{1f}Add parser\
+                    \u{1f}Bot <BOT@x.dev>\u{1d}Eve <eve@y.dev>\n\
                     src/lib.rs\nsrc/main.rs\n\
                     \u{1e}def\u{1f}1699999999\u{1f}Grace\u{1f}grace@y.dev\u{1f}Init";
         let commits = parse_log(text);
@@ -3009,8 +3045,10 @@ mod tests {
         check!(commits[0].committed_at == 1_700_000_000);
         check!(commits[0].author_email == "ada@x.dev");
         check!(commits[0].subject == "Add parser");
+        check!(commits[0].co_author_emails == vec!["bot@x.dev", "eve@y.dev"]); // lowercased
         check!(commits[0].files == vec!["src/lib.rs", "src/main.rs"]);
         check!(commits[1].hash == "def");
+        check!(commits[1].co_author_emails.is_empty()); // no 6th field
         check!(commits[1].files.is_empty());
         // A malformed timestamp drops the record rather than panicking.
         check!(parse_log("\u{1e}h\u{1f}notanint\u{1f}A\u{1f}a@x\u{1f}s").is_empty());
@@ -3212,6 +3250,67 @@ mod tests {
     }
 
     #[test]
+    fn build_repo_graph_bot_and_coauthor_attribution() {
+        let me = MeConfig {
+            emails: vec!["ada@x.dev".into()],
+            bots: vec!["*copilot*@users.noreply.github.com".into()],
+            ..Default::default()
+        };
+        let entry = |vis: glyphtrail_core::Visibility| RegistryEntry {
+            name: "proj".into(),
+            root: "/tmp/proj".into(),
+            alt_roots: vec![],
+            missing_since: None,
+            ids: vec![],
+            contributors: vec![],
+            identity: None,
+            visibility: vis,
+        };
+        let bot = "copilot@users.noreply.github.com";
+        let bot_commit = raw("c1", 1_500_000_000, "Copilot", bot, "bot work", &["a.rs"]);
+        let mut credited = raw(
+            "c2",
+            1_500_000_100,
+            "Stranger",
+            "eve@evil.dev",
+            "for me",
+            &["b.rs"],
+        );
+        credited.co_author_emails = vec!["ada@x.dev".into()]; // credits me via trailer
+        let stranger = raw(
+            "c3",
+            1_500_000_200,
+            "Eve",
+            "eve@evil.dev",
+            "theirs",
+            &["c.rs"],
+        );
+        let commits = vec![bot_commit, credited, stranger];
+
+        // Private (non-proprietary): allowlisted bot kept, co-author-credited kept,
+        // stranger skipped → 2 kept.
+        let (_, _, kept, skipped) = build_repo_graph(
+            &entry(glyphtrail_core::Visibility::Private),
+            &commits,
+            &me,
+            false,
+            (None, None),
+        );
+        check!(kept == 2 && skipped == 1);
+
+        // Proprietary: the bot path is gated off, but a co-author credit still counts
+        // → only the credited commit is kept.
+        let (_, _, kept, skipped) = build_repo_graph(
+            &entry(glyphtrail_core::Visibility::Proprietary),
+            &commits,
+            &me,
+            false,
+            (None, None),
+        );
+        check!(kept == 1 && skipped == 2);
+    }
+
+    #[test]
     fn truncate_caps_and_ellipsizes() {
         check!(truncate("short", 20) == "short");
         check!(truncate("0123456789", 5) == "0123…");
@@ -3317,6 +3416,7 @@ mod tests {
             author_name: name.into(),
             author_email: email.into(),
             subject: subject.into(),
+            co_author_emails: vec![],
             files: files.iter().map(|f| f.to_string()).collect(),
         }
     }
