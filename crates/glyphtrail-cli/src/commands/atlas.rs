@@ -1109,15 +1109,14 @@ fn github_targets(
 
     let mut pending: Vec<RegistryEntry> = Vec::new();
     let (mut cloned, mut already_local) = (0usize, 0usize);
-    // Cloning each uncloned repo is the slow part (network) — show progress over
+    // Fetching/cloning each repo is the slow part (network) — show progress over
     // the whole discovered set.
-    let bar = progress_bar(repos.len() as u64, "  github: cloning");
+    let bar = progress_bar(repos.len() as u64, "  github: caching");
     for r in &repos {
         if crate::interrupt::requested() {
             bar.suspend(|| println!("  github:  interrupted during discovery"));
             break;
         }
-        bar.set_message(format!("{}/{}", r.owner, r.name));
         bar.inc(1);
         let slug = format!("{}/{}/{}", r.host, r.owner, r.name);
         let numeric_src = r.numeric_id.as_ref().map(|n| format!("{}#{}", r.host, n));
@@ -1129,6 +1128,13 @@ fn github_targets(
             already_local += 1;
             continue; // a registered local clone already covers it
         }
+        // A new repo is cloned; an already-cached one only has its delta fetched.
+        let verb = if is_cached(&cache, r) {
+            "fetching"
+        } else {
+            "cloning"
+        };
+        bar.set_message(format!("{verb} {}/{}", r.owner, r.name));
         let root = match ensure_bare_cache(&cache, r) {
             Ok(p) => p,
             Err(err) => {
@@ -1168,7 +1174,7 @@ fn github_targets(
     }
     bar.finish_and_clear();
     println!(
-        "  github:  {} discovered, {cloned} via cache, {already_local} already local",
+        "  github:  {} discovered, {cloned} cached (cloned/fetched), {already_local} already local",
         repos.len()
     );
 
