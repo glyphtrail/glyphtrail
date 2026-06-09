@@ -42,6 +42,11 @@ re-evaluate the ignored ones. The list is mine-only (not used under `--everyone`
 never includes a registered local clone, and is hand-editable (add a source to
 force-ignore). A `[window]` scopes "zero contributions" to the window.
 
+`--cache-all` additionally keeps a blobless cache of repos you already have locally,
+so `~/.glyphtrail/atlas/cache/` becomes a history backup of *all* your repos in one
+place (it's bare/blobless — history + trees, not file contents). Backup-only: the
+local clone is still what's ingested. Auto-ignored repos stay excluded.
+
 ## Identity (`[me]`) and interruption
 
 `atlas sync` keeps only **your** commits by default (`--everyone` for all authors).
@@ -112,7 +117,7 @@ clear it with `glyphtrail atlas unlock`.
 ```bash
 glyphtrail atlas init                 # create the store (idempotent)
 glyphtrail atlas sync [--everyone]    # ingest git history (mine-only by default)
-glyphtrail atlas sync --github [--orgs a,b --all-orgs --collaborator --no-forks]  # + your GitHub repos
+glyphtrail atlas sync --github [--orgs a,b --all-orgs --collaborator --no-forks --cache-all]  # + your GitHub repos
 glyphtrail atlas unlock               # clear a stale write-lock (after a crash)
 glyphtrail atlas status               # store + embedding state
 glyphtrail atlas timeline | topics | story   # browse / narrate the history
