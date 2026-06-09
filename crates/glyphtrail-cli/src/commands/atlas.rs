@@ -2576,7 +2576,10 @@ fn git_head(root: &Path) -> Option<String> {
         .ok()
         .filter(|o| o.status.success())?;
     let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!head.is_empty()).then_some(head)
+    // A bare empty repo makes `rev-parse HEAD` exit 0 and echo the literal "HEAD"
+    // (not a commit). Accept only a real hex sha, so an unborn/empty repo yields
+    // None and is skipped — never saved as a bogus "HEAD" watermark.
+    (!head.is_empty() && head.bytes().all(|b| b.is_ascii_hexdigit())).then_some(head)
 }
 
 /// The user's configured git email (`git config --get user.email`), the
@@ -2623,12 +2626,25 @@ fn gather_commits(
     }
     let out = cmd.output().map_err(|e| anyhow!("running git log: {e}"))?;
     if !out.status.success() {
-        bail!(
-            "git log failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // An empty / unborn repo (no commits on the current branch) is not a
+        // failure — there is simply nothing to ingest. Common with `--github`,
+        // which clones placeholder repos that were never pushed to.
+        if is_empty_repo(&stderr) {
+            return Ok(Vec::new());
+        }
+        bail!("git log failed: {}", stderr.trim());
     }
     Ok(parse_log(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Whether a `git log` failure means the repo simply has no commits (an empty or
+/// unborn branch), rather than a real error.
+fn is_empty_repo(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    s.contains("does not have any commits yet")
+        || s.contains("bad default revision")
+        || s.contains("bad revision 'head'")
 }
 
 /// Whether a `gather_commits` error is git rejecting the `<head>..HEAD` range
@@ -2900,6 +2916,43 @@ mod tests {
         check!(commits[1].files.is_empty());
         // A malformed timestamp drops the record rather than panicking.
         check!(parse_log("\u{1e}h\u{1f}notanint\u{1f}A\u{1f}a@x\u{1f}s").is_empty());
+    }
+
+    #[test]
+    fn is_empty_repo_recognizes_unborn_and_skips_real_errors() {
+        check!(is_empty_repo(
+            "fatal: your current branch 'main' does not have any commits yet"
+        ));
+        check!(is_empty_repo("fatal: bad default revision 'HEAD'"));
+        check!(is_empty_repo("fatal: bad revision 'HEAD'"));
+        // A genuine error must still propagate.
+        check!(!is_empty_repo("fatal: bad object 0123abc"));
+        check!(!is_empty_repo("fatal: not a git repository"));
+    }
+
+    #[test]
+    fn git_head_rejects_bare_empty_repo_literal_head() {
+        // A bare empty repo's `rev-parse HEAD` exits 0 echoing the literal "HEAD";
+        // git_head must reject it (not a sha) so the repo is skipped, not saved with
+        // a bogus "HEAD" watermark.
+        let dir = std::env::temp_dir().join(format!(
+            "gt-empty-head-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let ok = std::process::Command::new("git")
+            .args(["init", "--bare", "-q"])
+            .arg(&dir)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            check!(git_head(&dir) == None);
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
