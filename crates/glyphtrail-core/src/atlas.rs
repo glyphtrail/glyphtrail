@@ -5,7 +5,7 @@
 //! commands in the CLI. Atlas writes only under `~/.glyphtrail/atlas/` — no
 //! network, no export.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -700,6 +700,67 @@ impl AtlasHeads {
     }
 }
 
+/// Repos `atlas sync --github` should skip: ones found to have **zero commits by
+/// any `[me]` email**, recorded so a later scan doesn't re-clone/re-walk them
+/// (#nnn). Keyed by canonical forge source (`host/owner/repo`). Persisted as
+/// `~/.glyphtrail/atlas/ignored.toml` — human-inspectable, and hand-editable to
+/// force an ignore. Self-correcting: finding any `me` commit removes a repo here.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct IgnoredRepos {
+    #[serde(default)]
+    pub repos: BTreeSet<String>,
+}
+
+impl IgnoredRepos {
+    /// Load `ignored.toml` from `atlas_dir`; empty when absent.
+    pub fn load(atlas_dir: &Path) -> crate::Result<IgnoredRepos> {
+        let path = atlas_dir.join("ignored.toml");
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                toml::from_str(&text).map_err(|source| crate::error::CoreError::ConfigParse {
+                    path,
+                    source: Box::new(source),
+                })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(IgnoredRepos::default()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Persist to `ignored.toml` under `atlas_dir`, atomically (temp + rename),
+    /// mirroring [`AtlasHeads::save`].
+    pub fn save(&self, atlas_dir: &Path) -> crate::Result<()> {
+        let path = atlas_dir.join("ignored.toml");
+        let toml =
+            toml::to_string_pretty(self).map_err(|e| crate::error::CoreError::ConfigInvalid {
+                path: path.clone(),
+                message: e.to_string(),
+            })?;
+        let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
+        std::fs::write(&tmp, toml)?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
+    pub fn contains(&self, source: &str) -> bool {
+        self.repos.contains(source)
+    }
+
+    /// Mark `source` ignored. Returns whether it was newly added.
+    pub fn insert(&mut self, source: &str) -> bool {
+        self.repos.insert(source.to_string())
+    }
+
+    /// Un-ignore `source`. Returns whether it had been ignored.
+    pub fn remove(&mut self, source: &str) -> bool {
+        self.repos.remove(source)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.repos.is_empty()
+    }
+}
+
 /// `[window]` — the optional global date bounds on what atlas indexes. Absent
 /// keys mean no bound on that side.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -1120,6 +1181,39 @@ mod tests {
         heads.set("repo", "deadbeef");
         heads.save(&dir).unwrap();
         check!(AtlasHeads::load(&dir).unwrap().get("repo") == Some("deadbeef"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ignored_repos_round_trip() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("gt-atlas-ignored-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        check!(IgnoredRepos::load(&dir).unwrap().is_empty());
+
+        let mut ig = IgnoredRepos::default();
+        check!(ig.insert("github.com/acme/widgets"));
+        check!(!ig.insert("github.com/acme/widgets")); // already present
+        ig.insert("github.com/acme/gizmos");
+        ig.save(&dir).unwrap();
+
+        let loaded = IgnoredRepos::load(&dir).unwrap();
+        check!(loaded.contains("github.com/acme/widgets"));
+        check!(loaded.contains("github.com/acme/gizmos"));
+        check!(!loaded.contains("github.com/acme/other"));
+
+        // Un-ignore (the "found a me-commit" path) drops it.
+        let mut loaded = loaded;
+        check!(loaded.remove("github.com/acme/widgets"));
+        loaded.save(&dir).unwrap();
+        check!(
+            !IgnoredRepos::load(&dir)
+                .unwrap()
+                .contains("github.com/acme/widgets")
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }
