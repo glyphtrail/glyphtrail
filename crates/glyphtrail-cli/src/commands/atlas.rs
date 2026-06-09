@@ -428,6 +428,11 @@ pub struct SyncArgs {
     /// With `--github`, skip archived repos.
     #[arg(long)]
     pub no_archived: bool,
+    /// With `--github`, also keep a (blobless) cache of repos you already have
+    /// locally, so the cache backs up all your repos in one place. Backup-only —
+    /// the local clone is still what's ingested. Auto-ignored repos stay excluded.
+    #[arg(long)]
+    pub cache_all: bool,
 }
 
 /// `~/.glyphtrail/atlas/`, or an error when no home directory is set.
@@ -983,8 +988,11 @@ fn sync(dir: &Path, args: SyncArgs) -> Result<()> {
             &cfg,
             opts,
             &ignored,
-            args.full,
-            args.everyone,
+            GithubMode {
+                full: args.full,
+                everyone: args.everyone,
+                cache_all: args.cache_all,
+            },
         )?);
     }
     if let Some(name) = &args.repo {
@@ -1161,15 +1169,28 @@ fn ignore_action(everyone: bool, kept: usize, full_walk: bool, github_cache: boo
 /// straight from the API's `private` flag, then `[repos]` globs are applied (same
 /// as `atlas_registry`). Deduped against the registry by forge id; a remote whose
 /// name collides with a different local repo is qualified as `owner/name`.
+/// Sync-mode flags that shape `--github` caching (separate from the discovery
+/// `ListOpts`): `full` re-evaluates ignored repos, `everyone` disables the mine-only
+/// ignore list, `cache_all` also backs up locally-cloned repos.
+struct GithubMode {
+    full: bool,
+    everyone: bool,
+    cache_all: bool,
+}
+
 fn github_targets(
     dir: &Path,
     registry: &Registry,
     cfg: &AtlasConfig,
     opts: ListOpts,
     ignored: &IgnoredRepos,
-    full: bool,
-    everyone: bool,
+    mode: GithubMode,
 ) -> Result<Vec<RegistryEntry>> {
+    let GithubMode {
+        full,
+        everyone,
+        cache_all,
+    } = mode;
     let forge_config = ForgeConfig::load_or_default(
         &default_registry_path()
             .map(|p| p.with_file_name("forge.toml"))
@@ -1197,7 +1218,8 @@ fn github_targets(
     let mut used_names: HashSet<String> = registry.repos.iter().map(|e| e.name.clone()).collect();
 
     let mut pending: Vec<RegistryEntry> = Vec::new();
-    let (mut cloned, mut already_local, mut ignored_skipped) = (0usize, 0usize, 0usize);
+    let (mut cloned, mut already_local, mut ignored_skipped, mut backed_up) =
+        (0usize, 0usize, 0usize, 0usize);
     // Fetching/cloning each repo is the slow part (network) — show progress over
     // the whole discovered set.
     let bar = progress_bar(repos.len() as u64, "  github: caching");
@@ -1215,6 +1237,15 @@ fn github_targets(
                 .is_some_and(|s| known_ids.contains(s))
         {
             already_local += 1;
+            // `--cache-all`: keep a blobless cache of locally-cloned repos too, so the
+            // cache backs up all your repos in one place. Backup-only — the local
+            // clone is still the ingest source, so this isn't added as a target.
+            if cache_all {
+                bar.set_message(format!("backing up {}/{}", r.owner, r.name));
+                if ensure_bare_cache(&cache, r).is_ok() {
+                    backed_up += 1;
+                }
+            }
             continue; // a registered local clone already covers it
         }
         // Skip a repo previously found to have zero commits by you — no clone/fetch,
@@ -1271,8 +1302,13 @@ fn github_targets(
         });
     }
     bar.finish_and_clear();
+    let backup = if cache_all {
+        format!(" ({backed_up} backed up)")
+    } else {
+        String::new()
+    };
     println!(
-        "  github:  {} discovered, {cloned} cached (cloned/fetched), {already_local} already local, \
+        "  github:  {} discovered, {cloned} cached (cloned/fetched), {already_local} already local{backup}, \
          {ignored_skipped} ignored",
         repos.len()
     );
