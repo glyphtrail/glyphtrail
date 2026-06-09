@@ -494,6 +494,13 @@ pub struct MeConfig {
     /// one char), e.g. `me+*@gmail.com` or `*@*.example.com`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub patterns: Vec<String>,
+    /// Bot author identities (glob patterns over the author address) whose commits
+    /// count as mine — e.g. `*copilot*@users.noreply.github.com`, `claude[bot]@*`.
+    /// Bots are *supplementary* (they don't make `is_set` true on their own) and are
+    /// only honoured in non-proprietary repos; a commit that credits one of my
+    /// `emails`/`domains`/`patterns` via `Co-authored-by` is mine regardless.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bots: Vec<String>,
 }
 
 impl MeConfig {
@@ -526,6 +533,13 @@ impl MeConfig {
             .any(|p| glob_match_ci(p.trim(), &email))
     }
 
+    /// Whether `email` is one of my configured bot identities (`bots` globs over the
+    /// author address). Caller gates this on repo visibility (non-proprietary only).
+    pub fn bot_matches(&self, email: &str) -> bool {
+        let email = email.trim().to_ascii_lowercase();
+        self.bots.iter().any(|p| glob_match_ci(p.trim(), &email))
+    }
+
     /// A display address for my unified identity: the first configured email, the
     /// first pattern, or `me@<first domain>` when only domains are known.
     pub fn display(&self) -> Option<String> {
@@ -550,6 +564,7 @@ impl MeConfig {
             .cloned()
             .chain(self.domains.iter().map(|d| format!("@{d}")))
             .chain(self.patterns.iter().cloned())
+            .chain(self.bots.iter().map(|b| format!("bot:{b}")))
             .collect();
         Some(parts.join(", "))
     }
@@ -978,13 +993,42 @@ mod tests {
             emails: vec!["a@x.com".into(), "b@y.com".into()],
             domains: vec!["mine.dev".into()],
             patterns: vec!["me+*@gmail.com".into()],
+            bots: vec!["claude[bot]@*".into()],
         };
-        // All three groups are named, so the matched scope is transparent — not
-        // reduced to the single representative `display` address.
-        check!(me.summary().as_deref() == Some("a@x.com, b@y.com, @mine.dev, me+*@gmail.com"));
+        // Every group is named, so the matched scope is transparent — not reduced to
+        // the single representative `display` address.
+        check!(
+            me.summary().as_deref()
+                == Some("a@x.com, b@y.com, @mine.dev, me+*@gmail.com, bot:claude[bot]@*")
+        );
         check!(me.display().as_deref() == Some("a@x.com")); // still just the first
         // Nothing configured → no summary.
         check!(MeConfig::default().summary() == None);
+        // Bots alone don't make an identity (sync still can't tell who you are).
+        let bots_only = MeConfig {
+            bots: vec!["*@bots.dev".into()],
+            ..Default::default()
+        };
+        check!(!bots_only.is_set());
+        check!(bots_only.summary() == None);
+    }
+
+    #[test]
+    fn me_bot_matches_globs_the_author_address() {
+        let me = MeConfig {
+            bots: vec![
+                "*copilot*@users.noreply.github.com".into(),
+                "claude[bot]@*".into(),
+            ],
+            ..Default::default()
+        };
+        check!(me.bot_matches("Copilot@users.noreply.github.com")); // case-insensitive
+        check!(me.bot_matches("198982749+copilot@users.noreply.github.com"));
+        check!(me.bot_matches("claude[bot]@anthropic.com"));
+        check!(!me.bot_matches("me@example.com")); // a human isn't a bot
+        check!(!me.bot_matches("dependabot[bot]@users.noreply.github.com"));
+        // bot_matches is independent of matches (different list).
+        check!(!me.matches("copilot@users.noreply.github.com"));
     }
 
     #[test]
