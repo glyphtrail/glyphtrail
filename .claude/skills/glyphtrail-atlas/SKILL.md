@@ -47,6 +47,14 @@ so `~/.glyphtrail/atlas/cache/` becomes a history backup of *all* your repos in 
 place (it's bare/blobless — history + trees, not file contents). Backup-only: the
 local clone is still what's ingested. Auto-ignored repos stay excluded.
 
+`--checkout` additionally shallow-clones each github repo's HEAD working tree
+(`git clone --depth 1`, recorded in `checkouts.json`) so the embedding **digest**
+can read its *code state* — the README + the manifest's description and declared
+deps — not just its commit history. (The bare blobless cache still supplies the full
+history for the timeline; the checkout is only HEAD.) It costs HEAD file contents on
+disk; full structural analysis of the checkout isn't run (yet). Auto-ignored repos'
+checkouts are removed.
+
 ## Identity (`[me]`) and interruption
 
 `atlas sync` keeps only **your** commits by default (`--everyone` for all authors).
@@ -117,7 +125,7 @@ clear it with `glyphtrail atlas unlock`.
 ```bash
 glyphtrail atlas init                 # create the store (idempotent)
 glyphtrail atlas sync [--everyone]    # ingest git history (mine-only by default)
-glyphtrail atlas sync --github [--orgs a,b --all-orgs --collaborator --no-forks --cache-all]  # + your GitHub repos
+glyphtrail atlas sync --github [--orgs a,b --all-orgs --collaborator --no-forks --cache-all --checkout]  # + your GitHub repos
 glyphtrail atlas unlock               # clear a stale write-lock (after a crash)
 glyphtrail atlas status               # store + embedding state
 glyphtrail atlas timeline | topics | story   # browse / narrate the history

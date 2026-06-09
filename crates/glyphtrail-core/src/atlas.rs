@@ -776,6 +776,58 @@ impl IgnoredRepos {
     }
 }
 
+/// HEAD working-tree checkouts of `--github --checkout` repos, keyed by their atlas
+/// repo **name** → the checkout directory. The bridge `embed` uses to find a github
+/// repo's README/manifest at digest time, since these repos aren't in the registry.
+/// Persisted as `~/.glyphtrail/atlas/checkouts.json`, mirroring [`AtlasHeads`].
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct Checkouts {
+    #[serde(default)]
+    pub paths: BTreeMap<String, PathBuf>,
+}
+
+impl Checkouts {
+    /// Load `checkouts.json` from `atlas_dir`; empty when absent.
+    pub fn load(atlas_dir: &Path) -> crate::Result<Checkouts> {
+        let path = atlas_dir.join("checkouts.json");
+        match std::fs::read_to_string(&path) {
+            Ok(text) => serde_json::from_str(&text)
+                .map_err(|source| crate::error::CoreError::RegistryParse { path, source }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Checkouts::default()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Persist to `checkouts.json` under `atlas_dir`, atomically (temp + rename),
+    /// mirroring [`AtlasHeads::save`].
+    pub fn save(&self, atlas_dir: &Path) -> crate::Result<()> {
+        let path = atlas_dir.join("checkouts.json");
+        let json = serde_json::to_string_pretty(self).map_err(|source| {
+            crate::error::CoreError::RegistryParse {
+                path: path.clone(),
+                source,
+            }
+        })?;
+        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        std::fs::write(&tmp, json)?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
+    /// The checkout dir for `name`, if any.
+    pub fn get(&self, name: &str) -> Option<&Path> {
+        self.paths.get(name).map(PathBuf::as_path)
+    }
+
+    pub fn set(&mut self, name: &str, dir: PathBuf) {
+        self.paths.insert(name.to_string(), dir);
+    }
+
+    pub fn remove(&mut self, name: &str) {
+        self.paths.remove(name);
+    }
+}
+
 /// `[window]` — the optional global date bounds on what atlas indexes. Absent
 /// keys mean no bound on that side.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -1225,6 +1277,30 @@ mod tests {
         heads.set("repo", "deadbeef");
         heads.save(&dir).unwrap();
         check!(AtlasHeads::load(&dir).unwrap().get("repo") == Some("deadbeef"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn checkouts_round_trip() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("gt-atlas-checkouts-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        check!(Checkouts::load(&dir).unwrap().get("r").is_none());
+
+        let mut c = Checkouts::default();
+        c.set("widgets", PathBuf::from("/cache/github.com/acme/widgets"));
+        c.save(&dir).unwrap();
+        let loaded = Checkouts::load(&dir).unwrap();
+        check!(loaded.get("widgets") == Some(Path::new("/cache/github.com/acme/widgets")));
+        check!(loaded.get("other").is_none());
+
+        let mut loaded = loaded;
+        loaded.remove("widgets");
+        loaded.save(&dir).unwrap();
+        check!(Checkouts::load(&dir).unwrap().get("widgets").is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 
