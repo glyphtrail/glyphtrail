@@ -13,10 +13,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand};
 use glyphtrail_core::config::RepoPaths;
 use glyphtrail_core::{
-    AtlasConfig, AtlasHeads, CodeGraph, CommitMeta, Confidence, EdgeKind, Embedding, GraphEmbedder,
-    GraphProfile, IgnoredRepos, MeConfig, Node, NodeId, NodeKind, Registry, RegistryEntry,
-    StructuralEmbedder, TimelineQuery, Window, author_scope_label, default_atlas_path,
-    default_registry_path, filelock, filter_timeline, format_date, scrub_secrets, timeline_value,
+    AtlasConfig, AtlasHeads, Checkouts, CodeGraph, CommitMeta, Confidence, EdgeKind, Embedding,
+    GraphEmbedder, GraphProfile, IgnoredRepos, MeConfig, Node, NodeId, NodeKind, Registry,
+    RegistryEntry, StructuralEmbedder, TimelineQuery, Window, author_scope_label,
+    default_atlas_path, default_registry_path, filelock, filter_timeline, format_date,
+    scrub_secrets, timeline_value,
 };
 use glyphtrail_forge_id::{
     ForgeConfig, ListOpts, RemoteRepo, forge_numeric_repo_id, list_account_repos, repo_ids,
@@ -433,6 +434,11 @@ pub struct SyncArgs {
     /// the local clone is still what's ingested. Auto-ignored repos stay excluded.
     #[arg(long)]
     pub cache_all: bool,
+    /// With `--github`, also check out each repo's HEAD working tree so embeddings
+    /// can read its README + declared dependencies (its "code state"), not just its
+    /// commit history. Costs HEAD file contents on disk (more than the blobless cache).
+    #[arg(long)]
+    pub checkout: bool,
 }
 
 /// `~/.glyphtrail/atlas/`, or an error when no home directory is set.
@@ -963,6 +969,9 @@ fn sync(dir: &Path, args: SyncArgs) -> Result<()> {
     // Repos found to have zero commits by you are remembered here so a later
     // `--github` scan skips them without re-cloning (#nnn). Self-correcting below.
     let mut ignored = IgnoredRepos::load(dir)?;
+    // HEAD checkouts (`--checkout`): name → working-tree dir, so `embed` can read a
+    // github repo's README/manifests even though it isn't in the registry.
+    let mut checkouts = Checkouts::load(dir)?;
     let mut targets: Vec<RegistryEntry> = registry.repos.clone();
     if args.github {
         let opts = ListOpts {
@@ -988,10 +997,12 @@ fn sync(dir: &Path, args: SyncArgs) -> Result<()> {
             &cfg,
             opts,
             &ignored,
+            &mut checkouts,
             GithubMode {
                 full: args.full,
                 everyone: args.everyone,
                 cache_all: args.cache_all,
+                checkout: args.checkout,
             },
         )?);
     }
@@ -1079,6 +1090,11 @@ fn sync(dir: &Path, args: SyncArgs) -> Result<()> {
                 IgnoreAction::Ignore => {
                     if ignored.insert(&source) {
                         let _ = std::fs::remove_dir_all(root);
+                        // Drop its HEAD checkout too, if any (`--checkout`).
+                        if let Some(hd) = checkouts.get(&e.name) {
+                            let _ = std::fs::remove_dir_all(hd);
+                        }
+                        checkouts.remove(&e.name);
                         println!("  {}: ignoring (no commits by you)", e.name);
                     }
                 }
@@ -1091,6 +1107,7 @@ fn sync(dir: &Path, args: SyncArgs) -> Result<()> {
     // way, so a graceful stop keeps its progress and the next sync resumes from there.
     heads.save(dir)?;
     ignored.save(dir)?;
+    checkouts.save(dir)?;
     if interrupted {
         println!("  total:   {total} commits ingested (stopped early; rerun to continue)");
         return Ok(());
@@ -1137,6 +1154,18 @@ fn is_github_cache(atlas_dir: &Path, e: &RegistryEntry) -> bool {
     e.root.starts_with(atlas_cache_dir(atlas_dir))
 }
 
+/// The working dir to build a repo's digest from: its registered local clone if any,
+/// else its `--checkout` HEAD working tree (github repos aren't in the registry).
+/// `None` → the digest falls back to commit-rows only.
+fn digest_root(registry: &Registry, checkouts: &Checkouts, name: &str) -> Option<PathBuf> {
+    registry
+        .repos
+        .iter()
+        .find(|e| e.name == name)
+        .map(|e| e.active_root().to_path_buf())
+        .or_else(|| checkouts.get(name).map(Path::to_path_buf))
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum IgnoreAction {
     /// Add to the ignore list (and drop its cache).
@@ -1171,11 +1200,13 @@ fn ignore_action(everyone: bool, kept: usize, full_walk: bool, github_cache: boo
 /// name collides with a different local repo is qualified as `owner/name`.
 /// Sync-mode flags that shape `--github` caching (separate from the discovery
 /// `ListOpts`): `full` re-evaluates ignored repos, `everyone` disables the mine-only
-/// ignore list, `cache_all` also backs up locally-cloned repos.
+/// ignore list, `cache_all` also backs up locally-cloned repos, `checkout` also
+/// materializes each repo's HEAD working tree for the digest.
 struct GithubMode {
     full: bool,
     everyone: bool,
     cache_all: bool,
+    checkout: bool,
 }
 
 fn github_targets(
@@ -1184,12 +1215,14 @@ fn github_targets(
     cfg: &AtlasConfig,
     opts: ListOpts,
     ignored: &IgnoredRepos,
+    checkouts: &mut Checkouts,
     mode: GithubMode,
 ) -> Result<Vec<RegistryEntry>> {
     let GithubMode {
         full,
         everyone,
         cache_all,
+        checkout,
     } = mode;
     let forge_config = ForgeConfig::load_or_default(
         &default_registry_path()
@@ -1285,6 +1318,17 @@ fn github_targets(
             r.name.clone()
         };
         used_names.insert(name.clone());
+        // --checkout: materialize HEAD so the digest can read this repo's README +
+        // declared deps (its code state), not just commit history. Best-effort;
+        // recorded by atlas name so `embed` can find it (these repos aren't registered).
+        if checkout {
+            match ensure_head_checkout(&cache, r) {
+                Some(head_dir) => {
+                    checkouts.set(&name, head_dir);
+                }
+                None => checkouts.remove(&name),
+            }
+        }
         let visibility = if r.private {
             glyphtrail_core::Visibility::Private
         } else {
@@ -1339,6 +1383,44 @@ fn bare_cache_path(cache_dir: &Path, repo: &RemoteRepo) -> PathBuf {
 /// discovery so brand-new repos are cloned before already-cached ones are fetched.
 fn is_cached(cache_dir: &Path, repo: &RemoteRepo) -> bool {
     bare_cache_path(cache_dir, repo).join("HEAD").exists()
+}
+
+/// Where a repo's HEAD working-tree checkout lives (`--checkout`): a plain dir beside
+/// the bare cache, `cache/<host>/<owner>/<name>` (no `.git`).
+fn head_checkout_path(cache_dir: &Path, repo: &RemoteRepo) -> PathBuf {
+    cache_dir
+        .join(&repo.host)
+        .join(&repo.owner)
+        .join(&repo.name)
+}
+
+/// Materialize the repo's HEAD working tree into [`head_checkout_path`] via a
+/// **shallow** `git clone --depth 1` — only HEAD's commit + file contents, no
+/// history (the bare blobless cache already holds the full history for the
+/// timeline). Refreshed each sync (removed + re-cloned). Best-effort: an empty repo
+/// or any failure yields `None` and leaves no partial dir. SSH first, then HTTPS.
+fn ensure_head_checkout(cache_dir: &Path, repo: &RemoteRepo) -> Option<PathBuf> {
+    let dir = head_checkout_path(cache_dir, repo);
+    let _ = std::fs::remove_dir_all(&dir); // always refresh to current HEAD
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    for url in [repo.ssh_url.as_str(), repo.clone_url.as_str()] {
+        if url.is_empty() {
+            continue;
+        }
+        let ok = git_command()
+            .args(["clone", "--depth", "1", "--quiet", url])
+            .arg(&dir)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
+            return Some(dir);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    None
 }
 
 fn ensure_bare_cache(cache_dir: &Path, repo: &RemoteRepo) -> Result<PathBuf> {
@@ -1593,13 +1675,8 @@ fn embed(dir: &Path, args: EmbedArgs) -> Result<()> {
     for row in &rows {
         by_repo.entry(row.repo.clone()).or_default().push(row);
     }
-    let root_of = |name: &str| -> Option<std::path::PathBuf> {
-        registry
-            .repos
-            .iter()
-            .find(|e| e.name == name)
-            .map(|e| e.active_root().clone())
-    };
+    let checkouts = Checkouts::load(dir)?;
+    let root_of = |name: &str| digest_root(&registry, &checkouts, name);
     // Building each repo's digest reads its index + README, so with many repos this
     // is the slow phase — show progress.
     let bar = progress_bar(by_repo.len() as u64, "building repo digests");
@@ -2217,13 +2294,8 @@ fn digest_cmd(dir: &Path, args: DigestArgs) -> Result<()> {
         }
         names = std::iter::once(repo.clone()).collect();
     }
-    let root_of = |name: &str| -> Option<std::path::PathBuf> {
-        registry
-            .repos
-            .iter()
-            .find(|e| e.name == name)
-            .map(|e| e.active_root().clone())
-    };
+    let checkouts = Checkouts::load(dir)?;
+    let root_of = |name: &str| digest_root(&registry, &checkouts, name);
     let empty: Vec<&glyphtrail_core::AtlasTimelineRow> = Vec::new();
     for name in &names {
         let repo_rows = by_repo.get(name).unwrap_or(&empty);
@@ -3129,6 +3201,38 @@ mod tests {
             visibility: glyphtrail_core::Visibility::Public,
         };
         check!(repo_source(&e).as_deref() == Some("github.com/acme/widgets"));
+    }
+
+    #[test]
+    fn digest_root_prefers_registry_then_checkout() {
+        let mut reg = Registry::default();
+        reg.repos.push(RegistryEntry {
+            name: "local".into(),
+            root: "/home/u/dev/local".into(),
+            alt_roots: vec![],
+            missing_since: None,
+            ids: vec![],
+            contributors: vec![],
+            identity: None,
+            visibility: glyphtrail_core::Visibility::Private,
+        });
+        let mut checkouts = glyphtrail_core::Checkouts::default();
+        checkouts.set(
+            "remote",
+            std::path::PathBuf::from("/cache/github.com/acme/remote"),
+        );
+        // Registered local clone wins.
+        check!(
+            digest_root(&reg, &checkouts, "local").as_deref()
+                == Some(Path::new("/home/u/dev/local"))
+        );
+        // Unregistered github repo → its HEAD checkout.
+        check!(
+            digest_root(&reg, &checkouts, "remote").as_deref()
+                == Some(Path::new("/cache/github.com/acme/remote"))
+        );
+        // Neither → None (digest falls back to commit rows).
+        check!(digest_root(&reg, &checkouts, "unknown") == None);
     }
 
     #[test]

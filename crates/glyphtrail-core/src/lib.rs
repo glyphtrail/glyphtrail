@@ -27,9 +27,10 @@ pub use api::{
     signature_has_literal_segment,
 };
 pub use atlas::{
-    AtlasConfig, AtlasHeads, AtlasTimelineRow, CommitMeta, IgnoredRepos, MeConfig, ReposConfig,
-    Timeline, TimelineQuery, WakaConfig, WakaStat, Window, author_matches, author_scope_label,
-    default_atlas_path, derive_topics, filter_timeline, format_date, paths_digest, timeline_value,
+    AtlasConfig, AtlasHeads, AtlasTimelineRow, Checkouts, CommitMeta, IgnoredRepos, MeConfig,
+    ReposConfig, Timeline, TimelineQuery, WakaConfig, WakaStat, Window, author_matches,
+    author_scope_label, default_atlas_path, derive_topics, filter_timeline, format_date,
+    paths_digest, timeline_value,
 };
 pub use config::{ApiConfig, Config, DynamicLanguage, SchemaFormat, SchemaSource};
 pub use dotnet::{CsprojProject, parse_csproj};
