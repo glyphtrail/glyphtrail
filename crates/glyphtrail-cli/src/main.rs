@@ -396,7 +396,10 @@ fn main() -> anyhow::Result<()> {
         Command::Cypher { query, repo } => commands::cypher::run(&repo, &query),
         Command::Wiki(args) => commands::wiki::run(args),
         Command::Story(args) => commands::story::run(args),
-        Command::Mcp { repo } => glyphtrail_mcp::serve_stdio(repo),
+        Command::Mcp { repo } => {
+            interrupt::server_mode();
+            glyphtrail_mcp::serve_stdio(repo)
+        }
         Command::Setup {
             path,
             local,

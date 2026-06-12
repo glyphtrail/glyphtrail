@@ -64,6 +64,7 @@ pub fn run(args: WikiArgs) -> Result<()> {
     // `--target serve --dry-run` browses a previously-generated wiki offline:
     // skip the graph/LLM work and just serve the existing output directory.
     if args.target == Target::Serve && args.dry_run {
+        crate::interrupt::server_mode();
         let rt = tokio::runtime::Runtime::new()?;
         return rt.block_on(glyphtrail_server::serve_wiki(
             args.output.clone(),
@@ -132,6 +133,7 @@ pub fn run(args: WikiArgs) -> Result<()> {
 
     // Serve the generated pages locally, rendering Markdown to HTML on request.
     if args.target == Target::Serve {
+        crate::interrupt::server_mode();
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(glyphtrail_server::serve_wiki(
             args.output.clone(),

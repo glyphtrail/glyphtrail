@@ -8,11 +8,18 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+static SERVER: AtomicBool = AtomicBool::new(false);
 
 /// Install the CTRL-C handler. First press requests a graceful stop; a second press
 /// aborts now. Best-effort: a failure to install just leaves the default behaviour.
 pub fn install() {
     let _ = ctrlc::set_handler(|| {
+        if SERVER.load(Ordering::SeqCst) {
+            // A long-lived server has no transaction "safe point" to reach and never
+            // polls the cooperative flag, so a single press stops it immediately.
+            eprintln!("\nshutting down");
+            std::process::exit(130);
+        }
         if INTERRUPTED.swap(true, Ordering::SeqCst) {
             // Already asked once — the user wants out now.
             eprintln!("\naborting (the database recovers from its WAL on next open)");
@@ -20,6 +27,13 @@ pub fn install() {
         }
         eprintln!("\nstopping at the next safe point — press CTRL-C again to abort immediately");
     });
+}
+
+/// Mark this process as a long-lived server (`atlas serve`, `atlas mcp`). Such
+/// commands never reach a transaction boundary to poll [`requested`], so the first
+/// CTRL-C should stop them outright instead of being swallowed by the graceful flag.
+pub fn server_mode() {
+    SERVER.store(true, Ordering::SeqCst);
 }
 
 /// Whether a graceful stop has been requested (a SIGINT was received). Long loops
