@@ -571,7 +571,10 @@ pub fn run(cmd: AtlasCmd) -> Result<()> {
         AtlasCmd::Digest(args) => digest_cmd(&dir, args)?,
         AtlasCmd::Viz(args) => viz(&dir, args)?,
         AtlasCmd::Serve(args) => viz_serve(&dir, args)?,
-        AtlasCmd::Mcp => glyphtrail_mcp::serve_atlas_stdio(dir)?,
+        AtlasCmd::Mcp => {
+            crate::interrupt::server_mode();
+            glyphtrail_mcp::serve_atlas_stdio(dir)?
+        }
         AtlasCmd::Unlock => match filelock::force_unlock(&atlas_lock_path(&dir))? {
             Some(desc) => println!("removed atlas lock ({desc})"),
             None => println!("no atlas lock held"),
@@ -2541,6 +2544,7 @@ fn viz_serve(dir: &Path, args: VizServeArgs) -> Result<()> {
     )?;
     let html = glyphtrail_viz::static_html_elements(elements);
     eprintln!("atlas viz: {repos} repos, {edges} similarity links, model {model}");
+    crate::interrupt::server_mode();
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(glyphtrail_server::serve_html(html, args.port))
 }
