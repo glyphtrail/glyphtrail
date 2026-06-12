@@ -1657,7 +1657,7 @@ fn graph_embed(dir: &Path, args: GraphEmbedArgs) -> Result<()> {
 /// (announced first), one of the few atlas functions allowed off-machine on explicit
 /// opt-in. Embeds every repo regardless of visibility (gating is at `similar` output).
 fn embed(dir: &Path, args: EmbedArgs) -> Result<()> {
-    use crate::commands::embed_provider::{EmbedConfig, embed_docs};
+    use crate::commands::embed_provider::{EmbedConfig, embed_docs_with_progress};
     let lb = ladybug_dir(dir);
     if !lb.exists() {
         bail!("atlas is disabled; run `glyphtrail atlas init` first");
@@ -1695,7 +1695,6 @@ fn embed(dir: &Path, args: EmbedArgs) -> Result<()> {
     if docs.is_empty() {
         bail!("no commits to embed; run `glyphtrail atlas sync` first");
     }
-    println!("embedding {} repo digests…", docs.len());
     let cfg = EmbedConfig {
         provider: args.provider,
         model: args.model.clone(),
@@ -1712,7 +1711,9 @@ fn embed(dir: &Path, args: EmbedArgs) -> Result<()> {
     }
     let names: Vec<String> = docs.keys().cloned().collect();
     let texts: Vec<String> = docs.values().cloned().collect();
-    let vectors = embed_docs(&cfg, &texts)?;
+    let bar = progress_bar(texts.len() as u64, "embedding repos");
+    let vectors = embed_docs_with_progress(&cfg, &texts, |done, _| bar.set_position(done as u64))?;
+    bar.finish_and_clear();
     let embeddings: Vec<Embedding> = names
         .into_iter()
         .zip(vectors)
@@ -1839,13 +1840,23 @@ fn resolve_model(store: &LadybugStore, space: &str, explicit: Option<&str>) -> R
 /// optional HNSW index on top. `local` never leaves the machine; `openai` POSTs
 /// commit subjects.
 fn embed_commits(dir: &Path, args: EmbedCommitsArgs) -> Result<()> {
-    use crate::commands::embed_provider::{EmbedConfig, embed_docs, host_of};
+    use crate::commands::embed_provider::{EmbedConfig, embed_docs_with_progress, host_of};
     let lb = ladybug_dir(dir);
     if !lb.exists() {
         bail!("atlas is disabled; run `glyphtrail atlas init` first");
     }
     let mut store = LadybugStore::open(&lb)?;
     let rows = store.atlas_timeline(None, None, None)?;
+    // One commit can surface more than once in the timeline (e.g. a duplicate
+    // `PartOf` edge); embeddings key on the commit node_id, so collapse to one row
+    // per commit — no duplicate primary key, and no paying to embed the same commit
+    // twice off-machine.
+    let rows: Vec<_> = {
+        let mut seen = std::collections::HashSet::new();
+        rows.into_iter()
+            .filter(|r| seen.insert(r.commit.node_id.0.clone()))
+            .collect()
+    };
     if rows.is_empty() {
         bail!("no commits to embed; run `glyphtrail atlas sync` first");
     }
@@ -1885,7 +1896,9 @@ fn embed_commits(dir: &Path, args: EmbedCommitsArgs) -> Result<()> {
             doc
         })
         .collect();
-    let vectors = embed_docs(&cfg, &docs)?;
+    let bar = progress_bar(docs.len() as u64, "embedding commits");
+    let vectors = embed_docs_with_progress(&cfg, &docs, |done, _| bar.set_position(done as u64))?;
+    bar.finish_and_clear();
     // Skip commits whose subject carries no signal (a zero vector has no defined
     // cosine and would poison the index).
     let embeddings: Vec<Embedding> = rows

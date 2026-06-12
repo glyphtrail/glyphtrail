@@ -115,14 +115,28 @@ pub fn config_from_stored(model_id: &str, base_url: Option<String>, dim: usize) 
 }
 
 /// Embed many documents in order. The local provider runs in-process; the
-/// OpenAI-compatible provider batches them into one request.
+/// OpenAI-compatible provider batches them into chunked requests.
 pub fn embed_docs(cfg: &EmbedConfig, docs: &[String]) -> Result<Vec<Vec<f32>>> {
+    embed_docs_with_progress(cfg, docs, |_done, _total| {})
+}
+
+/// Like [`embed_docs`], but calls `on_progress(done, total)` after each chunk — so a
+/// long off-machine run (thousands of commit subjects, dozens of requests) shows
+/// progress instead of appearing to hang.
+pub fn embed_docs_with_progress(
+    cfg: &EmbedConfig,
+    docs: &[String],
+    mut on_progress: impl FnMut(usize, usize),
+) -> Result<Vec<Vec<f32>>> {
+    let total = docs.len();
     match cfg.provider {
         EmbedProvider::Local => {
             let e = HashingEmbedder::new(cfg.dim);
-            Ok(docs.iter().map(|d| e.embed(d)).collect())
+            let out: Vec<Vec<f32>> = docs.iter().map(|d| e.embed(d)).collect();
+            on_progress(total, total);
+            Ok(out)
         }
-        EmbedProvider::Openai => openai_embed(cfg, docs),
+        EmbedProvider::Openai => openai_embed(cfg, docs, &mut on_progress),
     }
 }
 
@@ -141,7 +155,11 @@ const OPENAI_BATCH: usize = 256;
 /// Embed `docs` via an OpenAI-compatible endpoint, chunked into [`OPENAI_BATCH`]-
 /// sized requests. The key is `OPENAI_API_KEY` (optional for a local endpoint,
 /// required for a remote one).
-fn openai_embed(cfg: &EmbedConfig, docs: &[String]) -> Result<Vec<Vec<f32>>> {
+fn openai_embed(
+    cfg: &EmbedConfig,
+    docs: &[String],
+    on_progress: &mut impl FnMut(usize, usize),
+) -> Result<Vec<Vec<f32>>> {
     if docs.is_empty() {
         return Ok(Vec::new());
     }
@@ -152,9 +170,11 @@ fn openai_embed(cfg: &EmbedConfig, docs: &[String]) -> Result<Vec<Vec<f32>>> {
     if key.is_none() && !is_local_url(&url) {
         bail!("set OPENAI_API_KEY to use a remote embeddings provider (or use --provider local)");
     }
-    let mut out = Vec::with_capacity(docs.len());
+    let total = docs.len();
+    let mut out = Vec::with_capacity(total);
     for chunk in docs.chunks(OPENAI_BATCH) {
         out.extend(openai_embed_batch(cfg, &url, key.as_deref(), chunk)?);
+        on_progress(out.len(), total);
     }
     Ok(out)
 }
