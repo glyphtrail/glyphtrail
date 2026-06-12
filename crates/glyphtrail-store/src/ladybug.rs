@@ -1266,12 +1266,19 @@ impl GraphStore for LadybugStore {
             ),
             vec![],
         )?;
-        for e in embeddings {
-            self.run(
-                &format!("CREATE (v:{table} {{node_id:$id, vec:$e}})"),
-                vec![("id", s(&e.node_id.0)), ("e", float_array(&e.vector))],
-            )?;
-        }
+        // Bulk-insert via one UNWIND $rows (LIST-of-STRUCT) instead of a per-row
+        // CREATE — thousands of single-row queries (e.g. every commit) made storing
+        // slow and silent. Each struct carries `id` + the `FLOAT[dim]` `vec`.
+        let conn = Connection::new(&self.db)?;
+        let rows: Vec<Vec<(&str, Value)>> = embeddings
+            .iter()
+            .map(|e| vec![("id", s(&e.node_id.0)), ("vec", float_array(&e.vector))])
+            .collect();
+        self.exec_unwind(
+            &conn,
+            &format!("UNWIND $rows AS r CREATE (v:{table} {{node_id:r.id, vec:r.vec}})"),
+            rows,
+        )?;
         // Catalog the namespace (one row), so `embedding_index` can enumerate them.
         self.run(
             "MERGE (n:EmbeddingNs {pk:$pk}) SET n.space=$sp, n.model=$m, n.dim=$d",

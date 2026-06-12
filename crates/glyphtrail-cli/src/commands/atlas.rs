@@ -1723,10 +1723,14 @@ fn embed(dir: &Path, args: EmbedArgs) -> Result<()> {
         .iter()
         .filter_map(|name| {
             let nid = repo_node_id(name);
-            all.get(&nid.0).map(|v| Embedding {
-                node_id: nid,
-                vector: v.clone(),
-            })
+            // Skip a degenerate (all-zero) digest vector — it has no defined cosine
+            // and would poison the index, same as the commit path.
+            all.get(&nid.0)
+                .filter(|v| v.iter().any(|x| *x != 0.0))
+                .map(|v| Embedding {
+                    node_id: nid,
+                    vector: v.clone(),
+                })
         })
         .collect();
     if embeddings.is_empty() {
@@ -1744,7 +1748,9 @@ fn embed(dir: &Path, args: EmbedArgs) -> Result<()> {
         cfg.base_url.as_deref(),
         embeddings[0].vector.len(),
     )?;
+    let sp = spinner(&format!("storing {} repo embeddings…", embeddings.len()));
     store.set_embeddings(SPACE_TEXT, &model, &embeddings)?;
+    sp.finish_and_clear();
     journal.clear(); // checkpoint: vectors are durable in the DB (+ Parquet backup)
     let ann = build_ann_index(&store, SPACE_TEXT, &model);
     println!(
@@ -1979,7 +1985,9 @@ fn embed_commits(dir: &Path, args: EmbedCommitsArgs) -> Result<()> {
         cfg.base_url.as_deref(),
         dim,
     )?;
+    let sp = spinner(&format!("storing {} commit embeddings…", embeddings.len()));
     store.set_embeddings(SPACE_COMMIT, &model, &embeddings)?;
+    sp.finish_and_clear();
     journal.clear(); // checkpoint: vectors are now durably in the DB (+ Parquet backup)
     let ann = build_ann_index(&store, SPACE_COMMIT, &model);
     println!(
