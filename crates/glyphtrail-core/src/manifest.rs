@@ -65,6 +65,9 @@ pub struct CargoPackage {
     pub version: Option<String>,
     /// `[package].description`, when declared.
     pub description: Option<String>,
+    /// `[package].keywords`, lowercased — declared "what this is about" tags.
+    #[serde(default)]
+    pub keywords: Vec<String>,
     pub dependencies: Vec<CargoDependency>,
 }
 
@@ -97,6 +100,13 @@ pub fn parse_cargo_manifest(text: &str) -> Result<Option<CargoPackage>> {
         .and_then(Value::as_str)
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    let keywords = table
+        .get("package")
+        .and_then(Value::as_table)
+        .and_then(|pkg| pkg.get("keywords"))
+        .and_then(Value::as_array)
+        .map(|a| normalize_keywords(a.iter().filter_map(Value::as_str)))
+        .unwrap_or_default();
 
     let mut dependencies = Vec::new();
     for (key, kind) in [
@@ -115,6 +125,7 @@ pub fn parse_cargo_manifest(text: &str) -> Result<Option<CargoPackage>> {
         name: name.to_string(),
         version,
         description,
+        keywords,
         dependencies,
     }))
 }
@@ -216,8 +227,21 @@ pub fn workspace_members(text: &str) -> Vec<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestPackage {
     pub description: Option<String>,
+    /// Declared package keywords (npm/pyproject), lowercased + deduped.
+    pub keywords: Vec<String>,
     pub deps: Vec<String>,
     pub ecosystem: &'static str,
+}
+
+/// Normalize declared keyword/topic strings: trimmed, lowercased, non-empty,
+/// de-duplicated (order-preserving), and capped — they ride into the embedding card.
+pub fn normalize_keywords<'a>(it: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    it.map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .filter(|s| seen.insert(s.clone()))
+        .take(20)
+        .collect()
 }
 
 /// The external dependency names a Cargo package declares: `Normal`-kind deps that
@@ -287,8 +311,14 @@ pub fn parse_npm_manifest(text: &str) -> Option<ManifestPackage> {
     }
     deps.sort();
     deps.dedup();
-    (description.is_some() || !deps.is_empty()).then_some(ManifestPackage {
+    let keywords = v
+        .get("keywords")
+        .and_then(|k| k.as_array())
+        .map(|a| normalize_keywords(a.iter().filter_map(|x| x.as_str())))
+        .unwrap_or_default();
+    (description.is_some() || !deps.is_empty() || !keywords.is_empty()).then_some(ManifestPackage {
         description,
+        keywords,
         deps,
         ecosystem: "npm",
     })
@@ -319,8 +349,14 @@ pub fn parse_pyproject_manifest(text: &str) -> Option<ManifestPackage> {
     }
     deps.sort();
     deps.dedup();
-    (description.is_some() || !deps.is_empty()).then_some(ManifestPackage {
+    let keywords = project
+        .get("keywords")
+        .and_then(Value::as_array)
+        .map(|a| normalize_keywords(a.iter().filter_map(Value::as_str)))
+        .unwrap_or_default();
+    (description.is_some() || !deps.is_empty() || !keywords.is_empty()).then_some(ManifestPackage {
         description,
+        keywords,
         deps,
         ecosystem: "pypi",
     })
@@ -365,6 +401,7 @@ pub fn parse_gomod_manifest(text: &str) -> Option<ManifestPackage> {
     deps.dedup();
     (!deps.is_empty()).then_some(ManifestPackage {
         description: None,
+        keywords: Vec::new(),
         deps,
         ecosystem: "go",
     })
@@ -383,8 +420,14 @@ pub fn parse_composer_manifest(text: &str) -> Option<ManifestPackage> {
         .and_then(|d| d.as_object())
         .map(|o| o.keys().cloned().collect())
         .unwrap_or_default();
-    (description.is_some() || !deps.is_empty()).then_some(ManifestPackage {
+    let keywords = v
+        .get("keywords")
+        .and_then(|k| k.as_array())
+        .map(|a| normalize_keywords(a.iter().filter_map(|x| x.as_str())))
+        .unwrap_or_default();
+    (description.is_some() || !deps.is_empty() || !keywords.is_empty()).then_some(ManifestPackage {
         description,
+        keywords,
         deps,
         ecosystem: "composer",
     })
@@ -574,6 +617,38 @@ mod tests {
         check!(m.description.as_deref() == Some("a tool"));
         check!(m.deps == vec!["react".to_string(), "react-dom".to_string()]);
         check!(m.ecosystem == "npm");
+    }
+
+    #[test]
+    fn keywords_parsed_normalized_across_ecosystems() {
+        // Cargo: lowercased, trimmed, deduped, order-preserving.
+        let cargo = parse_cargo_manifest(
+            r#"[package]
+               name = "w"
+               keywords = ["CLI", " Cli ", "graph", "embeddings"]"#,
+        )
+        .unwrap()
+        .unwrap();
+        check!(
+            cargo.keywords
+                == vec![
+                    "cli".to_string(),
+                    "graph".to_string(),
+                    "embeddings".to_string()
+                ]
+        );
+        // npm.
+        let npm = parse_npm_manifest(r#"{ "keywords": ["React", "ui"] }"#).unwrap();
+        check!(npm.keywords == vec!["react".to_string(), "ui".to_string()]);
+        // pyproject (PEP 621).
+        let py = parse_pyproject_manifest("[project]\nname=\"p\"\nkeywords=[\"ml\",\"vision\"]\n")
+            .unwrap();
+        check!(py.keywords == vec!["ml".to_string(), "vision".to_string()]);
+        // normalize_keywords standalone: dedup + cap + lowercase.
+        check!(
+            normalize_keywords(["A", "a", "b"].into_iter())
+                == vec!["a".to_string(), "b".to_string()]
+        );
     }
 
     #[test]

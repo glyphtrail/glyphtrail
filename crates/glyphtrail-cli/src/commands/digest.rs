@@ -21,6 +21,11 @@ pub struct RepoDigest {
     /// The package description from a manifest, when declared — the most
     /// authoritative one-line "what is this repo".
     pub description: Option<String>,
+    /// The forge's repo description (GitHub "about"), when known — the most
+    /// authoritative "what is this" for a repo on a forge.
+    pub forge_description: Option<String>,
+    /// Declared package keywords (manifest) ∪ forge topics — curated "about" tags.
+    pub keywords: Vec<String>,
     /// `(language, file count)`, descending.
     pub languages: Vec<(String, usize)>,
     pub total_files: usize,
@@ -49,10 +54,13 @@ pub fn build_repo_digest(
     name: &str,
     root: Option<&Path>,
     rows: &[&AtlasTimelineRow],
+    forge: Option<&glyphtrail_core::RepoForgeMeta>,
 ) -> RepoDigest {
     let mut d = RepoDigest {
         name: name.to_string(),
         description: None,
+        forge_description: forge.and_then(|f| f.description.clone()),
+        keywords: forge.map(|f| f.topics.clone()).unwrap_or_default(),
         languages: Vec::new(),
         total_files: 0,
         functions: 0,
@@ -129,8 +137,11 @@ pub fn build_repo_digest(
     // package description + external dependencies are more authoritative than
     // inferred imports — use them when a manifest is present.
     if let Some(root) = root {
-        let (description, manifest_deps, _ecosystems) = repo_manifest_digest(root);
+        let (description, keywords, manifest_deps, _ecosystems) = repo_manifest_digest(root);
         d.description = description;
+        // Manifest keywords ∪ forge topics (already seeded), deduped.
+        d.keywords.extend(keywords);
+        d.keywords = glyphtrail_core::normalize_keywords(d.keywords.iter().map(String::as_str));
         if !manifest_deps.is_empty() {
             d.deps = manifest_deps.into_iter().take(20).collect();
         }
@@ -164,9 +175,15 @@ pub fn build_repo_digest(
 /// `pyproject.toml`/`go.mod`/`composer.json`, parses each with the core manifest
 /// parsers, and unions the declared external dependencies. The description is the
 /// shallowest manifest's (root wins over a member crate). #338.
-type ParsedManifest = (Option<String>, Vec<String>, &'static str, Option<String>);
+type ParsedManifest = (
+    Option<String>, // description
+    Vec<String>,    // keywords
+    Vec<String>,    // external deps
+    &'static str,   // ecosystem
+    Option<String>, // own package name (workspace self-dep subtraction)
+);
 
-fn repo_manifest_digest(root: &Path) -> (Option<String>, Vec<String>, Vec<String>) {
+fn repo_manifest_digest(root: &Path) -> (Option<String>, Vec<String>, Vec<String>, Vec<String>) {
     use glyphtrail_core::{
         cargo_external_deps, parse_cargo_manifest, parse_composer_manifest, parse_gomod_manifest,
         parse_npm_manifest, parse_pyproject_manifest, workspace_dependencies,
@@ -175,6 +192,7 @@ fn repo_manifest_digest(root: &Path) -> (Option<String>, Vec<String>, Vec<String
     collect_manifests(root, 0, &mut manifests);
     manifests.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1))); // shallowest (root) first
     let mut description: Option<String> = None;
+    let mut keywords: Vec<String> = Vec::new();
     let mut deps: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut ecosystems: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     // The repo's own package names — these leak into a member's deps via
@@ -184,34 +202,37 @@ fn repo_manifest_digest(root: &Path) -> (Option<String>, Vec<String>, Vec<String
         let Ok(text) = std::fs::read_to_string(path) else {
             continue;
         };
-        // Parse into `(description, external deps, ecosystem, own package name)`.
         let parsed: Option<ParsedManifest> =
             match path.file_name().and_then(|n| n.to_str()).unwrap_or("") {
                 "Cargo.toml" => match parse_cargo_manifest(&text) {
                     Ok(Some(pkg)) => {
                         let mut d = cargo_external_deps(&pkg);
                         d.extend(workspace_dependencies(&text));
-                        Some((pkg.description.clone(), d, "cargo", Some(pkg.name.clone())))
+                        Some((
+                            pkg.description.clone(),
+                            pkg.keywords.clone(),
+                            d,
+                            "cargo",
+                            Some(pkg.name.clone()),
+                        ))
                     }
                     // A virtual workspace root: still mine its `[workspace.dependencies]`.
                     _ => {
                         let ws = workspace_dependencies(&text);
-                        (!ws.is_empty()).then_some((None, ws, "cargo", None))
+                        (!ws.is_empty()).then_some((None, Vec::new(), ws, "cargo", None))
                     }
                 },
-                "package.json" => {
-                    parse_npm_manifest(&text).map(|m| (m.description, m.deps, m.ecosystem, None))
-                }
+                "package.json" => parse_npm_manifest(&text)
+                    .map(|m| (m.description, m.keywords, m.deps, m.ecosystem, None)),
                 "pyproject.toml" => parse_pyproject_manifest(&text)
-                    .map(|m| (m.description, m.deps, m.ecosystem, None)),
-                "go.mod" => {
-                    parse_gomod_manifest(&text).map(|m| (m.description, m.deps, m.ecosystem, None))
-                }
+                    .map(|m| (m.description, m.keywords, m.deps, m.ecosystem, None)),
+                "go.mod" => parse_gomod_manifest(&text)
+                    .map(|m| (m.description, m.keywords, m.deps, m.ecosystem, None)),
                 "composer.json" => parse_composer_manifest(&text)
-                    .map(|m| (m.description, m.deps, m.ecosystem, None)),
+                    .map(|m| (m.description, m.keywords, m.deps, m.ecosystem, None)),
                 _ => None,
             };
-        if let Some((desc, mdeps, eco, own)) = parsed {
+        if let Some((desc, kw, mdeps, eco, own)) = parsed {
             // Only the root manifest's description is repo-level; a member crate's
             // is too narrow, so a workspace falls back to its README.
             if *depth == 0
@@ -220,6 +241,7 @@ fn repo_manifest_digest(root: &Path) -> (Option<String>, Vec<String>, Vec<String
             {
                 description = Some(s);
             }
+            keywords.extend(kw);
             deps.extend(mdeps);
             ecosystems.insert(eco.to_string());
             if let Some(n) = own {
@@ -228,8 +250,10 @@ fn repo_manifest_digest(root: &Path) -> (Option<String>, Vec<String>, Vec<String
         }
     }
     deps.retain(|d| !local.contains(d));
+    let keywords = glyphtrail_core::normalize_keywords(keywords.iter().map(String::as_str));
     (
         description,
+        keywords,
         deps.into_iter().collect(),
         ecosystems.into_iter().collect(),
     )
@@ -282,16 +306,33 @@ fn collect_manifests(dir: &Path, depth: usize, out: &mut Vec<(usize, std::path::
 pub fn render_embed_doc(d: &RepoDigest) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "{}", d.name);
-    // The manifest description is the most authoritative "what is this"; fall back
-    // to the README excerpt only when there's no description.
-    match (&d.description, &d.readme) {
-        (Some(desc), _) => {
-            let _ = writeln!(s, "{desc}");
+    // What-is-this, most authoritative first: the forge "about", the package
+    // description, then the README summary — each included only when it adds signal
+    // (skip a line a prior one already covers, since the README often repeats the
+    // description).
+    let mut said: Vec<String> = Vec::new();
+    for cand in [
+        d.forge_description.as_deref(),
+        d.description.as_deref(),
+        d.readme.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let c = cand.trim();
+        let lc = c.to_lowercase();
+        if c.is_empty()
+            || said
+                .iter()
+                .any(|p| p.contains(&lc) || lc.contains(p.as_str()))
+        {
+            continue;
         }
-        (None, Some(readme)) => {
-            let _ = writeln!(s, "{readme}");
-        }
-        (None, None) => {}
+        let _ = writeln!(s, "{c}");
+        said.push(lc);
+    }
+    if !d.keywords.is_empty() {
+        let _ = writeln!(s, "Keywords: {}", d.keywords.join(", "));
     }
     if !d.languages.is_empty() {
         let langs = d
@@ -326,9 +367,16 @@ pub fn render_embed_doc(d: &RepoDigest) -> String {
             .map(i32::to_string)
             .collect::<Vec<_>>()
             .join(", ");
+        // Lead with the era span so the historical context the work was made in is a
+        // salient signal in the embedding, then the exact dates + active years.
+        let era = match (d.active_years.first(), d.active_years.last()) {
+            (Some(a), Some(b)) if a != b => format!("{a}–{b}"),
+            (Some(a), _) => a.to_string(),
+            _ => "?".to_string(),
+        };
         let _ = writeln!(
             s,
-            "Activity: {} commits, {}..{} (active {years})",
+            "Era: {era}; {} commits {}..{} (active {years})",
             d.total_commits,
             d.first_commit.as_deref().unwrap_or("?"),
             d.last_commit.as_deref().unwrap_or("?"),
@@ -358,8 +406,14 @@ pub fn render_markdown(d: &RepoDigest) -> String {
                 .join(", "),
         );
     }
+    if let Some(desc) = &d.forge_description {
+        let _ = writeln!(s, "> {desc}\n");
+    }
     if let Some(desc) = &d.description {
         let _ = writeln!(s, "> {desc}\n");
+    }
+    if !d.keywords.is_empty() {
+        let _ = writeln!(s, "**Keywords:** {}\n", d.keywords.join(", "));
     }
     if let Some(readme) = &d.readme {
         let _ = writeln!(s, "{readme}\n");
@@ -398,6 +452,8 @@ pub fn render_json(d: &RepoDigest) -> serde_json::Value {
     serde_json::json!({
         "name": d.name,
         "description": d.description,
+        "forge_description": d.forge_description,
+        "keywords": d.keywords,
         "languages": d.languages.iter().map(|(l, c)| serde_json::json!({ "name": l, "files": c })).collect::<Vec<_>>(),
         "total_files": d.total_files,
         "functions": d.functions,
@@ -463,6 +519,8 @@ mod tests {
         RepoDigest {
             name: "codegraph".into(),
             description: Some("Local code intelligence graph.".into()),
+            forge_description: Some("Code intelligence for AI coding agents.".into()),
+            keywords: vec!["code-graph".into(), "embeddings".into()],
             languages: vec![("Rust".into(), 120), ("TOML".into(), 8)],
             total_files: 128,
             functions: 400,
@@ -483,14 +541,16 @@ mod tests {
     fn embed_doc_is_compact_and_high_signal() {
         let doc = render_embed_doc(&digest());
         check!(doc.contains("codegraph"));
-        check!(doc.contains("Local code intelligence graph.")); // manifest description leads
+        check!(doc.contains("Code intelligence for AI coding agents.")); // forge "about" leads
+        check!(doc.contains("Local code intelligence graph.")); // manifest description too
+        check!(doc.contains("Keywords: code-graph, embeddings")); // manifest kw ∪ forge topics
         check!(doc.contains("Languages: Rust, TOML"));
         check!(doc.contains("Dependencies: lbug, clap"));
         check!(doc.contains("API: 2 endpoints"));
         check!(doc.contains("Topics: embeddings, atlas"));
-        check!(doc.contains("active 2025, 2026"));
-        // Bounded — a few lines, not a commit dump.
-        check!(doc.lines().count() < 12);
+        check!(doc.contains("Era: 2025–2026")); // historical context, explicit span
+        // Bounded — a card, not a commit dump.
+        check!(doc.lines().count() < 14);
     }
 
     #[test]
