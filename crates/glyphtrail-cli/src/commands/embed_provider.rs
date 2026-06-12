@@ -129,14 +129,31 @@ pub fn embed_docs_with_progress(
     mut on_progress: impl FnMut(usize, usize),
 ) -> Result<Vec<Vec<f32>>> {
     let total = docs.len();
+    let mut out: Vec<Vec<f32>> = Vec::with_capacity(total);
+    embed_docs_streaming(cfg, docs, |_start, batch| {
+        out.extend(batch);
+        on_progress(out.len(), total);
+    })?;
+    Ok(out)
+}
+
+/// Embed `docs`, handing each completed batch to `on_batch(start_idx, vectors)` as
+/// soon as it returns from the provider — so a caller can persist results
+/// incrementally (the embedding WAL) and resume after a crash without re-embedding.
+/// Batches arrive in order; `start_idx` is the offset of the batch in `docs`.
+pub fn embed_docs_streaming(
+    cfg: &EmbedConfig,
+    docs: &[String],
+    mut on_batch: impl FnMut(usize, Vec<Vec<f32>>),
+) -> Result<()> {
     match cfg.provider {
         EmbedProvider::Local => {
             let e = HashingEmbedder::new(cfg.dim);
-            let out: Vec<Vec<f32>> = docs.iter().map(|d| e.embed(d)).collect();
-            on_progress(total, total);
-            Ok(out)
+            let vecs: Vec<Vec<f32>> = docs.iter().map(|d| e.embed(d)).collect();
+            on_batch(0, vecs);
+            Ok(())
         }
-        EmbedProvider::Openai => openai_embed(cfg, docs, &mut on_progress),
+        EmbedProvider::Openai => openai_embed(cfg, docs, &mut on_batch),
     }
 }
 
@@ -158,10 +175,10 @@ const OPENAI_BATCH: usize = 256;
 fn openai_embed(
     cfg: &EmbedConfig,
     docs: &[String],
-    on_progress: &mut impl FnMut(usize, usize),
-) -> Result<Vec<Vec<f32>>> {
+    on_batch: &mut impl FnMut(usize, Vec<Vec<f32>>),
+) -> Result<()> {
     if docs.is_empty() {
-        return Ok(Vec::new());
+        return Ok(());
     }
     let url = cfg.endpoint();
     let key = std::env::var("OPENAI_API_KEY")
@@ -170,13 +187,13 @@ fn openai_embed(
     if key.is_none() && !is_local_url(&url) {
         bail!("set OPENAI_API_KEY to use a remote embeddings provider (or use --provider local)");
     }
-    let total = docs.len();
-    let mut out = Vec::with_capacity(total);
+    let mut start = 0usize;
     for chunk in docs.chunks(OPENAI_BATCH) {
-        out.extend(openai_embed_batch(cfg, &url, key.as_deref(), chunk)?);
-        on_progress(out.len(), total);
+        let vecs = openai_embed_batch(cfg, &url, key.as_deref(), chunk)?;
+        on_batch(start, vecs);
+        start += chunk.len();
     }
-    Ok(out)
+    Ok(())
 }
 
 /// POST a single batch (≤ [`OPENAI_BATCH`]) to the endpoint.
@@ -264,10 +281,140 @@ pub fn host_of(url: &str) -> String {
     authority.split(':').next().unwrap_or(authority).to_string()
 }
 
+/// An on-disk WAL of embeddings for one `(space, model)` namespace: append-only
+/// NDJSON of `{node_id, vector}` at `<atlas>/embed-journal/<vec_table>.jsonl`.
+/// Written per batch as vectors come back from the provider, so a crash before the
+/// DB store doesn't lose the paid vectors; a later run loads it and skips what's
+/// already embedded; it's cleared once the store succeeds.
+pub struct EmbedJournal {
+    path: std::path::PathBuf,
+}
+
+impl EmbedJournal {
+    pub fn open(atlas_dir: &std::path::Path, vec_table: &str) -> EmbedJournal {
+        EmbedJournal {
+            path: atlas_dir
+                .join("embed-journal")
+                .join(format!("{vec_table}.jsonl")),
+        }
+    }
+
+    /// Already-embedded vectors by node_id. Absent file → empty; malformed lines
+    /// (e.g. a half-written tail from a crash) are skipped, never poisoning a resume.
+    pub fn load(&self) -> std::collections::HashMap<String, Vec<f32>> {
+        let mut map = std::collections::HashMap::new();
+        let Ok(text) = std::fs::read_to_string(&self.path) else {
+            return map;
+        };
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            let (Some(id), Some(arr)) = (v["node_id"].as_str(), v["vector"].as_array()) else {
+                continue;
+            };
+            let vec: Option<Vec<f32>> = arr.iter().map(|x| x.as_f64().map(|f| f as f32)).collect();
+            if let Some(vec) = vec
+                && !vec.is_empty()
+            {
+                map.insert(id.to_string(), vec);
+            }
+        }
+        map
+    }
+
+    /// Append a batch of `(node_id, vector)` and flush — durable before the next call.
+    pub fn append(&self, batch: &[(&str, &[f32])]) -> std::io::Result<()> {
+        use std::io::Write;
+        if batch.is_empty() {
+            return Ok(());
+        }
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        let mut buf = String::new();
+        for (id, vec) in batch {
+            let line = json!({ "node_id": id, "vector": vec });
+            buf.push_str(&serde_json::to_string(&line).unwrap_or_default());
+            buf.push('\n');
+        }
+        f.write_all(buf.as_bytes())?;
+        f.flush()
+    }
+
+    /// Remove the journal (the checkpoint after a successful store). Best-effort.
+    pub fn clear(&self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use assert2::check;
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let d = std::env::temp_dir().join(format!("gt-journal-{tag}-{n}"));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn embed_journal_round_trip_and_skips_malformed() {
+        let dir = tmp_dir("rt");
+        let j = EmbedJournal::open(&dir, "Vec_commit_m");
+        check!(j.load().is_empty()); // absent file
+        j.append(&[("a", &[1.0, 2.0]), ("b", &[3.0, 4.0])]).unwrap();
+        j.append(&[("c", &[5.0, 6.0])]).unwrap(); // second batch appends
+        // A half-written/garbage trailing line must not break the resume.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(dir.join("embed-journal").join("Vec_commit_m.jsonl"))
+                .unwrap();
+            f.write_all(b"{not json\n").unwrap();
+        }
+        let loaded = j.load();
+        check!(loaded.len() == 3);
+        check!(loaded.get("a") == Some(&vec![1.0, 2.0]));
+        check!(loaded.get("c") == Some(&vec![5.0, 6.0]));
+        j.clear();
+        check!(j.load().is_empty()); // file removed
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn embed_docs_streaming_local_covers_all_docs() {
+        let cfg = EmbedConfig {
+            provider: EmbedProvider::Local,
+            model: None,
+            base_url: None,
+            dim: 8,
+        };
+        let docs: Vec<String> = ["alpha", "beta", "gamma"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut batches: Vec<(usize, usize)> = Vec::new(); // (start, len)
+        embed_docs_streaming(&cfg, &docs, |start, vecs| batches.push((start, vecs.len()))).unwrap();
+        // Local embeds in one batch covering all docs from index 0.
+        check!(batches == vec![(0, 3)]);
+        // And embed_docs (the collecting wrapper) returns one vector per doc.
+        check!(embed_docs(&cfg, &docs).unwrap().len() == 3);
+    }
 
     #[test]
     fn local_is_the_default_and_never_offmachine() {

@@ -207,9 +207,17 @@ line when data is present.
 ## Embedding durability — read this before paying for OpenAI embeddings
 
 Embeddings can be expensive (one paid API call per document). They are protected
-three ways so you don't recompute them:
+four ways so you don't recompute them:
 
-1. **In-database, across upgrades.** Embeddings live in the atlas database but are
+0. **Crash-safe WAL while embedding.** `embed repos` / `embed commits` append each
+   batch's vectors to a per-namespace journal (`~/.glyphtrail/atlas/embed-journal/
+   <table>.jsonl`) the moment they come back from the provider. If the run dies
+   before the database write (a crash, interrupt, network blip), re-running **skips
+   what's already journaled** and embeds only the rest — a paid run is never
+   repeated. The journal is cleared once the vectors are durably stored.
+
+
+1. **In-database, across code-graph upgrades.** Embeddings live in the atlas database but are
    versioned independently of the code-graph schema (`EMBEDDING_SCHEMA_VERSION`).
    A glyphtrail upgrade that changes the code-graph schema rebuilds only the
    code-graph tables and **preserves** the embeddings, their catalog, and the

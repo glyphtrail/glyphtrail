@@ -1657,7 +1657,7 @@ fn graph_embed(dir: &Path, args: GraphEmbedArgs) -> Result<()> {
 /// (announced first), one of the few atlas functions allowed off-machine on explicit
 /// opt-in. Embeds every repo regardless of visibility (gating is at `similar` output).
 fn embed(dir: &Path, args: EmbedArgs) -> Result<()> {
-    use crate::commands::embed_provider::{EmbedConfig, embed_docs_with_progress};
+    use crate::commands::embed_provider::EmbedConfig;
     let lb = ladybug_dir(dir);
     if !lb.exists() {
         bail!("atlas is disabled; run `glyphtrail atlas init` first");
@@ -1711,19 +1711,28 @@ fn embed(dir: &Path, args: EmbedArgs) -> Result<()> {
     }
     let names: Vec<String> = docs.keys().cloned().collect();
     let texts: Vec<String> = docs.values().cloned().collect();
-    let bar = progress_bar(texts.len() as u64, "embedding repos");
-    let vectors = embed_docs_with_progress(&cfg, &texts, |done, _| bar.set_position(done as u64))?;
-    bar.finish_and_clear();
+    // Resume from + journal to the embedding WAL (per the text+model namespace), so a
+    // crashed/paid run isn't repeated.
+    let model = cfg.model_id();
+    let table = glyphtrail_core::vec_table(SPACE_TEXT, &model);
+    let node_id_strings: Vec<String> = names.iter().map(|n| repo_node_id(n).0).collect();
+    let node_ids: Vec<&str> = node_id_strings.iter().map(String::as_str).collect();
+    let (journal, all) =
+        embed_with_journal(dir, &cfg, &table, &node_ids, &texts, "embedding repos")?;
     let embeddings: Vec<Embedding> = names
-        .into_iter()
-        .zip(vectors)
-        .map(|(name, vector)| Embedding {
-            node_id: repo_node_id(&name),
-            vector,
+        .iter()
+        .filter_map(|name| {
+            let nid = repo_node_id(name);
+            all.get(&nid.0).map(|v| Embedding {
+                node_id: nid,
+                vector: v.clone(),
+            })
         })
         .collect();
+    if embeddings.is_empty() {
+        bail!("no repo digests produced a usable embedding");
+    }
     let mut store = store;
-    let model = cfg.model_id();
     // Replace just this (text, model) namespace — other models and the graph/commit
     // spaces coexist untouched, so a model upgrade never mixes with the old set.
     // Record the active model first, so the Parquet backup captures it;
@@ -1736,6 +1745,7 @@ fn embed(dir: &Path, args: EmbedArgs) -> Result<()> {
         embeddings[0].vector.len(),
     )?;
     store.set_embeddings(SPACE_TEXT, &model, &embeddings)?;
+    journal.clear(); // checkpoint: vectors are durable in the DB (+ Parquet backup)
     let ann = build_ann_index(&store, SPACE_TEXT, &model);
     println!(
         "embedded {} repo{} ({}) [model {}{}]",
@@ -1833,6 +1843,46 @@ fn resolve_model(store: &LadybugStore, space: &str, explicit: Option<&str>) -> R
     );
 }
 
+/// Embed `docs` (aligned 1:1 with `node_ids`) under the `vec_table` namespace,
+/// **resuming from and journaling to** the on-disk WAL: already-journaled node_ids
+/// are skipped (not re-embedded — no re-paying an off-machine provider), and each
+/// fresh batch is appended (flushed) as it returns, so a crash before the DB store
+/// loses nothing. A progress bar covers the work. Returns the journal (so the caller
+/// can `clear()` it after a successful store) and `node_id -> vector` for every doc.
+fn embed_with_journal(
+    dir: &Path,
+    cfg: &crate::commands::embed_provider::EmbedConfig,
+    vec_table: &str,
+    node_ids: &[&str],
+    docs: &[String],
+    label: &str,
+) -> Result<(
+    crate::commands::embed_provider::EmbedJournal,
+    std::collections::HashMap<String, Vec<f32>>,
+)> {
+    use crate::commands::embed_provider::{EmbedJournal, embed_docs_streaming};
+    let journal = EmbedJournal::open(dir, vec_table);
+    let cached = journal.load();
+    let missing: Vec<usize> = (0..docs.len())
+        .filter(|&i| !cached.contains_key(node_ids[i]))
+        .collect();
+    let missing_docs: Vec<String> = missing.iter().map(|&i| docs[i].clone()).collect();
+    let bar = progress_bar(docs.len() as u64, label);
+    bar.set_position((docs.len() - missing.len()) as u64); // already-journaled count
+    embed_docs_streaming(cfg, &missing_docs, |start, batch| {
+        let appends: Vec<(&str, &[f32])> = batch
+            .iter()
+            .enumerate()
+            .map(|(j, v)| (node_ids[missing[start + j]], v.as_slice()))
+            .collect();
+        let _ = journal.append(&appends); // best-effort WAL; embedding still proceeds
+        bar.inc(batch.len() as u64);
+    })?;
+    bar.finish_and_clear();
+    let all = journal.load(); // cached + freshly journaled
+    Ok((journal, all))
+}
+
 /// `glyphtrail atlas embed-commits` — embed every in-bounds commit (by subject +
 /// changed-path digest) into its `FLOAT[]` namespace, so `atlas similar-commits`
 /// can find commits like a query (#338). Vectors are the source of truth and search
@@ -1840,7 +1890,7 @@ fn resolve_model(store: &LadybugStore, space: &str, explicit: Option<&str>) -> R
 /// optional HNSW index on top. `local` never leaves the machine; `openai` POSTs
 /// commit subjects.
 fn embed_commits(dir: &Path, args: EmbedCommitsArgs) -> Result<()> {
-    use crate::commands::embed_provider::{EmbedConfig, embed_docs_with_progress, host_of};
+    use crate::commands::embed_provider::{EmbedConfig, host_of};
     let lb = ladybug_dir(dir);
     if !lb.exists() {
         bail!("atlas is disabled; run `glyphtrail atlas init` first");
@@ -1896,25 +1946,28 @@ fn embed_commits(dir: &Path, args: EmbedCommitsArgs) -> Result<()> {
             doc
         })
         .collect();
-    let bar = progress_bar(docs.len() as u64, "embedding commits");
-    let vectors = embed_docs_with_progress(&cfg, &docs, |done, _| bar.set_position(done as u64))?;
-    bar.finish_and_clear();
+    // Resume from + journal to the embedding WAL: a crashed/paid run isn't repeated.
+    let model = cfg.model_id();
+    let table = glyphtrail_core::vec_table(SPACE_COMMIT, &model);
+    let node_ids: Vec<&str> = rows.iter().map(|r| r.commit.node_id.0.as_str()).collect();
+    let (journal, all) =
+        embed_with_journal(dir, &cfg, &table, &node_ids, &docs, "embedding commits")?;
     // Skip commits whose subject carries no signal (a zero vector has no defined
     // cosine and would poison the index).
     let embeddings: Vec<Embedding> = rows
         .iter()
-        .zip(vectors)
-        .filter(|(_, v)| v.iter().any(|x| *x != 0.0))
-        .map(|(r, vector)| Embedding {
-            node_id: r.commit.node_id.clone(),
-            vector,
+        .filter_map(|r| {
+            let v = all.get(r.commit.node_id.0.as_str())?;
+            v.iter().any(|x| *x != 0.0).then(|| Embedding {
+                node_id: r.commit.node_id.clone(),
+                vector: v.clone(),
+            })
         })
         .collect();
     if embeddings.is_empty() {
         bail!("no commit subjects produced a usable embedding");
     }
     let dim = embeddings[0].vector.len();
-    let model = cfg.model_id();
     // Durable `FLOAT[]` rows (offline + export) namespaced so a model upgrade
     // coexists with the prior commit embeddings; `set_embeddings` replaces just this
     // namespace. Record the active model first so the Parquet backup captures it; an
@@ -1927,6 +1980,7 @@ fn embed_commits(dir: &Path, args: EmbedCommitsArgs) -> Result<()> {
         dim,
     )?;
     store.set_embeddings(SPACE_COMMIT, &model, &embeddings)?;
+    journal.clear(); // checkpoint: vectors are now durably in the DB (+ Parquet backup)
     let ann = build_ann_index(&store, SPACE_COMMIT, &model);
     println!(
         "embedded {} commits ({}) [model {model}{}]",
