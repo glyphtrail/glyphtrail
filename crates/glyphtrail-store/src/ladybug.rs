@@ -1235,6 +1235,16 @@ impl GraphStore for LadybugStore {
     }
 
     fn set_embeddings(&mut self, space: &str, model: &str, embeddings: &[Embedding]) -> Result<()> {
+        // Collapse to one vector per node_id (first wins): the FLOAT[] table keys on
+        // node_id, so a caller passing the same node twice — e.g. a commit the
+        // timeline returned more than once — must not violate the primary key.
+        let embeddings: Vec<&Embedding> = {
+            let mut seen = std::collections::HashSet::new();
+            embeddings
+                .iter()
+                .filter(|e| seen.insert(e.node_id.0.as_str()))
+                .collect()
+        };
         let Some(first) = embeddings.first() else {
             // Nothing to store; ensure the namespace is cleared.
             return self.clear_embeddings_for(space, model);
@@ -2513,6 +2523,35 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Regression: a duplicate node_id in one set_embeddings call (e.g. a commit the
+    // timeline returned twice) must NOT violate the FLOAT[] primary key — it's
+    // collapsed to one vector (first wins).
+    #[test]
+    fn set_embeddings_dedups_duplicate_node_ids() {
+        let dir = tmp_dir("atlas-embed-dup");
+        let mut lb = LadybugStore::open(&dir).unwrap();
+        let embs = vec![
+            Embedding {
+                node_id: NodeId("commit:a".into()),
+                vector: vec![1.0, 0.0],
+            },
+            Embedding {
+                node_id: NodeId("commit:a".into()), // duplicate node — different vec
+                vector: vec![0.0, 1.0],
+            },
+            Embedding {
+                node_id: NodeId("commit:b".into()),
+                vector: vec![0.5, 0.5],
+            },
+        ];
+        lb.set_embeddings("commit", "openai:m", &embs).unwrap(); // must not error
+        let stored = lb.embeddings_for("commit", "openai:m").unwrap();
+        check!(stored.len() == 2); // a (once) + b
+        let a = stored.iter().find(|e| e.node_id.0 == "commit:a").unwrap();
+        check!(a.vector == vec![1.0, 0.0]); // first occurrence kept
         std::fs::remove_dir_all(&dir).ok();
     }
 
