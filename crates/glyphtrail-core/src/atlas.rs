@@ -828,6 +828,67 @@ impl Checkouts {
     }
 }
 
+/// A repo's forge-side metadata (GitHub's description + topics), captured during
+/// `--github` discovery for the embedding "repo card".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RepoForgeMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub topics: Vec<String>,
+}
+
+/// Per-repo forge metadata keyed by atlas repo **name**, persisted as
+/// `~/.glyphtrail/atlas/forge-meta.json` (mirrors [`Checkouts`]). The bridge that
+/// lets `embed`/`digest` add a github repo's description + topics to its card, since
+/// these repos aren't in the registry.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ForgeMeta {
+    #[serde(default)]
+    pub repos: BTreeMap<String, RepoForgeMeta>,
+}
+
+impl ForgeMeta {
+    pub fn load(atlas_dir: &Path) -> crate::Result<ForgeMeta> {
+        let path = atlas_dir.join("forge-meta.json");
+        match std::fs::read_to_string(&path) {
+            Ok(text) => serde_json::from_str(&text)
+                .map_err(|source| crate::error::CoreError::RegistryParse { path, source }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ForgeMeta::default()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn save(&self, atlas_dir: &Path) -> crate::Result<()> {
+        let path = atlas_dir.join("forge-meta.json");
+        let json = serde_json::to_string_pretty(self).map_err(|source| {
+            crate::error::CoreError::RegistryParse {
+                path: path.clone(),
+                source,
+            }
+        })?;
+        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        std::fs::write(&tmp, json)?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
+    pub fn get(&self, name: &str) -> Option<&RepoForgeMeta> {
+        self.repos.get(name)
+    }
+
+    pub fn set(&mut self, name: &str, meta: RepoForgeMeta) {
+        // Only record something worth carrying.
+        if meta.description.is_some() || !meta.topics.is_empty() {
+            self.repos.insert(name.to_string(), meta);
+        }
+    }
+
+    pub fn remove(&mut self, name: &str) {
+        self.repos.remove(name);
+    }
+}
+
 /// `[window]` — the optional global date bounds on what atlas indexes. Absent
 /// keys mean no bound on that side.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -1301,6 +1362,36 @@ mod tests {
         loaded.remove("widgets");
         loaded.save(&dir).unwrap();
         check!(Checkouts::load(&dir).unwrap().get("widgets").is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn forge_meta_round_trip_and_skips_empty() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("gt-forge-meta-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        check!(ForgeMeta::load(&dir).unwrap().get("r").is_none());
+
+        let mut fm = ForgeMeta::default();
+        fm.set(
+            "widgets",
+            RepoForgeMeta {
+                description: Some("a widget kit".into()),
+                topics: vec!["ui".into(), "rust".into()],
+            },
+        );
+        // Empty meta isn't recorded (nothing to carry into the card).
+        fm.set("blank", RepoForgeMeta::default());
+        fm.save(&dir).unwrap();
+
+        let loaded = ForgeMeta::load(&dir).unwrap();
+        let w = loaded.get("widgets").unwrap();
+        check!(w.description.as_deref() == Some("a widget kit"));
+        check!(w.topics == vec!["ui".to_string(), "rust".to_string()]);
+        check!(loaded.get("blank").is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 

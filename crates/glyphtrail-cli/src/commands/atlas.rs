@@ -972,6 +972,8 @@ fn sync(dir: &Path, args: SyncArgs) -> Result<()> {
     // HEAD checkouts (`--checkout`): name → working-tree dir, so `embed` can read a
     // github repo's README/manifests even though it isn't in the registry.
     let mut checkouts = Checkouts::load(dir)?;
+    // Forge description + topics, captured per repo for the embedding card.
+    let mut forge_meta = glyphtrail_core::ForgeMeta::load(dir)?;
     let mut targets: Vec<RegistryEntry> = registry.repos.clone();
     if args.github {
         let opts = ListOpts {
@@ -998,6 +1000,7 @@ fn sync(dir: &Path, args: SyncArgs) -> Result<()> {
             opts,
             &ignored,
             &mut checkouts,
+            &mut forge_meta,
             GithubMode {
                 full: args.full,
                 everyone: args.everyone,
@@ -1095,6 +1098,7 @@ fn sync(dir: &Path, args: SyncArgs) -> Result<()> {
                             let _ = std::fs::remove_dir_all(hd);
                         }
                         checkouts.remove(&e.name);
+                        forge_meta.remove(&e.name);
                         println!("  {}: ignoring (no commits by you)", e.name);
                     }
                 }
@@ -1108,6 +1112,7 @@ fn sync(dir: &Path, args: SyncArgs) -> Result<()> {
     heads.save(dir)?;
     ignored.save(dir)?;
     checkouts.save(dir)?;
+    forge_meta.save(dir)?;
     if interrupted {
         println!("  total:   {total} commits ingested (stopped early; rerun to continue)");
         return Ok(());
@@ -1209,6 +1214,9 @@ struct GithubMode {
     checkout: bool,
 }
 
+// Distinct, cohesive inputs (discovery opts, three atlas side-stores, mode); bundling
+// them would only add lifetime noise.
+#[allow(clippy::too_many_arguments)]
 fn github_targets(
     dir: &Path,
     registry: &Registry,
@@ -1216,6 +1224,7 @@ fn github_targets(
     opts: ListOpts,
     ignored: &IgnoredRepos,
     checkouts: &mut Checkouts,
+    forge_meta: &mut glyphtrail_core::ForgeMeta,
     mode: GithubMode,
 ) -> Result<Vec<RegistryEntry>> {
     let GithubMode {
@@ -1318,6 +1327,15 @@ fn github_targets(
             r.name.clone()
         };
         used_names.insert(name.clone());
+        // Capture the forge's description + topics for the repo card (#nnn), regardless
+        // of --checkout (it's free — already in the discovery response).
+        forge_meta.set(
+            &name,
+            glyphtrail_core::RepoForgeMeta {
+                description: r.description.clone(),
+                topics: r.topics.clone(),
+            },
+        );
         // --checkout: materialize HEAD so the digest can read this repo's README +
         // declared deps (its code state), not just commit history. Best-effort;
         // recorded by atlas name so `embed` can find it (these repos aren't registered).
@@ -1676,6 +1694,7 @@ fn embed(dir: &Path, args: EmbedArgs) -> Result<()> {
         by_repo.entry(row.repo.clone()).or_default().push(row);
     }
     let checkouts = Checkouts::load(dir)?;
+    let forge = glyphtrail_core::ForgeMeta::load(dir)?;
     let root_of = |name: &str| digest_root(&registry, &checkouts, name);
     // Building each repo's digest reads its index + README, so with many repos this
     // is the slow phase — show progress.
@@ -1684,7 +1703,12 @@ fn embed(dir: &Path, args: EmbedArgs) -> Result<()> {
     for (name, repo_rows) in &by_repo {
         bar.set_message(name.clone());
         let root = root_of(name);
-        let digest = crate::commands::digest::build_repo_digest(name, root.as_deref(), repo_rows);
+        let digest = crate::commands::digest::build_repo_digest(
+            name,
+            root.as_deref(),
+            repo_rows,
+            forge.get(name),
+        );
         docs.insert(
             name.clone(),
             crate::commands::digest::render_embed_doc(&digest),
@@ -2370,12 +2394,17 @@ fn digest_cmd(dir: &Path, args: DigestArgs) -> Result<()> {
         names = std::iter::once(repo.clone()).collect();
     }
     let checkouts = Checkouts::load(dir)?;
+    let forge = glyphtrail_core::ForgeMeta::load(dir)?;
     let root_of = |name: &str| digest_root(&registry, &checkouts, name);
     let empty: Vec<&glyphtrail_core::AtlasTimelineRow> = Vec::new();
     for name in &names {
         let repo_rows = by_repo.get(name).unwrap_or(&empty);
-        let digest =
-            crate::commands::digest::build_repo_digest(name, root_of(name).as_deref(), repo_rows);
+        let digest = crate::commands::digest::build_repo_digest(
+            name,
+            root_of(name).as_deref(),
+            repo_rows,
+            forge.get(name),
+        );
         if args.json {
             print_value(&crate::commands::digest::render_json(&digest), Emit::Json)?;
         } else {

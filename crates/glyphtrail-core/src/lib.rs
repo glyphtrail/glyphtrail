@@ -27,10 +27,10 @@ pub use api::{
     signature_has_literal_segment,
 };
 pub use atlas::{
-    AtlasConfig, AtlasHeads, AtlasTimelineRow, Checkouts, CommitMeta, IgnoredRepos, MeConfig,
-    ReposConfig, Timeline, TimelineQuery, WakaConfig, WakaStat, Window, author_matches,
-    author_scope_label, default_atlas_path, derive_topics, filter_timeline, format_date,
-    paths_digest, timeline_value,
+    AtlasConfig, AtlasHeads, AtlasTimelineRow, Checkouts, CommitMeta, ForgeMeta, IgnoredRepos,
+    MeConfig, RepoForgeMeta, ReposConfig, Timeline, TimelineQuery, WakaConfig, WakaStat, Window,
+    author_matches, author_scope_label, default_atlas_path, derive_topics, filter_timeline,
+    format_date, paths_digest, timeline_value,
 };
 pub use config::{ApiConfig, Config, DynamicLanguage, SchemaFormat, SchemaSource};
 pub use dotnet::{CsprojProject, parse_csproj};
@@ -62,8 +62,9 @@ pub use link_hints::{
 pub use links::{CrossRepoLink, LinkKind, RepoIdentity, imported_symbols, resolve_links};
 pub use manifest::{
     CargoDependency, CargoPackage, DepKind, DepSource, ManifestPackage, cargo_external_deps,
-    manifest_repository, parse_cargo_manifest, parse_composer_manifest, parse_gomod_manifest,
-    parse_npm_manifest, parse_pyproject_manifest, workspace_dependencies, workspace_members,
+    manifest_repository, normalize_keywords, parse_cargo_manifest, parse_composer_manifest,
+    parse_gomod_manifest, parse_npm_manifest, parse_pyproject_manifest, workspace_dependencies,
+    workspace_members,
 };
 pub use matcher::{ClientCall, Endpoint, Match, Matcher};
 pub use model::{CodeGraph, Confidence, Edge, EdgeKind, Node, NodeId, NodeKind, PendingLink, Span};

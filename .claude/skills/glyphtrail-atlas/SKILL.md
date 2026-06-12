@@ -161,11 +161,15 @@ related projects emerge (`--graph` for structural similarity, `--neighbors N` fo
 edge density). `atlas viz` writes a self-contained HTML file; `atlas serve` serves
 the same map over HTTP. Both reuse the `glyphtrail viz`/`serve` renderer.
 
-The `text` embedding represents each repo by a **structured digest** (languages,
-dependencies, API/endpoint surface, structure counts, git timeline, README excerpt,
-and frequency-ranked topics) built from its own index + commit history — not raw
-commit subjects — so repo similarity matches what a repo *is*. `atlas digest [repo]`
-prints that digest (`--json` for structured); it's the same document `embed` uses.
+The `text` embedding represents each repo by a **structured "repo card"**: its name,
+the **forge (GitHub) description** and the **package description** together, package
+**keywords ∪ forge topics**, languages, dependencies, API/endpoint surface, structure
+counts, a README summary, frequency-ranked commit topics, and an **era** line
+(`Era: 2019–2023 …`) for historical context. Built from its own index + commit
+history (and, for github repos, the captured forge metadata) — not raw commit
+subjects — so repo similarity matches what a repo *is*. `atlas digest [repo]` prints
+it (`--json` for structured); it's the same document `embed` uses. (A future `card`
+space will blend in the mean of the repo's commit embeddings.)
 
 An **embedding namespace** is a `(space, model)` pair. `space` is one of `text`
 (repo digest), `graph` (structural, from the code graph),

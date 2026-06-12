@@ -235,6 +235,10 @@ pub struct RemoteRepo {
     pub private: bool,
     pub fork: bool,
     pub archived: bool,
+    /// The forge's repo description (GitHub's one-line "about"), if set.
+    pub description: Option<String>,
+    /// The forge's repo topics (GitHub topics), lowercased by the API.
+    pub topics: Vec<String>,
 }
 
 /// Which repos account discovery returns. **Owned** repos are always included;
@@ -407,6 +411,22 @@ fn repo_from_value(v: &Value) -> Option<RemoteRepo> {
         private: bool_field("private"),
         fork: bool_field("fork"),
         archived: bool_field("archived"),
+        description: v
+            .get("description")
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        topics: v
+            .get("topics")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default(),
     })
 }
 
@@ -454,7 +474,8 @@ mod tests {
         let page = json!([
             {"full_name": "octo/app", "ssh_url": "git@github.com:octo/app.git",
              "clone_url": "https://github.com/octo/app.git", "id": 12, "private": true,
-             "fork": false, "archived": false},
+             "fork": false, "archived": false,
+             "description": "  A neat app  ", "topics": ["CLI", "rust"]},
             {"full_name": "octo/forked", "ssh_url": "git@github.com:octo/forked.git",
              "clone_url": "https://github.com/octo/forked.git", "id": 34, "private": false,
              "fork": true, "archived": false},
@@ -470,6 +491,9 @@ mod tests {
         check!(app.numeric_id.as_deref() == Some("12"));
         check!(app.private && !app.fork && !app.archived);
         check!(app.ssh_url == "git@github.com:octo/app.git");
+        check!(app.description.as_deref() == Some("A neat app")); // trimmed
+        check!(app.topics == vec!["cli".to_string(), "rust".to_string()]); // lowercased
+        check!(all[1].description.is_none() && all[1].topics.is_empty()); // absent → defaults
 
         // Default opts drop forks and archived.
         let lean = filter_repos(
