@@ -2453,19 +2453,35 @@ fn atlas_similarity_elements(
             repo_node_id(name)
         }
     };
-    let by_id: std::collections::HashMap<String, &RegistryEntry> = registry
+    // Name and gate every embedded repo from its `Repo` node rather than the registry
+    // alone: a repo discovered on a forge but never registered locally still has a node
+    // (so a name and a visibility tier), and would otherwise vanish from the map.
+    let reg_vis: std::collections::HashMap<&str, glyphtrail_core::Visibility> = registry
         .repos
         .iter()
-        .map(|e| (id_of(&e.name).0, e))
+        .map(|e| (e.name.as_str(), e.visibility))
         .collect();
-    // Only repos the registry can name and that the visibility gate allows.
+    // (space-scoped node id) -> (name, restricted). The registry tier wins when the
+    // repo is registered (it reflects live `[repos]` reclassification); the node's own
+    // tier covers the rest. Anything not tagged `public` is treated as restricted.
+    let by_id: std::collections::HashMap<String, (String, bool)> = store
+        .repo_visibilities()?
+        .into_iter()
+        .map(|(name, node_vis)| {
+            let restricted = match reg_vis.get(name.as_str()) {
+                Some(v) => v.is_restricted(),
+                None => node_vis != "public",
+            };
+            (id_of(&name).0, (name, restricted))
+        })
+        .collect();
     let repos: Vec<(&str, &str, &Vec<f32>)> = embs
         .iter()
         .filter_map(|e| {
-            let entry = by_id.get(&e.node_id.0)?;
-            (!entry.visibility.is_restricted() || include_restricted).then_some((
+            let (name, restricted) = by_id.get(&e.node_id.0)?;
+            (!*restricted || include_restricted).then_some((
                 e.node_id.0.as_str(),
-                entry.name.as_str(),
+                name.as_str(),
                 &e.vector,
             ))
         })
@@ -2733,7 +2749,7 @@ fn similar(dir: &Path, args: SimilarArgs) -> Result<()> {
     }
     let dim = embeddings[0].vector.len();
 
-    // Registry id→entry map in this space's id scheme, for naming + visibility.
+    // node id (this space's scheme) → (name, visibility label), for naming + gating.
     let id_of = |name: &str| -> NodeId {
         if args.graph {
             repo_graph_node_id(name)
@@ -2741,10 +2757,29 @@ fn similar(dir: &Path, args: SimilarArgs) -> Result<()> {
             repo_node_id(name)
         }
     };
-    let by_id: std::collections::HashMap<String, &RegistryEntry> = registry
+    // Built from the `Repo` nodes, so forge-discovered repos that were never
+    // registered locally are still named (not just shown as an opaque id). The
+    // registry's tier wins when the repo is registered (live `[repos]`
+    // reclassification); the node's own tier covers the rest.
+    let reg_vis: std::collections::HashMap<&str, glyphtrail_core::Visibility> = registry
         .repos
         .iter()
-        .map(|e| (id_of(&e.name).0, e))
+        .map(|e| (e.name.as_str(), e.visibility))
+        .collect();
+    let by_id: std::collections::HashMap<String, (String, &'static str)> = store
+        .repo_visibilities()?
+        .into_iter()
+        .map(|(name, node_vis)| {
+            let vis: &'static str = match reg_vis.get(name.as_str()) {
+                Some(v) => v.as_str(),
+                None => match node_vis.as_str() {
+                    "public" => "public",
+                    "proprietary" => "proprietary",
+                    _ => "private",
+                },
+            };
+            (id_of(&name).0, (name, vis))
+        })
         .collect();
 
     // Resolve the query vector: a known repo uses its stored embedding (excluded
@@ -2793,23 +2828,19 @@ fn similar(dir: &Path, args: SimilarArgs) -> Result<()> {
         if Some(id) == self_id.as_ref() {
             continue;
         }
-        let entry = by_id.get(id);
-        let restricted = entry.map(|x| x.visibility.is_restricted()).unwrap_or(true);
+        // Every synced repo has a `Repo` node, so a candidate that isn't named here
+        // has no node at all (shouldn't happen) — skip it rather than emit an opaque
+        // row, and count it as hidden.
+        let Some((name, vis)) = by_id.get(id) else {
+            excluded += 1;
+            continue;
+        };
+        let restricted = *vis != "public";
         if restricted && !args.include_restricted {
             excluded += 1;
             continue;
         }
-        // The repo name can't be recovered from the one-way node id, so tag an
-        // unregistered row with a short id prefix to keep multiple ones distinct.
-        let name = entry.map(|x| x.name.clone()).unwrap_or_else(|| {
-            let short: String = id.chars().take(8).collect();
-            format!("(unregistered {short})")
-        });
-        let vis = match entry.map(|x| x.visibility) {
-            Some(v) => v.as_str(),
-            None => "unregistered",
-        };
-        scored.push((*sim, name, vis));
+        scored.push((*sim, name.clone(), *vis));
     }
     scored.sort_by(|a, b| {
         b.0.partial_cmp(&a.0)

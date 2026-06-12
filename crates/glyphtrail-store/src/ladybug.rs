@@ -946,6 +946,22 @@ impl LadybugStore {
             .collect())
     }
 
+    /// Every synced repo's name and visibility tier, read from its `Repo` node
+    /// (`kind:'repo'`, with the tier stored in `signature`). Covers repos that were
+    /// discovered on a forge but never registered locally, which a name→entry map
+    /// built from the registry alone cannot name. Empty `signature` ⇒ empty string.
+    pub fn repo_visibilities(&self) -> Result<Vec<(String, String)>> {
+        Ok(self
+            .run(
+                "MATCH (r:Node {kind:'repo'}) RETURN r.name, r.signature",
+                vec![],
+            )?
+            .iter()
+            .map(|r| (get_str(r, 0), get_str(r, 1)))
+            .filter(|(name, _)| !name.is_empty())
+            .collect())
+    }
+
     /// Build the HNSW cosine index on a namespace's `FLOAT[]` table when the vector
     /// extension is loaded, for fast ANN; returns whether it was built. The table is
     /// created by [`GraphStore::set_embeddings`]; this just adds the index. No-op
@@ -2143,6 +2159,33 @@ mod tests {
         let neighbors = lb.neighbors("a", None, true).unwrap();
         check!(neighbors.len() == 1);
         check!(neighbors[0].0.id == NodeId("b".into()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // `repo_visibilities` returns every `Repo` node's name + visibility tier (and
+    // only repo nodes), so the atlas map/`similar` can name forge-discovered repos
+    // that were never registered locally.
+    #[test]
+    fn repo_visibilities_lists_repo_nodes_with_tier() {
+        let dir = tmp_dir("repo-vis");
+        let mut lb = LadybugStore::open(&dir).unwrap();
+        let mut public = node("repo:alpha", "alpha");
+        public.kind = NodeKind::Repo;
+        public.signature = Some("public".into());
+        let mut private = node("repo:beta", "beta");
+        private.kind = NodeKind::Repo;
+        private.signature = Some("private".into());
+        let func = node("fn:x", "x"); // non-repo node, must be excluded
+        lb.insert_nodes(&[public, private, func], true).unwrap();
+
+        let mut got = lb.repo_visibilities().unwrap();
+        got.sort();
+        check!(
+            got == vec![
+                ("alpha".to_string(), "public".to_string()),
+                ("beta".to_string(), "private".to_string()),
+            ]
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
