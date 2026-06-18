@@ -30,7 +30,7 @@ use anyhow::{Context, Result, anyhow, bail};
 /// `assets/` changes (and the `glyphtrail-version` in the skill frontmatter).
 /// An install stamped with a lower version is reported stale — a hint only;
 /// `analyze`/`status` never rewrite the files, only `setup` does.
-pub const SKILL_VERSION: u32 = 1;
+pub const SKILL_VERSION: u32 = 2;
 
 /// Version-independent prefix of the begin marker, so an existing section is
 /// detected (and replaced) regardless of the `v=` it was written with.
