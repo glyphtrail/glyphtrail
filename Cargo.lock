@@ -709,7 +709,7 @@ dependencies = [
 
 [[package]]
 name = "glyphtrail-analyze"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "assert2",
@@ -729,7 +729,7 @@ dependencies = [
 
 [[package]]
 name = "glyphtrail-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "assert2",
@@ -763,7 +763,7 @@ dependencies = [
 
 [[package]]
 name = "glyphtrail-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "assert2",
  "blake3",
@@ -776,7 +776,7 @@ dependencies = [
 
 [[package]]
 name = "glyphtrail-forge-id"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "assert2",
  "serde",
@@ -789,7 +789,7 @@ dependencies = [
 
 [[package]]
 name = "glyphtrail-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "assert2",
@@ -804,7 +804,7 @@ dependencies = [
 
 [[package]]
 name = "glyphtrail-parse"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "assert2",
@@ -839,7 +839,7 @@ dependencies = [
 
 [[package]]
 name = "glyphtrail-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "assert2",
@@ -858,7 +858,7 @@ dependencies = [
 
 [[package]]
 name = "glyphtrail-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "assert2",
@@ -870,7 +870,7 @@ dependencies = [
 
 [[package]]
 name = "glyphtrail-viz"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "assert2",
