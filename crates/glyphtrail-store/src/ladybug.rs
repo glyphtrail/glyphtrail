@@ -303,8 +303,8 @@ impl LadybugStore {
         let result = self
             .conn()?
             .query(&format!(
-                "COPY {table} FROM '{}' (PARALLEL=FALSE)",
-                path.display()
+                "COPY {table} FROM {} (PARALLEL=FALSE)",
+                path_literal(&path)
             ))
             .map(|_| ())
             .with_context(|| format!("COPY {table} FROM {}", path.display()));
@@ -374,6 +374,14 @@ fn s(v: &str) -> Value {
 /// embedded quote) so a comma/quote/newline in an id can't break a row.
 fn csv_field(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
+}
+
+/// Quote a filesystem path as a Cypher string literal for `COPY ... FROM/TO` and
+/// `LOAD FROM`, which take no parameters. The parser treats `\` as an escape, so a
+/// raw Windows path (`C:\Users\...`) fails to parse (#562); escape `\` and `'`.
+fn path_literal(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    format!("'{}'", raw.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
 /// `$rows` structs for an edge insert ([`MERGE_EDGES`] / [`CREATE_EDGES`]).
@@ -747,8 +755,8 @@ impl LadybugStore {
             self.run(&materialize, vec![])?;
             self.run(
                 &format!(
-                    "COPY (MATCH (b:{bk}) RETURN b.node_id AS node_id, b.key AS key, b.vec AS vec) TO '{}'",
-                    file.display()
+                    "COPY (MATCH (b:{bk}) RETURN b.node_id AS node_id, b.key AS key, b.vec AS vec) TO {}",
+                    path_literal(&file)
                 ),
                 vec![],
             )?;
@@ -833,7 +841,10 @@ impl LadybugStore {
                 ),
                 vec![],
             )?;
-            self.run(&format!("COPY {tmp} FROM '{}'", parquet.display()), vec![])?;
+            self.run(
+                &format!("COPY {tmp} FROM {}", path_literal(&parquet)),
+                vec![],
+            )?;
             self.run(
                 &format!("MATCH (t:{tmp}) CREATE (v:{table} {{node_id:t.node_id, vec:t.vec}})"),
                 vec![],
@@ -2162,6 +2173,43 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // #562: a Windows temp path (`C:\Users\...`) in a `COPY`/`LOAD FROM` literal
+    // broke the Cypher parser (`\U` is an invalid escape). The quoted literal must
+    // parse and decode back to the exact path, backslashes and quotes included.
+    #[test]
+    fn path_literal_round_trips_backslashes_and_quotes() {
+        let dir = tmp_dir("path-literal");
+        let lb = LadybugStore::open(&dir).unwrap();
+        let path = Path::new(r"C:\Users\o'neil\AppData\Local\Temp\glyphtrail-copy-Node-1-0.csv");
+        let rows = lb
+            .run(&format!("RETURN {} AS p", path_literal(path)), vec![])
+            .unwrap();
+        check!(get_str(&rows[0], 0) == path.to_string_lossy());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // #562 end to end: a file whose directory name holds a backslash and a quote
+    // (legal on Unix, so this exercises the escaping off Windows too) loads.
+    #[cfg(unix)]
+    #[test]
+    fn load_from_path_with_backslash_and_quote() {
+        let dir = tmp_dir("path-escape");
+        let lb = LadybugStore::open(&dir).unwrap();
+        let data = tmp_dir(r"odd\dir'name");
+        std::fs::create_dir_all(&data).unwrap();
+        let csv = data.join("rows.csv");
+        std::fs::write(&csv, "a\nb\nc\n").unwrap();
+        let rows = lb
+            .run(
+                &format!("LOAD FROM {} RETURN count(*)", path_literal(&csv)),
+                vec![],
+            )
+            .unwrap();
+        check!(get_i64(&rows[0], 0) == 3);
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&data).ok();
+    }
+
     // `repo_visibilities` returns every `Repo` node's name + visibility tier (and
     // only repo nodes), so the atlas map/`similar` can name forge-discovered repos
     // that were never registered locally.
@@ -2469,7 +2517,7 @@ mod tests {
             ));
             format!(
                 "{}",
-                conn.query(&format!("LOAD FROM '{}' RETURN key", f.display()))
+                conn.query(&format!("LOAD FROM {} RETURN key", path_literal(&f)))
                     .unwrap()
             )
         };
