@@ -829,7 +829,9 @@ dependencies = [
  "tree-sitter-scala",
  "tree-sitter-swift",
  "tree-sitter-typescript",
+ "tree-sitter-vb-dotnet",
  "tree-sitter-zig",
+ "wicked-estate-tree-sitter-vb6",
 ]
 
 [[package]]
@@ -2369,6 +2371,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tree-sitter-vb-dotnet"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "180e4a199378505f9305c3d01d6ece8a8d34035f310de1c727693f8a2296025e"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "tree-sitter-zig"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2589,6 +2601,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52f5ee44c96cf55f1b349600768e3ece3a8f26010c05265ab73f945bb1a2eb9d"
 dependencies = [
  "rustls-pki-types",
+]
+
+[[package]]
+name = "wicked-estate-tree-sitter-vb6"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "017d92da769f03ed825384e34ba15c52d88f69a5bd8ae00a0e01a8ecc432f097"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
 ]
 
 [[package]]

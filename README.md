@@ -510,7 +510,7 @@ is rarely needed given the self-healing above, and only removes the lock file.
 Coverage is driven by a tree-sitter grammar registry. Built in:
 Rust, Python, JavaScript, TypeScript/TSX, Go, Java, C, C++, C#, Ruby, Kotlin, Bash,
 PHP, Scala, OCaml, Haskell, Lua, Swift, Elixir, Zig, R, Dart, Pascal (Free Pascal /
-Delphi), and Merlin 6502 assembly. Adding a built-in
+Delphi), Visual Basic 6 / VBA, VB.NET, and Merlin 6502 assembly. Adding a built-in
 language is a grammar in `glyphtrail-parse/src/registry.rs` plus a query file under
 `glyphtrail-parse/queries/`.
 

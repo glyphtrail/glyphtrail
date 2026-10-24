@@ -39,6 +39,10 @@ tree-sitter-r = "1.3.0"
 tree-sitter-dart = "0.2.0"
 tree-sitter-merlin6502 = "4.0.0"
 tree-sitter-pascal = "0.10.2"
+# Same grammar as `tree-sitter-vb6`, but with the `LanguageFn` binding the other
+# grammars use (ABI 15, no direct `tree-sitter` dependency).
+wicked-estate-tree-sitter-vb6 = "0.1.1"
+tree-sitter-vb-dotnet = "0.1.0"
 
 [dev-dependencies]
 assert2.workspace = true
