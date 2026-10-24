@@ -261,6 +261,19 @@ tasks:
     cmds:
       - cargo doc --workspace --no-deps --open
 
+  # Lints the GitHub Actions workflows: actionlint (correctness, shellcheck over
+  # `run:` scripts) and zizmor (security). Mirrors the `workflow lint` CI job,
+  # with the same pinned tool versions, fetched on demand through uv.
+  # zizmor's online audits use GH_TOKEN when set; without it they are skipped.
+  lint:actions:
+    desc: Lint GitHub Actions workflows (actionlint + zizmor)
+    preconditions:
+      - sh: command -v uvx
+        msg: "uvx not found — install uv from https://docs.astral.sh/uv/"
+    cmds:
+      - uvx --from actionlint-py==1.7.12.25 actionlint
+      - uvx zizmor==1.31.1 {{.CLI_ARGS}} .
+
   # Runs fmt:check, lint, and cargo check in sequence. Use before committing.
   check:
     desc: Static checks — fmt, clippy, cargo check

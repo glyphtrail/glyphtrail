@@ -1,21 +1,53 @@
 name: release
 
-# Build cross-platform `glyphtrail` binaries on a version tag and attach them to
-# the GitHub Release. Publishing to crates.io is intentionally left manual.
+# On a version tag, build cross-platform `glyphtrail` binaries and, once every
+# target has built, create the GitHub Release (notes generated from the merged
+# PRs) with all archives and MCP bundles attached. A failed target means no
+# release at all rather than a partial one. Publishing to crates.io is
+# intentionally left manual.
 on:
   push:
     tags: ["v*"]
 
-permissions:
-  contents: write
+# Least privilege by default; only the final release job can write.
+permissions: {}
+
+# Never run two releases for the same tag side by side.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Refuse to release a tag that disagrees with the workspace version, so a
+  # mistyped tag can't ship binaries that report a different `--version`.
+  verify-tag:
+    name: Verify tag matches workspace version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # check out the repository
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Compare tag and Cargo.toml version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)"
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::tag $TAG does not match workspace version $version"
+            exit 1
+          fi
+
   build:
     name: ${{ matrix.target }}
+    needs: verify-tag
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read # check out the repository
     strategy:
       fail-fast: false
       matrix:
@@ -24,60 +56,65 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: macos-latest
             target: aarch64-apple-darwin
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+    # Template values reach the scripts as environment variables, never inlined
+    # into the shell source.
+    env:
+      TARGET: ${{ matrix.target }}
+      TAG: ${{ github.ref_name }}
 
     steps:
-      - uses: actions/checkout@v7
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
           targets: ${{ matrix.target }}
       # LadybugDB (default feature) links `lbug`. macOS/Windows use the prebuilt
       # liblbug. Linux builds it from source with the runner's compiler: the
       # prebuilt was compiled with an older GCC and segfaults when linked next to
       # a newer libstdc++ (see rust.yml). The flag goes through $GITHUB_ENV, not a
       # matrix-wide `env:`, because lbug's build script only checks whether
-      # LBUG_BUILD_FROM_SOURCE is set at all. Unlike CI, release builds don't use
-      # sccache: release binaries compile lbug cold rather than from C++ objects
-      # in the shared Actions cache.
+      # LBUG_BUILD_FROM_SOURCE is set at all.
+      #
+      # Release builds deliberately use no cache (neither rust-cache nor
+      # sccache): a cache entry written by any branch could otherwise be restored
+      # into the shipped binaries.
       - name: Install LadybugDB build dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update && sudo apt-get install -y cmake clang build-essential pkg-config libssl-dev
           echo "LBUG_BUILD_FROM_SOURCE=1" >> "$GITHUB_ENV"
-      - name: Cache Cargo artifacts
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
       # Embed an SBOM (the exact dependency tree) into the binary so it can be
       # audited after the fact with `cargo audit bin <binary>` (#301). Installed
       # from a prebuilt to avoid compiling it on every target.
       - name: Install cargo-auditable
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-auditable
       - name: Build (SBOM embedded)
-        run: cargo auditable build --release --locked -p glyphtrail-cli --target ${{ matrix.target }}
+        shell: bash
+        run: cargo auditable build --release --locked -p glyphtrail-cli --target "$TARGET"
       - name: Package
         shell: bash
         run: |
-          staging="glyphtrail-${{ github.ref_name }}-${{ matrix.target }}"
-          mkdir "$staging"
+          staging="glyphtrail-$TAG-$TARGET"
+          mkdir -p "$staging" dist
           if [ "$RUNNER_OS" = "Windows" ]; then
-            cp "target/${{ matrix.target }}/release/glyphtrail.exe" "$staging/"
+            cp "target/$TARGET/release/glyphtrail.exe" "$staging/"
           else
-            cp "target/${{ matrix.target }}/release/glyphtrail" "$staging/"
+            cp "target/$TARGET/release/glyphtrail" "$staging/"
           fi
           cp README.md LICENSE-EUPL-1.2 "$staging/"
           if [ "$RUNNER_OS" = "Windows" ]; then
-            7z a "$staging.zip" "$staging" >/dev/null
-            echo "ASSET=$staging.zip" >> "$GITHUB_ENV"
+            7z a "dist/$staging.zip" "$staging" >/dev/null
           else
-            tar czf "$staging.tar.gz" "$staging"
-            echo "ASSET=$staging.tar.gz" >> "$GITHUB_ENV"
+            tar czf "dist/$staging.tar.gz" "$staging"
           fi
       # Build a one-click MCP Bundle (.mcpb) for Claude Desktop (#303): a zip of
       # the platform binary plus a manifest derived from packaging/mcpb. The bundle
@@ -86,32 +123,67 @@ jobs:
       - name: Package MCP bundle (.mcpb)
         shell: bash
         run: |
-          tag="${{ github.ref_name }}"
-          ver="${tag#v}"
-          case "${{ matrix.target }}" in
+          ver="${TAG#v}"
+          case "$TARGET" in
             *windows*) bin="glyphtrail.exe"; platform="win32" ;;
             *darwin*)  bin="glyphtrail";     platform="darwin" ;;
             *)         bin="glyphtrail";     platform="linux" ;;
           esac
-          bundle="glyphtrail-${tag}-${{ matrix.target }}.mcpb"
           work="$(mktemp -d)"
-          cp "target/${{ matrix.target }}/release/$bin" "$work/"
+          cp "target/$TARGET/release/$bin" "$work/"
           jq --arg v "$ver" --arg bin "$bin" --arg plat "$platform" \
             '.version = $v
              | .server.entry_point = $bin
              | .server.mcp_config.command = "${__dirname}/" + $bin
              | .compatibility.platforms = [$plat]' \
             packaging/mcpb/manifest.json > "$work/manifest.json"
-          out="$PWD/$bundle"
+          out="$PWD/dist/glyphtrail-$TAG-$TARGET.mcpb"
           if [ "$RUNNER_OS" = "Windows" ]; then
             ( cd "$work" && 7z a -tzip "$out" . >/dev/null )
           else
             ( cd "$work" && zip -r -q "$out" . )
           fi
-          echo "MCPB=$bundle" >> "$GITHUB_ENV"
-      - name: Upload to release
-        uses: softprops/action-gh-release@v3
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          files: |
-            ${{ env.ASSET }}
-            ${{ env.MCPB }}
+          name: dist-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release and upload its assets
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum -- * > SHA256SUMS
+      # Tags with a pre-release suffix (v1.2.0-rc.1) become pre-releases. If the
+      # release already exists (e.g. drafted by hand, or a re-run), only its
+      # assets are replaced; the notes are left alone.
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            prerelease=()
+            case "$TAG" in *-*) prerelease=(--prerelease) ;; esac
+            gh release create "$TAG" dist/* \
+              --verify-tag \
+              --title "$TAG" \
+              --generate-notes \
+              "${prerelease[@]}"
+          fi

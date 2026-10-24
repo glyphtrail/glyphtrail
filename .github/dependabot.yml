@@ -2,6 +2,10 @@ version: 2
 updates:
   - package-ecosystem: "cargo"
     directory: "/"
+    # Let fresh releases age a week before adopting them, so a compromised or
+    # yanked release is usually caught before it lands here.
+    cooldown:
+      default-days: 7
     schedule:
       interval: "weekly"
       day: "monday"
@@ -19,6 +23,10 @@ updates:
 
   - package-ecosystem: "github-actions"
     directory: "/"
+    # Let fresh releases age a week before adopting them, so a compromised or
+    # yanked release is usually caught before it lands here.
+    cooldown:
+      default-days: 7
     schedule:
       interval: "weekly"
       day: "monday"

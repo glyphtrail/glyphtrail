@@ -1,0 +1,47 @@
+name: workflow lint
+
+# Lint the GitHub Actions setup itself: actionlint for correctness (expression
+# types, runner labels, shellcheck over `run:` scripts) and zizmor for security
+# (unpinned actions, template injection, excessive permissions, cache
+# poisoning, ...). Runs only when workflow or Dependabot config changes.
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/**"
+      - "Taskfile.dist.yaml"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/**"
+      - "Taskfile.dist.yaml"
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    name: actionlint + zizmor
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # check out the repository; zizmor's online audits read action repos
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          enable-cache: false
+      # Same entry point as `task lint:actions` locally, so CI and developers
+      # run identical tool versions. The token enables zizmor's online audits
+      # (known-vulnerable actions, impostor commits, ref confusion).
+      - name: Lint workflows
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          uvx --from actionlint-py==1.7.12.25 actionlint -color
+          uvx zizmor==1.31.1 --format=github .
