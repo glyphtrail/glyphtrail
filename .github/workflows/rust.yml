@@ -15,6 +15,23 @@ jobs:
     strategy:
       matrix:
         toolchain: [stable, 1.95.0]
+    # LadybugDB is the sole storage backend (a required dependency), so every
+    # build links `lbug`. On Linux we build it from source instead of using the
+    # prebuilt liblbug: the prebuilt was compiled with an older GCC, and linking
+    # it next to code built with a newer libstdc++ (e.g. Ubuntu 26.04's GCC 15)
+    # merges mismatched `std::format` template instances and segfaults at
+    # runtime. A source build compiles everything with one compiler.
+    #
+    # The C++ build is slow, so it is cached at two levels: rust-cache restores
+    # the whole lbug build output while Cargo.lock and the toolchain are
+    # unchanged, and sccache (CMake compiler launcher, GitHub Actions cache
+    # backend) serves the individual C++ objects when rust-cache misses, e.g.
+    # after a Dependabot lockfile bump.
+    env:
+      LBUG_BUILD_FROM_SOURCE: "1"
+      SCCACHE_GHA_ENABLED: "true"
+      CMAKE_C_COMPILER_LAUNCHER: sccache
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
 
     steps:
       - uses: actions/checkout@v6
@@ -23,11 +40,12 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain }}
           components: rustfmt, clippy
-      # LadybugDB is the sole storage backend (a required dependency), so every
-      # build links `lbug` (a prebuilt liblbug, or a cmake/clang source build as
-      # fallback) and needs the C++ toolchain.
       - name: Install LadybugDB build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake clang build-essential
+        run: sudo apt-get update && sudo apt-get install -y cmake clang build-essential pkg-config libssl-dev
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: "v0.18.0"
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@v2
       - name: Format check
@@ -43,6 +61,9 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace --verbose
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
 
   dependencies:
     name: Dependency Submission

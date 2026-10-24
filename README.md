@@ -37,6 +37,17 @@ cargo install --git https://github.com/glyphtrail/glyphtrail glyphtrail-cli
 cargo build --release   # binary at target/release/glyphtrail
 ```
 
+On Linux distributions with a recent GCC (seen with GCC 15 on Ubuntu 26.04;
+Ubuntu 24.04's GCC 13 is fine), build the LadybugDB storage engine from source
+as well. The prebuilt library it otherwise
+downloads was compiled with an older GCC and crashes when linked against the newer
+libstdc++. This needs `cmake`, a C++ compiler and the OpenSSL headers
+(`libssl-dev`), and adds a one-time C++ compile of several minutes:
+
+```sh
+LBUG_BUILD_FROM_SOURCE=1 cargo install --git https://github.com/glyphtrail/glyphtrail glyphtrail-cli
+```
+
 ## Usage
 
 ```sh
