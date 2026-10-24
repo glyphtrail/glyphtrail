@@ -176,7 +176,7 @@ pub fn parse_with(
         let mut def_node: Option<tree_sitter::Node> = None;
         let mut name_text: Option<String> = None;
 
-        for cap in m.captures {
+        for cap in m.captures() {
             let cap_name = capture_names[cap.index as usize];
             let node = cap.node;
             let text = node.utf8_text(src).unwrap_or("").to_string();
