@@ -51,6 +51,10 @@ pub fn resolve_import(importer_rel: &str, raw: &str, lang: &Language) -> Vec<Str
         // Merlin PUT/USE includes are recorded raw; file-node resolution (append
         // `.S`, resolve against the source dir) is a follow-up (#359).
         | Language::Merlin6502
+        // VB.NET `Imports` names a namespace; VB6 has no in-source imports
+        // (the `.vbp` project file lists the modules).
+        | Language::Vb6
+        | Language::VbNet
         | Language::Other(_) => Vec::new(),
     }
 }

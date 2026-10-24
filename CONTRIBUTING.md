@@ -17,6 +17,13 @@ This repo uses [GitHub Flow](https://docs.github.com/en/get-started/using-github
 - Releases are cut from `main`. There are no long-lived release or develop
   branches.
 
+## Vocabulary
+
+[`GLOSSARY.md`](GLOSSARY.md) defines the project's domain terms (Index, Seed,
+Blast Radius, Endpoint, Cross-Repo Link, ...) and lists synonyms to avoid. Use
+those terms in code, docs, issues and PR titles, and extend the glossary when a
+new concept settles.
+
 ## Releasing
 
 Bump `workspace.package.version` (and the lockstep `[workspace.dependencies]`
