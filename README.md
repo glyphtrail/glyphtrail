@@ -36,6 +36,10 @@ flowchart LR
 
 Prebuilt binaries for Linux, macOS (Intel + Apple Silicon) and Windows are
 attached to each [tagged release](https://github.com/glyphtrail/glyphtrail/releases).
+For Linux there are two builds: `x86_64-unknown-linux-gnu` (needs glibc and
+OpenSSL 3 on the system) and a fully static `x86_64-unknown-linux-musl` that runs
+on any x86_64 Linux, including Alpine and older distributions. The static build
+cannot load LadybugDB extensions, so the vector index is unavailable there.
 
 Or build from source:
 
