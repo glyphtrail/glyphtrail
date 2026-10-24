@@ -6,3 +6,11 @@
 # different flags and lbug's prebuilt vector extension targets Linux.
 [target.'cfg(target_os = "linux")']
 rustflags = ["-C", "link-arg=-Wl,--export-dynamic"]
+
+# Pin the prebuilt liblbug that `lbug`'s build script downloads to the version
+# of the `lbug` crate in Cargo.lock. Unset, it fetches the *latest* LadybugDB
+# release, which drifts ahead of the crate's bindings (v0.21 also needs OpenSSL)
+# and fails to link on a cold cache. Bump this together with `lbug` in
+# crates/glyphtrail-store/Cargo.toml.
+[env]
+LBUG_VERSION = "0.17.1"
