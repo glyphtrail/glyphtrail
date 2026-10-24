@@ -24,6 +24,14 @@ the CLI. Use it as a repo index for Claude Code, Cursor, Windsurf, and Codex.
 
 Built native in Rust.
 
+```mermaid
+flowchart LR
+  src["source repo"] -- "tree-sitter<br/>glyphtrail analyze" --> db[("per-repo graph<br/>.glyphtrail/ladybug")]
+  db --> cli["CLI<br/>query · impact · outline"]
+  db --> mcp["MCP server<br/>coding agents"]
+  db --> viz["serve / viz<br/>graph explorer"]
+```
+
 ## Install
 
 Prebuilt binaries for Linux, macOS (Intel + Apple Silicon) and Windows are
@@ -407,6 +415,14 @@ data.
 
 A federated query (`impact --downstream` / `--group`, or the MCP `impact` tool)
 stitches those independent indexes together at query time:
+
+```mermaid
+flowchart LR
+  reg["~/.glyphtrail/registry.json<br/>names → roots"] --> q{{"impact --downstream"}}
+  a[("repo A<br/>publishes crate a")] --> q
+  b[("repo B<br/>uses a::foo")] --> q
+  q --> r["blast radius<br/>A first, then B"]
+```
 
 1. **Select the members** — the whole registry, or a named group. The current
    repo (matched to a registry entry by path) is always included.
