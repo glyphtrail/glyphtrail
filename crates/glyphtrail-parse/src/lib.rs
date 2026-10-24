@@ -335,6 +335,9 @@ type
     procedure Draw;
   end;
   TBox<T> = class(TList<T>) end;
+  TStrHelper = record helper for string
+    function Shout: string;
+  end;
 procedure Helper(X: Integer);
 implementation
 procedure Helper(X: Integer);
@@ -362,6 +365,7 @@ end.
         check!(defs("TColor") == vec![NodeKind::Enum]);
         check!(defs("IDrawable") == vec![NodeKind::Interface]);
         check!(defs("TBox") == vec![NodeKind::Class]);
+        check!(defs("TStrHelper") == vec![NodeKind::Class]);
         check!(defs("Helper") == vec![NodeKind::Function]);
         // The `TShape.Draw` body and the `IDrawable` member; not the class header.
         check!(defs("Draw") == vec![NodeKind::Method, NodeKind::Method]);

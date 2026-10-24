@@ -3,12 +3,14 @@
 ; methods are taken from the body only — one def per routine keeps local call
 ; resolution unambiguous.
 
-; Types: `TFoo = class(...)`, `record`, `interface`, enum `(A, B)`.
+; Types: `TFoo = class(...)`, `record`, `interface`, helper, enum `(A, B)`.
 ; Generic names (`TList<T>`) wrap the identifier in `genericTpl`.
 (declType name: [(identifier) @name (genericTpl entity: (identifier) @name)] type: (declClass (kClass))) @def.class
 (declType name: [(identifier) @name (genericTpl entity: (identifier) @name)] type: (declClass (kObject))) @def.class
 (declType name: [(identifier) @name (genericTpl entity: (identifier) @name)] type: (declClass (kRecord))) @def.struct
 (declType name: [(identifier) @name (genericTpl entity: (identifier) @name)] type: (declIntf)) @def.interface
+; Delphi `class helper for X` / `record helper for X` adds methods to X.
+(declType name: (identifier) @name type: (declHelper)) @def.class
 (declType name: (identifier) @name type: (type (declEnum))) @def.enum
 
 ; Interface methods have no body anywhere, so their declaration is the def.
