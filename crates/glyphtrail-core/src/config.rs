@@ -318,10 +318,10 @@ impl Config {
             message,
         };
         for r in &self.api.rewrites {
-            r.validate().map_err(&invalid)?;
+            r.validate().map_err(invalid)?;
         }
         for p in &self.api.gateway_prefixes {
-            crate::rewrite::validate_gateway_prefix(p).map_err(&invalid)?;
+            crate::rewrite::validate_gateway_prefix(p).map_err(invalid)?;
         }
         Ok(())
     }
