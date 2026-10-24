@@ -29,6 +29,7 @@ pub fn resolve_import(importer_rel: &str, raw: &str, lang: &Language) -> Vec<Str
         Language::C | Language::Cpp => c_candidates(importer_rel, raw),
         Language::Python => python_candidates(raw),
         Language::Java => java_candidates(raw),
+        Language::Pascal => pascal_candidates(raw),
         // Go/Rust/C#/Ruby/Kotlin imports name modules/namespaces, not file
         // paths, so they aren't resolved to files here.
         Language::Go
@@ -129,6 +130,13 @@ fn python_candidates(raw: &str) -> Vec<String> {
     vec![format!("{path}.py"), format!("{path}/__init__.py")]
 }
 
+/// Pascal `uses` names a unit, conventionally defined in `<Unit>.pas` (or the
+/// Free Pascal `.pp`); a Delphi dotted unit (`System.SysUtils`) keeps its dots in
+/// the file name. RTL/package units simply won't match any repo file.
+fn pascal_candidates(raw: &str) -> Vec<String> {
+    vec![format!("{raw}.pas"), format!("{raw}.pp")]
+}
+
 /// Java fully-qualified types (`com.foo.Bar`) map to `com/foo/Bar.java`.
 /// Wildcard imports (`com.foo.*`) name a package, not a type, so are skipped.
 fn java_candidates(raw: &str) -> Vec<String> {
@@ -183,6 +191,15 @@ mod tests {
             resolve_import("X.java", "com.foo.Bar", &Language::Java) == vec!["com/foo/Bar.java"]
         );
         check!(resolve_import("X.java", "com.foo.*", &Language::Java).is_empty());
+    }
+
+    // #555: a Pascal unit maps to `<Unit>.pas`/`.pp`, dotted names kept intact.
+    #[test]
+    fn pascal_unit_maps_to_unit_file() {
+        check!(
+            resolve_import("prog.lpr", "Geometry.Vectors", &Language::Pascal)
+                == vec!["Geometry.Vectors.pas", "Geometry.Vectors.pp"]
+        );
     }
 
     #[test]
