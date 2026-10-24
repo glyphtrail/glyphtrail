@@ -13,4 +13,4 @@ rustflags = ["-C", "link-arg=-Wl,--export-dynamic"]
 # and fails to link on a cold cache. Bump this together with `lbug` in
 # crates/glyphtrail-store/Cargo.toml.
 [env]
-LBUG_VERSION = "0.17.1"
+LBUG_VERSION = "0.21.2"
