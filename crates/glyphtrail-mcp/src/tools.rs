@@ -1282,11 +1282,9 @@ fn remote_to_https(url: &str) -> Option<String> {
     } else if let Some(r) = url.strip_prefix("ssh://") {
         // ssh://git@host/owner/repo
         r.split_once('@').map(|(_, h)| h).unwrap_or(r).to_string()
-    } else if let Some(r) = url.strip_prefix("git@") {
-        // scp-style: git@host:owner/repo
-        r.replacen(':', "/", 1)
     } else {
-        return None;
+        // scp-style: git@host:owner/repo
+        url.strip_prefix("git@")?.replacen(':', "/", 1)
     };
     // `rest` is scheme-less (`host/owner/repo[.git]`); re-attach https.
     Some(format!("https://{}", trim_repo_url(&rest)))
