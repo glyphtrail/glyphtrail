@@ -33,6 +33,8 @@ pub enum Language {
     Dart,
     /// Merlin 6502 assembly (#359).
     Merlin6502,
+    /// Pascal: Free Pascal and Delphi (#555).
+    Pascal,
     /// A language identified by name but not built in (dynamically loaded).
     Other(String),
 }
@@ -64,6 +66,7 @@ impl Language {
             Language::R => "r",
             Language::Dart => "dart",
             Language::Merlin6502 => "merlin6502",
+            Language::Pascal => "pascal",
             Language::Other(name) => name,
         }
     }
@@ -100,6 +103,10 @@ impl Language {
             // is left to generic assemblers (GNU as). A non-6502 `.S` repo can
             // override via a per-repo dynamic `[[languages]]` entry (#359).
             "s" if raw == "S" => Language::Merlin6502,
+            // `.pp` is also Puppet's extension; a Puppet repo can override it via
+            // a per-repo dynamic `[[languages]]` entry. `.lpr`/`.dpr` are the
+            // Lazarus/Delphi program files (#555).
+            "pas" | "pp" | "lpr" | "dpr" => Language::Pascal,
             _ => return None,
         })
     }
@@ -130,11 +137,12 @@ impl Language {
             "r" => Language::R,
             "dart" => Language::Dart,
             "merlin6502" | "merlin" => Language::Merlin6502,
+            "pascal" | "delphi" => Language::Pascal,
             _ => return None,
         })
     }
 
-    pub const ALL: [Language; 24] = [
+    pub const ALL: [Language; 25] = [
         Language::Rust,
         Language::Python,
         Language::JavaScript,
@@ -159,6 +167,7 @@ impl Language {
         Language::R,
         Language::Dart,
         Language::Merlin6502,
+        Language::Pascal,
     ];
 }
 

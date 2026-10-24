@@ -112,6 +112,7 @@ mod tests {
             (Language::R, "f <- function() 1\n"),
             (Language::Dart, "void f() {}\n"),
             (Language::Merlin6502, "f rts\n"),
+            (Language::Pascal, "procedure f;\nbegin\nend;\n"),
         ];
         for (lang, src) in cases {
             let parsed = parse_source(&lang, src)
@@ -247,6 +248,11 @@ mod tests {
             (Language::R, "# note\nf <- function() { g() }\n", "g"),
             (Language::Dart, "// note\nvoid f() { g(); }\n", "g"),
             (Language::Merlin6502, "* note\nf jsr g\n", "g"),
+            (
+                Language::Pascal,
+                "{ note }\nprocedure f;\nbegin\n  g(1);\nend;\n",
+                "g",
+            ),
         ];
         for (lang, src, call) in cases {
             let parsed = parse_source(&lang, src)
@@ -308,6 +314,83 @@ mod tests {
         check!(kind("routine") == Some(NodeKind::Function));
         check!(kind("width") == Some(NodeKind::Constant));
         check!(kind("buf") == Some(NodeKind::Constant));
+    }
+
+    // #555: a Pascal routine is declared twice (interface header + `defProc`
+    // body; class member + `TFoo.Bar` body). Only the body is a def, so each
+    // routine is one node and a local call resolves to it unambiguously.
+    #[test]
+    fn pascal_extracts_one_def_per_routine_and_resolves_calls() {
+        use glyphtrail_core::{EdgeKind, NodeId, NodeKind};
+        let src = "unit Shapes;
+interface
+uses SysUtils, Geometry.Vectors;
+type
+  TShape = class(TObject, IDrawable)
+    procedure Draw;
+  end;
+  TPoint = record X, Y: Integer; end;
+  TColor = (Red, Green);
+  IDrawable = interface
+    procedure Draw;
+  end;
+  TBox<T> = class(TList<T>) end;
+procedure Helper(X: Integer);
+implementation
+procedure Helper(X: Integer);
+begin
+end;
+procedure TShape.Draw;
+begin
+  Helper(1);
+  Canvas.Rectangle(0, 0);
+  Refresh;
+end;
+end.
+";
+        let parsed = parse_source(&Language::Pascal, src).unwrap();
+        let defs = |name: &str| {
+            parsed
+                .defs
+                .iter()
+                .filter(|d| d.name == name)
+                .map(|d| d.kind)
+                .collect::<Vec<_>>()
+        };
+        check!(defs("TShape") == vec![NodeKind::Class]);
+        check!(defs("TPoint") == vec![NodeKind::Struct]);
+        check!(defs("TColor") == vec![NodeKind::Enum]);
+        check!(defs("IDrawable") == vec![NodeKind::Interface]);
+        check!(defs("TBox") == vec![NodeKind::Class]);
+        check!(defs("Helper") == vec![NodeKind::Function]);
+        // The `TShape.Draw` body and the `IDrawable` member; not the class header.
+        check!(defs("Draw") == vec![NodeKind::Method, NodeKind::Method]);
+
+        let bases: Vec<&str> = parsed.bases.iter().map(|b| b.name.as_str()).collect();
+        check!(bases == vec!["TObject", "IDrawable", "TList"]);
+        check!(parsed.imports == vec!["SysUtils", "Geometry.Vectors"]);
+        let calls: Vec<&str> = parsed.calls.iter().map(|c| c.name.as_str()).collect();
+        check!(calls == vec!["Helper", "Rectangle", "Refresh"]);
+
+        let file_id = NodeId::derive(&["file", "Shapes.pas"]);
+        let fg = build_file_graph("Shapes.pas", &Language::Pascal, &file_id, &parsed, src);
+        // The `TShape.Draw` body is top-level (`Draw`); the interface member is
+        // `IDrawable::Draw`.
+        let node = |qualified: &str| {
+            fg.graph
+                .nodes
+                .iter()
+                .find(|n| n.qualified_name == qualified)
+                .map(|n| n.id.clone())
+                .unwrap()
+        };
+        let (draw, helper) = (node("Draw"), node("Helper"));
+        check!(
+            fg.graph
+                .edges
+                .iter()
+                .any(|e| e.src == draw && e.dst == helper && e.kind == EdgeKind::Calls)
+        );
     }
 
     // #5: `new Foo()` constructor instantiation is a reference to the class, so
