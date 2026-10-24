@@ -38,26 +38,16 @@ jobs:
       # LadybugDB (default feature) links `lbug`. macOS/Windows use the prebuilt
       # liblbug. Linux builds it from source with the runner's compiler: the
       # prebuilt was compiled with an older GCC and segfaults when linked next to
-      # a newer libstdc++ (see rust.yml). The flags go through $GITHUB_ENV, not a
+      # a newer libstdc++ (see rust.yml). The flag goes through $GITHUB_ENV, not a
       # matrix-wide `env:`, because lbug's build script only checks whether
-      # LBUG_BUILD_FROM_SOURCE is set at all. sccache reuses the C++ objects
-      # that CI on main already compiled (same Release flags; tag runs can read
-      # the default branch's cache).
+      # LBUG_BUILD_FROM_SOURCE is set at all. Unlike CI, release builds don't use
+      # sccache: release binaries compile lbug cold rather than from C++ objects
+      # in the shared Actions cache.
       - name: Install LadybugDB build dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update && sudo apt-get install -y cmake clang build-essential pkg-config libssl-dev
-          {
-            echo "LBUG_BUILD_FROM_SOURCE=1"
-            echo "SCCACHE_GHA_ENABLED=true"
-            echo "CMAKE_C_COMPILER_LAUNCHER=sccache"
-            echo "CMAKE_CXX_COMPILER_LAUNCHER=sccache"
-          } >> "$GITHUB_ENV"
-      - name: Set up sccache (Linux)
-        if: runner.os == 'Linux'
-        uses: mozilla-actions/sccache-action@v0.0.11
-        with:
-          version: "v0.18.0"
+          echo "LBUG_BUILD_FROM_SOURCE=1" >> "$GITHUB_ENV"
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@v2
         with:
