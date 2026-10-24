@@ -53,9 +53,9 @@ clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
-tower-http = { version = "0.6", features = ["fs", "trace"] }
-tree-sitter = "0.26"
-tree-sitter-loader = "0.26"
+tower-http = { version = "0.7", features = ["fs", "trace"] }
+tree-sitter = "0.27"
+tree-sitter-loader = "0.27"
 tree-sitter-language = "0.1"
 tree-sitter-rust = "0.24"
 tree-sitter-python = "0.25"
@@ -69,10 +69,10 @@ tree-sitter-c-sharp = "0.23"
 tree-sitter-ruby = "0.23"
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 tree-sitter-bash = "0.25"
-tree-sitter-php = "0.24"
+tree-sitter-php = "0.25"
 tree-sitter-scala = "0.26"
-tree-sitter-ocaml = "0.25"
-tree-sitter-haskell = "0.23"
+tree-sitter-ocaml = "0.26"
+tree-sitter-haskell = "0.24"
 tree-sitter-lua = "0.5"
 tree-sitter-elixir = "0.3"
 tree-sitter-swift = "0.7"
