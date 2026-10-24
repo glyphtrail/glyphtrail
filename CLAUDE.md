@@ -6,6 +6,10 @@ installs into a consuming repo — this repo dogfoods its own onboarding, and th
 bundled copies under `crates/glyphtrail-cli/assets/` are derived from here (run
 `task assets:sync` after editing the skill or this section).
 
+Workflow: GitHub Flow. Branch off `main` as `feature/<short-kebab-name>` for
+every change (fixes and docs too), open a PR, and squash-merge it once CI is
+green. Never commit to `main` directly. See `CONTRIBUTING.md`.
+
 <!-- glyphtrail:begin v=2 (managed section — edits are overwritten) -->
 # Code graph (glyphtrail)
 
