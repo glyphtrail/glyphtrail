@@ -31,6 +31,8 @@ pub fn grammar(lang: &Language) -> Option<TsLanguage> {
         Language::Dart => tree_sitter_dart::LANGUAGE.into(),
         Language::Merlin6502 => tree_sitter_merlin6502::LANGUAGE.into(),
         Language::Pascal => tree_sitter_pascal::LANGUAGE.into(),
+        Language::Vb6 => wicked_estate_tree_sitter_vb6::LANGUAGE.into(),
+        Language::VbNet => tree_sitter_vb_dotnet::LANGUAGE.into(),
         Language::Other(_) => return None,
     })
 }
@@ -69,6 +71,8 @@ pub fn query_source(lang: &Language) -> Option<&'static str> {
         Language::Dart => include_str!("../queries/dart.scm"),
         Language::Merlin6502 => include_str!("../queries/merlin6502.scm"),
         Language::Pascal => include_str!("../queries/pascal.scm"),
+        Language::Vb6 => include_str!("../queries/vb6.scm"),
+        Language::VbNet => include_str!("../queries/vbnet.scm"),
         Language::Other(_) => return None,
     })
 }

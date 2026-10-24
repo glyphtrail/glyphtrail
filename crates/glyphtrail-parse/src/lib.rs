@@ -113,6 +113,11 @@ mod tests {
             (Language::Dart, "void f() {}\n"),
             (Language::Merlin6502, "f rts\n"),
             (Language::Pascal, "procedure f;\nbegin\nend;\n"),
+            (Language::Vb6, "Sub f()\nEnd Sub\n"),
+            (
+                Language::VbNet,
+                "Module M\n    Sub f()\n    End Sub\nEnd Module\n",
+            ),
         ];
         for (lang, src) in cases {
             let parsed = parse_source(&lang, src)
@@ -251,6 +256,12 @@ mod tests {
             (
                 Language::Pascal,
                 "{ note }\nprocedure f;\nbegin\n  g(1);\nend;\n",
+                "g",
+            ),
+            (Language::Vb6, "' note\nSub f()\n    g 1\nEnd Sub\n", "g"),
+            (
+                Language::VbNet,
+                "' note\nModule M\n    Sub f()\n        g(1)\n    End Sub\nEnd Module\n",
                 "g",
             ),
         ];
@@ -395,6 +406,147 @@ end.
                 .iter()
                 .any(|e| e.src == draw && e.dst == helper && e.kind == EdgeKind::Calls)
         );
+    }
+
+    // Classic VB: procedures, `Property Get`/`Let` merged into one def, types,
+    // `Implements`, and the call forms (`Foo x`, `Call Foo(x)`, `Foo(x)` in an
+    // expression, `obj.Foo`, `New Foo`), resolved locally in a `.cls` module.
+    #[test]
+    fn vb6_extracts_procedures_types_and_calls() {
+        use glyphtrail_core::{EdgeKind, NodeId, NodeKind};
+        let src = "VERSION 1.0 CLASS
+BEGIN
+  MultiUse = -1  'True
+END
+Attribute VB_Name = \"Account\"
+Option Explicit
+Implements IAccount
+
+Private Const MAX_ITEMS As Integer = 10
+Public Type Point
+    X As Long
+End Type
+Public Enum Kind
+    Small
+End Enum
+
+Public Property Get Balance() As Currency
+    Balance = 1
+End Property
+
+Public Property Let Balance(ByVal v As Currency)
+End Property
+
+Private Sub Deposit(ByVal amt As Currency)
+    Log \"deposit\"
+    Call Audit(amt)
+    total = Twice(amt)
+    Form1.Show
+    Set c = New Collection
+End Sub
+
+Private Sub Audit(ByVal amt As Currency)
+End Sub
+
+Private Function Twice(ByVal n As Long) As Long
+    Twice = n * 2
+End Function
+";
+        let parsed = parse_source(&Language::Vb6, src).unwrap();
+        let kind = |name: &str| parsed.defs.iter().find(|d| d.name == name).map(|d| d.kind);
+        check!(kind("Deposit") == Some(NodeKind::Function));
+        check!(kind("Twice") == Some(NodeKind::Function));
+        check!(kind("Balance") == Some(NodeKind::Method));
+        check!(kind("Point") == Some(NodeKind::Struct));
+        check!(kind("Kind") == Some(NodeKind::Enum));
+        check!(kind("MAX_ITEMS") == Some(NodeKind::Constant));
+        let bases: Vec<&str> = parsed.bases.iter().map(|b| b.name.as_str()).collect();
+        check!(bases == vec!["IAccount"]);
+        let calls: Vec<&str> = parsed.calls.iter().map(|c| c.name.as_str()).collect();
+        for want in ["Log", "Audit", "Twice", "Show", "Collection"] {
+            check!(calls.contains(&want), "missing call {want}: {calls:?}");
+        }
+
+        let file_id = NodeId::derive(&["file", "Account.cls"]);
+        let fg = build_file_graph("Account.cls", &Language::Vb6, &file_id, &parsed, src);
+        // Get + Let derive the same id, so analyze stores the property as one node.
+        let balance: Vec<_> = fg
+            .graph
+            .nodes
+            .iter()
+            .filter(|n| n.name == "Balance")
+            .map(|n| &n.id)
+            .collect();
+        check!(balance.len() == 2);
+        check!(balance[0] == balance[1]);
+        let id = |name: &str| {
+            fg.graph
+                .nodes
+                .iter()
+                .find(|n| n.name == name)
+                .map(|n| n.id.clone())
+                .unwrap()
+        };
+        let (deposit, audit) = (id("Deposit"), id("Audit"));
+        check!(
+            fg.graph
+                .edges
+                .iter()
+                .any(|e| e.src == deposit && e.dst == audit && e.kind == EdgeKind::Calls)
+        );
+    }
+
+    // VB.NET: types and members nest under their block, `Imports` is recorded,
+    // and `Foo(x)`, `obj.Foo()`, a parameterless `Foo` and `New Foo()` are calls.
+    #[test]
+    fn vbnet_extracts_types_members_and_calls() {
+        use glyphtrail_core::NodeKind;
+        let src = "Imports System.Collections.Generic
+
+Namespace Geometry
+    Public Class Shape
+        Public Sub Draw()
+            Helper(1)
+            Me.Refresh()
+            Reset
+            Dim sb = New StringBuilder()
+        End Sub
+        Private Function Helper(x As Integer) As Integer
+            Return x * 2
+        End Function
+        Public Property Name As String
+    End Class
+    Public Interface IDrawable
+        Sub Draw()
+    End Interface
+    Public Structure Pt
+        Public X As Integer
+    End Structure
+    Public Enum Color
+        Red
+    End Enum
+    Public Module Util
+        Public Const Max As Integer = 3
+    End Module
+End Namespace
+";
+        let parsed = parse_source(&Language::VbNet, src).unwrap();
+        let kind = |name: &str| parsed.defs.iter().find(|d| d.name == name).map(|d| d.kind);
+        check!(kind("Shape") == Some(NodeKind::Class));
+        check!(kind("Helper") == Some(NodeKind::Method));
+        check!(kind("Name") == Some(NodeKind::Method));
+        check!(kind("IDrawable") == Some(NodeKind::Interface));
+        check!(kind("Pt") == Some(NodeKind::Struct));
+        check!(kind("Color") == Some(NodeKind::Enum));
+        check!(kind("Util") == Some(NodeKind::Module));
+        check!(kind("Max") == Some(NodeKind::Constant));
+        check!(parsed.imports == vec!["System.Collections.Generic"]);
+        let calls: Vec<&str> = parsed.calls.iter().map(|c| c.name.as_str()).collect();
+        for want in ["Helper", "Refresh", "Reset", "StringBuilder"] {
+            check!(calls.contains(&want), "missing call {want}: {calls:?}");
+        }
+        // `Me.Refresh()` has no receiver scope.
+        check!(parsed.calls.iter().all(|c| c.scope.is_none()));
     }
 
     // #5: `new Foo()` constructor instantiation is a reference to the class, so

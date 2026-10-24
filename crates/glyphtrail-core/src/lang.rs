@@ -35,6 +35,10 @@ pub enum Language {
     Merlin6502,
     /// Pascal: Free Pascal and Delphi (#555).
     Pascal,
+    /// Classic Visual Basic: VB6 and exported VBA modules.
+    Vb6,
+    /// Visual Basic .NET.
+    VbNet,
     /// A language identified by name but not built in (dynamically loaded).
     Other(String),
 }
@@ -67,6 +71,8 @@ impl Language {
             Language::Dart => "dart",
             Language::Merlin6502 => "merlin6502",
             Language::Pascal => "pascal",
+            Language::Vb6 => "vb6",
+            Language::VbNet => "vbnet",
             Language::Other(name) => name,
         }
     }
@@ -107,6 +113,11 @@ impl Language {
             // a per-repo dynamic `[[languages]]` entry. `.lpr`/`.dpr` are the
             // Lazarus/Delphi program files (#555).
             "pas" | "pp" | "lpr" | "dpr" => Language::Pascal,
+            // VB6/VBA modules, classes, forms and user controls. `.cls` is also a
+            // LaTeX class file; a LaTeX repo can override it via a per-repo
+            // dynamic `[[languages]]` entry.
+            "bas" | "cls" | "frm" | "ctl" => Language::Vb6,
+            "vb" => Language::VbNet,
             _ => return None,
         })
     }
@@ -138,11 +149,13 @@ impl Language {
             "dart" => Language::Dart,
             "merlin6502" | "merlin" => Language::Merlin6502,
             "pascal" | "delphi" => Language::Pascal,
+            "vb6" | "vba" => Language::Vb6,
+            "vbnet" => Language::VbNet,
             _ => return None,
         })
     }
 
-    pub const ALL: [Language; 25] = [
+    pub const ALL: [Language; 27] = [
         Language::Rust,
         Language::Python,
         Language::JavaScript,
@@ -168,6 +181,8 @@ impl Language {
         Language::Dart,
         Language::Merlin6502,
         Language::Pascal,
+        Language::Vb6,
+        Language::VbNet,
     ];
 }
 

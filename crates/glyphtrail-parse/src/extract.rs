@@ -123,12 +123,21 @@ fn call_qualifier(node: tree_sitter::Node, src: &[u8]) -> Option<String> {
         "member_access_expression" => parent.child_by_field_name("expression"), // C#
         "call" => parent.child_by_field_name("receiver"),          // Ruby `recv.meth`
         "exprDot" => parent.child_by_field_name("lhs"),            // Pascal `obj.Meth`
+        // VB.NET `obj.Meth` (`object`); VB6 `obj.Meth` (`first`).
+        "member_access" => parent
+            .child_by_field_name("object")
+            .or_else(|| parent.child_by_field_name("first")),
         _ => None,
     }?;
     let text = recv.utf8_text(src).ok()?;
     // Reduce a dotted/scoped receiver to its last segment (the immediate scope).
     let seg = text.rsplit(['.', ':']).next().unwrap_or(text).trim();
-    if seg.is_empty() || matches!(seg, "self" | "Self" | "this" | "cls" | "super") {
+    if seg.is_empty()
+        || matches!(
+            seg,
+            "self" | "Self" | "this" | "cls" | "super" | "Me" | "MyBase" | "MyClass"
+        )
+    {
         return None;
     }
     Some(seg.to_string())
