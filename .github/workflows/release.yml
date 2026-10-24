@@ -8,6 +8,9 @@ name: release
 on:
   push:
     tags: ["v*"]
+  # Manual runs build and package every target (artifacts only) without
+  # creating a release: use it to test release changes from a branch.
+  workflow_dispatch:
 
 # Least privilege by default; only the final release job can write.
 permissions: {}
@@ -25,6 +28,7 @@ jobs:
   # mistyped tag can't ship binaries that report a different `--version`.
   verify-tag:
     name: Verify tag matches workspace version
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
       contents: read # check out the repository
@@ -45,6 +49,8 @@ jobs:
   build:
     name: ${{ matrix.target }}
     needs: verify-tag
+    # Run when verify-tag passed, or was skipped on a manual run.
+    if: ${{ !failure() && !cancelled() }}
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read # check out the repository
@@ -64,7 +70,7 @@ jobs:
     # into the shell source.
     env:
       TARGET: ${{ matrix.target }}
-      TAG: ${{ github.ref_name }}
+      TAG: ${{ github.ref_type == 'tag' && github.ref_name || format('dev-{0}', github.sha) }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -90,6 +96,29 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y cmake clang build-essential pkg-config libssl-dev
           echo "LBUG_BUILD_FROM_SOURCE=1" >> "$GITHUB_ENV"
+      # lbug (>= 0.21) links OpenSSL. macOS and Windows have no system OpenSSL,
+      # so link it statically there: otherwise the binary depends on whatever
+      # the runner happened to have (on macOS, Homebrew's dylibs under
+      # /opt/homebrew) and fails to start on users' machines. lbug's build
+      # script honours OPENSSL_DIR (expects <dir>/lib), so point it at a
+      # directory holding only the static libraries. Linux keeps linking the
+      # distro's libssl dynamically.
+      - name: Provide static OpenSSL (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
+          src="$(brew --prefix openssl@3)/lib"
+          dir="$RUNNER_TEMP/openssl-static"
+          mkdir -p "$dir/lib"
+          cp "$src/libssl.a" "$src/libcrypto.a" "$dir/lib/"
+          echo "OPENSSL_DIR=$dir" >> "$GITHUB_ENV"
+      - name: Provide static OpenSSL (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          vcpkg install openssl:x64-windows-static-md
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "OPENSSL_DIR=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md" >> $env:GITHUB_ENV
       # Embed an SBOM (the exact dependency tree) into the binary so it can be
       # audited after the fact with `cargo audit bin <binary>` (#301). Installed
       # from a prebuilt to avoid compiling it on every target.
@@ -100,6 +129,22 @@ jobs:
       - name: Build (SBOM embedded)
         shell: bash
         run: cargo auditable build --release --locked -p glyphtrail-cli --target "$TARGET"
+      # Guard against shipping a binary that only runs on the build machine:
+      # nothing may be loaded from Homebrew (or another /usr/local prefix).
+      - name: Check dynamic dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          otool -L "target/$TARGET/release/glyphtrail"
+          if otool -L "target/$TARGET/release/glyphtrail" | tail -n +2 | grep -E '/opt/homebrew|/usr/local'; then
+            echo "::error::binary links libraries outside the macOS base system"
+            exit 1
+          fi
+      - name: Smoke test
+        shell: bash
+        run: |
+          bin="target/$TARGET/release/glyphtrail"
+          [ "$RUNNER_OS" = "Windows" ] && bin="$bin.exe"
+          "$bin" --version
       - name: Package
         shell: bash
         run: |
@@ -154,6 +199,7 @@ jobs:
   release:
     name: Create GitHub Release
     needs: build
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
       contents: write # create the release and upload its assets
