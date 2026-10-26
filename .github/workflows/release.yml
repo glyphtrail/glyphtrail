@@ -145,49 +145,10 @@ jobs:
           bin="target/$TARGET/release/glyphtrail"
           [ "$RUNNER_OS" = "Windows" ] && bin="$bin.exe"
           "$bin" --version
+      # Archive + MCP bundle (.mcpb) into dist/; shared with the musl job.
       - name: Package
         shell: bash
-        run: |
-          staging="glyphtrail-$TAG-$TARGET"
-          mkdir -p "$staging" dist
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            cp "target/$TARGET/release/glyphtrail.exe" "$staging/"
-          else
-            cp "target/$TARGET/release/glyphtrail" "$staging/"
-          fi
-          cp README.md LICENSE-EUPL-1.2 "$staging/"
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            7z a "dist/$staging.zip" "$staging" >/dev/null
-          else
-            tar czf "dist/$staging.tar.gz" "$staging"
-          fi
-      # Build a one-click MCP Bundle (.mcpb) for Claude Desktop (#303): a zip of
-      # the platform binary plus a manifest derived from packaging/mcpb. The bundle
-      # is arch-specific because it ships a native binary, so we build one per
-      # target and stamp the version / binary name / platform into the manifest.
-      - name: Package MCP bundle (.mcpb)
-        shell: bash
-        run: |
-          ver="${TAG#v}"
-          case "$TARGET" in
-            *windows*) bin="glyphtrail.exe"; platform="win32" ;;
-            *darwin*)  bin="glyphtrail";     platform="darwin" ;;
-            *)         bin="glyphtrail";     platform="linux" ;;
-          esac
-          work="$(mktemp -d)"
-          cp "target/$TARGET/release/$bin" "$work/"
-          jq --arg v "$ver" --arg bin "$bin" --arg plat "$platform" \
-            '.version = $v
-             | .server.entry_point = $bin
-             | .server.mcp_config.command = "${__dirname}/" + $bin
-             | .compatibility.platforms = [$plat]' \
-            packaging/mcpb/manifest.json > "$work/manifest.json"
-          out="$PWD/dist/glyphtrail-$TAG-$TARGET.mcpb"
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            ( cd "$work" && 7z a -tzip "$out" . >/dev/null )
-          else
-            ( cd "$work" && zip -r -q "$out" . )
-          fi
+        run: .github/scripts/package.sh
       - name: Upload build artifacts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -196,9 +157,80 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # Fully static Linux binary (no glibc / libssl version requirements), built
+  # natively in an Alpine container. Separate from the matrix because nearly
+  # every step differs. Notes on the flags:
+  # - RUSTFLAGS replaces the repo's Linux `--export-dynamic` link flag (see
+  #   .cargo/config.toml), which breaks a static-pie binary. A static binary
+  #   cannot dlopen lbug extensions anyway, so the `vector` extension is
+  #   unavailable in this build.
+  # - lbug requests OpenSSL as a dylib, which rustc places after libc; with the
+  #   static OpenSSL archives that leaves libc symbols unresolved, so libc is
+  #   linked once more at the very end (`-lc`).
+  # - `--target` keeps those flags off build scripts and proc-macros, which
+  #   must stay dynamic.
+  build-musl:
+    name: x86_64-unknown-linux-musl
+    needs: verify-tag
+    # Run when verify-tag passed, or was skipped on a manual run.
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read # check out the repository
+    container:
+      image: rust:1.99-alpine@sha256:b1d5dd5a22a09404d3e798c0cf051b689077360374eb505fa5bb93c479693d87
+    env:
+      TARGET: x86_64-unknown-linux-musl
+      TAG: ${{ github.ref_type == 'tag' && github.ref_name || format('dev-{0}', github.sha) }}
+      LBUG_BUILD_FROM_SOURCE: "1"
+      CC: gcc
+      CXX: g++
+      OPENSSL_DIR: /opt/openssl-static
+      RUSTFLAGS: -C target-feature=+crt-static -C link-arg=-lc
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install build dependencies
+        run: |
+          apk add --no-cache bash build-base cmake jq linux-headers openssl-dev \
+            openssl-libs-static perl pkgconf python3 zip
+          mkdir -p "$OPENSSL_DIR/lib"
+          cp /usr/lib/libssl.a /usr/lib/libcrypto.a "$OPENSSL_DIR/lib/"
+      # Built for the host, so it must not get the job's static-target
+      # RUSTFLAGS (proc-macros can't be built with crt-static). Empty, not
+      # unset, so the repo's --export-dynamic is overridden as well.
+      - name: Install cargo-auditable
+        env:
+          RUSTFLAGS: ""
+        run: cargo install cargo-auditable --locked --version 0.7.7
+      - name: Build (SBOM embedded)
+        run: cargo auditable build --release --locked -p glyphtrail-cli --target "$TARGET"
+      - name: Check the binary is static
+        run: |
+          bin="target/$TARGET/release/glyphtrail"
+          if readelf -d "$bin" | grep -q NEEDED; then
+            readelf -d "$bin" | grep NEEDED
+            echo "::error::musl binary has dynamic library dependencies"
+            exit 1
+          fi
+          "$bin" --version
+      - name: Package
+        shell: bash
+        run: .github/scripts/package.sh
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-x86_64-unknown-linux-musl
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
   release:
     name: Create GitHub Release
-    needs: build
+    needs: [build, build-musl]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:

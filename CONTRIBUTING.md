@@ -41,7 +41,7 @@ pre-releases. Publishing to crates.io stays manual (`task publish`).
 ```mermaid
 flowchart LR
   tag["push tag v*"] --> verify["verify-tag<br/>tag == Cargo version"]
-  verify --> build["build matrix<br/>linux · macOS arm/x64 · windows"]
+  verify --> build["build matrix<br/>linux gnu/musl · macOS arm/x64 · windows"]
   build --> release["release<br/>notes + archives + .mcpb + SHA256SUMS"]
 ```
 
