@@ -199,7 +199,12 @@ jobs:
             openssl-libs-static perl pkgconf python3 zip
           mkdir -p "$OPENSSL_DIR/lib"
           cp /usr/lib/libssl.a /usr/lib/libcrypto.a "$OPENSSL_DIR/lib/"
+      # Built for the host, so it must not get the job's static-target
+      # RUSTFLAGS (proc-macros can't be built with crt-static). Empty, not
+      # unset, so the repo's --export-dynamic is overridden as well.
       - name: Install cargo-auditable
+        env:
+          RUSTFLAGS: ""
         run: cargo install cargo-auditable --locked --version 0.7.7
       - name: Build (SBOM embedded)
         run: cargo auditable build --release --locked -p glyphtrail-cli --target "$TARGET"
