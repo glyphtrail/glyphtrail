@@ -123,7 +123,7 @@ jobs:
       # audited after the fact with `cargo audit bin <binary>` (#301). Installed
       # from a prebuilt to avoid compiling it on every target.
       - name: Install cargo-auditable
-        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: cargo-auditable
       - name: Build (SBOM embedded)
