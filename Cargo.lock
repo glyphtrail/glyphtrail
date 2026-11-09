@@ -492,9 +492,9 @@ checksum = "9e9de72ce2ad1f90dc62fa25f0f430ef85eb4b0d8fa0be4f30373bc40a21d28e"
 
 [[package]]
 name = "detect-coding-agent"
-version = "0.1.1"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be8df8d4e032e29ed623c6d5815d8ac7b8b82106f2f04a4e174f93fc807145a3"
+checksum = "97ac45f8db613a0dd189206604756712e17056fc87deb058423dba9eb5f04583"
 
 [[package]]
 name = "diff"
@@ -1128,9 +1128,9 @@ checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
 name = "lbug"
-version = "0.21.2"
+version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "862a51324bf4785f3f1e4dca9b86d38745b543c0f06b1a5731956e66979879c3"
+checksum = "0dd89790069b850c2ae89d3cc8962b4cdffa2cafface814c4cae5c7e6f666e0b"
 dependencies = [
  "cmake",
  "cxx",
@@ -2107,9 +2107,9 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter-dart"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "325dd1e24ee9ee21111e9c43680ae7d6010aaa9f282b048a99b9c7163c1cf553"
+checksum = "973ff905142c61200ef0bf5e226f03a5f20a9a7d3a0ae2c4c86cdb42f98b63eb"
 dependencies = [
  "cc",
  "tree-sitter-language",
